@@ -798,6 +798,7 @@ function checksEnv(o: ChecksOpts = {}) {
   const pool = stub<SlotPool>({
     reset: async (s, commit) => { resets.push(`reset:${s}@${commit}`); current = commit; if (o.resetError !== undefined) throw o.resetError; },
     cleanForChecks: async s => { resets.push(`clean:${s}`); },
+    get: async () => stub<SlotRecord>({ state: "leased", managers: [], manifests: {}, updatedAt: "unchanged" }),
     // The plan's slots: the ci slot that observed a suite failure, and this check's slot.
     list: async () => [stub<SlotRecord>({ path: nodePath.resolve("/ci") }), stub<SlotRecord>({ path: nodePath.resolve("/slot") })],
   });
@@ -834,7 +835,7 @@ function checksEnv(o: ChecksOpts = {}) {
     ...(o.allowCommand === undefined ? {} : { allowCommand: o.allowCommand }),
     fileExists: async p => (o.exists ?? (() => true))(p),
   });
-  return { checks, spawned, released, acquired, preempts, resets, background, at: () => current };
+  return { checks, pool, git, igit, spawned, released, acquired, preempts, resets, background, at: () => current };
 }
 
 function checkReq(o: Partial<CheckRequest> = {}): CheckRequest {
@@ -1042,6 +1043,104 @@ describe("integration checks: prepare and select", () => {
 });
 
 describe("integration checks: run", () => {
+  it("reuses the candidate checkout with one clean and no reset when HEAD still matches", async () => {
+    const { checks, git, resets } = checksEnv();
+    const head = vi.spyOn(git, "revParse");
+    expect(await checks.run(checkReq({ reuseCheckout: true }))).toMatchObject({ verdict: "pass" });
+    expect(resets).toEqual(["clean:s1"]);
+    expect(head).toHaveBeenCalledExactlyOnceWith("/slot", "HEAD");
+  });
+
+  it("falls back to full prepare when the reused checkout HEAD does not match", async () => {
+    const { checks, git, resets } = checksEnv();
+    vi.spyOn(git, "revParse").mockResolvedValueOnce("other").mockResolvedValue("cand");
+    expect(await checks.run(checkReq({ reuseCheckout: true }))).toMatchObject({ verdict: "pass" });
+    expect(resets).toEqual(["clean:s1", "reset:s1@cand", "clean:s1"]);
+  });
+
+  it.each([
+    { drift: "managers", change: { managers: ["pnpm"] } },
+    { drift: "manifests", change: { manifests: { "package.json": "new-digest" } } },
+    { drift: "provisioning", change: { updatedAt: "changed" } },
+  ])("falls back to full prepare when $drift changes during the reuse clean", async ({ change }) => {
+    const { checks, pool, resets } = checksEnv();
+    const before = { ...(await pool.get("s1"))!, managers: ["npm"], manifests: { "package.json": "old-digest" } };
+    vi.spyOn(pool, "get").mockResolvedValueOnce(before).mockResolvedValueOnce({ ...before, ...change });
+    expect(await checks.run(checkReq({ reuseCheckout: true }))).toMatchObject({ verdict: "pass" });
+    expect(resets).toEqual(["clean:s1", "reset:s1@cand", "clean:s1"]);
+  });
+
+  it("retains the prepare error when full prepare cannot repair a reused checkout HEAD", async () => {
+    const { checks, resets } = checksEnv({ head: "other" });
+    expect(await checks.run(checkReq({ reuseCheckout: true }))).toMatchObject({
+      verdict: "error", reason: "prepare", message: "slot s1 is at other, not cand", components: [],
+    });
+    expect(resets).toEqual(["clean:s1", "reset:s1@cand", "clean:s1"]);
+  });
+
+  it("wraps a reused checkout clean failure with the same prepare error semantics", async () => {
+    const { checks, pool, resets } = checksEnv();
+    vi.spyOn(pool, "cleanForChecks").mockRejectedValue("clean failed");
+    expect(await checks.run(checkReq({ reuseCheckout: true }))).toMatchObject({
+      verdict: "error", reason: "prepare", message: "could not prepare slot s1: clean failed", components: [],
+    });
+    expect(resets).toEqual([]);
+  });
+
+  it.each([false, true])("overlaps commit selection reads with the clean (reuseCheckout=%s), but resolves commands afterwards", async reuseCheckout => {
+    let release!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const cleaning = new Promise<void>(resolve => { entered = resolve; });
+    let cleanDone = false;
+    const resolve = vi.fn((ref: RunCommandRef) => {
+      expect(cleanDone).toBe(true);
+      return { ok: true as const, command: { ...cmd, label: ref.script, ref } };
+    });
+    const { checks, pool, igit } = checksEnv({ files: { "package.json": JSON.stringify({ scripts: { typecheck: "tsc" } }) }, resolve });
+    const show = vi.spyOn(igit, "showFile");
+    const diff = vi.spyOn(igit, "diffNameStatus");
+    vi.spyOn(pool, "cleanForChecks").mockImplementation(async () => { entered(); await gate; cleanDone = true; });
+    const running = checks.run(checkReq({ reuseCheckout }));
+    try {
+      await cleaning;
+      expect(show.mock.calls.map(([, commit, path]) => [commit, path])).toEqual(
+        ["package.json", "pytest.ini", "conftest.py", "pyproject.toml", "setup.cfg", "tox.ini"].map(path => ["cand", path]),
+      );
+      expect(diff).toHaveBeenCalledExactlyOnceWith("/slot", "base", "cand");
+      expect(resolve).not.toHaveBeenCalled();
+    } finally { release(); }
+    expect(await running).toMatchObject({ verdict: "pass" });
+    expect(resolve).toHaveBeenCalledExactlyOnceWith({ script: "typecheck", args: [] }, "/slot");
+  });
+
+  it.each([false, true])("reports prepare failure before failed overlapped reads without unhandled rejection (reuseCheckout=%s)", async reuseCheckout => {
+    let release!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const preparing = new Promise<void>(resolve => { entered = resolve; });
+    const unhandled: unknown[] = [];
+    const onUnhandled = (e: unknown): void => { unhandled.push(e); };
+    const { checks, pool, igit } = checksEnv({ diffError: new Error("diff failed") });
+    vi.spyOn(igit, "showFile").mockRejectedValue(new Error("show failed"));
+    const failPrepare = async (): Promise<void> => { entered(); await gate; throw new Error("prepare failed"); };
+    if (reuseCheckout) vi.spyOn(pool, "cleanForChecks").mockImplementation(failPrepare);
+    else vi.spyOn(pool, "reset").mockImplementation(failPrepare);
+    process.on("unhandledRejection", onUnhandled);
+    const running = checks.run(checkReq({ reuseCheckout }));
+    try {
+      await preparing;
+      await new Promise<void>(resolve => setImmediate(resolve)); // reads reject while prepare is still pending
+      release();
+      expect(await running).toMatchObject({ verdict: "error", reason: "prepare", message: "could not prepare slot s1: prepare failed" });
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(unhandled).toEqual([]);
+    } finally {
+      release();
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+
   it("reports a prepare error with no component", async () => {
     const { checks, acquired } = checksEnv({ resetError: new Error("boom") });
     const r = await checks.run(checkReq());

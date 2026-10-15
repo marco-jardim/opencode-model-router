@@ -714,6 +714,8 @@ class Queue implements IntegrationQueue {
   private passed = new Set<string>();
   /** M18: verdicts by candidate sha within the current serial entry. */
   private verdicts = new Map<string, "pass" | "fail">();
+  /** One-use proof of the checkout produced by the latest successful stack rebase. */
+  private stackedCheckout: { slot: string; head: string } | null = null;
   private resumed = false;
   private resuming: Promise<ResumeReport> | null = null;
   private serialRunning = false;
@@ -899,6 +901,7 @@ class Queue implements IntegrationQueue {
       this.passed = new Set();
       this.verdicts = new Map();
       this.lastFail = new Map();
+      this.stackedCheckout = null;
       if (!this.holdLock) await this.releaseLock();
     }
     if (this.background === live) this.background = null;
@@ -1444,6 +1447,7 @@ class Queue implements IntegrationQueue {
   /** M17: stack T in the slot of T's last task. A conflict on the head is terminal (row 31); against a batch-mate it defers. */
   private async stack(live: LiveEntry, T: readonly TaskId[],
     given: Array<{ taskId: TaskId; tip: string; upstream: string }> | null): Promise<StackResult> {
+    this.stackedCheckout = null;
     const head = this.ledger.integration.head;
     const lastId = T[T.length - 1];
     const slotId = lastId === undefined ? null : this.ledger.tasks[lastId]?.slot ?? null;
@@ -1462,6 +1466,7 @@ class Queue implements IntegrationQueue {
       const preparation = observation?.start("service-prep", "checkout-reset");
       try {
         await this.guardWrite(live, lease.path, "slot");
+        this.stackedCheckout = null;
         await this.d.pool.reset(lease.slot, p.tip);
         preparation?.end("completed");
       } finally { preparation?.end("error"); }
@@ -1469,12 +1474,14 @@ class Queue implements IntegrationQueue {
       const r = await (observation === undefined ? this.d.git.rebaseOnto(lease.path, prev, p.upstream)
         : this.d.git.rebaseOnto(lease.path, prev, p.upstream, observation));
       if (r.ok) {
+        this.stackedCheckout = { slot: lease.slot, head: r.head };
         stacked.push({ taskId: p.taskId, from: prev, to: r.head });
         prev = r.head;
         continue;
       }
       await this.assertLock(live); // QA-3.2-28: rebaseAbort is a write too
       await this.d.git.rebaseAbort(lease.path);
+      this.stackedCheckout = null;
       if (prev !== head) {
         deferred.push(p.taskId);
         continue;
@@ -1548,6 +1555,8 @@ class Queue implements IntegrationQueue {
     const tipRange = S[S.length - 1];
     if (tipRange === undefined) throw new ExecutorError("E_INVALID_INPUT", "empty stack", null);
     const candidate = tipRange.to;
+    let checkout = this.stackedCheckout;
+    this.stackedCheckout = null;
     const tasks = S.map(r => r.taskId);
     if (step === "bisect") this.probes++;
     const memo = this.verdicts.get(candidate);
@@ -1567,7 +1576,10 @@ class Queue implements IntegrationQueue {
       await this.start(live, step, { v: 1, base: head, candidate, tasks }, { candidate });
       await this.assertLock(live); // QA-3.2-28: the checks prepare (reset + clean) the slot first
       const observation = this.service(live, "checks", candidate);
+      const reuseCheckout = (step === "checks" || step === "batch-checks") && checkout?.slot === lease.slot && checkout.head === candidate;
+      checkout = null;
       const r = await this.d.checks.run({ slot: lease, base: head, candidate, priority: "foreground", extra: null, signal: this.ctl.signal,
+        ...(reuseCheckout ? { reuseCheckout: true } : {}),
         ...(observation === undefined ? {} : { observation }) });
       // QA-3.2-13: once the outer signal fired the run is interrupted whatever it returned: no failed/onFailed during abort.
       if (this.ctl.signal.aborted) throw new LaneStop("checks interrupted");

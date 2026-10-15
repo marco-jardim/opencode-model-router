@@ -82,6 +82,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **OpenCode v2: shorter serial integration entries.** Integration checks on the slot the queue has just rebased to the
+  candidate no longer reset it a second time (clean and HEAD check only, falling back to the full prepare on a HEAD
+  mismatch or provisioning drift), and the check-selection reads overlap the clean. Bisect probes, reruns, reverts and
+  phase suites keep the full prepare.
 - **CPX e2e smoke: amended G8 intrinsic-service oracle (A-6.1-1).** The bound uses the pre-run DAG, authored work,
   attributable verification/integration/phase-suite service and configured parallelism, with fail-closed evidence
   checks and raw CP/integration diagnostics retained. Throughput uses the default integration batching; resilience

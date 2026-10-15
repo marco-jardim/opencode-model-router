@@ -126,6 +126,10 @@ The phase suite is the backstop for breakage that affected-test scoping misses. 
 - **M8 Clean step before every check run.**
   - `prepare(slot, commit)` = `pool.reset(slot, commit)` (detached checkout, clean tracked files, re-provision if manifests drifted, `types.ts:1388`), then `pool.cleanForChecks(slot)` (`checkout --force`, `clean -ffdx -e keep`, empty status), then assert `revParse(slot, "HEAD") === commit`.
   - Runs before checks, batch-checks, every bisect probe, every rerun, the base check, revert-checks and the suite.
+  - *Amended 2026-10-15 (Phase 6.1, integration lane latency):* for `checks`/`batch-checks` on the slot the queue's
+    `stack()` has just rebased to exactly this candidate, the reset is skipped: `cleanForChecks` then the same
+    `HEAD === commit` assertion. A HEAD mismatch or provisioning/manifest drift during the clean falls back to the full
+    `prepare`; bisect probes, reruns, the base check, revert-checks and the suite always use the full `prepare`.
   - Any failure is `error:"prepare"`, never pass.
 - **M9 Check selection** (`select(tree)`, read at the candidate).
   1. typecheck, if `package.json` has a string `scripts.typecheck`; resolved as a package script with no args.

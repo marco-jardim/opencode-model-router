@@ -2265,6 +2265,65 @@ describe("batches of 4 (M17, M18)", () => {
   });
 });
 
+describe("post-rebase checkout reuse", () => {
+  it.each([1, 4])("offers reuse for the same slot and candidate just rebased by the queue (%s tasks)", async tasks => {
+    const env = await setup({ tasks });
+    const run = vi.spyOn(env.checks, "run");
+    const ids = Array.from({ length: tasks }, (_, i) => `T${i + 1}`);
+    env.queue.enqueue(ids);
+    await env.until(() => ids.every(id => env.state(id) === "integrated") && env.quiet());
+    expect(run).toHaveBeenCalledTimes(1);
+    const req = run.mock.calls[0]![0];
+    expect(req.reuseCheckout).toBe(true);
+    expect(req.slot.slot).toBe(`slot-${tasks}`);
+    expect(req.candidate).toBe(env.w.slotCommit.get(req.slot.slot));
+    env.assertInvariants();
+  });
+
+  it.each(["spawn", "preempted"] as const)("consumes checkout reuse before a %s retry", async reason => {
+    const env = await setup();
+    const run = vi.spyOn(env.checks, "run");
+    env.w.checkScript.push(errorResult(reason));
+    env.queue.enqueue(["T1"]);
+    await env.until(() => env.state("T1") === "integrated" && env.quiet());
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(run.mock.calls[0]![0].reuseCheckout).toBe(true);
+    expect(run.mock.calls[1]![0]).not.toHaveProperty("reuseCheckout");
+    env.assertInvariants();
+  });
+
+  it("does not offer reuse after a rebase abort leaves the slot away from the stacked candidate", async () => {
+    const env = await setup({ tasks: 2 });
+    const run = vi.spyOn(env.checks, "run");
+    env.w.conflictOnMate.add("T2");
+    env.queue.enqueue(["T1", "T2"]);
+    await env.until(() => env.state("T2") === "integrated" && env.quiet());
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(run.mock.calls[0]![0]).not.toHaveProperty("reuseCheckout");
+    expect(run.mock.calls[1]![0].reuseCheckout).toBe(true); // a fresh successful stack of the deferred task
+    env.assertInvariants();
+  });
+
+  it("never offers checkout reuse to bisect checks from halve, but permits a freshly restacked remainder", async () => {
+    const env = await setup({ tasks: 4 });
+    const requests: Array<{ step: IntegrationStep | undefined; req: CheckRequest }> = [];
+    const run = env.checks.run.bind(env.checks);
+    vi.spyOn(env.checks, "run").mockImplementation(async req => {
+      requests.push({ step: env.writer.openIntegration().find(o => o.entry.kind === "batch")?.step, req });
+      return run(req);
+    });
+    env.w.bad.add("T2");
+    env.queue.enqueue(["T1", "T2", "T3", "T4"]);
+    await env.until(() => env.state("T4") === "integrated" && env.quiet());
+    expect(requests[0]).toMatchObject({ step: "batch-checks", req: { reuseCheckout: true } });
+    const probes = requests.filter(r => r.step === "bisect");
+    expect(probes).toHaveLength(2);
+    for (const { req } of probes) expect(req).not.toHaveProperty("reuseCheckout");
+    expect(requests.at(-1)).toMatchObject({ step: "batch-checks", req: { reuseCheckout: true } });
+    env.assertInvariants();
+  });
+});
+
 // ---------------------------------------------------------------------------------------------------------------
 // M13a / M13b / M36 / M7: infrastructure errors and halts
 // ---------------------------------------------------------------------------------------------------------------

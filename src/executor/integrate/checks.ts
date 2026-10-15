@@ -64,6 +64,8 @@ export type CheckResult =
 export interface CheckRequest {
   observation?: ServiceObservation;
   slot: SlotLease; base: string; candidate: string; priority: "foreground" | "background";
+  /** The queue just rebased this slot to candidate; clean and verify before reusing it. */
+  reuseCheckout?: boolean;
   extra?: { ids: string[]; files: string[]; commands: ResolvedCommand[] } | null; signal: AbortSignal;
 }
 export interface CommandRunRequest {
@@ -492,6 +494,26 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
     }
   }
 
+  async function prepareReused(slot: SlotLease, commit: string): Promise<void> {
+    try {
+      const before = await d.pool.get(slot.slot);
+      await d.pool.cleanForChecks(slot.slot);
+      const head = await d.git.revParse(slot.path, "HEAD");
+      const after = await d.pool.get(slot.slot);
+      // A drift install can change tracked files after the clean. Only a full prepare restores and verifies those.
+      if (head !== commit || before === null || after === null || before.state !== "leased" || after.state !== "leased"
+        || before.updatedAt !== after.updatedAt || before.managers.length !== after.managers.length
+        || before.managers.some((m, i) => m !== after.managers[i])
+        || Object.keys(before.manifests).length !== Object.keys(after.manifests).length
+        || Object.entries(before.manifests).some(([p, hash]) => after.manifests[p] !== hash)) {
+        await prepare(slot, commit);
+      }
+    } catch (e) {
+      if (e instanceof CheckPrepareError) throw e;
+      throw new CheckPrepareError(`could not prepare slot ${slot.slot}: ${errText(e)}`);
+    }
+  }
+
   async function resolveRef(ref: RunCommandRef, cwd: string): Promise<ResolvedCommand> {
     const r = await d.resolver.resolve(ref, cwd);
     if (!r.ok) throw new CheckResolveError(`${ref.script}: ${r.reason}`);
@@ -506,15 +528,17 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
       ...(c.cwd === undefined ? {} : { cwd: c.cwd }), ...(c.env === undefined ? {} : { env: c.env }) };
   }
 
-  async function select(cwd: string, commit: string): Promise<CheckSelection> {
+  async function readSelection(cwd: string, commit: string) {
     const read = (p: string) => d.igit.showFile(cwd, commit, p);
     const [packageJson, pytestIni, conftest, pyproject, setupCfg, toxIni] = await Promise.all([
       read("package.json"), read("pytest.ini"), read("conftest.py"), read("pyproject.toml"), read("setup.cfg"), read("tox.ini"),
     ]);
+    return { packageJson, pytestIni: pytestIni !== null, conftest: conftest !== null, pyproject, setupCfg, toxIni };
+  }
+
+  async function resolveSelection(cwd: string, files: Awaited<ReturnType<typeof readSelection>>): Promise<CheckSelection> {
     const cfg = d.ledger().config;
-    const sel = selectFromFiles(
-      { packageJson, pytestIni: pytestIni !== null, conftest: conftest !== null, pyproject, setupCfg, toxIni }, cfg.integrationChecks,
-    );
+    const sel = selectFromFiles(files, cfg.integrationChecks);
     const typecheck = sel.typecheck ? await resolveRef({ script: "typecheck", args: [] }, cwd) : null;
     const tests: TestComponent[] = [];
     if (sel.node) tests.push({ framework: "node", full: await resolveRef({ script: "test", args: [] }, cwd) });
@@ -528,6 +552,10 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
     const extras: ResolvedCommand[] = [];
     for (const ref of sel.extras) extras.push(await resolveRef(ref, cwd));
     return { typecheck, tests, extras };
+  }
+
+  async function select(cwd: string, commit: string): Promise<CheckSelection> {
+    return resolveSelection(cwd, await readSelection(cwd, commit));
   }
 
   /** M12: holds one machine-wide verification slot around `body`, which gets a signal for abort, preemption and a lost slot. */
@@ -819,15 +847,21 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
     const cwd = req.slot.path;
     let selection: CheckSelection;
     let changed: ChangedPath[];
+    // These read immutable commit objects, not the checkout. Handle rejection immediately, but let prepare fail first.
+    const reads = Promise.all([readSelection(cwd, req.candidate), Promise.resolve().then(() => d.igit.diffNameStatus(cwd, req.base, req.candidate))])
+      .then(value => ({ ok: true as const, value }), (error: unknown) => ({ ok: false as const, error }));
     try {
-      await prepare(req.slot, req.candidate);
+      if (req.reuseCheckout) await prepareReused(req.slot, req.candidate);
+      else await prepare(req.slot, req.candidate);
     } catch (e) {
       return err("prepare", errText(e));
     }
     let extraFiles: string[];
     try {
-      selection = await select(cwd, req.candidate);
-      changed = (await d.igit.diffNameStatus(cwd, req.base, req.candidate)).map(n => ({ path: nodePath.join(cwd, n.path), status: n.status }));
+      const read = await reads;
+      if (!read.ok) throw read.error;
+      selection = await resolveSelection(cwd, read.value[0]);
+      changed = read.value[1].map(n => ({ path: nodePath.join(cwd, n.path), status: n.status }));
       extraFiles = await reroot(req.extra?.files ?? [], cwd);
     } catch (e) {
       return err(e instanceof CheckResolveError ? "resolve" : "prepare", errText(e));
