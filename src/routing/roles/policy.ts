@@ -361,7 +361,7 @@ export function effectiveFactsOf(classified: ClassifiedDispatch): TaskFacts {
  *   unknown ceiling or pin name is ignored.
  *
  * Reasons (deduplicated, in order of application):
- * `gated:authority` the opt-in policy lowered the authority floor;
+ * `gated:authority` the opt-in authority policy lowered the final floor compared with strict;
  * `floor:<source>` a source raised the floor (source = authority | floorTier | running);
  * `round:<source>:<from>-><to>` a built-in name missing from the order was rounded (source adds role | ceiling);
  * `unknown:<source>:<name>-><top>` an unknown floor name was placed at the top of the order (fail closed);
@@ -383,7 +383,7 @@ export function tierBounds(
 
   const { risk, scope } = effectiveFactsOf(classified);
   const authority = authorityFloor(grant, detection, risk, scope, opts.floorPolicy);
-  if (authority !== authorityFloor(grant, detection, risk, scope)) reasons.push("gated:authority");
+  const strictAuthority = authorityFloor(grant, detection, risk, scope);
   const sources: Array<[FloorSource, string | null]> = [
     ["role", role.tierRange.floor],
     ["authority", authority],
@@ -405,6 +405,11 @@ export function tierBounds(
     } else if (placed.index === floor && source === "authority") {
       owner = source;
     }
+  }
+  if (authority !== strictAuthority) {
+    const strictFloor = Math.max(0, ...sources.map(([source, tier]) =>
+      tier === null ? 0 : placeFloor(source === "authority" ? strictAuthority : tier, order).index));
+    if (floor < strictFloor) reasons.unshift("gated:authority");
   }
   const lift = owner === "authority" ? "lift:authority" : "lift:floor";
 

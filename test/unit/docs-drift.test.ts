@@ -1283,7 +1283,10 @@ describe("docs drift: roles delegation keys (#84)", () => {
     expect(cell("routing.delegation")).toBe(defaultCell(defaults.delegation));
     expect(cell("routing.roleFloor")).toBe(defaultCell(defaults.roleFloor));
     expect(defaults.roleFloor).toBe("strict");
-    expect(keyRow(doc, "routing.roleFloor")?.[4]).toBe("global only (stripped from the project layer)");
+    expect(keyRow(doc, "routing.roleFloor")?.[4]).toBe("tiers.json, global (stripped from the project layer)");
+    const roleFloorNotice = "only tiers.json or the global override may set it";
+    expect(read("src/router/config.ts")).toContain(roleFloorNotice);
+    expect(doc.replace(/\s+/g, " ")).toContain(`this key is stripped from the project layer; ${roleFloorNotice}`);
     expect(cell("routing.exploration.rate")).toBe(defaultCell(defaults.exploration.rate));
     expect(cell("routing.exploration.requireDetection")).toBe(defaultCell(defaults.exploration.requireDetection));
     expect(cell("routing.run.timeoutMs")).toBe(defaultCell(defaults.run.timeoutMs));
@@ -1556,6 +1559,9 @@ describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () =
     expect(flat).toContain("Otherwise the strict table applies.");
     expect(flat).toContain("Deferred `testsPass` does not qualify.");
     expect(flat).toContain("`raise:verification-fail:heavy`");
+    expect(flat).toContain("the next tier above `medium` within the role's ceiling and active tier order is `heavy`");
+    expect(flat).toContain("only when gating lowers the final floor compared with strict");
+    expect(flat).toContain("For gated children, **UNVERIFIABLE** at return also records the same raise");
   });
 
   it("detects gated table cell and code mutations without weakening the strict-table pins", () => {
@@ -1586,6 +1592,9 @@ describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () =
       "acceptance other than `none`", "`gated:authority`", "FAIL → heavy safety net", "`raise:verification-fail:heavy`"]) {
       expect(d4, text).toContain(text);
     }
+    expect(d4).toContain("the next tier above `medium` within the role's ceiling and active tier order is `heavy`");
+    expect(d4).toContain("only when gating lowers the final floor compared with strict");
+    expect(d4).toContain("For gated children, UNVERIFIABLE at return also records the same raise");
   });
 
   it("detects a floor cell that differs from the code, a code change and an unreadable cell", () => {

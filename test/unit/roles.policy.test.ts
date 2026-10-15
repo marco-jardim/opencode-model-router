@@ -498,6 +498,25 @@ describe("tierBounds — window", () => {
     }
   });
 
+  it("R1-541a0cb-3: gated:authority describes a lower final floor, not an overridden authority cell", () => {
+    const g = grantOf("edit", "router_run");
+    const base = opts({ floorPolicy: { mode: "gated", gateAtReturn: true } });
+    for (const source of ["floorTier", "runningTier"] as const) {
+      const b = tierBounds(ROLES.implementer, g, facts(), "grader", { ...base, [source]: "heavy" });
+      expect(b).toEqual({
+        floor: "heavy", ceiling: "heavy", pinned: null,
+        reasons: ["floor:authority", `floor:${source === "runningTier" ? "running" : source}`],
+      });
+    }
+    const heavyRole = { ...ROLES.implementer, tierRange: { floor: "heavy", ceiling: "heavy" } };
+    expect(tierBounds(heavyRole, g, facts(), "grader", base)).toEqual({
+      floor: "heavy", ceiling: "heavy", pinned: null, reasons: [],
+    });
+    const rounded = tierBounds(ROLES.implementer, g, facts(), "grader", { ...base, tiers: ["fast", "heavy"] });
+    expect(rounded.floor).toBe("heavy");
+    expect(rounded.reasons).not.toContain("gated:authority");
+  });
+
   it("a read-only grant keeps the role range", () => {
     expect(tierBounds(ROLES.implementer, grantOf(...LOCAL), facts(), "none", opts())).toEqual({
       floor: "fast",

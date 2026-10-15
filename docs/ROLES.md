@@ -609,7 +609,9 @@ orchestrator never sets `tier=` or `model` for that.
 **Gated floor (`routing.roleFloor: "gated"`, opt-in, global only, OpenCode v2 only).**
 This table applies only when verification actually runs **at return**: enforcement is on, not bypassed,
 `verify.require` is not `never`, the verification placement is allowed, verification is not deferred, and the
-effective acceptance is not `none`. Otherwise the strict table applies. Effective detection and risk are unchanged;
+effective acceptance is not `none`. It also requires that the next tier above `medium` within the role's ceiling and
+active tier order is `heavy`; a ceiling of `medium`, a missing tier, or an intermediate rung does not qualify.
+Otherwise the strict table applies. Effective detection and risk are unchanged;
 in particular, a criteria-only acceptance needs a route-line `d=grader` claim to count as `grader`.
 
 <!-- authority-floor-gated-table -->
@@ -620,9 +622,13 @@ in particular, a criteria-only acceptance needs a route-line `d=grader` claim to
 | write + exec | `medium` | `medium`; `heavy` if risk `high` | `heavy` |
 
 Exactly one cell changes: write + exec with effective `grader` detection and risk below `high` has authority floor
-`medium` instead of `heavy` (bounds reason `gated:authority`). All other floors, including role ranges, configured
-floors and running tiers, still apply. Deferred `testsPass` does not qualify. The safety net is unchanged: a
-verification **FAIL** raises a child that ran on `medium` to `heavy` on its next resume (`raise:verification-fail:heavy`).
+`medium` instead of `heavy`. All other floors, including role ranges, configured floors and running tiers, still
+apply; bounds reason `gated:authority` is recorded only when gating lowers the final floor compared with strict.
+Deferred `testsPass` does not qualify. The FAIL → heavy safety net remains: a verification **FAIL** raises a child that
+ran on `medium` to `heavy` on its next resume (`raise:verification-fail:heavy`). For gated children, **UNVERIFIABLE**
+at return also records the same raise (including a grader timeout or error, an exhausted gate budget, or no fitting
+criterion), even when the result is accepted with a caveat. Strict children's UNVERIFIABLE behaviour is unchanged;
+incomplete returns do not escalate.
 Tier-agent and delegate (non-role) paths stay strict. On OpenCode v1 the key is inert and uses the existing single
 “roles delegation requires OpenCode v2; using tiers” notice.
 

@@ -56,7 +56,8 @@ import { buildForcingNote, createChangedFileStore } from "../../src/verify/dispa
 import { buildEscalatePolicy, newLadderState, nextAction } from "../../src/escalate/ladder";
 import { BUDGET_INCOMPLETE_REASON, incompleteVerdict } from "../../src/verify/checker";
 import { createVerificationWiring } from "../../src/verify/wiring";
-import type { DoD } from "../../src/verify/dod";
+import { CRITERIA_BUDGET_CHARS, type DoD } from "../../src/verify/dod";
+import { routedRoleSnapshotOf } from "../../src/compat/background";
 import { runAdvisor } from "../../src/routing/advisor";
 
 // A pass-through spy on the cost doctor's entry point: the tests read the extras the plugin hands it (P2.2 wiring).
@@ -1697,6 +1698,7 @@ describe("QA round 1 (P2.1)", () => {
     await v2.toolHooks["execute.before"](fresh);
     const first = routedRoleOf(fresh.id)!;
     expect(first).toMatchObject({ tier: "medium", detection: "grader", window: { floor: "medium" } });
+    expect(first.gated).toBe(true);
     sessions["gated-child"] = { id: "gated-child", parentID: "root", agent: "implementer", title: fresh.input.description, location: { directory: dir } };
     await v2.toolHooks["execute.before"]({ sessionID: "gated-child", agent: "implementer", messageID: "m", id: "gated-read", tool: "read", input: { path: join(dir, "x.ts") } });
     const finished = parentCall(fresh.id, "gated-child", "implementer", "DONE: updated x", fresh.input);
@@ -1714,12 +1716,79 @@ describe("QA round 1 (P2.1)", () => {
     await v2.toolHooks["execute.before"](resume);
     const raised = routedRoleOf(resume.id)!;
     expect(raised).toMatchObject({ tier: "heavy", window: { floor: "heavy" } });
+    expect(raised.gated).toBeUndefined();
     expect(raised.notes).toContain("raise:verification-fail:heavy");
     expect(raised.grant.actions.has("edit")).toBe(true);
     expect(raised.grant.actions.has("router_run")).toBe(true);
     expect(String(resume.input.model).split("#")[0]).toBe(resolveCandidates("heavy", cfg)[0]!.model);
     expect(pendingResumeRaise("gated-child", "root")).toBeNull();
   }, 60_000);
+
+  it.each([
+    { roleFloor: "gated", needs: "shell,edit", gated: true, strictUnverifiable: false },
+    { roleFloor: "gated", needs: "shell,edit", gated: true, strictUnverifiable: true },
+    { roleFloor: "strict", needs: "edit", gated: false, strictUnverifiable: false },
+    { roleFloor: "strict", needs: "edit", gated: false, strictUnverifiable: true },
+    { roleFloor: "gated", needs: "edit", gated: false, strictUnverifiable: false },
+    { roleFloor: "gated", needs: "edit", gated: false, strictUnverifiable: true },
+    { roleFloor: "gated", needs: "shell,edit", gated: true, strictUnverifiable: false, noFit: true },
+    { roleFloor: "strict", needs: "edit", gated: false, strictUnverifiable: false, noFit: true },
+  ] as const)("R1-541a0cb-2: UNVERIFIABLE raises only gated children (%j)", async (scenario) => {
+    const { roleFloor, needs, gated, strictUnverifiable } = scenario;
+    const noFit = "noFit" in scenario;
+    const { dir, cfg } = home({
+      routing: { delegation: "roles", engine: "enforce", roleFloor },
+      enforcement: { verify: { strictUnverifiable } },
+    }, { MODEL_ROUTER_ENFORCE: "1" });
+    const runner = {
+      run: vi.fn(async () => { throw new Error("grader unavailable"); }),
+      dispose: vi.fn(async () => {}),
+    };
+    const { hooks } = await plugin(dir, "v2", { routerChildRunner: runner });
+    const sessions: Record<string, Record<string, unknown>> = {};
+    const v2 = host(dir, cfg, sessions);
+    await v2.start(hooks);
+    const criterion = noFit ? "x".repeat(CRITERIA_BUDGET_CHARS + 1) : "the change is minimal";
+    const fresh = {
+      sessionID: "root", agent: "build", messageID: "m", id: "unverifiable", tool: "subagent",
+      input: {
+        agent: "implementer", description: "change x",
+        prompt: `[route class=implement risk=medium scope=single needs=${needs} d=grader]\nVERIFY:required\nchange x\n[acceptance]\ncriteria: ${criterion}\n[/acceptance]`,
+      } as Record<string, unknown>,
+    };
+    await v2.toolHooks["execute.before"](fresh);
+    expect(routedRoleOf(fresh.id)!.tier).toBe("medium");
+    expect(routedRoleOf(fresh.id)!.gated).toBe(gated ? true : undefined);
+    sessions["unverifiable-child"] = { id: "unverifiable-child", parentID: "root", agent: "implementer", title: fresh.input.description, location: { directory: dir } };
+    await v2.toolHooks["execute.before"]({ sessionID: "unverifiable-child", agent: "implementer", messageID: "m", id: "unverifiable-read", tool: "read", input: { path: join(dir, "x.ts") } });
+    const finished = parentCall(fresh.id, "unverifiable-child", "implementer", "DONE: updated x", fresh.input);
+    await v2.toolHooks["execute.after"](finished);
+    expect(runner.run).toHaveBeenCalledTimes(noFit ? 0 : 1);
+    const text = resultText(finished);
+    expect(text).toContain(noFit ? "no criterion fits the verification budget" : "grader unavailable");
+    expect(text.includes("NOT ACCEPTED")).toBe(strictUnverifiable);
+    expect(pendingResumeRaise("unverifiable-child", "root")).toBe(gated ? "heavy" : null);
+    if (!gated) {
+      expect(text).not.toContain("resume the same sessionID");
+      expect(text).not.toContain("the router raises it");
+    } else {
+      const resume = {
+        sessionID: "root", agent: "build", messageID: "m", id: "unverifiable-resume", tool: "subagent",
+        input: { agent: "implementer", sessionID: "unverifiable-child", prompt: "retry verification" } as Record<string, unknown>,
+      };
+      await v2.toolHooks["execute.before"](resume);
+      expect(routedRoleOf(resume.id)).toMatchObject({ tier: "heavy", window: { floor: "heavy" }, notes: expect.arrayContaining(["raise:verification-fail:heavy"]) });
+      expect(pendingResumeRaise("unverifiable-child", "root")).toBeNull();
+    }
+  }, 60_000);
+
+  it("R1-541a0cb-2: the gated marker survives a routed-role snapshot; strict snapshots stay byte-identical", () => {
+    const strict = { verifyRoot: "/work", parentSessionID: "root", resumeID: null };
+    expect(routedRoleSnapshotOf(strict)).toEqual(strict);
+    expect(routedRoleSnapshotOf({ ...strict, gated: true })).toEqual({ ...strict, gated: true });
+    expect(routedRoleSnapshotOf({ ...strict, gated: false })).toBeUndefined();
+    expect(routedRoleSnapshotOf({ ...strict, gated: "true" })).toBeUndefined();
+  });
 
   it("QA-P21-2-3: a role dispatch's own CAP:3 caps its child's reads (banners, CAP REACHED, budget note); no CAP, no cap", async () => {
     let snapshot: ((child: string) => ReturnType<typeof captureBudget>) | undefined;

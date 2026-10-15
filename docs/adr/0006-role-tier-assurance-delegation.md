@@ -76,9 +76,13 @@ itself in the dispatch's work root; edit + execution never runs on `fast`.
 (a project cannot lower its own floor), and is inert on OpenCode v1 with the existing single v2-required notice.
 `gated` changes exactly one authority-floor cell: write + exec with effective detection `grader` and effective risk
 other than `high` may use `medium` instead of `heavy`, only when verification actually runs at return (not deferred,
-with acceptance other than `none`). The bounds record `gated:authority` only when this lowers the authority floor.
-Every strict cell, every other floor source, and the non-role paths are unchanged. The FAIL → heavy safety net stays:
-a verification FAIL of the child running on `medium` records `raise:verification-fail:heavy` for its next resume.
+with acceptance other than `none`) and the next tier above `medium` within the role's ceiling and active tier order
+is `heavy`. A ceiling below heavy, a missing tier, or an intermediate rung keeps the strict floor. The bounds record
+`gated:authority` only when gating lowers the final floor compared with strict. Every strict cell, every other floor
+source, and the non-role paths are unchanged. The FAIL → heavy safety net stays: a verification FAIL of the child
+running on `medium` records `raise:verification-fail:heavy` for its next resume. For gated children, UNVERIFIABLE at
+return also records the same raise (grader timeout or error, gate budget, or no fitting criterion), even when accepted
+with a caveat. Strict children's UNVERIFIABLE behaviour is unchanged; incomplete returns do not escalate.
 
 ### D5 — Detection is effective, never claimed
 

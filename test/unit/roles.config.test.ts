@@ -433,6 +433,7 @@ describe("layers (loadConfig)", () => {
     expect(cfg.routing?.margin).toBe(0.2);
     const text = getConfigNotices(project).map((notice) => notice.message).join("\n");
     expect(text).toContain("routing.roleFloor");
+    expect(text).toContain("only tiers.json or the global override may set it");
     expect(text).not.toContain("unknown routing key");
   });
 

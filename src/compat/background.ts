@@ -218,15 +218,18 @@ export interface RoutedRoleSnapshot {
   readonly verifyRoot: string;
   readonly parentSessionID: string;
   readonly carried?: true;
+  /** Gating lowered this dispatch's final floor; UNVERIFIABLE at return also records its raise. Absent for strict children. */
+  readonly gated?: true;
   readonly resumeID: string | null;
 }
 
-const ROUTED_SNAPSHOT_KEYS: ReadonlySet<string> = new Set(["verifyRoot", "parentSessionID", "carried", "resumeID"]);
+const ROUTED_SNAPSHOT_KEYS: ReadonlySet<string> = new Set(["verifyRoot", "parentSessionID", "carried", "gated", "resumeID"]);
 
 /**
  * QA-SYNC1-13: the journaled routed-role snapshot, validated strictly: a plain object with only the known keys, a non-empty
  * `verifyRoot`, a string `parentSessionID`, `resumeID` a non-empty string or null, `carried` absent or `true` (and only with a
- * `resumeID`). Anything else is malformed: undefined, and the record is dropped (never a partial or a guessed snapshot).
+ * `resumeID`), `gated` absent or `true`. Anything else is malformed: undefined, and the record is dropped (never a partial or
+ * a guessed snapshot).
  * Pure; never throws.
  */
 export function routedRoleSnapshotOf(value: unknown): RoutedRoleSnapshot | undefined {
@@ -236,12 +239,14 @@ export function routedRoleSnapshotOf(value: unknown): RoutedRoleSnapshot | undef
   const parentSessionID: unknown = Reflect.get(value, "parentSessionID");
   const resumeID: unknown = Reflect.get(value, "resumeID");
   const carried: unknown = Reflect.get(value, "carried");
+  const gated: unknown = Reflect.get(value, "gated");
   if (typeof verifyRoot !== "string" || verifyRoot === "") return undefined;
   // An empty parent is the dispatch module's own "no orchestrator" value (roleReadSetFor reads it as no read set).
   if (typeof parentSessionID !== "string") return undefined;
   if (resumeID !== null && (typeof resumeID !== "string" || resumeID === "")) return undefined;
   if (carried !== undefined && (carried !== true || resumeID === null)) return undefined;
-  return { verifyRoot, parentSessionID, resumeID, ...(carried === true ? { carried: true as const } : {}) };
+  if (gated !== undefined && gated !== true) return undefined;
+  return { verifyRoot, parentSessionID, resumeID, ...(carried === true ? { carried: true as const } : {}), ...(gated === true ? { gated: true as const } : {}) };
 }
 
 /** QA-2.1-17: the `dispatch` field of a journaled record, keeping only string fields. Pure; never throws. */

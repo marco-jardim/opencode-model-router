@@ -1105,7 +1105,7 @@ The seven shipped role agents (`explorer`, `researcher`, `runner`, `implementer`
 | Key | Type | Default | Values / range | Layers |
 |---|---|---|---|---|
 | `routing.delegation` | `string` | `"tiers"` | `tiers \| roles` | tiers.json, global, project |
-| `routing.roleFloor` | `string` | `"strict"` | `strict \| gated`; invalid values become `strict` with a notice (OpenCode v2 roles mode only; inert on v1) | global only (stripped from the project layer) |
+| `routing.roleFloor` | `string` | `"strict"` | `strict \| gated`; invalid values become `strict` with a notice (OpenCode v2 roles mode only; inert on v1) | tiers.json, global (stripped from the project layer) |
 | `roleAgents` | `Record<string, object>` | `{}` | keys are shipped role names; unknown names are noticed and ignored | tiers.json, global (stripped from the project layer) |
 | `roleAgents.<name>.enabled` | `boolean` | `true` | `false` removes the role; `true` cannot revive a role that is disabled by default | as `roleAgents` |
 | `roleAgents.<name>.description` | `string` | shipped text | non-empty, at most 1000 characters | as `roleAgents` |
@@ -1132,10 +1132,14 @@ The seven shipped role agents (`explorer`, `researcher`, `runner`, `implementer`
 
 **`routing.roleFloor`.** The default `strict` keeps every existing authority floor. Opt-in `gated` lowers only write + exec
 with effective `grader` detection and risk other than `high` from `heavy` to `medium`, and only when the router verifies
-at return (not deferred, acceptance other than `none`). Every other cell stays strict, and other floor sources still
-apply. A verification FAIL raises the resumed child from `medium` to `heavy`. See the two [floor tables](./ROLES.md#tier-floor).
-A project cannot choose its own policy: this key is stripped from the project layer. On v1 it is inert; setting it
-also triggers only the existing once-per-process `roles delegation requires OpenCode v2; using tiers` notice.
+at return (not deferred, acceptance other than `none`) and the next tier above `medium` within the role's ceiling and
+active tier order is `heavy`. Otherwise the strict floor applies. Every other cell stays strict, and other floor
+sources still apply; `gated:authority` is recorded only when gating lowers the final floor compared with strict.
+A verification FAIL raises the resumed child from `medium` to `heavy`; UNVERIFIABLE at return also records this raise
+for gated children, even when accepted with a caveat (not for incomplete returns). See the two [floor tables](./ROLES.md#tier-floor).
+A project cannot choose its own policy: this key is stripped from the project layer; only tiers.json or the global
+override may set it. On v1 it is inert; setting it also triggers only the existing once-per-process
+`roles delegation requires OpenCode v2; using tiers` notice.
 
 Fully resolved defaults (parsed by a test and compared with `resolveRolesRouting`):
 

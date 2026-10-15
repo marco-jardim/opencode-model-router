@@ -372,6 +372,44 @@ describe("role dispatch path", () => {
   });
 
   it.each([
+    {
+      name: "role ceiling medium",
+      extra: { roleAgents: { implementer: { tierRange: { ceiling: "medium" } } } },
+      reasons: ["floor:authority", "lift:authority"],
+    },
+    {
+      name: "custom rung between medium and heavy",
+      extra: {
+        activePreset: "gated-test",
+        presets: {
+          "gated-test": {
+            fast: { model: "anthropic/fast", costRatio: 1 },
+            medium: { model: "anthropic/medium", costRatio: 2 },
+            middle: { model: "anthropic/middle", costRatio: 3 },
+            heavy: { model: "anthropic/heavy", costRatio: 4 },
+          },
+        },
+      },
+      reasons: ["floor:authority"],
+    },
+  ])("R1-541a0cb-1: gated stays strict with $name (no direct raise to heavy)", async ({ extra, reasons }) => {
+    const prompt = "[route class=implement risk=medium scope=single needs=shell,edit d=grader]\nchange x\n[acceptance]\ncriteria: the change is minimal\n[/acceptance]";
+    const windows = [];
+    for (const roleFloor of ["gated", "strict"] as const) {
+      const world = makeWorld({ delegation: "roles", engine: "enforce", roleFloor }, { extra });
+      const c = call(world, { agent: "implementer", prompt });
+      const outcome = await world.router.route(c);
+      expect(outcome.role).toMatchObject({ tier: "heavy", detection: "grader", window: { floor: "heavy", ceiling: "heavy" } });
+      expect(outcome.role!.gated).toBeUndefined();
+      expect(outcome.model).toBe(tierRef(world.cfg, "heavy"));
+      windows.push(outcome.role!.window);
+      world.router.commit(c.callID, applied(c.args, outcome));
+      expect((await world.rows())[0]!.boundsReasons).toEqual(reasons);
+    }
+    expect(windows[0]).toEqual(windows[1]);
+  });
+
+  it.each([
     { name: "deferred testsPass", directive: "VERIFY:deferred\n", checks: "check: testsPass\n", detection: "grader" },
     { name: "high effective risk", risk: "high", detection: "grader" },
     { name: "no d= claim", claim: "", detection: "none" },

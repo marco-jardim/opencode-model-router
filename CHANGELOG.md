@@ -10,9 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **OpenCode v2: opt-in `routing.roleFloor: "gated"`** (global only, default `"strict"`). A role dispatch that may edit
-  and run commands, whose detection is `grader`, whose risk is not `high` and whose return gate runs, gets a `medium`
-  authority floor instead of `heavy` (bounds reason `gated:authority`). A verification FAIL still raises the resumed
-  child to `heavy`. Every other floor cell is unchanged; inert on OpenCode v1.
+  and run commands, whose detection is `grader`, whose risk is not `high`, whose return gate runs and whose role can
+  be raised from `medium` straight to `heavy`, gets a `medium` authority floor instead of `heavy` (bounds reason
+  `gated:authority`, recorded only when gating lowers the final floor). A verification FAIL, and for gated children also
+  an UNVERIFIABLE return, raises the resumed child to `heavy`. Every other floor cell is unchanged; inert on OpenCode v1.
 - **OpenCode v2: intrinsic service observations for the amended G8 oracle (A-6.1-1).** With the opt-in observations
   below, verification checks/grading, integration rebase/checks/fast-forward and phase-suite commands emit paired
   service spans that bracket only their execution; preparation, slot and lease waits, and retry backoff are recorded as

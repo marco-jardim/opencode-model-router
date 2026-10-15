@@ -4001,6 +4001,12 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           // M6 (2.1.3): a real verdict of a registered child dispatch feeds the outcome store (v2, engine != static).
           // #84 P3.3 fix 2 (plan §2.6, I6): a grader's verdict is a grader signal of a role dispatch, never a deterministic one.
           if (childSessionID && !res.verdict.skipped) ingest?.onVerdict(childSessionID, verdictOf(res.verdict), verdictGraderOf(res.verdict));
+          // A gated child must not stay on medium when its return gate cannot verify it, even if accepted with a caveat.
+          // Strict children and incomplete returns keep their existing behaviour and text.
+          if (isV2Host && routedRole?.gated === true && childSessionID && !res.verdict.skipped &&
+              res.verdict.outcome === "unverifiable" && !isIncompleteVerdict(res.verdict)) {
+            roleEscalationAfterFail(cfg, childSessionID, orchestratorSessionID);
+          }
           if (!res.accepted && !res.verdict.skipped) {
             const ladder = cfg.enforcement?.escalate?.ladder ?? ["fast", "medium", "heavy"];
             const li = ladder.indexOf(producerTier);
@@ -4547,6 +4553,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       const routed: RoutedRoleSnapshot | undefined = routedRole === undefined ? undefined : {
         verifyRoot: routedRole.verifyRoot, parentSessionID: routedRole.parentSessionID, resumeID: routedRole.resumeID,
         ...(routedRole.carried === true ? { carried: true as const } : {}),
+        ...(routedRole.gated === true ? { gated: true as const } : {}),
       };
       return {
         ...(prompt === undefined ? {} : { prompt }),

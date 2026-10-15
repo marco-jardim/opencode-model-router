@@ -305,6 +305,8 @@ export interface RoleRouted {
   /** Grant and catalog notes (decision-row / diagnostic text; they are not shown in the dispatch header or the parent result). */
   readonly notes: readonly string[];
   readonly detection: EffectiveDetection;
+  /** The bounds reason includes `gated:authority`: gating lowered the final floor compared with strict. Absent otherwise. */
+  readonly gated?: true;
   /** The dispatch's total call budget (`roleGuardProfile(spec, tier, routeLine.budget).budget`). */
   readonly budget: number;
   /** The route line's `budget=`, or null (pass it to `roleGuardProfile`, handoff 27). */
@@ -2158,7 +2160,11 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     const raised = resumeID === null ? null : pendingResumeRaise(resumeID, call.sessionID);
     const floorTier = higherTier(tiers, rp.cfg.enforcement?.escalate?.floorTier ?? null, raised);
     const bounds = tierBounds(rp.spec, grant, classified, detection, {
-      floorPolicy: { mode: resolveRolesRouting(rp.cfg, "v2").roleFloor, gateAtReturn },
+      // The gated cell promises a one-step raise to heavy; a narrowed ceiling or an intermediate rung cannot back it.
+      floorPolicy: {
+        mode: resolveRolesRouting(rp.cfg, "v2").roleFloor,
+        gateAtReturn: gateAtReturn && nextRoleTier(tiers, rp.spec.tierRange.ceiling, "medium") === "heavy",
+      },
       floorTier,
       runningTier: running?.tier ?? null,
       pinTier: routeLine?.tier ?? null,
@@ -2285,6 +2291,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
       requestedRoot: root.requested,
       notes,
       detection,
+      ...(bounds.reasons.includes("gated:authority") ? { gated: true as const } : {}),
       budget,
       routeBudget,
       nonce,
