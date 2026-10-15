@@ -2721,6 +2721,56 @@ describe("physical slot observations", () => {
 });
 
 describe("metrics", () => {
+  it("observes a context-age commit before a closed-gate tick reports its watermark", async () => {
+    const rows: ObservationRecord[] = [];
+    const observations = createV2Observations({ write: line => { rows.push(JSON.parse(line)); } });
+    const h = await mk(planOf([task("T1")]), observations);
+    try {
+      h.launcher.gateValue = DISPOSED_GATE; // Closed without a wake that could mask the metric-only commit.
+      await h.begin();
+      await h.settled();
+      const before = h.ledger().seq;
+      const metric: MetricPayload = {
+        name: "context-age", taskId: "T1", attempt: 1, bootID: GATE_CONTEXT.bootID, epoch: 1,
+        callID: "call-1", capturedAt: T0, ageMs: 0, result: "confirmed",
+      };
+      h.runtime.recordMetric(PLAN_ID, metric);
+      await h.settled();
+      const metricSeq = before + 1;
+      expect(h.ledger().seq).toBe(metricSeq);
+
+      h.runtime.onRouterToolCall(ORCH);
+      await h.settled();
+      // No non-metric batch may supply the missing graph between recordMetric and this tick.
+      expect((await h.events()).filter(e => e.seq > before)).toEqual([
+        expect.objectContaining({ type: "metric", seq: metricSeq, metric }),
+      ]);
+      expect(h.launcher.runs).toEqual([]);
+      observations.flush();
+      expect(rows.filter(r => r.family === "scheduler" && r.action === "ledger"
+        && (r.state as Record<string, unknown>).ledgerSeq === metricSeq)).toHaveLength(1);
+      expect(rows.filter(r => r.family === "scheduler" && r.action === "schedule"
+        && (r.state as Record<string, unknown>).ledgerSeq === metricSeq)).toHaveLength(1);
+    } finally {
+      await h.close();
+      observations.close();
+    }
+
+    const latestGraph = new Map<string, unknown>();
+    let runtimeRows = 0;
+    for (const row of rows) {
+      if (row.family !== "scheduler" || row.planId !== PLAN_ID) continue;
+      const state = row.state as Record<string, unknown>;
+      if (row.action === "attach" || row.action === "ledger") latestGraph.set(row.stream, state.ledgerSeq);
+      else if (state.ledgerSeq !== undefined) {
+        expect(latestGraph.has(row.stream), `${row.action} at ${row.seq} has a preceding graph`).toBe(true);
+        expect(state.ledgerSeq, `${row.action} at ${row.seq}`).toBe(latestGraph.get(row.stream));
+        runtimeRows++;
+      }
+    }
+    expect(runtimeRows).toBeGreaterThan(0);
+  });
+
   it("observations do not change native launches or ledger bytes, including a throwing sink", async () => {
     const results: string[] = [];
     for (const mode of ["off", "on", "broken"] as const) {

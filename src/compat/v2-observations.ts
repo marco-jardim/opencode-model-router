@@ -36,8 +36,9 @@
  * {ledgerSeq,status,maxParallel,tasks:[{id,state,kind,phase,p50,slot,attempts:[{n,callID,
  * childSessionID,outcome}]}],edges:[{from,to}],phases:[{id,gate,paused}],
  * writeConflicts:[[taskId,taskId]]}. A graph >256 tasks invalidates the stream, not a
- * silently truncated snapshot. Ledger rows are emitted at the actual committed swap,
- * including collaborators' batches, before any subsequent await.
+ * silently truncated snapshot. A ledger graph row follows every nonempty committed batch,
+ * including metric-only and collaborators' batches, at the actual committed swap before
+ * any subsequent await. Empty appends emit no graph row.
  * Runtime state is {clockMs,ledgerSeq,orchIdle,passive,recovering,disposed,latch,
  * inFlight:[taskId],tokens:["task#attempt"],detail}. Actions/detail:
  * - route {taskId,provider,heavy}; route-unavailable {taskId}

@@ -6,6 +6,7 @@ import { mkdir, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { createV2Observations, type ObservationRecord, type ObservationValue, type V2Observations } from "../../src/compat/v2-observations";
 import {
   ADOPT_TAKEOVER_REASON,
   createLedgerStore,
@@ -71,6 +72,7 @@ interface EnvOpts {
   snapshotEvery?: number;
   staleMs?: number;
   heartbeatMs?: number;
+  observations?: V2Observations;
 }
 
 async function newRoot(): Promise<string> {
@@ -96,6 +98,7 @@ async function mk(o: EnvOpts = {}): Promise<Env> {
     heartbeatMs: o.heartbeatMs ?? 10_000,
     staleMs: o.staleMs ?? 60_000,
     snapshotEvery: o.snapshotEvery ?? 200,
+    observations: o.observations,
     ...(o.fs === undefined ? {} : { fs: o.fs }),
   };
   return {
@@ -165,6 +168,91 @@ async function plant(
 function asLedger(v: unknown): LedgerV1 {
   return v as LedgerV1;
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// Committed graph observations
+// ---------------------------------------------------------------------------------------------------------------
+
+describe("committed graph observations", () => {
+  it.each([
+    { name: "singleton metric", batch: [metric(1)], metricOnly: true },
+    { name: "multi-event metric-only batch", batch: [metric(1), metric(2), metric(3)], metricOnly: true },
+    { name: "mixed batch", batch: [metric(1), addTask("A"), metric(2)], metricOnly: false },
+  ])("emits exactly one graph at the final seq of a $name", async ({ batch, metricOnly }) => {
+    const rows: ObservationRecord[] = [];
+    const sink = createV2Observations({ write: line => { rows.push(JSON.parse(line)); } });
+    const e = await mk({ observations: sink });
+    const w = await e.store.create(buildDraft(1), e.holder("s1"));
+    try {
+      await w.append([transition("T1", "pending", "ready", "deps-satisfied")]);
+      sink.flush();
+      expect(rows).toHaveLength(1);
+      const previous = rows[0] as ObservationRecord & { state: Record<string, ObservationValue> };
+      rows.length = 0;
+      const finalSeq = w.ledger.seq + batch.length;
+
+      await w.append(batch);
+      sink.flush();
+      expect(w.ledger.seq).toBe(finalSeq);
+      expect(rows).toEqual([expect.objectContaining({
+        family: "scheduler", action: "ledger", planId: PLAN_ID,
+        state: expect.objectContaining({ ledgerSeq: finalSeq }),
+      })]);
+      const current = rows[0] as ObservationRecord & { state: Record<string, ObservationValue> };
+      if (metricOnly) expect(current.state).toEqual(Object.assign({}, previous.state, { ledgerSeq: finalSeq }));
+      else expect(current.state.tasks).toEqual(expect.arrayContaining([expect.objectContaining({ id: "A" })]));
+    } finally {
+      await w.close();
+      sink.close();
+    }
+  });
+
+  it("emits no graph for an empty append or empty builder", async () => {
+    const rows: ObservationRecord[] = [];
+    const sink = createV2Observations({ write: line => { rows.push(JSON.parse(line)); } });
+    const e = await mk({ observations: sink });
+    const w = await e.store.create(buildDraft(1), e.holder("s1"));
+    try {
+      const before = w.ledger;
+      expect(await w.append([])).toBe(before);
+      expect(await w.append(() => [])).toBe(before);
+      sink.flush();
+      expect(rows).toEqual([]);
+      expect(sink.counts().attempted).toBe(0);
+    } finally {
+      await w.close();
+      sink.close();
+    }
+  });
+
+  it("observes a metric-only committed swap before the history append resumes", async () => {
+    const rows: ObservationRecord[] = [];
+    const sink = createV2Observations({ write: line => { rows.push(JSON.parse(line)); } });
+    const history = gate();
+    const fs = interceptFs(realFs, async call => {
+      if (call.op === "appendText" && /history\.jsonl$/.test(call.path)) {
+        history.markReached();
+        await history.wait;
+      }
+    });
+    const e = await mk({ fs, observations: sink });
+    const w = await e.store.create(buildDraft(1), e.holder("s1"));
+    const append = w.append([metric(1)]);
+    try {
+      await history.reached;
+      expect(w.ledger.seq).toBe(2);
+      sink.flush();
+      expect(rows).toEqual([expect.objectContaining({
+        family: "scheduler", action: "ledger", state: expect.objectContaining({ ledgerSeq: 2 }),
+      })]);
+    } finally {
+      history.open();
+      await append;
+      await w.close();
+      sink.close();
+    }
+  });
+});
 
 // ---------------------------------------------------------------------------------------------------------------
 // Round trip

@@ -228,6 +228,34 @@ describe("G8 independent maximal idle episodes (no host)", () => {
     else expect(() => assertG8IdleEpisodes(episodes, [])).toThrow(/exceeds 10,000/);
   });
 
+  it.each([10_000, 10_001])("does not split a %i ms idle episode when only the committed watermark advances", ms => {
+    const f = fixture();
+    for (const at of [2_500, 5_000, 7_500]) {
+      const previous = f.ledger;
+      f.commit(at, {}); // A metric-only commit repeats the graph, changing only ledgerSeq.
+      expect(f.ledger).toEqual({ ...previous, ledgerSeq: previous.ledgerSeq + 1 });
+      f.runtime("schedule", at);
+    }
+    f.finish(ms);
+    const { episodes } = reconstruct(f);
+    expect(episodes.map(e => [e.fromMs - BASE, e.toMs - BASE, e.ms, e.endedBy]))
+      .toEqual([[0, ms, ms, "plan-completed"]]);
+    if (ms === 10_000) expect(() => assertG8IdleEpisodes(episodes, [])).not.toThrow();
+    else expect(() => assertG8IdleEpisodes(episodes, [])).toThrow(/episode 10001 ms exceeds 10,000/);
+  });
+
+  it("rejects an unobserved runtime watermark even when a later graph supplies that watermark", () => {
+    const f = fixture();
+    const unobservedSeq = f.ledger.ledgerSeq + 1;
+    f.runtime("schedule", 1_000);
+    const runtimeSeq = f.rows.length;
+    (f.rows.at(-1)!.state as Record<string, ObservationValue>).ledgerSeq = unobservedSeq;
+    f.commit(2_000, {}); // This later graph cannot retroactively validate the preceding runtime row.
+    expect(f.ledger.ledgerSeq).toBe(unobservedSeq);
+    f.finish(3_000);
+    expect(() => reconstruct(f)).toThrow(`missing committed graph at ${runtimeSeq}`);
+  });
+
   it("uses idle-close after a wakeOnce delay, not the earlier launch-gate time", () => {
     const f = fixture();
     const metric = fragment(0, 5_020);

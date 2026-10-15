@@ -1319,7 +1319,7 @@ class StoreWriter implements LedgerWriter {
       throw e;
     }
     this.current = work;
-    if (this.env.observations !== undefined && events.some((e) => e.type !== "metric")) {
+    if (this.env.observations !== undefined) {
       observeSchedulerLedger(this.env.observations, work, "ledger");
     }
     this.tracker = tracker;
