@@ -397,3 +397,63 @@ Outstanding phase gates and the Phase 6.2 full-suite obligation remain. **No fre
 claimed by this amendment.** Scoped validation (orchestrator shell, 2026-10-15): `cpx-g8-oracle.test.ts` 55/55 passed
 under `vitest.smoke.config.ts`, `docs-drift.test.ts` 126/126 passed and `npm run typecheck` was clean; the real-host smoke
 was not run for this change.
+
+## Executor fixes, heavy QA rounds 1-2 and smoke runs 15-21 — 2026-10-15 (not accepted)
+
+### Commits on `cpx/p61` since the handover (`78f2443`)
+
+| Commit | Change |
+|---|---|
+| `40bad1e`, `26d0a8b` | QA fix-task route line is a launchable `[route …]` line; unsafe roots omitted; legacy lines launch. Fixed the run-14 critical (`2.1.FIX1-1`). |
+| `2e0a78e`, `26d0a8b` | Integration checks skip the duplicate post-rebase slot reset; selection reads overlap the clean; `showFile` fails closed except git's explicit missing-path errors. |
+| `a81bcef`, `edcfab9` | Owner amendment **A-6.1-2** (G8 bound measured/disclosed); idle oracle accepts the approval-time capacity re-init. |
+| `541a0cb`, `d1983e6` | Opt-in `routing.roleFloor: "gated"` (v2, global, default strict) and its QA fixes. |
+| `3df0230` | Role decision rows record `trace.riskSources`. |
+| `ae84880`, `375a2d5` | Snapshot/grader failure reasons and git stage labels (diagnostics only). |
+| `399e210` | A ledger graph observation for every nonempty batch, including metric-only. |
+| `d2989e1`, `0ac00b8`, `7df9c76`, `85924bc` | Smoke driver: real deferred/held G2/G3 paths (fixture erratum: the ad hoc dispatch is `VERIFY:deferred`); restart recovery asserted by evidence; the root answers the post-restart stale-context wake with one status call; G9 compares counted attempts. |
+| `422826e`, `22cad78` | Host contract **C16** (server-pid-only kill) and its R2-1 extension: 15/15 on OpenCode 2.0.26; observation **O16**. |
+| `642f6de`, `66efe47` | Launcher-liveness recovery: a `running` child whose launcher is provably dead on this host and whose history shows no tool in flight is requeued at once; otherwise the 60 s probation. ADR 0007 D16. |
+| `3d92c7e` | Slots are claimed in launch-priority order (base lookup awaited inside the claim). |
+
+### Heavy QA
+
+- **Round 1** (`40bad1e 2e0a78e a81bcef 541a0cb`): one major (gated floor without a reachable raise to heavy) and minors/nits; all
+  fixed in `d1983e6` and `26d0a8b`.
+- **Round 2** (`541a0cb..3d92c7e`, 14 commits): **one major, R2-1** (the dead-launcher fast path reset a slot a surviving tool
+  process tree could still write in) — fixed in `66efe47`, premise proven by C16 (15/15) and O16. Round-1 fixes verified.
+- **Deferred under the owner rule (round 2: fix major+ only):**
+  - R2-2 (minor, `399e210`): a graph row per metric-only batch can exhaust the 16 MiB observation cap on large plans (fails closed,
+    diagnostics only). Follow-up: a compact watermark row.
+  - R2-3 (minor, `3d92c7e`): no `assertLive()` after the queued base lookup; a hung lookup (≤ 120 s) blocks queued claims.
+  - R2-4 (minor, `85924bc`): G9 normalization would also excuse a lost attempt in the uninterrupted baseline. Follow-up: subtract
+    only restart-checkpoint attempts and assert zero lost attempts in the baseline.
+  - R2-5 (minor, hypothesis, `642f6de`): a future 2.x host that resumes orphaned children at boot would break the C16 premise; C16
+    pins only 2.0.26.
+  - R2-6..R2-10 (nits): open `\w*` risk-vocabulary terms logged verbatim; snapshot stage labels for `harden`/`finalize`; an
+    always-true G9 session assertion; CHANGELOG/ROLES "global only" wording for `roleFloor`; the idle oracle accepts more than one
+    pre-launch capacity re-init.
+  - Pre-existing (not from these commits), recorded by the R2-1 design: an interrupted provisioning stage reruns while its install
+    lock is already stale; reverify after a restart can overlap the dead server's verification tree; `resetSlotContents` swallows
+    a failed reset.
+- **Open product design item (not fixed):** smoke 17 showed a recovery dependency cycle — a recovered task's reverify needs a
+  grader, the grader needs a fresh orchestrator context, and the stale-context wake cannot be sent while recovery is in progress.
+  It did not recur in runs 18-21 (no task was `verifying` at the kill). The grader-failure reason is now logged (`375a2d5`).
+
+### Real-host smoke results (`npm run smoke:cpx:e2e`)
+
+| Run | Head | Result | Notes |
+|---|---|---|---|
+| 15 | `541a0cb` | 6 failed | Run-14 critical fixed; G2 driver defects, idle-oracle capacity re-init. |
+| 16 | `d2989e1` | 6 failed | Metric-only commits not observed; restart resume refused; restart orphan probation. |
+| 17 | `642f6de` | 3 failed | Throughput and resilience baselines green; restart wake not answered; recovery cycle (pnpm); snapshot git timeout (npm). |
+| 18 | `375a2d5` | 3 failed | Restart runs complete; G9 attempt numbering; priority inversion in slot claims (py-pip). |
+| 19 | `3d92c7e` | **green** (32 passed, 9 documented `unmeasured` skips) | |
+| 20 | `3d92c7e` | **green** | |
+| 21 | `66efe47` | **green** | First green after the R2-1 recovery change (restarts the consecutive count). |
+
+Throughput (A-6.1-2, recorded): makespan 115-132 s in runs 19-21 versus 166 s in run 14; `g8Ratio` 1.32-1.47 (target 1.3, not met);
+longest idle-with-ready episode ≤ 7.1 s (ceiling 10 s).
+
+**Phase 6.1 is not accepted.** Outstanding: two more consecutive green runs at the final head; the mandatory subcases still listed as
+`unmeasured` in the smoke; 6.1.4 (detached worktree, three green runs); 6.1.5 documentation; final heavy phase QA. G13 remains unmet.
