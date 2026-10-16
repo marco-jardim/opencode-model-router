@@ -442,6 +442,9 @@ was not run for this change.
 
 ### Real-host smoke results (`npm run smoke:cpx:e2e`)
 
+Runs 22–26 are appended at final QA, using the orchestrator shell and the real Claude Code host.
+For runs 24–25, fixture triples are **makespan / g8Ratio / max idle-with-ready**.
+
 | Run | Head | Result | Notes |
 |---|---|---|---|
 | 15 | `541a0cb` | 6 failed | Run-14 critical fixed; G2 driver defects, idle-oracle capacity re-init. |
@@ -451,9 +454,23 @@ was not run for this change.
 | 19 | `3d92c7e` | **green** (32 passed, 9 documented `unmeasured` skips) | |
 | 20 | `3d92c7e` | **green** | |
 | 21 | `66efe47` | **green** | First green after the R2-1 recovery change (restarts the consecutive count). |
+| 22 | `66efe47` | **green** (32 passed, 9 documented `unmeasured` skips) | |
+| 23 | `66efe47` | **green** (32 passed, 9 documented `unmeasured` skips) | Reported throughput: makespan 130.2 s, g8Ratio 1.51, max idle-with-ready 5.6 s. |
+| 24 | `2b2cb58` | **green** (32 passed, 9 documented `unmeasured` skips) | Recovered-verification admission; ~1839 s. node-npm: 134.2 s / 1.47 / 6.6 s; node-pnpm: 141.3 s / 1.49 / 7.6 s; py-pip: 130.4 s / 1.52 / 6.3 s. |
+| 25 | `2b2cb58` code (HEAD `9b8593f`, docs-only on top) | **green** (32 passed, 9 documented `unmeasured` skips) | ~1738 s. node-npm: 118.5 s / 1.35 / 6.5 s; node-pnpm: 128.6 s / 1.40 / 7.0 s; py-pip: 128.5 s / 1.50 / 8.8 s. |
+| 26 | `2b2cb58` code; final docs head to be recorded | in progress — orchestrator fills in | 6.1.4 clean checkout after `npm ci`; counts as the third green under A-6.1-4 only if successful. |
 
-Throughput (A-6.1-2, recorded): makespan 115-132 s in runs 19-21 versus 166 s in run 14; `g8Ratio` 1.32-1.47 (target 1.3, not met);
+Evidence: `.cpx-logs\e2e-runNN.log`, `.cpx-logs\run23-evidence\`, `.cpx-logs\run24-evidence\` and
+`.cpx-logs\run25-evidence\` are **untracked local scratch, not committed**. The run-26 result and evidence are for the
+orchestrator to fill in.
+
+Throughput (A-6.1-2, recorded): makespan 115-132 s in runs 19-21 versus 166 s in run 14; `g8Ratio` 1.32-1.47 (target ≤ 1.0, not met);
 longest idle-with-ready episode ≤ 7.1 s (ceiling 10 s).
+
+As coded in `test/smoke/helpers/cpx-g8-oracle.ts` and `test/smoke/cpx-e2e.smoke.test.ts`,
+`bound = 1.3 × max(CP_eff, W_auth/p, ΣI_service)` and `g8Ratio = makespan/bound`;
+the bound is met iff **`g8Ratio <= 1.0`** (`g8BoundMet = makespan <= bound`). The 1.3 factor is already in the bound;
+ΣI_service is inside `max`, not added outside it. Under A-6.1-2 this is measured/disclosed, not an acceptance gate.
 
 **Phase 6.1 is not accepted.** Outstanding: two more consecutive green runs at the final head; the mandatory subcases still listed as
 `unmeasured` in the smoke; 6.1.4 (detached worktree, three green runs); 6.1.5 documentation; final heavy phase QA. G13 remains unmet.
@@ -466,7 +483,7 @@ historical evidence. The plan's 6.1.3, 6.1.4 and amendment log record the decisi
 
 - **6.1.4:** after `npm ci`, run `npm run smoke:cpx:e2e` **once**, not three times, in the detached worktree at the
   committed integration head (under the fallback, `cpx/p61`). This catches environment leakage on a clean checkout —
-  dependencies outside the lockfile and untracked files — since runs **19–23** already proved the same code three
+  dependencies outside the lockfile and untracked files — since runs **21–23** already proved the same code three
   consecutive times in the working worktree. Record the detached result separately; no detached pass is claimed here.
 - The remaining `unmeasured` smoke subcases are **not accepted by new synthetic smoke scenarios**: G1 sampled/prior/off,
   G2 capture counters, G3 FAIL + forced C15 fallback, G5 frozen largest plans, G6 shared-tree read/search/run + deferred
@@ -492,8 +509,9 @@ The smoke-17 recovery dependency cycle (recorded above as an open product design
 - Recovery no longer re-verifies, or completes a finished child, inside the global barrier. Each becomes per-task
   `RecoveredWork` (task, attempt, nonce, state), registered in feed order; the task keeps its slot and leases while it waits.
 - Recovered work is admitted after the barrier through the launcher's context gate, once any current router-tool context
-  of the owning root exists. Until then the runtime requests a stale-context wake even with no ready producer, also on
-  a paused plan. Admission re-checks identity, context and leases under the task mutex and never spends a grader rerun.
+  of the owning root exists. Until then the runtime requests the launch gate's wake (awaiting the first router call, or
+  no context) even with no ready producer, also on a paused plan. Admission re-checks identity, context and leases under
+  the task mutex and never spends a grader rerun.
 - Each attachment has an `AbortController`. `closePlan` (dispose or adopt) aborts it: that attachment's graders and
   backoff are cut (verdict marked `cut`, never journaled, no attempt spent) and its pipelines are awaited before the
   writer closes. The process-wide verifier is not disposed.
@@ -542,3 +560,107 @@ run** (detached worktree, `npm ci`), which counts as the third. All three run th
 touch only docs); any red resets the count.
 The change touches only the executor recovery path and the plan-task verifier's attachment cut; runs 19–23 covered the
 rest of the code. Recorded in the plan's amendment log.
+
+**A-6.1-5 (record only):** owner-approved out-of-plan additions are opt-in `routing.roleFloor: "gated"`
+(`541a0cb`, `d1983e6`) and risk-origin recording in `trace.riskSources` (`3df0230`); v2-only, inert on v1;
+no acceptance criterion changes. Mirrored in the plan's amendment log.
+
+## Findings
+
+Final Phase 6.1 heavy QA: **accept after fixes (MA-1, MA-2)**, not unconditional phase acceptance.
+
+- **MA-1 (major):** the report lacked §0.7's final findings/fixes/deferred/handoff/verdict structure and a consolidated
+  disposition of open findings. These final sections supply it; dated progress sections above remain historical.
+- **MA-2 (major):** soak-analyzer subcase statuses require correction by the parallel analyzer fix. Confirmation remains
+  with the orchestrator; this documentation change does not establish that fix's result.
+- Final-QA minors **m-A, m-B, m-C, m-E, m-G, m-H** and prior open findings are consolidated below. Smoke attribution,
+  the ratio target, **m-F**'s stale three-working-worktree-runs wording and the wake/wrapping nits are corrected here.
+
+## Fixes
+
+- Prior correction rounds fixed lease validation/enforcement, writer grants, CI execution scope, redaction and rebase
+  diagnostics; executor/oracle rounds fixed reset proof, admission, idle closure and service accounting. Their commits
+  and scoped evidence remain in the dated sections above; no new full-suite result is claimed.
+- Executor rounds 1–2 fixed the gated role floor, QA fix routes and **R2-1**'s unsafe dead-launcher fast path
+  (`d1983e6`, `26d0a8b`, `66efe47`), with C16/O16 evidence. The recovery-cycle fix is `2b2cb58`, including recovery
+  round-1 **M1, m3–m6, m8** and the fixed nits recorded above; round 2 verified those corrections.
+- This docs-only round fixes **MA-1**, records runs 22–25 and run 26's placeholder, corrects the same-code claim to
+  runs 21–23 (with a bracketed correction in the plan's owner quote), states the coded G8 formula/ratio threshold,
+  annotates acceptance with A-6.1-4, records A-6.1-5, and fixes wake wording and **N5**'s line wrap.
+- **MA-2:** “fixed in this round” is a **placeholder only**, pending orchestrator confirmation of the analyzer fix
+  and its checks. No checks were run by this documentation implementer; docs-drift remains for the orchestrator.
+
+## Deferred findings
+
+The deferral rule was applied: **after QA round 2 fix only critical/major/blocking; defer the rest with reasons**.
+Its **dated owner ratification is PENDING**; the orchestrator fills the date only if the owner confirms. The earlier
+reports' references to an owner rule do not supply that ratification. No missing rationale is inferred below.
+
+This is the single consolidated disposition table for prior and final-QA open items. Local prefixes disambiguate
+reused ids; the four deferred recovery nits and three pre-existing items receive local ids. **N5** is retained as fixed
+in this round, and **MA-2** as a fix-confirmation placeholder, not as an approved major deferral.
+
+| ID | Origin round | Severity | Summary | Reason | Owner / next step |
+|---|---|---|---|---|---|
+| Scope-P3 | Product-correction R3 | P3 | `failingFiles` reporting is wrong for explicit `cwd` overrides. | no reason recorded; for owner decision in 6.2 | 6.2 owner: decide/report effective file paths. |
+| Oracle-R3-P2-1 | Executor/oracle R3 | P2 | Oracle does not correlate verification candidate with checked candidate. | Bounded major/critical/blocking review; no fix requested under the recorded rule. | 6.2 owner: decide candidate correlation fix. |
+| Oracle-R3-P2-2 | Executor/oracle R3 | P2 | Required-service coverage is component-level, not operation-level. | Bounded major/critical/blocking review; no fix requested under the recorded rule. | 6.2 owner: decide operation-level coverage. |
+| Oracle-R3-P2-3 | Executor/oracle R3 | P2 | Abnormal service spans can include post-exit drain/kill tails. | Bounded major/critical/blocking review; no fix requested under the recorded rule. | 6.2 owner: decide lifecycle service boundaries. |
+| R2-2 | Executor fixes R2 | minor | A graph row per metric-only batch can exhaust the 16 MiB observation cap. | Fails closed; diagnostics only; recorded major+ scope. | 6.2 owner: compact watermark row. |
+| R2-3 | Executor fixes R2 | minor | No `assertLive()` after queued base lookup; a hung lookup blocks claims for ≤120 s. | no reason recorded; for owner decision in 6.2 | 6.2 owner: recheck liveness after lookup. |
+| R2-4 | Executor fixes R2 | minor | G9 normalization can excuse a lost attempt in the uninterrupted baseline. | no reason recorded; for owner decision in 6.2 | 6.2 owner: subtract only restart-checkpoint attempts; assert zero baseline lost attempts. |
+| R2-5 | Executor fixes R2 | minor (hypothesis) | A future host resuming orphaned children could invalidate C16's premise; only 2.0.26 is pinned. | no reason recorded; for owner decision in 6.2 | 6.2 owner: re-probe C16 on supported host upgrades. |
+| R2-6 | Executor fixes R2 | nit | Open `\w*` risk-vocabulary terms are logged verbatim. | no reason recorded; for owner decision in 6.2 | 6.2 owner: decide vocabulary/log normalization. |
+| R2-7 | Executor fixes R2 | nit | Snapshot stage labels omit `harden`/`finalize`. | no reason recorded; for owner decision in 6.2 | 6.2 owner: complete labels. |
+| R2-8 | Executor fixes R2 | nit | G9 session assertion is always true. | no reason recorded; for owner decision in 6.2 | 6.2 owner: replace with an assertion that can fail. |
+| R2-9 | Executor fixes R2 | nit | CHANGELOG/ROLES describe `roleFloor` as “global only”. | no reason recorded; for owner decision in 6.2 | 6.2 owner: reconcile wording with `tiers.json` and the global override. |
+| R2-10 | Executor fixes R2 | nit | Idle oracle accepts multiple pre-launch capacity re-inits. | no reason recorded; for owner decision in 6.2 | 6.2 owner: decide stricter re-init cardinality. |
+| R2-pre-1 | Executor fixes R2 / pre-existing | Not assigned | Interrupted provisioning reruns while its install lock is already stale. | Pre-existing; no reason recorded; for owner decision in 6.2 | 6.2 owner: assess install-lock recovery. |
+| R2-pre-2 | Executor fixes R2 / pre-existing | Not assigned | Restart re-verification can overlap the dead server's verification tree. | Pre-existing; no reason recorded; for owner decision in 6.2 | 6.2 owner: assess verification-process lifetime/draining. |
+| R2-pre-3 | Executor fixes R2 / pre-existing | Not assigned | `resetSlotContents` swallows a failed reset. | Pre-existing; no reason recorded; for owner decision in 6.2 | 6.2 owner: decide fail-closed reset handling. |
+| Recovery-R1-m1 | Recovery fix R1 | minor | `closePlan` waits beyond `PLAN_TASK_ABORT_MS`; non-grader work continues. | Bounded in practice; no infinite wait with the production verifier. | 6.2 owner: decide bounded attachment shutdown. |
+| Recovery-R1-m2 | Recovery fix R1 | minor | An in-flight grader dispatch is absent from the snapshot; `accept()` is abandoned, not drained. | Draining needs abort-contract redesign; overlap is with dying cut-attachment checks, and the slot is cleaned before new checks. | 6.2 owner: redesign/drain together with N1. |
+| Recovery-R1-m7 | Recovery fix R1 | minor | Parked recovered work has no inbox item, counter or observation. | Visibility, not correctness; next root router call admits work and the plan line shows the block. | 6.2 owner: decide recovery visibility. |
+| Recovery-R1-n1 | Recovery fix R1 | nit | `applyFeed` has an unreachable `requeue-lost` guard. | Orchestrator deferred; no reason recorded; for owner decision in 6.2 | 6.2 owner: reconcile with m-A before removing guards. |
+| Recovery-R1-n2 | Recovery fix R1 | nit | Lease-held recovered work can request a spurious wake. | Orchestrator deferred; no reason recorded; for owner decision in 6.2 | 6.2 owner: suppress non-admissible wake. |
+| Recovery-R1-n3 | Recovery fix R1 | nit | Recovery test has a stranded attempt-2 expectation (QA reference `:1310`). | Orchestrator deferred; no reason recorded; for owner decision in 6.2 | 6.2 owner: correct expectation. |
+| Recovery-R1-n4 | Recovery fix R1 | nit | Aborted attachments leave stale `recoveredWork` entries. | Orchestrator deferred; no reason recorded; for owner decision in 6.2 | 6.2 owner: clear stale entries. |
+| N1 | Recovery fix R2 | minor | Cached running observation's `git status` can briefly hold `index.lock` against a new attachment's commit/checks. | Narrow post-adopt timing window; follow-up together with m2. | 6.2 owner: await the cached observation, cut-aware. |
+| N2 | Recovery fix R2 / pre-existing | minor | Cut verification drops record/change-store ids; restart fallback can cost a counted `unverifiable`. | Pre-existing behaviour; CHANGELOG claim was narrowed. | 6.2 owner: test runtime path without re-calling `begin`; decide retention. |
+| N3 | Recovery fix R2 | minor | Admission identity mismatch drops a parked end's bookkeeping and leaks its forced token. | Bounded to one attachment. | 6.2 owner: route end work through `processEndNow` unconditionally. |
+| N4 | Recovery fix R2 | nit | m3's background queuing is effectively reached only by two tests awaiting `onChildEnd` before native end. | Correct and exactly-once per QA. | 6.2 owner: document or revert with test change. |
+| N5 | Recovery fix R2 | nit | Unwrapped recovery paragraph in EXECUTOR.md. | Cosmetic; fixed in this round, retained for traceability, not deferred. | Orchestrator: confirm docs-drift. |
+| N6 | Recovery fix R2 | nit | `registerRecoveredWork` keys by latest attempt rather than the end's `n`. | Safe under the ledger rule that the open attempt is latest. | 6.2 owner: make `if (a.n !== n) return` explicit. |
+| m-A | Final QA | minor | Lease-loss recovery can discard a finished end: `runtime.ts:3151/:3216` lack the `:3113–3117` guard, producing an uncounted lost attempt and relaunch. | no reason recorded; for owner decision in 6.2 | 6.2 owner: guard the lease-held requeue and regress a terminal end during interruption. |
+| m-B | Final QA | minor | `2b2cb58` restart-while-verifying path has unit coverage only; no smoke restart point. | no reason recorded; for owner decision in 6.2 | 6.2 owner: deterministic restart-while-verifying smoke point. |
+| m-C | Final QA | minor | Final-head `smoke:cpx`, `router_verify pending:true`, goldens and `smoke:v1` are not yet evidenced. | Final-head DoD checks pending; this is not a pass or waiver. | Orchestrator: run and record results before finalising; carry full matrix to 6.2. |
+| m-E | Final QA | minor | Out-of-plan `routing.roleFloor: "gated"` and `trace.riskSources` need traceability/disclosure. | Owner-approved, v2-only and inert on v1; A-6.1-5 records them without changing acceptance. | Orchestrator / 6.2 owner: disclose both additions in the PR. |
+| m-G | Final QA | minor | Analyzer imports test helpers at runtime and needs Node ≥22.13 for `stripTypeScriptTypes`. | no reason recorded; for owner decision in 6.2 | 6.2 owner: decide runtime dependency packaging and document the Node requirement. |
+| m-H | Final QA | minor | Applicable executor fixes still need porting to `cpx/pdf2-1` and bounded re-check of `4070b22`. | no reason recorded; for owner decision in 6.2 | Orchestrator / 6.2 owner: fulfil `phase-6.1-handover.md`'s port obligation. |
+| MA-2 | Final QA | major | Soak-analyzer subcase statuses need correction. | “fixed in this round” — placeholder only; orchestrator confirmation pending, not deferred acceptance. | Analyzer implementer / orchestrator: confirm implementation and checks before closing. |
+
+## Handoffs
+
+- **Orchestrator, before finalising 6.1:** fill run 26 (6.1.4 clean checkout), confirm MA-2, and record final-head DoD
+  evidence, including `smoke:cpx`, `router_verify pending:true`, goldens and `smoke:v1` (or an explicit unavailable-host
+  disposition). Run `npx vitest run test/unit/docs-drift.test.ts`; no docs-drift pass is claimed by this edit.
+- **6.2 validation:** run the full suite with coverage, goldens, `smoke:v1`, all smokes and `router_verify pending:true`
+  at the delivery head. Follow the plan's unavailable-v1-host rule if needed; absent evidence is not a pass. Add a
+  deterministic restart-while-verifying smoke point for `2b2cb58`'s recovery path (m-B).
+- **Soak, A-6.1-3:** collect at least 5 working days of real plans with `MODEL_ROUTER_V2_OBSERVATIONS` enabled; analyse
+  offline with `scripts/soak-analyze.mjs`. Each observable criterion (G1/G2/G6/G8/G9) needs ≥3 occurrences and zero
+  violations. Preserve per-subcase statuses; missing/not-observable evidence is not a pass. G5 remains with 2.3 and
+  G12's full matrix with 6.2; only the owner may change the soak criteria.
+- **6.2 PR disclosures:** G13 remains unmet until the owner decides; disclose the G8 bound and ratio (bound met iff
+  `g8Ratio <= 1.0`, measured/disclosed only), soak gaps including unobserved G3/G11 and not-observable subcases, and
+  the owner-approved out-of-plan `roleFloor: "gated"` / `trace.riskSources` additions (v2-only, inert on v1).
+- **Cross-phase obligation:** port applicable executor fixes to `cpx/pdf2-1` and finish its bounded heavy QA re-check
+  of `4070b22`, as required by `phase-6.1-handover.md`. The consolidated table supplies the 6.2 owner-decision queue;
+  ratification of the applied deferral rule still needs the owner's dated confirmation.
+
+## Verdict
+
+Pending 6.1.4 (run 26) and DoD checks; final QA verdict: accept after fixes (MA-1, MA-2).
+
+The orchestrator finalises this verdict after recording those results and confirming MA-2. No completed soak or
+unconditional Phase 6.1 acceptance is claimed here.

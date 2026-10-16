@@ -767,7 +767,11 @@ toplevel is reconciled with host evidence. Each child is classified from `ctx.se
   (`C16/D16`); missing or unknown tool state is not proof it closed. A child stopped inside a tool and the `ready`
   adoptable row keep the 60 s liveness probation, even with a provably dead launcher. This narrows the preceding
   amendment; launcher identity, the probation timing and the lost-attempt requeue are unchanged.
-- *Amended 2026-10-15 (recovered verification admission).* Feed application and pipeline registration remain in task-id order, but re-verification and finished-child completion run outside the recovery barrier as tracked per-task work, admitted only by the bound orchestrator's live context gate; pending verification alone requests the stale-context wake, and attachment changes invalidate old work without spending transient reruns or changing slot/lease ownership.
+- *Amended 2026-10-15 (recovered verification admission).* Feed application and pipeline registration remain in task-id
+  order, but re-verification and finished-child completion run outside the recovery barrier as tracked per-task work,
+  admitted only by the bound orchestrator's live context gate; pending verification alone requests the launch gate's wake
+  (awaiting the first router call, or no context), and attachment changes invalidate old work without spending transient
+  reruns or changing slot/lease ownership.
 
 **Alternatives rejected.**
 

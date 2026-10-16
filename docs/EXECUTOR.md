@@ -421,7 +421,8 @@ and the task keeps waiting; the executor does not reset a slot a child might sti
 Completed or verifying tasks are reverified; verified tasks are re-enqueued; an integrating task resumes the serial
 integration queue. The router's attempt trailer prevents recovery from making a duplicate commit. Gates, capacity
 state, leases, blocked dependencies and missed breaker failures are rebuilt from durable state before the first tick.
-Recovered verification/completion pipelines run outside that barrier and wait for any current router-tool context of the owning root, requesting a stale-context wake even with no ready producer.
+Recovered verification/completion pipelines run outside that barrier and wait for any current router-tool context of the
+owning root, requesting the launch gate's wake (awaiting the first router call, or no context) even with no ready producer.
 The verification fallback after a restart remains [fail closed](#verification-of-plan-tasks), so a lost observation
 can cost a counted attempt rather than grant an unchecked pass.
 
@@ -493,10 +494,11 @@ The throughput smoke reconstructs and records these values; they are **not field
   integration and phase-suite service. Raw CP/ΣI remain diagnostics. Queueing, resource waits, launch/preparation,
   cold initialization, idle and driver holds never enlarge a denominator term. Shared-batch service is assigned in
   full to each member (an antichain) but counted once in serial integration's service union.
-- **`g8Ratio = makespan/bound`**, and **`g8BoundMet = makespan <= bound`**. A ratio above 1 means the measured bound was
-  missed, not that another 1.3 multiplier is allowed. Under owner amendment **A-6.1-2**, this bound is measured and
-  disclosed, **not a Phase 6.1 acceptance gate**. `service-unattributed` grading is recognized evidence at zero
-  intrinsic credit, so the computed bound is conservative; missing/malformed service evidence still fails closed.
+- **`g8Ratio = makespan/bound`**, and **`g8BoundMet = makespan <= bound`**: the bound is met iff **`g8Ratio <= 1.0`**.
+  A ratio above 1 means the measured bound was missed, not that another 1.3 multiplier is allowed. Under owner amendment
+  **A-6.1-2**, this bound is measured and disclosed, **not a Phase 6.1 acceptance gate**. `service-unattributed` grading
+  is recognized evidence at zero intrinsic credit, so the computed bound is conservative; missing/malformed service
+  evidence still fails closed.
 - **Idle ceiling: 10,000 ms per predicate-A episode**, still asserted independently of the makespan metric. Predicate A
   means a running plan, an idle orchestrator and at least one durably ready automatic task with satisfied
   dependencies/phase admission and observed provider capacity, with no successful launch inside the episode. It does

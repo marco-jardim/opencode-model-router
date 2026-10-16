@@ -4061,7 +4061,7 @@ documentation. The dogfood comparison (§0.12-5) is written in 6.2.0.
   `router_plan action=done task=6.1.4`. Red: `router_plan action=add-tasks` with a fix task that 6.1.4 depends on (or a
   fix in `D:\git\omr-cpx-p61` under the fallback), then rerun.
   *Amended by A-6.1-3 (owner decision 2026-10-15):* this single detached run catches environment leakage on a clean
-  checkout (dependencies outside the lockfile, untracked files); runs 19–23 already proved the same code three
+  checkout (dependencies outside the lockfile, untracked files); runs 21–23 already proved the same code three
   consecutive times in the working worktree. It is not another three-run repeatability gate.
   *Amended by A-6.1-4 (owner decision 2026-10-15):* after `2b2cb58`, this run is the third of the three consecutive
   greens at the new head, after two green working-worktree runs.
@@ -4124,6 +4124,7 @@ Edge cases are those listed in 6.1.2.
 **Acceptance criteria:**
 - G1–G12 asserted green in three consecutive working-worktree runs, with the remaining `unmeasured` subcases governed
   by A-6.1-3's real-use soak, retained 2.3/6.2 assignments and disclosed gaps; no absent evidence counts as a pass.
+  *Amended by A-6.1-4:* two working-worktree runs plus the 6.1.4 clean-checkout run.
 - Docs complete and pinned.
 - The ADR is final.
 
@@ -4668,7 +4669,8 @@ Node ≥ 22.18; DF-2 switch procedure and the 24 h pending TTL from DF-1; QA tas
 
   > 6.1.4 runs `npm run smoke:cpx:e2e` **once**, not three times, in the detached worktree after `npm ci`. Its purpose
   > is to catch environment leakage (dependencies outside the lockfile, untracked files) on a clean checkout, since
-  > runs 19–23 already proved the same code three consecutive times in the working worktree.
+  > runs 19–23 [corrected at final QA: 21–23; 66efe47 changed src after runs 19–20] already proved the same code three
+  > consecutive times in the working worktree.
 
   The smoke subcases still listed as `unmeasured` — G1 sampled/prior/off, G2 capture counters, G3 FAIL + forced C15
   fallback, G5 frozen largest plans, G6 shared-tree read/search/run + deferred plugin verification, G8 idle telemetry
@@ -4698,5 +4700,9 @@ Node ≥ 22.18; DF-2 switch procedure and the 24 h pending TTL from DF-1; QA tas
   19–23 already covered the remaining code, and smoke cost and duration are an owner constraint. The 6.1.4 run keeps
   its A-6.1-3 purpose (environment leakage on a clean checkout). Recorded in
   `docs\qa\critical-path-execution\phase-6.1.md`, "Owner amendment A-6.1-4 — 2026-10-15".
+
+- **A-6.1-5 (record only)** (Phase 6.1) — Owner-approved out-of-plan additions: opt-in
+  `routing.roleFloor: "gated"` (`541a0cb`, `d1983e6`) and recording risk origin in `trace.riskSources` (`3df0230`).
+  Both are v2-only, inert on v1; no acceptance criterion changes. Recorded in the Phase 6.1 report.
 
 **Owner execution rules for the implementation session** — §0.14 (continuous iteration, momentary takeover, atomic delegation with [tier:heavy] for complex coding and lighter test runs, bounded QA rounds, pre-flight fix-or-document, Linear not used, worktree reporting), the testing policy (§0.6-9: scoped, accelerated, full suite only in 6.2), the bounded executor QA loop (default 3 rounds), and the handover's kickoff prompt.
