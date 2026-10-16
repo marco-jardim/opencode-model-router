@@ -307,7 +307,9 @@ function slugOf(heading: string): string {
     .trim()
     .toLowerCase()
     .replace(/`/g, "")
-    .replace(/<[^>]+>/g, "")
+    // Drop inline HTML tags, then any stray angle bracket, so no tag can be rebuilt from nested fragments.
+    .replace(/<[^<>]*>/g, "")
+    .replace(/[<>]/g, "")
     .replace(/[^\p{L}\p{N}\s_-]/gu, "")
     .replace(/\s/g, "-");
 }

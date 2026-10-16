@@ -574,9 +574,12 @@ function fmtRatioAmount(x: number): string {
   return fix(x, 2);
 }
 
-/** Keys contain `|`; a cell must neither break the table nor span lines. */
+/**
+ * Keys contain `|`; a cell must neither break the table nor span lines. A backslash is escaped first, so a key that
+ * ends in `\` cannot turn the escaped `\|` back into a column separator.
+ */
 function cell(text: string): string {
-  return text.replace(/\|/g, "\\|").replace(/\r?\n/g, " ");
+  return text.replace(/\\/g, "\\\\").replace(/\|/g, "\\|").replace(/\r?\n/g, " ");
 }
 
 /**

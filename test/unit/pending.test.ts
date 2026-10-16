@@ -459,7 +459,7 @@ describe("handles (R2)", () => {
     expect(normalizeHandle(`\`${h}\``)).toBe(h);
     expect(normalizeHandle(`"${h}"`)).toBe(h);
     expect(normalizeHandle(`'${h}'`)).toBe(h);
-    expect(normalizeHandle(h.toUpperCase().replace("VRF_", "VRF_"))).toBe(h);
+    expect(normalizeHandle(h.toUpperCase())).toBe(h);
     expect(normalizeHandle(`""${h}""`)).toBeUndefined();
     expect(normalizeHandle(`"${h}'`)).toBeUndefined();
     expect(normalizeHandle(`${h}0`)).toBeUndefined();
