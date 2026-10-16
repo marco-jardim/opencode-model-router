@@ -147,10 +147,19 @@ jobs:
           node-version: 22
           package-manager-cache: false
       - run: npm ci
+      # One download per artifact, each into its own directory: with a single match (a PR, Linux only) a
+      # pattern download extracts straight into `path`, without the artifact-name subdirectory.
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: coverage-*
-          path: coverage-artifacts
+          name: coverage-linux
+          path: coverage-artifacts/coverage-linux
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ needs.windows.result != 'skipped' }}
+        # A failed Windows job may have uploaded nothing; the gate step reports the missing input.
+        continue-on-error: true
+        with:
+          name: coverage-windows
+          path: coverage-artifacts/coverage-windows
       - name: Merge and enforce the per-file gate
         shell: bash
         run: |
