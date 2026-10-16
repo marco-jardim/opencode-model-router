@@ -2036,6 +2036,80 @@ describe("integration checks: test search and filesystem seams", () => {
     expect(entries.map(e => e.toLowerCase())).not.toContain(a.scripts.toLowerCase());
   });
 
+  /**
+   * N-A-1: the command selected in slot A (its argv[0] is A's interpreter), then `change` to slot A, then the command's
+   * run in slot B: B's own interpreter runs, derived from the configuration, never A's absolute path.
+   */
+  async function movedAfter(change: (a: { cwd: string; python: string }) => Promise<void>): Promise<void> {
+    vi.mocked(runTools.resolveCommandExecutable).mockRestore();
+    const a = await venvFixture();
+    const aPython = await provisionedPython(a.scripts);
+    register(a.cwd, ["uv"], [aPython]);
+    const b = await venvFixture();
+    const bPython = await provisionedPython(b.scripts);
+    register(b.cwd, ["uv"], [bPython]);
+    const { checks, spawned } = checksEnv({ files: { "pytest.ini": "" } });
+    const full = (await checks.select(a.cwd, "cand")).tests[0]?.full;
+    if (full === undefined) throw new Error("no pytest selection");
+    expect(full.file).toBe(aPython.path);
+    await change({ cwd: a.cwd, python: aPython.path });
+    const r = await checks.runCommands({ slot: { ...slot, path: b.cwd }, commit: "cand", commands: [full], mode: "full",
+      priority: "foreground", signal: new AbortController().signal, prepare: false });
+    expect(r).toMatchObject({ verdict: "pass" });
+    const c = spawned.find(s => s.c.label === "python -m pytest")?.c;
+    if (c === undefined) throw new Error("no pytest spawn");
+    expect(c.file).toBe(bPython.path);
+    const { env, entries } = strippedEnv(c, b.cwd);
+    expect(env.VIRTUAL_ENV).toBe(nodePath.join(b.root, ".venv"));
+    expect(entries[0]).toBe(b.scripts);
+  }
+
+  it("N-A-1: a command moved to another slot after its first slot's interpreter was rewritten runs the other slot's own", async () => {
+    await movedAfter(async a => { await writeFile(a.python, "rewritten"); });
+  });
+
+  it("N-A-1: a command moved to another slot after its first slot was unregistered runs the other slot's own", async () => {
+    await movedAfter(async a => { unregisterSlot(a.cwd); });
+  });
+
+  it("N-A-1 (minor-1): the slot's own interpreter rewritten between selection and spawn falls back to the host python, as the selection would", async () => {
+    vi.mocked(runTools.resolveCommandExecutable).mockRestore();
+    const f = await venvFixture();
+    const venv = await provisionedPython(f.scripts);
+    register(f.cwd, ["uv"], [venv]);
+    // Check code (a typecheck, the test planner's step) rewrites the interpreter after the selection resolved it.
+    runnerHooks.planScopedRun = async () => {
+      await writeFile(venv.path, "rewritten by check code");
+      return unverifiable;
+    };
+    const { checks, spawned } = checksEnv({ files: { "pytest.ini": "" } });
+    expect(await checks.run(checkReq({ slot: { ...slot, path: f.cwd } }))).toMatchObject({ verdict: "pass" });
+    expect(spawned.map(s => s.c.label)).toEqual(["python -m pytest"]);
+    const c = spawned[0]?.c;
+    if (c === undefined) throw new Error("no pytest spawn");
+    expect(c.file).toBe(f.hostPython);
+    const { env, entries } = strippedEnv(c, f.cwd);
+    expect(env.VIRTUAL_ENV).toBe(nodePath.join(f.root, ".venv"));
+    expect(entries[0]).toBe(f.scripts);
+  });
+
+  it.runIf(process.platform === "win32")("N-A (minor-6): pytest's ComSpec is the validated system shell, never one planted in the slot", async () => {
+    vi.mocked(runTools.resolveCommandExecutable).mockRestore();
+    const f = await venvFixture();
+    const venv = await provisionedPython(f.scripts);
+    register(f.cwd, ["uv"], [venv]);
+    const planted = nodePath.join(f.cwd, "cmd.exe");
+    await writeFile(planted, "planted shell; never executed");
+    vi.stubEnv("ComSpec", planted);
+    const c = await pytestRun(f.cwd);
+    const env: Readonly<Record<string, string>> = c.env ?? {};
+    expect(Object.keys(env).filter(k => k.toUpperCase() === "COMSPEC")).toEqual(["ComSpec"]);
+    const shell = env.ComSpec ?? "";
+    expect(nodePath.isAbsolute(shell)).toBe(true);
+    expect(nodePath.basename(shell).toLowerCase()).toBe("cmd.exe");
+    expect(shell.toLowerCase().startsWith(f.cwd.toLowerCase())).toBe(false);
+  });
+
   it.runIf(process.platform === "win32")("N-A: with a registered slot the Windows spawn seam still never selects the planted slot-root python.exe", async () => {
     vi.mocked(runTools.resolveCommandExecutable).mockRestore();
     const f = await venvFixture();

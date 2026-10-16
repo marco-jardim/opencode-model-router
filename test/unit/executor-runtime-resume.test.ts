@@ -1735,6 +1735,54 @@ describe("pdf2-1 round 4: blocked dependents, re-provisioning and slot paths", (
     expect(await readFile(join(h.r.slot, "b.txt"), "utf8")).toBe("dependent's unsaved work\n");
   }, TEST_MS);
 
+  /** T1 ready after a lost attempt, still holding its slot with unsaved work, not relaunched (no context); then row 34. */
+  async function blockedReadyDependent(stateKey: string) {
+    const h = await rig();
+    const inputs = captureInputs(h);
+    await h.start();
+    const first = await h.launched(1);
+    await h.child(first, "ses-1");
+    await writeFile(join(h.r.slot, "b.txt"), "dependent's unsaved work\n");
+    vi.spyOn(h.deps.launcher, "gate").mockReturnValue({ ok: false, reason: "no-context", wake: { reason: "stale-context", stateKey } });
+    first.end({ kind: "lost", childSessionID: "ses-1", reason: "runner-error", endedAt: h.deps.clock.iso() });
+    await untilState(h, "ready");
+    expect((await h.ledger()).tasks.T1?.slot).toBe("slot-1");
+    const { input, releaseSlot } = releaseSlotOf(inputs);
+    await input.writer.append([
+      { type: "task-transition", taskId: "T1", from: "ready", to: "blocked", trigger: "dep-reverted", detail: null },
+      { type: "task-slot", taskId: "T1", slot: null, branch: null },
+    ]);
+    return { h, input, releaseSlot };
+  }
+
+  it("N-D: a blocked dependent whose dependency recovered (ready again, same attempt) still has its slot saved and freed", async () => {
+    const { h, input, releaseSlot } = await blockedReadyDependent("nd-recovered");
+    // The dependency recovers before the queue's fire-and-forget release takes the task's mutex.
+    await input.writer.append([{ type: "task-transition", taskId: "T1", from: "blocked", to: "ready", trigger: "dep-recovered", detail: null }]);
+    await releaseSlot("T1", "slot-1");
+    expect(await sh(h.r.top, "show", `refs/heads/${wipRef}:b.txt`)).toBe("dependent's unsaved work\n");
+    expect(h.pool.release).toHaveBeenCalledTimes(1);
+    expect(h.pool.release).toHaveBeenCalledWith("slot-1");
+    expect(await status(h.r.slot)).toBe("");
+    const t1 = (await h.ledger()).tasks.T1;
+    expect(t1?.state).toBe("ready");
+    expect(t1?.slot).toBeNull();
+    expect(t1?.attempts.map((a) => a.n)).toEqual([1]);
+  }, TEST_MS);
+
+  it("N-D: a blocked dependent an abort cancelled still has its slot saved and freed by the queue's late release", async () => {
+    const { h, releaseSlot } = await blockedReadyDependent("nd-cancelled");
+    // The abort cancels T1; its ledger slot is null, so the abort itself neither saves nor releases the slot.
+    await h.runtime.abort(PLAN, ORCH);
+    expect((await h.ledger()).tasks.T1?.state).toBe("cancelled");
+    expect(h.pool.release).not.toHaveBeenCalled();
+    await releaseSlot("T1", "slot-1");
+    expect(await sh(h.r.top, "show", `refs/heads/${wipRef}:b.txt`)).toBe("dependent's unsaved work\n");
+    expect(h.pool.release).toHaveBeenCalledTimes(1);
+    expect(h.pool.release).toHaveBeenCalledWith("slot-1");
+    expect(await status(h.r.slot)).toBe("");
+  }, TEST_MS);
+
   it("minor-4: a failed save before the re-provisioning reset keeps the new slot leased under its hold and drops its cached lease", async () => {
     const io = { failSave: false, refuse: false };
     const h = await rig({

@@ -177,12 +177,16 @@ pending 6.2.QA
   `applySlotEnv(runEnvironment(...), slotEnvFor(cwd))` (VIRTUAL_ENV, `.venv\Scripts` / `.venv/bin` first on PATH,
   PYTHONPATH/PYTHONHOME unset), and argv[0] is `slotToolExecutable(...) ?? resolveCommandExecutable(...)`
   (`slotToolExecutable` is now exported from `src/router/run-tools.ts`). G-4's guarantees stay: credentials stripped,
-  an absolute executable, never a bare name resolved from the cwd, `envMode: "replace"`. A slot interpreter is taken
-  only from a registered Python-manager slot's tool directories and only when it matches the pool's post-provisioning
-  snapshot; a file planted in the slot root or written into `.venv` later is never selected. An interpreter an earlier
-  resolution took from a slot (another slot's, when a command moves to a prepared slot) is re-resolved by its bare
-  name for the slot it runs in. Tests in `test/unit/executor-integrate-bisect.test.ts` (real `slotToolExecutable`,
-  real files): the provisioned `.venv` interpreter with the slot environment and no credential; the absolute host
+  an absolute executable, never a bare name resolved from the cwd, `envMode: "replace"`. A file planted in the slot
+  root is never selected. A `.venv` interpreter is accepted only from a registered Python-manager slot's tool
+  directories and only when it matches the pool's post-provisioning snapshot (path, size and mtime), the same trust
+  model as router_run; a file that no longer matches falls back to the host interpreter. As in router_run
+  (`slots/env.ts` `buildSlotEnv`), a registered slot without a detected Python manager gets no virtual environment and
+  unsets PYTHONPATH, PYTHONHOME and VIRTUAL_ENV; only a cwd outside every registered slot gets no slot environment, so
+  the host's values pass through there (wording corrected in round 3, minor-2/3). 306ad9e's bare-name re-lookup of an
+  earlier resolution's slot interpreter failed open and was replaced by N-A-1 below. Tests in
+  `test/unit/executor-integrate-bisect.test.ts` (real `slotToolExecutable`, real files): the provisioned `.venv`
+  interpreter with the slot environment and no credential; the absolute host
   python with the stripped environment for a slot without a provisioned interpreter and for one without a Python
   manager; a command resolved in one slot runs the other slot's interpreter; on Windows, the spawn seam with a
   registered slot still never selects the planted slot-root `python.exe`. Both G-4 tests are unchanged.
@@ -199,6 +203,41 @@ pending 6.2.QA
   is at the attempt it was blocked in. Test: `test/unit/executor-runtime-resume.test.ts`, "N-D: a late queue release
   of a blocked dependent never frees the slot its relaunch leased again".
   No checks run by this implementer for N-A, N-B or N-D; typecheck and tests remain with the orchestrator.
+
+- **N-A-1 (major, focused QA of 306ad9e) — fixed: a pytest command moved to another slot never runs the first slot's
+  interpreter.** 306ad9e re-looked-up an earlier resolution's interpreter by its bare name only while it still matched
+  its slot's snapshot; otherwise its absolute path was kept and `resolveCommandExecutable` accepted it, because
+  `workRootGuards(B)` does not cover slot A (slots live in `<drive>:\.omr-slots\<plan>`). The phase suite selects in
+  the integration worktree and re-resolves those commands in the `ci` slot on every run, rerun and bisect probe, so a
+  re-provisioned, unregistered (broken) or rewritten slot A made B run A's interpreter (A's site-packages: the wrong
+  commit tested, wrong blame or revert) or fail with "not found". Now no earlier resolution's absolute path is ever
+  accepted: a full pytest command's argv[0] is derived from the configuration (`python`, "auto" meaning `python`) at
+  every resolution (selection, `resolveForSlot`, each spawn) and resolved for the slot it runs in
+  (`slotToolExecutable` for that slot, else the host fallback). The commands resolved from the configuration are
+  tracked in a `WeakSet`; a scoped or rerun spec (a new object, planned in the same cwd) keeps its planner's argv[0]
+  under the same rules. This also fixes **minor-1**: a slot's own interpreter rewritten between selection and spawn
+  (check code) now falls back to the host interpreter as the selection would, instead of a `resolve` error. Tests in
+  `test/unit/executor-integrate-bisect.test.ts`: "N-A-1: a command moved to another slot after its first slot's
+  interpreter was rewritten runs the other slot's own", "… after its first slot was unregistered …", and "N-A-1
+  (minor-1): the slot's own interpreter rewritten between selection and spawn falls back to the host python, as the
+  selection would". The G-4 and earlier N-A tests are unchanged.
+- **minor-2/3 (docs) — fixed:** the N-A wording in CHANGELOG.md and above no longer says a planted file "in the slot"
+  is never run. A file planted in the slot root is never selected. The `.venv` interpreter is accepted only from the
+  post-provisioning snapshot (path, size, mtime), the same trust model as router_run. Python variables pass through
+  only outside a registered slot (a registered slot without a Python manager unsets them, `buildSlotEnv`); the QA
+  note's "pass through for slots without a detected Python manager" does not match the code and is stated as coded.
+- **minor-4 — fixed:** `releaseBlockedSlot` also releases a task that is `ready` again on the same attempt with a null
+  ledger slot (its dependency recovered): the task's mutex orders the release before its next launch step, which then
+  takes a fresh slot and restores the saved work. Tests in `test/unit/executor-runtime-resume.test.ts`: "N-D: a blocked
+  dependent whose dependency recovered (ready again, same attempt) still has its slot saved and freed" and "N-D: a
+  blocked dependent an abort cancelled still has its slot saved and freed by the queue's late release".
+- **minor-6 — fixed:** `resolvePython` sets `ComSpec` to the validated system shell (`resolveSystemShell`, as
+  `planRun`) on win32. Test: "N-A (minor-6): pytest's ComSpec is the validated system shell, never one planted in the
+  slot" (win32 only).
+- **minor-5 (N-B residual window) — deferred.** The QA reported a residual window in the N-B guard when the task's
+  lease is missing from `slotLeases` (the sweep then knows no slot of its own). Reason for deferral: the QA rates it a
+  low-confidence edge, there is no reproduction, and a fix without one would be speculative; recorded for 6.2.QA.
+  No checks run by this implementer for N-A-1 or the minors; typecheck and tests remain with the orchestrator.
 
 ## Deferred findings
 

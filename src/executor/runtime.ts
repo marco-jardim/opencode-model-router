@@ -3588,9 +3588,11 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
    * stop keeps the slot under its hold. N-1: the save and release run under the task's mutex, so a launch step of the
    * same task never saves or resets the slot meanwhile; the queue never awaits this in its serial lane.
    * N-D: that release is fire-and-forget, so the task can be relaunched before the mutex is taken; the pool hands the
-   * relaunch the same slot (same owner). Under the mutex the slot goes back only while the task is still blocked with no
-   * slot in the ledger, at the attempt it was blocked in. An abort that cancelled the blocked task meanwhile releases no
-   * such slot itself (its ledger slot is null) and a cancelled task never relaunches: its slot still goes back here.
+   * relaunch the same slot (same owner). Under the mutex the slot goes back only while the task has no slot in the
+   * ledger and is at the attempt it was blocked in, and is still blocked, or cancelled (an abort that cancelled the
+   * blocked task releases no such slot itself, and a cancelled task never relaunches), or ready again (its dependency
+   * recovered; the mutex orders this release before its next launch step, which then takes a fresh slot and restores the
+   * saved work).
    */
   async function releaseBlockedSlot(p: PlanRt, taskId: TaskId, slot: string): Promise<void> {
     const key = `${p.planId}/${taskId}`;
@@ -3614,7 +3616,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     }
     await withTask(p, taskId, async () => {
       const now = own(p.writer.ledger, taskId);
-      if (now === null || (now.state !== "blocked" && now.state !== "cancelled") || now.slot !== null
+      if (now === null || (now.state !== "blocked" && now.state !== "cancelled" && now.state !== "ready") || now.slot !== null
         || now.attempts[now.attempts.length - 1]?.n !== blockedAt) return;
       if (!(await slotHeldBy(p, taskId, slot))) return;
       await releaseSlotSaved(p, taskId, slot, "dep-reverted");
