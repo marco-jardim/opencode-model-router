@@ -3,8 +3,14 @@
  * (QA-2.4-16) and the host `generate`. The plugin factory, the runtime and the hook registration are replaced by recorders, so only the
  * wiring in `v2.ts` is under test.
  */
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Plugin } from "@opencode/plugin";
+import { readFileSync } from "node:fs";
+import * as configModule from "../../src/router/config";
+import * as gitTools from "../../src/router/git-tools";
+import * as executorModule from "../../src/executor/create";
+import * as platformModule from "../../src/executor/platform";
+import { createV2Runtime } from "../../src/compat/v2-client";
 
 const captured: { input?: Record<string, unknown> } = {};
 
@@ -23,6 +29,18 @@ vi.mock("../../src/compat/v2-hooks", () => ({
 
 import v2Plugin from "../../src/v2";
 
+const bundled = JSON.parse(readFileSync(new URL("../../tiers.json", import.meta.url), "utf8")) as Record<string, unknown>;
+function configuration(delegation = "tiers", leases = "enforce", require = "always", workRoots: string[] = []) {
+  return configModule.validateConfig({ ...bundled, routing: { delegation, leases: { mode: leases }, workRoots },
+    enforcement: { verify: { require } } });
+}
+beforeEach(() => {
+  vi.spyOn(configModule, "loadConfig").mockReturnValue(configuration());
+  // The wiring under test is the Windows one; the G-16 case below drives the platform seam off Windows.
+  vi.spyOn(platformModule, "executorPlatformSupported").mockReturnValue(true);
+});
+afterEach(() => { vi.restoreAllMocks(); vi.clearAllMocks(); captured.input = undefined; });
+
 function context(extra: Record<string, unknown> = {}) {
   return {
     location: { directory: "/project/sub", project: { directory: "/project" } },
@@ -34,6 +52,76 @@ function context(extra: Record<string, unknown> = {}) {
 }
 
 describe("src/v2.ts: the host objects the plugin receives", () => {
+  it.each([
+    ["tiers mode", "tiers", "enforce", "always", []],
+    ["leases off", "roles", "off", "always", []],
+    ["verification never", "roles", "enforce", "never", []],
+    ["outside workRoots", "roles", "enforce", "always", [process.platform === "win32" ? "E:/allowed" : "/allowed"]],
+  ] as const)("runs no executor discovery git in %s", async (_label, delegation, leases, require, workRoots) => {
+    vi.mocked(configModule.loadConfig).mockReturnValue(configuration(delegation, leases, require, [...workRoots]));
+    const spawn = vi.spyOn(gitTools, "spawnBounded").mockRejectedValue(new Error("unexpected discovery git"));
+    const prepare = vi.spyOn(executorModule, "prepareExecutor");
+    await v2Plugin.setup(context() as unknown as Plugin.Context);
+    expect(prepare).not.toHaveBeenCalled();
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("discovers an eligible roles/enforce location inside workRoots", async () => {
+    const root = process.platform === "win32" ? "D:/project" : "/project";
+    const directory = `${root}/sub`;
+    vi.mocked(configModule.loadConfig).mockReturnValue(configuration("roles", "enforce", "always", [root]));
+    const prepare = vi.spyOn(executorModule, "prepareExecutor").mockResolvedValue({ ok: false, reason: "test repository unavailable" });
+    await v2Plugin.setup(context({ location: { directory, project: { directory: root } } }) as unknown as Plugin.Context);
+    expect(prepare).toHaveBeenCalledExactlyOnceWith(directory);
+  });
+
+  it("G-16: off Windows an eligible roles/enforce location runs no executor discovery and names the platform", async () => {
+    const root = process.platform === "win32" ? "D:/project" : "/project";
+    vi.mocked(configModule.loadConfig).mockReturnValue(configuration("roles", "enforce", "always", [root]));
+    vi.mocked(platformModule.executorPlatformSupported).mockReturnValue(false);
+    const spawn = vi.spyOn(gitTools, "spawnBounded").mockRejectedValue(new Error("unexpected discovery git"));
+    const prepare = vi.spyOn(executorModule, "prepareExecutor");
+    await v2Plugin.setup(context({ location: { directory: `${root}/sub`, project: { directory: root } } }) as unknown as Plugin.Context);
+    expect(prepare).not.toHaveBeenCalled();
+    expect(spawn).not.toHaveBeenCalled();
+    const access = captured.input?.routerExecutor as executorModule.ExecutorAccess;
+    expect(access.runtime()).toBeNull();
+    expect(access.unavailable()).toBe(`the plan executor is not available: ${platformModule.EXECUTOR_PLATFORM_REASON}`);
+  });
+
+  it("explains a missing child runner rather than leaving the executor not initialized", async () => {
+    vi.mocked(configModule.loadConfig).mockReturnValue(configuration("roles"));
+    vi.spyOn(executorModule, "prepareExecutor").mockResolvedValue({ ok: true, toplevel: "/project", home: "/project/.git/omr-executor" });
+    vi.mocked(createV2Runtime).mockReturnValueOnce({ client: {} } as unknown as ReturnType<typeof createV2Runtime>);
+    await v2Plugin.setup(context() as unknown as Plugin.Context);
+    const access = captured.input?.routerExecutor as executorModule.ExecutorAccess;
+    expect(access.runtime()).toBeNull();
+    expect(access.unavailable()).toBe("the plan executor is not available: the child runner is not available");
+  });
+
+  it.each([
+    ["configuration gate", "tiers", "routing.delegation must be roles at start"],
+    ["repository discovery", "roles", "the repository toplevel could not be resolved"],
+    ["workRoots gate", "roles", "the location is outside routing.workRoots"],
+  ])("QA-5.1-23 a missing child runner does not overwrite the earlier %s reason", async (label, delegation, reason) => {
+    const workRoots = label === "workRoots gate" ? [process.platform === "win32" ? "E:/allowed" : "/allowed"] : [];
+    vi.mocked(configModule.loadConfig).mockReturnValue(configuration(delegation, "enforce", "always", workRoots));
+    vi.spyOn(executorModule, "prepareExecutor").mockResolvedValue({ ok: false, reason });
+    vi.mocked(createV2Runtime).mockReturnValueOnce({ client: {} } as unknown as ReturnType<typeof createV2Runtime>);
+    await v2Plugin.setup(context() as unknown as Plugin.Context);
+    const access = captured.input?.routerExecutor as executorModule.ExecutorAccess;
+    expect(access.runtime()).toBeNull();
+    expect(access.unavailable()).toBe(`the plan executor is not available: ${reason}`);
+  });
+
+  it("hands over the late executor access, plan annotate port and slot verifier port (Phase 5.1 D1)", async () => {
+    await v2Plugin.setup(context() as unknown as Plugin.Context);
+    expect(captured.input?.routerExecutor).toEqual(expect.objectContaining({
+      runtime: expect.any(Function), unavailable: expect.any(Function), set: expect.any(Function), clear: expect.any(Function),
+    }));
+    expect(captured.input?.routerOnPlanAnnotate).toEqual(expect.any(Function));
+    expect(captured.input?.routerOnSlotVerifier).toEqual(expect.any(Function));
+  });
   it("routerAgents lists the agents of this plugin instance's location (QA-2.4-16)", async () => {
     const ctx = context();
     await v2Plugin.setup(ctx as unknown as Plugin.Context);

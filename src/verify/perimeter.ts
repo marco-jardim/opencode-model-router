@@ -1030,6 +1030,9 @@ export interface PlannedPerimeter extends DispatchPerimeter {
   readonly unadmittedMore?: number;
 }
 
+/** A-5.1-12: a plan-task verification id, `plan:<orchestratorSessionID>:<planId>/<taskId>#<n>`; group 1 is the orchestrator. */
+export const PLAN_TASK_PERIMETER_ID = /^plan:([^:/]+):[^/]+\/.+#[1-9][0-9]*$/;
+
 /**
  * The perimeter beyond W of the dispatch `dispatchID` (a native `task` dispatch, `task:<orchestrator>:<callID>`) verified at
  * `cwd`, or undefined when it has none (I9): not a routed role dispatch, or neither a grant location nor another working-set
@@ -1042,14 +1045,17 @@ export function planPerimeter(
   admission: () => PerimeterAdmission,
   io: DependencyIO = defaultDependencyIO,
 ): PlannedPerimeter | undefined {
-  if (!dispatchID.startsWith("task:")) return undefined;
+  // A-5.1-12 (Phase 5.1, additive): a plan-task attempt `plan:<orchestrator>:<planId>/<taskId>#<n>` is planned too, with W its
+  // slot (`cwd`, no grant location), the orchestrator's working set and W's link targets.
+  const planTask = PLAN_TASK_PERIMETER_ID.exec(dispatchID);
+  if (!dispatchID.startsWith("task:") && planTask === null) return undefined;
   const rest = dispatchID.slice("task:".length);
   const separator = rest.indexOf(":");
-  if (separator <= 0) return undefined;
-  const orchestrator = rest.slice(0, separator);
-  const routed = routedRoleOf(rest.slice(separator + 1));
-  if (routed === undefined || routed.parentSessionID !== orchestrator) return undefined;
-  const location = routed.grant?.location;
+  if (planTask === null && separator <= 0) return undefined;
+  const orchestrator = planTask?.[1] ?? rest.slice(0, separator);
+  const routed = planTask === null ? routedRoleOf(rest.slice(separator + 1)) : undefined;
+  if (planTask === null && (routed === undefined || routed.parentSessionID !== orchestrator)) return undefined;
+  const location = routed?.grant?.location;
   const w = location?.worktree ?? cwd;
   const workingSet = workingSetOf(orchestrator);
   const others = workingSet.filter((entry) => !insideOrEqual(w, entry.worktree) && !insideOrEqual(entry.worktree, w));

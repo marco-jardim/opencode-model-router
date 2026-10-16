@@ -1,0 +1,22 @@
+{
+  "v": 1,
+  "kind": "decision",
+  "ts": "2026-10-12T09:00:00.000Z",
+  "sessionID": "parent",
+  "decisionID": "decision-1",
+  "mode": "enforce",
+  "childSessionID": null,
+  "facts": { "class": "code", "risk": "low", "scope": "local", "needs": [], "confidence": 1, "source": "rules" },
+  "chosen": { "key": "code|router:medium|fixture/model#default", "agent": "medium", "origin": "router", "model": "fixture/model", "variant": "default" },
+  "best": null,
+  "switched": false,
+  "pinned": false,
+  "unit": "ratio",
+  "costs": {},
+  "confidence": 1,
+  "reason": "kept",
+  "step": "dispatch",
+  "resume": false,
+  "tier": "medium",
+  "window": { "floor": "fast", "ceiling": "heavy", "tiers": ["fast", "medium", "heavy"] }
+}

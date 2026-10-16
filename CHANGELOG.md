@@ -7,6 +7,350 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **OpenCode v2: role-dispatch decision rows record where their risk came from.** `trace.riskSources` lists the class
+  base risk, the rules estimate, the route line's `risk=` claim, the merged facts, any inherited resume risk and the
+  effective risk, plus an optional bounded vocabulary label (a single word or a table id, never prompt text). Routing
+  is unchanged; older rows stay readable.
+- **OpenCode v2: configurable `routing.roleFloor: "gated"`** (bundled `tiers.json` or global override, not project overrides;
+  code default `"strict"`). A role dispatch that may edit
+  and run commands, whose detection is `grader`, whose risk is not `high`, whose return gate runs and whose role can
+  be raised from `medium` straight to `heavy`, gets a `medium` authority floor instead of `heavy` (bounds reason
+  `gated:authority`, recorded only when gating lowers the final floor). A verification FAIL, and for gated children also
+  an UNVERIFIABLE return, raises the resumed child to `heavy`. Every other floor cell is unchanged; inert on OpenCode v1.
+- **OpenCode v2: intrinsic service observations for the amended G8 oracle (A-6.1-1).** With the opt-in observations
+  below, verification checks/grading, integration rebase/checks/fast-forward and phase-suite commands emit paired
+  service spans that bracket only their execution; preparation, slot and lease waits, and retry backoff are recorded as
+  separate spans so they cannot inflate a bound term. Off by default and inert on OpenCode v1.
+- **OpenCode v2: opt-in diagnostic observations.** Set `MODEL_ROUTER_V2_OBSERVATIONS=<directory>` to an existing
+  directory before setup to write bounded, sequence-numbered JSONL streams, sealed on adapter disposal. They
+  record dispatch native-argument fingerprints, completion effects, scheduler and physical-slot transitions,
+  without prompt or file content. Off by default and inert on OpenCode v1.
+- **CPX e2e smoke diagnostics:** bounded wrapper/child-command timings and host/setup/launch checkpoints are
+  retained with failure evidence before scratch cleanup. These are diagnostic observations only; executor
+  behavior, offline checks and G1–G12 bounds are unchanged.
+- **CPX soak: `npm run soak:analyze` offline soak analyzer (amendment A-6.1-3).** It reads retained soak evidence and
+  reports observations, violations and per-criterion and per-subcase status. Subcases the current logs cannot show
+  are reported as `not-observable` declared gaps, never as passes (A-6.1-6); an overall passing verdict requires at least
+  five working days and every required criterion to be `ok`. Absence of evidence is never a pass.
+- **OpenCode v2: `/router stats` shows a "Dispatch durations" table and an "Orchestrator cache-read share" line** when
+  timing logs exist.
+- **OpenCode v2: background dispatch.** A subagent dispatch whose predicted duration is long runs in the background
+  (`routing.background.mode`: `auto` decides from the predicted duration, `model` lets the orchestrating model decide,
+  `off` keeps every dispatch in the foreground as before; `routing.background.minPredictedMs` sets the `auto` threshold).
+  The router state lists the dispatches in flight and those completed since the last turn, and the router guarantees
+  apply when a background child completes.
+- **OpenCode v2: held results with verdict delivery.** The result of a background dispatch that requires verification
+  is held: the orchestrator sees a placeholder until the verification gate settles, a resume of the held child is
+  refused, and the verdict is posted to the orchestrator's session. A held result whose gate gives no verdict (a
+  failed or interrupted child, no verification required, an error in the gate, a restart that lost the verification
+  data) is posted as `UNVERIFIABLE` with its reason, never as `PASS`. `router_verify` refuses a held handle: its own
+  gate posts the verdict.
+- **OpenCode v2: work leases** (`routing.leases.mode`, `routing.leases.run`). A child session holds a lease on each
+  file it edits in its checkout; another child's edit of that file in the same checkout is refused until the lease is
+  released (a plan task's lease also refuses another plan task's edit of that path in any linked worktree), search
+  results under another holder's edit are omitted, and `router_run` annotates or refuses a run on a leased target.
+- **OpenCode v2: restart recovery.** In-flight dispatches, held results and pending verifications are journaled in
+  `pending.jsonl` in the per-user state directory (`~/.local/state/opencode-model-router`, or
+  `$XDG_STATE_HOME/opencode-model-router` when set, outside Windows), never in the temp directory. `/router approve`
+  refuses that directory and any repository inside it (a protected location). After a restart the router recovers a
+  dispatch whose child finished, re-posts a verdict that was reached but not delivered, and keeps posted results
+  hidden. A restored pending verification keeps its cross-repo checks: the branch and HEAD recorded at return, the
+  unobservable writers and the check placements of a deferred dispatch are journaled and checked again, and a record
+  with a malformed one is dropped. A dispatch's perimeter is not journaled, so `router_verify` on a restored handle
+  whose dispatch had one reports `UNVERIFIABLE` (`perimeter lost in restart`), never `PASS`. A held result's
+  dispatch-time head is journaled and checked again: a held result whose head or perimeter was lost settles
+  `UNVERIFIABLE`, and a restored held result settles in place. A journal that vanishes under a running process is
+  rewritten from memory. OpenCode v1 ignores every `routing.background.*` and `routing.leases.*` key and logs one
+  notice per process that names them.
+- **OpenCode v2: the plan executor is Windows only in this release.** Its execution slots need a drive-letter path
+  (`routing.executor.slotsDir`, default `<drive>:\.omr-slots\<planId>`). On platforms other than Windows it is inert:
+  `router_plan` and `/plan` are not registered, `/router` does not list `/plan`, role agents get no slots rule and no
+  executor-home lookup runs (`<git common dir>/omr-executor`, found on disk without running git, is still denied to
+  them whenever the common directory resolves, even before it exists), invalid `routing.executor.*` values are not reported, no executor discovery runs at start, and when
+  roles mode at start with enforced leases and verification not `never` would assemble it the router logs one notice
+  per process, `plan executor requires Windows; router_plan and /plan are not registered`.
+- **OpenCode v2: plan executor registration.** `router_plan` and `/plan` are registered only in roles mode selected at
+  start, and `router_plan` resolves the executor at call time; `/router` lists `/plan` only when it is registered, not
+  user-defined, and the executor prerequisites hold (roles delegation, enforced leases, verification not `never`, a
+  location inside `routing.workRoots` when configured). State-changing and authority actions (`compile`, `residue`, `approve`, `adopt`, `abort`, `purge`, `land`,
+  `answer`, `pause`, `resume`, `add-tasks`, `done`, `gc`, and any other state-changing action) require a proven
+  depth-0 session with no parent, with no bound-plan-child exception; failed parent lookups refuse. Read-only
+  `status`, `ready`, `export` and `/plan inbox` allow roots or exactly bound plan children reading only their own
+  explicitly named plan, never another plan. The same rule guards the tool and command. An existing user-defined
+  `/plan` is preserved: v2 checks the host command registry, logs one conflict warning and keeps `router_plan` available;
+  v1 adds no `/plan` notice for that user command. Active plans add executor instructions to router state after the plan
+  section. Assembly requires a git repository, roles delegation, enforced leases and a plan-task verifier with
+  verification enabled; otherwise the tool and command report why the executor is unavailable. The keys, tool and
+  command have a user guide ([docs/EXECUTOR.md](docs/EXECUTOR.md)) and a design record
+  ([ADR 0007](docs/adr/0007-critical-path-execution.md)); `slotsDir`, `integrationChecks`, `phaseSuite`,
+  `provision` and `python` are trusted keys that only the global override sets. `/router approve` refuses a repository's
+  executor home (`<git common dir>\omr-executor`, with its plan and slot-marker directories) and any repository inside
+  it; that check runs git within one 15 s bound in all, and
+  refuses a candidate it could not finish in time. OpenCode v1 ignores every `routing.executor.*` key and logs one
+  notice per process that names them; a best-effort `/plan` use without a user-defined command shares that notice and
+  adds no output. The v1 tool, command and help maps are unchanged. Breaker answers and QA-cap `accept`/`fix` answers
+  that unpause a phase re-enqueue its verified tasks and wake the integration lanes, without duplicating queued entries
+  or bypassing task leases. Foreign plans attach read-only: startup and failed-adopt recovery check the ledger's
+  repository before opening a writer, so viewing a foreign plan takes no writer lock and changes no writer epoch or
+  journal. Status remains available; mutation requires that repository. The trusted slots root stays allowed after a
+  restart or `/router-reload` while slot and integration worktrees exist; roots inside or above a non-slot checkout are
+  refused, and the default slots drive comes from the location's repository toplevel; a registered worktree whose folder
+  is gone never blocks that allow. One executor runs per process: a plugin copy refused by the process claim waits and
+  assembles once the holder disposes, running recovery once, and is wired into the host exactly like an executor
+  assembled at start (plan state, executor instructions, host events, retry stop, ordered disposal). Plan-task
+  verification is cancelled first at disposal, a verdict decided before disposal is still journaled, manual `gc` of a
+  completed plan waits for pending phase tags, and `purge` creates no directories, removes the empty plan directory and
+  skips collection for an invalid `slotsDir` when the plan holds no slot markers. A `NEED MORE: budget` end resumes
+  the same child session as many times as the guard's cumulative call multiplier allows (`BUDGET_RESUMES`), then
+  parks as `budget-cap`; each budget resume starts a new guard round for that child across plugin locations (its per-dispatch budget and read
+  count restart, the cumulative ceiling stays). A superseded run's late rejection cannot interrupt or unregister its resumed round.
+  Plan children keep their resolved tier for both round budgets and cumulative ceilings. An editing task's
+  child gets the executor's `CAP:12` read cap (its `[cap: n/12]` and `CAP REACHED` banners, as a routed child's `CAP`)
+  and its route's `budget=` as its call budget; interrupted, parked or lost attempts keep
+  their uncommitted work on `omr/<plan>/wip/<task>` for the next attempt; WIP refs remain until purge, including after
+  abort. Unsaved-slot holds are rebuilt after restarts; gc and purge retry saving before collection. Purge waits up to
+  30 seconds for abort cleanup and refuses if it is still pending. Successful clean or presaved releases clear rebuilt
+  holds too, preventing duplicate abort releases; retained gc predicates still refuse any remaining hold.
+  Metadata-less slot directories are quarantined,
+  not counted as clean, and pool gc preserves uncommitted work unless the caller explicitly marks it saved.
+  Orchestrator-shell filtering drops only the semicolon-delimited clause marked `(orchestrator shell)`, not its
+  neighbours, and compilation warns on mixed criteria lines. A block left with no criteria and no checks falls back to
+  the inferred DoD. A cap written in the plan is neutralised with the task's other directives, and shared-context
+  directives are neutralised at compile, keeping the stored text identical at launch; editing tasks receive the
+  executor's own `CAP:12`, placed first (right after `PLAN CONTEXT`, before the shared context and the task text), so
+  it is the first cap token in the child prompt even when a plan token split across lines survives neutralisation.
+  Compilation takes the base branch tip from the repository toplevel (detached HEAD is refused) using the
+  full branch ref, so a same-named tag cannot confuse it; approval reads the actual plan's ledger rather than deriving
+  its id from the slots directory and refuses a moved base with `E_STALE_BASE`. Integration/CI worktrees start from
+  the ledger's integration head. Disposal no longer waits on a launch begun after it started: once a plan is disposing,
+  the runtime hands the launcher no new child and no budget resume. A park whose slot work could not be saved keeps
+  the slot on the parked task (the ledger accepts a slot on a parked task for this), so the slot is never reset or
+  released while that work is unsaved. After an abort, slot collection (automatic or `gc`) waits until each cancelled
+  child's slot was saved and released, or held when its save failed, so a slot is never collected mid-save.
+
+### Changed
+
+- **CI: pull requests are Linux-only; one Windows Node 22 typecheck + full-suite coverage job runs on master pushes
+  and manual runs.** Linux e2e and Bun smoke stay blocking. Without Windows coverage, only `src/verify/exec.ts`
+  and the `src/executor/` prefix are warn-only; with it, all coverage gates block (G-21).
+- **OpenCode v2: register `router_plan` and `/plan` only in roles mode selected at start, like `router_run`.** Tiers
+  mode no longer carries the unusable plan-tool schema; switching to roles needs a restart. `/router` help never
+  advertises an unregistered or user-defined `/plan`. OpenCode v1's tool, command and help maps are unchanged.
+- **OpenCode v2: shorter serial integration entries.** Integration checks on the slot the queue has just rebased to the
+  candidate no longer reset it a second time (clean and HEAD check only, falling back to the full prepare on a HEAD
+  mismatch or provisioning drift), and the check-selection reads overlap the clean. Bisect probes, reruns, reverts and
+  phase suites keep the full prepare.
+- **CPX e2e smoke: the G8 makespan bound is recorded, not asserted (owner amendment A-6.1-2).** The throughput run
+  still reconstructs and records makespan, CP_eff, W_auth/p, ΣI_service, the bound, the ratio and whether it was met;
+  service-evidence integrity and the 10,000 ms idle-with-ready ceiling stay asserted. Delegated grading observed as
+  `service-unattributed` is recognized verification evidence credited at zero intrinsic cost, so the computed bound is
+  conservative.
+- **CPX e2e smoke: amended G8 intrinsic-service oracle (A-6.1-1).** The bound uses the pre-run DAG, authored work,
+  attributable verification/integration/phase-suite service and configured parallelism, with fail-closed evidence
+  checks and raw CP/integration diagnostics retained. Throughput uses the default integration batching; resilience
+  keeps singleton batches.
+- **OpenCode v2: declared plan writers must produce a diff in every verification mode.** The owner's 2026-10-14
+  amendment to M39 makes a nonempty write footprint with no changes a counted `commit-failed` (`no changes`) for
+  `VERIFY:required`, `deferred` and `none`: bounded retries, then park, never silent `done`. No idempotent exception
+  is allowed. Empty-write no-change success and its phase-gate reconciliation are preserved.
+- **OpenCode v2: per-turn router state moves out of the system prompt.** The pending-verification list, late
+  verification notices and the route hint are delivered in a per-turn `<router-state>` message appended after the
+  conversation, so the system prompt stays byte-stable across turns. Late notices are repeated every turn until
+  `router_verify` reads them. OpenCode v1 is unchanged.
+
+### Fixed
+
+- **OpenCode v2: `/router` lists `/plan` only when `/plan` is registered and the executor can assemble.** That is roles
+  mode selected at start and still configured, no user-defined `/plan`, enforced leases, verification not `never` and a location inside
+  `routing.workRoots` when configured. Without a routing block, help remains byte-identical to the legacy output;
+  OpenCode v1 is unchanged.
+- **OpenCode v2: a task blocked by a reverted dependency keeps its unsaved work.** The integration queue no longer
+  gives such a task's slot back to the pool unsaved. The work is first saved at the task's WIP ref (a failed save keeps
+  the slot leased). A running task's slot is released once, by the executor, after its cancelled child has ended.
+- **OpenCode v2: recovered plan work keeps interrupted-attempt safety.** Re-provisioning saves an owned slot before
+  releasing or resetting it and retains unsaved-work holds on failure. Recovered budget ends wait for root-context
+  admission before resuming the same child; launcher-liveness evidence follows the current resume round. Abort drains
+  attachment verification before saving/releasing its slots, and collection waits for those pipelines too.
+- **OpenCode v2: executor recovery no longer deadlocks when a task was verifying at restart.** Recovered
+  re-verification (and a finished child's completion) no longer blocks the recovery barrier: it waits for the owning
+  root's next router call, then runs. An adopt cuts the old attachment's graders, and a cut observation is no longer graded as a counted
+  `unverifiable` by the next attachment.
+- **OpenCode v2: plan slots are claimed in launch-priority order.** A slot acquisition took its place in the pool's
+  queue only after its own `git rev-parse` returned, so the highest-priority task could claim the last slot and wait
+  behind every other slot's provisioning. Claims now queue in call order and await their base lookup inside the claim.
+- **OpenCode v2: after a host restart, the executor requeues a plan child at once when its launching process is
+  provably gone.** It records each child's launcher (pid, hostname, per-process token); recovery treats a child as lost
+  without the 60 s liveness probation only when that process is dead on this host and the child was not running a tool
+  when the host stopped (host contract C16). A child stopped inside a tool, whose processes (for example a `router_run`
+  test run) can outlive the host, keeps the probation, as does every other case.
+- **OpenCode v2: diagnostic observations record a scheduler graph row for every committed ledger batch**, including
+  metric-only batches, so a runtime row never reports a ledger sequence that no graph row preceded.
+- **OpenCode v2: a plan-task verification that cannot snapshot its slot says why.** The unverifiable result now
+  includes a bounded, scrubbed reason (for example a git timeout or a missing file) naming the git stage that failed;
+  it still fails closed. A grader that cannot start, and each transient verification rerun, log their reason.
+- **OpenCode v2: integration check selection never treats a failed `git show` as a missing file.** Only git's explicit
+  "path does not exist" error means absent; any other read failure fails the check as `prepare`, never a `no-checks`
+  pass. A failed prepare now waits for its overlapped reads before the slot is retried.
+- **OpenCode v2: integration-check pytest uses the slot's virtual environment again.** Since the guarded-executable
+  change, pytest checks ran the host interpreter without the slot's environment. They again run the slot's provisioned
+  `.venv` interpreter with `VIRTUAL_ENV` set, the virtual environment first on `PATH` and `PYTHONPATH`/`PYTHONHOME`
+  unset, as `router_run` does; credentials stay stripped and `ComSpec` is the validated system shell on Windows. The
+  `.venv` interpreter is accepted only when it matches the slot's post-provisioning snapshot (path, size and
+  modification time), the same trust rule as `router_run`. Otherwise the absolute host interpreter outside the slot runs.
+  A file planted in the slot root is never selected. As in `router_run`, a slot without a detected Python manager gets
+  no virtual environment (and unsets `PYTHONPATH`, `PYTHONHOME` and `VIRTUAL_ENV`); only outside a registered slot do
+  the host's values pass through. The interpreter is resolved again from the configuration for every slot a command
+  runs in, never reused from another slot.
+- **OpenCode v2: QA fix tasks get a launchable route line for any repository path.** A repository or phase root that
+  cannot be written safely into a route line (brackets, quotes, separators) is omitted, since the slot root is always
+  appended at launch; fix tasks stored by the earlier build with an unbracketed line launch as well.
+- **OpenCode v2: the executor's default QA fix task route line is now a well-formed `[route ...]` line**, so a fix task created at runtime without a phase `FIX` template launches instead of failing route rendering.
+- **OpenCode v2: service observations exclude process preparation, mark native grading without provider-attempt events as insufficient evidence, and attribute plan-task checks and grading to the checked candidate.**
+- **OpenCode v2: the executor admits tasks to physical slots in critical-path priority order.** A lower-priority
+  task no longer takes the only free slot ahead of a higher-priority ready task, and a durable slot release reschedules
+  slot-blocked tasks at once instead of waiting for their retry backoff.
+- **OpenCode v2: reused executor slots no longer launch dirty or at the wrong base after dependency provisioning.** An
+  acquisition whose reset ran an installer afterwards gives no reset proof, so the launch resets the slot again.
+- **OpenCode v2: executor children adopted after a launch-confirmation timeout get their timing row**, exactly once,
+  without reviving the launch's settled completion effects.
+- **OpenCode v2: executor launches reuse acquisition's verified reset at the current integration head, avoiding a duplicate reset while retaining full preparation for moved heads and unproven leases.**
+- **OpenCode v2: the executor's idle-with-ready metric reports a duration exactly equal to its endpoints.**
+- **CPX e2e G8 idle checks reconstruct maximal episodes from committed v2 observations.** Failed slot/launch
+  reservations no longer hide stalls by fragmenting ledger metrics. The unchanged 10,000 ms ceiling applies to
+  whole episodes; every ledger fragment must be covered, and missing seals, sequence gaps or dropped events fail
+  closed. The asserted G8 idle predicate, confirmed by the owner on 2026-10-14, is **A: durable ready work with
+  provider capacity**, so time spent waiting for a physical slot counts as idle. The physical-slot-blocked/launchable
+  split (predicate B) is diagnostic only and cannot shorten an asserted episode; the 10,000 ms bound has not been
+  relaxed. Per-host streams are retained before scratch cleanup, including incomplete failure/restart diagnostics.
+- **CPX e2e smoke throughput checks follow the strict G8 contract:** provider delays and the independent CP/W
+  oracle use authored fixture milliseconds, makespan has no additive slack, and idle with ready work is capped at
+  10,000 ms. By owner amendment (2026-10-14) the fixed 90 s per-host watchdog, which cannot hold a complete run
+  (measured serial integration alone is ~75–85 s), is replaced by one derived from the contract: a 60 s setup
+  watchdog, then 1.3 × max(CP, W/p, entries × 5 s) plus a 60 s audit margin, capped at 300 s per host. The
+  per-entry allowance only sizes the watchdog; the G8 assertion keeps the measured serial integration.
+- **OpenCode v2: malformed shared lease registry entries no longer disable enforcement.** Entries are validated
+  individually; an invalid entry is refused without replacing it or disturbing valid registries. If the registry cannot
+  start with leases enforced, lease-checked file, search, git and run tools are refused instead of bypassing enforcement.
+- **OpenCode v2: plan checks re-resolve inherited router commands for the prepared execution slot.** Phase suites,
+  base checks, bisect probes and revert regressions refresh the command executable, environment and authorization
+  against the checkout under test rather than reusing the integration worktree's resolution. Explicit working-directory
+  and environment overrides are preserved. Configured commands and commands with explicit `cwd` or `env` overrides
+  execute unchanged in full instead of being replaced by scoped runs; ordinary equivalent package-script test scoping
+  is retained.
+- **OpenCode v2: plan phase bisects distinguish actual file-scoped checks from full-command fallbacks.** A full or
+  mixed run cannot establish isolated-file evidence. With a failing base and no valid isolation, a regression remains
+  unattributed instead of blaming the wrong task; a file-scoped bisect also stops unattributed if a historical probe
+  falls back to full commands. Genuine file-scoped bisects are preserved.
+- **OpenCode v2: explicit plan-writer routes are checked against the selected role's edit grant.** Compilation uses
+  the resolved role policy, including configured permission narrowing, rather than class/tier heuristics. A writer
+  routed to a general role without an `edit` grant is rejected with a task and line diagnostic; valid edit-capable routes
+  remain accepted.
+- **OpenCode v2: failed rebase cleanup preserves the initiating Git error.** Cleanup checks the slot's rebase state
+  before aborting and retains the original failure alongside any cleanup error. Integration refusals persist bounded
+  diagnostic details in the journal with URL credentials redacted from keys and string values before clipping, with
+  bounded traversal and output handling.
+- **OpenCode v2: inferred plan writers no longer launch as read-only explorers.** Before role selection, explicit
+  or ownership-inferred write footprints reconcile automatically inferred read-only classes and add the `edit` need,
+  keeping the tier, pin, risk and existing needs. Incompatible authored read-only routes fail compilation with a task
+  and line diagnostic instead of being silently overridden. Manual/preflight/QA tasks and `Writes: none` are excluded;
+  explorer permissions are unchanged.
+- **OpenCode v2: plan phase suites and base checks run in the CI slot at the commit under test, not the integration worktree's current head.**
+- **OpenCode v2: plan phases no longer stall after a no-change completion.** Tasks that finish without a commit and
+  manual/preflight tasks reported done reconcile their phase gates and dependent phases, so QA launches without another
+  orchestrator turn.
+- **OpenCode v2: work leases no longer collide across linked worktrees.** Two child sessions that edit the same
+  repo-relative path in two worktrees of one repository (`git worktree add`) are both allowed: an ordinary write lease
+  is keyed by its checkout, not by the repository, and a write whose target the router cannot read is refused only while
+  another child holds a lease in the same checkout. The leases of plan tasks stay repository-wide among plan tasks, so
+  two plan tasks that edit one path in two slots still refuse each other, and a plan child's write whose target the
+  router cannot read is checked against the plan-task leases in the whole repository. A path spelling that may name
+  any file (a device path, an 8.3 short name, a drive-relative path) still fails closed against every holder anywhere.
+  A refusal names the file under edit and asks for the requester's own path in `NEED MORE: lease` (repo-relative for a
+  plan task). Reads were already keyed by the file on disk. OpenCode v1 is unchanged.
+- **OpenCode v2: plugin module copies share one process-wide lease registry.** Snapshot restoration is attempted only
+  once when the registry is created, even if the snapshot is missing or invalid, so a later location cannot overwrite
+  live leases by restoring again.
+- **OpenCode v2: a resumed background dispatch delivers its own answer.** It no longer takes an earlier turn's
+  completion as its own result, even when the earlier turn was still being processed when the parent saw it, nor the
+  child's earlier answer. Completions are told apart by the message that carries them rather than by their text, so two
+  turns with the same answer each get one verdict; a dispatch whose child ended before its answer could be read is
+  read again on the parent's next request instead of waiting for the 6 h sweep. Known limit: the set of completions
+  already taken lives in memory, so a resume right after a plugin restart can still mis-attribute.
+- **OpenCode v2: background dispatches without a deterministic check are graded.** Their grader launches as the
+  orchestrator agent that made the call, also after a restart, never from a role child's context (which denies
+  `subagent`); an entry journaled by an older build falls back to the parent session's current agent and its latest
+  assistant message (looked up for at most 2 s, and not for a completion that did not succeed), and a result that
+  could not be verified is tagged `UNVERIFIABLE` instead of `PASS`. Acceptance is unchanged. OpenCode v1 is unchanged.
+- **OpenCode v2: one plugin copy per process decides each background call.** Call claims are process-wide across the
+  plugin copies a host loads per location (bounded to 8000 claims in all, the oldest of any copy evicted first): a
+  call that reaches several copies is completed once, and the claiming copy's background decision stands. A copy that
+  lost the claim leaves the call's `background` flag as it found it and does not tell the orchestrator the result is
+  unverified. OpenCode v1 is unchanged.
+- **OpenCode v2: an unrecorded child session never backgrounds a dispatch.** A child the plugin never recorded (after a
+  reload, or past the 1000-entry bound) no longer counts as a root parent in the background decision (root parents
+  only): its kind comes from the role decision's session read or from the host, and a failed lookup keeps the
+  foreground value. OpenCode v1 is unchanged.
+- **OpenCode v2: background-first runs write `turns.jsonl` rows.** The end of a root session's run now closes its
+  orchestrator turn, so the kickoff and each wake-up (runs that no user prompt starts) get one row each, even while a
+  background dispatch is still open. OpenCode v1 is unchanged.
+- **Role prompts: the dispatch's work root wins over the host's environment block.** The work-root rule of every role
+  prompt now says that the router's `Working directory:` line and the work root in the dispatch's ENVIRONMENT win over
+  the working directory in the host's environment block (role children get the task without the route line), so a role
+  no longer refuses its work root because the host named the parent's directory.
+- **OpenCode v2: a second booted location no longer settles another location's running dispatch as `lost in
+  restart`.** When one host process loads a router instance per location, each instance now keeps a beat file in
+  `pending.instances` next to `pending.claims` while it holds a session claim. A new instance refuses to adopt a
+  session whose claim belongs to a live sibling instance, so that instance's records stay dormant and its verdict is
+  the only one delivered. A dead owner (stale beat, or dead pid) is still recovered as before. Journal and claim
+  records written by earlier builds read as before. OpenCode v1 is unchanged.
+- **OpenCode v2: no start-up reference GC in a location outside `routing.workRoots`.** When `routing.workRoots` is
+  configured and non-empty, an instance loaded in a directory outside every entry skips the start-up reference GC and
+  logs one info line naming the skip. Role agent registration in roles mode still lists the repository's worktrees
+  there (`git worktree list`, read-only), so a `routing.workRoots` glob meant for later-created worktrees does not drop
+  the existing ones from the role agents' `external_directory` rules. With executor enforcement enabled, role agents
+  still deny the executor home there when worktrees were listed or their listing failed, and get no executor slots-root
+  allowance. The location check uses the documented
+  glob semantics (`*` crosses separators, as in the role agents' rules) and compares canonical paths. Without
+  `routing.workRoots` nothing changes. OpenCode v1 is unchanged.
+- **OpenCode v2: `router_verify` on a held background handle reports the verdict its gate reached** (method, outcome,
+  reasons, caveats and notes). It used to settle every held gate verdict as a deterministic result with no caveats, so
+  a checker that could not verify showed "UNVERIFIED: deterministic" without the grader's reason and a pass with
+  caveats showed "✓ verified". The stored pass/outcome always match the posted tag (a trivial dispatch the gate accepts
+  unverified reads pass, a pass that `strictUnverifiable` rejects reads fail, also when re-posted after a restart). The
+  posted verdict is unchanged. OpenCode v1 is unchanged.
+- **OpenCode v2: plugin copies loaded per booted location share the pending journal safely.** A fresh writer mark of
+  the same process under another module token counts as a live writer (start-up compaction is skipped), each copy
+  compacts through its own temp file, and a recreate merges the records of every copy. Beat files in
+  `pending.instances` are written atomically, a half-written beat counts as live while its modification time is
+  fresh, and stale beats are swept at start. When the host evicts a location while its child still runs, the adopting
+  instance keeps that dispatch dormant until its end event instead of reporting it `lost in restart`.
+- **OpenCode v2: the background decision's parent lookup is bounded.** An unrecorded parent is looked up at most once
+  and for at most 1 s; on timeout the dispatch stays in the foreground.
+- **OpenCode v2: plugin copies loaded per host location share one timing recorder.** When one host process loads the
+  plugin once per location, `turns.jsonl` no longer gets repeated rows and its turn numbers no longer restart, and the
+  `/router stats` orchestrator cache-read share is no longer over-counted. The recorder is shared per directory across
+  the copies of one build; a recorder registered by a build with another registry version is left alone. OpenCode v1 is
+  unchanged.
+- **Plan executor: a child adopted after a restart no longer writes into a released slot.** When its task is blocked by
+  a reverted dependency or the plan is aborted, the child is interrupted and awaited before its slot is saved and
+  released. If it cannot be stopped, the slot stays held with one blocking inbox item.
+
+### Security
+
+- **OpenCode v2: executor check discovery uses absolute, guarded executables.** Git searches use hardened arguments
+  and environment; pytest resolves its interpreter outside guarded checkouts, or takes the slot's provisioned
+  virtual-environment interpreter as `router_run` does. Both use a credential-stripped run
+  environment with explicit full-environment replacement and Windows current-directory search protection, so process
+  inheritance cannot restore provider credentials. Other process callers retain their default environment merging.
+- **OpenCode v2 (v1 unchanged): an unbound plan child is refused every tool call.** A child session whose first message
+  is a plan launcher prompt (`PLAN CONTEXT` followed by the launch header at its grammar position) but that has no
+  matching plan binding is refused every tool call (fail closed). The prompt is recognized at the start of the message
+  or right after the one preamble line the host puts before a subagent's first message ("You are a subagent spawned by
+  another session."); any other leading text makes it an ordinary prompt. Parallel tool calls of such a session all
+  wait for the same check, and an ordinary prompt is never refused, even when the session's kind cannot be looked up.
+
 ## [2.8.0] - 2026-10-13
 
 ### Added

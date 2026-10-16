@@ -236,6 +236,14 @@ suite("verify resource budget: deferred (3.1.2.f-h)", { concurrent: false }, () 
     let snapshots: Snapshot[] = [];
     let results: E2ETaskResult[] = [];
     try {
+      // G-17: dispatch only once the sampler took its first snapshot. On win32 the sampler is a powershell.exe whose cold
+      // start (CIM session included) used about a second of a 2-4 core windows-latest runner (PR #116: 32 snapshots at a
+      // 110 ms median in a window of about 4.4 s, so the first came about 0.9 s in). That start overlapped the 20
+      // before hooks and was counted in their capture wait (all 20 at 1950 ms, p50 bound 1500 ms). It is load from this
+      // test, not from the plugin. Waiting also makes the sampler cover the whole dispatch window. A sampler that never
+      // snapshots still fails the withSelf >= 5 check below.
+      const live = Date.now() + 30_000;
+      while (sampler.count() === 0 && Date.now() < live) await sleep(20);
       results = await Promise.all(
         Array.from({ length: 20 }, (_, i) =>
           plugin.task({

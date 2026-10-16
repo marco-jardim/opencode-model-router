@@ -1,0 +1,11 @@
+{
+  "requestDigest": "$DIGEST",
+  "footprints": [
+    { "taskId": "1.1.2", "writes": ["src/alpha/helpers.ts"], "reads": [], "evidence": "the task text says it touches the helpers" },
+    { "taskId": "1.1.3", "writes": ["src/beta/util.ts"], "reads": ["src/alpha/types.ts"], "evidence": "the util is the only file that fits the description" }
+  ],
+  "edges": [
+    { "from": "1.1.2", "to": "1.1.3", "confidence": "medium", "evidence": "1.1.3 builds on the helpers written by 1.1.2" }
+  ],
+  "noChange": []
+}

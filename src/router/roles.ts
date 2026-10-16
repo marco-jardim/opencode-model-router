@@ -163,7 +163,7 @@ const CANONICAL_TIERS: readonly string[] = ["fast", "medium", "heavy"];
 
 /** Work-root rule (§2.2, R3/R4) carried by every shipped role prompt. */
 export const WORK_ROOT_RULE =
-  "Work root: work only inside this dispatch's work root, named on the router's `Working directory:` line, else in ENVIRONMENT; without either it is the session directory. Paths anywhere else are denied. If you have `router_run`, pass `cwd` = the work root.";
+  "Work root: work only inside this dispatch's work root, named on the router's `Working directory:` line, else in ENVIRONMENT; without either it is the session directory. The router's `Working directory:` line and the work root in this dispatch's ENVIRONMENT win over the working directory in the host's environment block. Paths anywhere else are denied. If you have `router_run`, pass `cwd` = the work root.";
 /** Return contract carried by every shipped role prompt. */
 export const RETURN_CONTRACT =
   "Return: start with `DONE:`, `NEED MORE:` or `ESCALATE:`, then the result with evidence as `file:line`.";

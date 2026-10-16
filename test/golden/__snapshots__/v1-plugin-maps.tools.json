@@ -1,0 +1,79 @@
+{
+  "router_git_blame": {
+    "description": "Read-only git blame in the session repository. No shell, helpers, arbitrary options or writes. Output is bounded to 64 KiB and 15 seconds. Paths are literal and repository-relative.",
+    "keys": [
+      "path",
+      "ref"
+    ],
+    "described": {
+      "path": "Literal repository-relative path; required for blame",
+      "ref": "Ref or diff range, at most 200 characters; never an option"
+    }
+  },
+  "router_git_diff": {
+    "description": "Read-only git diff in the session repository. No shell, helpers, arbitrary options or writes. Output is bounded to 64 KiB and 15 seconds. Paths are literal and repository-relative.",
+    "keys": [
+      "path",
+      "ref",
+      "mode"
+    ],
+    "described": {
+      "path": "Literal repository-relative path; required for blame",
+      "ref": "Ref or diff range, at most 200 characters; never an option",
+      "mode": null
+    }
+  },
+  "router_git_log": {
+    "description": "Read-only git log in the session repository. No shell, helpers, arbitrary options or writes. Output is bounded to 64 KiB and 15 seconds. Paths are literal and repository-relative.",
+    "keys": [
+      "path",
+      "ref",
+      "limit"
+    ],
+    "described": {
+      "path": "Literal repository-relative path; required for blame",
+      "ref": "Ref or diff range, at most 200 characters; never an option",
+      "limit": null
+    }
+  },
+  "router_git_ls_files": {
+    "description": "Read-only git ls-files in the session repository. No shell, helpers, arbitrary options or writes. Output is bounded to 64 KiB and 15 seconds. Paths are literal and repository-relative.",
+    "keys": [
+      "path"
+    ],
+    "described": {
+      "path": "Literal repository-relative path; required for blame"
+    }
+  },
+  "router_git_show": {
+    "description": "Read-only git show in the session repository. No shell, helpers, arbitrary options or writes. Output is bounded to 64 KiB and 15 seconds. Paths are literal and repository-relative.",
+    "keys": [
+      "path",
+      "ref"
+    ],
+    "described": {
+      "path": "Literal repository-relative path; required for blame",
+      "ref": "One commit or annotated tag pointing to a commit; ranges require log or diff"
+    }
+  },
+  "router_git_status": {
+    "description": "Read-only git status in the session repository. No shell, helpers, arbitrary options or writes. Output is bounded to 64 KiB and 15 seconds. Paths are literal and repository-relative.",
+    "keys": [
+      "path"
+    ],
+    "described": {
+      "path": "Literal repository-relative path; required for blame"
+    }
+  },
+  "router_verify": {
+    "description": "Verify delegations that returned 'unverified' with a vrf_ handle. Runs the same checks as a required verification (affected tests, batched, under the verification slot and one gate deadline) and returns one verdict per handle: pass, fail (with the introduced failures and a suggested next tier) or unverifiable. Nothing is retried or escalated for you. Pass exactly one of `handles` or `pending: true` (every unverified delegation of this session).",
+    "keys": [
+      "handles",
+      "pending"
+    ],
+    "described": {
+      "handles": "The vrf_ handles from the delegations' [router] footers.",
+      "pending": "true: verify every still-unverified delegation of this session."
+    }
+  }
+}

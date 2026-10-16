@@ -13,13 +13,15 @@ import type { DoD, InferHints } from "./dod";
 import { isIncompleteReason } from "./checker";
 import { stripDispatchHeader } from "../router/dispatch-header";
 import { DEFAULT_IDLE_TTL_MS } from "../router/idle-sweep";
-import { basename, dirname, join, resolve } from "node:path";
-import { existsSync, realpathSync } from "node:fs";
+import { resolve } from "node:path";
+import { existsSync } from "node:fs";
+import { canonicalPath } from "./canonical-path";
 import type { ReferenceState, Verdict } from "./types";
 import type { DispatchReference } from "./reference";
 import { REFERENCE_NONE } from "./baseline";
 import { neutralizeDirectives } from "./pending";
 import { withTimeout } from "./timeout";
+import { applyPatchHeaderPaths } from "../router/tool-paths";
 import type { HeadRead } from "./head";
 
 export interface TreeSnapshot {
@@ -152,29 +154,8 @@ function none(reason: string): ReferenceState {
   return { kind: "none", reason };
 }
 
-/**
- * QA-2.1-8: the canonical spelling of `path`, so a Windows 8.3 short name (`C:\Users\MARQUI~1\…`),
- * a junction or symlink alias, and the long real path of one file key the same change-set entry.
- * The native realpath of the path, or of its nearest existing ancestor with the missing tail
- * appended (a deleted file keeps its directory's canonical spelling); lexical `resolve` when no
- * ancestor resolves.
- */
-export function canonicalPath(path: string): string {
-  const absolute = resolve(path);
-  let head = absolute;
-  const tail: string[] = [];
-  for (;;) {
-    try {
-      const real = realpathSync.native(head);
-      return tail.length === 0 ? real : join(real, ...tail.reverse());
-    } catch {
-      const parent = dirname(head);
-      if (parent === head) return absolute;
-      tail.push(basename(head));
-      head = parent;
-    }
-  }
-}
+// QA-2.1-8 / QA-1.3-16: canonicalPath lives in the leaf module canonical-path.ts; re-exported for every caller.
+export { canonicalPath };
 
 /** A change-set key: the canonical path with "/" separators, case-folded on win32. */
 function pathKey(path: string): string {
@@ -261,6 +242,20 @@ export interface ChangedFile {
   status: string;
   /** Rename/copy source (absolute) when git status reports R or C. */
   previousPath?: string;
+}
+
+/**
+ * Phase 2.1.4.b: the change set of a dispatch, computed when its child ends (captureDelta) so a background
+ * completion verifies what the child changed, not what the tree holds when the processor finally runs.
+ */
+export interface DispatchDelta {
+  readonly callID: string;
+  readonly childSessionID: string;
+  /** Files attributed to the dispatch; "unavailable" when attribution failed (never [] for a failure). */
+  readonly files: readonly ChangedFile[] | "unavailable";
+  /** Set when a foreign write contaminated the dispatch's snapshot (the change set is then unavailable). */
+  readonly contaminatedBy?: string;
+  readonly capturedAt: number;
 }
 
 /** Derive a {path,status} record from a write/edit tool call, or null. */
@@ -710,6 +705,16 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
       return dispatches.get(id)?.head;
     },
     /**
+     * QA-SYNC1-3: the unattributed writers `delta(id, childID)` would report (sorted), read without joining `childID` to the
+     * lineage: a held registration journals them, so the gate re-run after a restart keeps them.
+     */
+    unattributedWritersOf(id: string, childID: string): string[] {
+      const d = dispatches.get(id);
+      const writers = new Set<string>(d ? d.writers : []);
+      for (const producer of d ? [...d.producers, childID] : [childID]) for (const tool of writersBySession.get(producer) ?? []) writers.add(tool);
+      return [...writers].sort();
+    },
+    /**
      * QA-3.1-2: how many other dispatches were live at some moment of this one's window so far and
      * work in the git tree at `root` (default: this dispatch's own root, else its cwd). Their edits
      * land in the same working tree, so they are part of this dispatch's tree delta. 0 when untracked.
@@ -744,10 +749,8 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
         writersBySession.set(sessionID, w);
       }
       if (tool.toLowerCase() === "apply_patch") {
-        const a = args && typeof args === "object" ? args as Record<string, unknown> : {};
-        const patch = typeof a.patchText === "string" ? a.patchText : typeof a.patch === "string" ? a.patch : "";
         const files = bySession.get(sessionID) ?? new Map<string, string>();
-        for (const match of patch.matchAll(/^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+)$/gm)) files.set(match[1].trim(), "modified");
+        for (const p of applyPatchHeaderPaths(args)) files.set(p, "modified");
         bySession.set(sessionID, files);
       }
       const cf = extractChangedFile(tool, args);
@@ -765,6 +768,39 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
       const m = bySession.get(sessionID);
       if (!m) return [];
       return [...m.entries()].map(([path, status]) => ({ path, status }));
+    },
+    /**
+     * Phase 2.1.4.b: freezes the files the child changed so far (the tool calls observed in its session)
+     * at child end. A contaminated dispatch snapshot makes the set "unavailable", as the foreground gate
+     * treats it. Pure read: the child's record stays until clear(). QA-2.1-7: the dispatch record is keyed by its dispatch
+     * id (`task:<parent>:<callID>`), which the caller passes as `dispatchID`; it defaults to `callID`.
+     */
+    captureDelta(callID: string, childSessionID: string, dispatchID: string = callID): DispatchDelta {
+      const contaminatedBy = dispatches.get(dispatchID)?.snapshotContaminatedBy;
+      const files = contaminatedBy !== undefined ? "unavailable" : [...(bySession.get(childSessionID)?.entries() ?? [])].map(
+        ([path, status]): ChangedFile => ({ path, status }),
+      );
+      return {
+        callID,
+        childSessionID,
+        files,
+        ...(contaminatedBy !== undefined ? { contaminatedBy } : {}),
+        capturedAt: now(),
+      };
+    },
+    /**
+     * QA-2.1-17 (v2 only): a gate re-run after a restart has no observed tool calls for the child; the change set the
+     * restored pending entry persisted at child end is put back under the child's session, so the gate verifies what
+     * the child changed instead of a read-only delegation. Merges with anything recorded since.
+     */
+    seed(sessionID: string, files: readonly ChangedFile[]): void {
+      touch(sessionID);
+      let m = bySession.get(sessionID);
+      if (!m) {
+        m = new Map();
+        bySession.set(sessionID, m);
+      }
+      for (const file of files) if (!m.has(file.path)) m.set(file.path, file.status);
     },
     clear(sessionID: string): void {
       evict(sessionID);

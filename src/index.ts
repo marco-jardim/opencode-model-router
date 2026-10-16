@@ -1,4 +1,5 @@
 import type { Plugin } from "@opencode-ai/plugin";
+import { completionIdentity, observeV2 } from "./compat/v2-observations";
 import type { RouterPluginInput } from "./compat/child-session";
 import { DEPTH_BANNER, ResumeRejectedError, TASK_VERIFICATION } from "./compat/child-session";
 
@@ -91,8 +92,17 @@ import { isAnnotationRow, verdictGraderOf, verdictOf, type LogRow } from "./rout
 import { createPersister, nodePersistDeps, summarizeRoles } from "./routing/outcomes";
 import { roleAgentSteps } from "./router/role-agents";
 import type { HostBudgetObservation } from "./compat/v2-hooks";
+import { ROUTER_TURN_STATE_ATTACH, TURN_STATE_ROOT, type TurnStateRegistry } from "./compat/turn-state";
+import { ADOPTION_REFUSED, ROUTER_FINISH_ATTACH, type AdoptedRecords, type AdoptionRefused, type FinishApi, type FinishAttach, type FinishInput, type FinishResult, type HeldSink, type InflightJournal, type LeaseGuard, type PersistedRecord, type RestoredDispatch, type RoutedRoleSnapshot } from "./compat/background";
+import type { DispatchDelta } from "./verify/dispatch";
+import { configAsWritten, configuredV2OnlyKeys, setConfigNoticeHost } from "./router/config";
+
+/** Phase 2.1: the v2-only config keys already announced as ignored on a v1 host (once per key per process). */
+const warnedV2OnlyKeys = new Set<string>();
 import { checkpointLine, formatStatsReply, runStatsCommand } from "./routing/commands/stats";
-import { buildAnnotateDirectives } from "./routing/commands/annotate-plan";
+import { agentInfosForPlan, buildAnnotateDirectives } from "./routing/commands/annotate-plan";
+import { annotateSteps } from "./routing/engine/plan";
+import { classifyMany as classifyPlanSteps } from "./routing/classify";
 import { applyV1Roles, hasExplicitV1Roles, v1AgentInfos } from "./routing/commands/v1-roles";
 import type { HostAgentInfo } from "./routing/engine/types";
 import { createEngineRuntime } from "./routing/wire/runtime";
@@ -123,19 +133,24 @@ import {
   lastStepContext,
 } from "./router/sessions";
 import type { Cap, SubagentState } from "./router/sessions";
+import { EXECUTOR_READ_CAP_LINE, type ExecutorChildGuardPort } from "./executor/types";
+import { executorChildRound, publishExecutorChildRound } from "./executor/child-guards";
 import { createTrajectoryStore } from "./telemetry/trajectory";
 import { createGuardStore } from "./guard/store";
 import { createIdleTtlSweeper } from "./router/idle-sweep";
 import { guardBeforeCall, guardAfterCall, guardRefusedCall, formatScorecard } from "./guard/enforce";
 import { mkdirSync, writeFileSync, existsSync, realpathSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join, isAbsolute } from "node:path";
 import { access, readFile as fsReadFile } from "node:fs/promises";
 import { tool } from "@opencode-ai/plugin";
 import { scrubText } from "./guard/scrub";
 import { accept, unverifiableGateResult } from "./verify/gate";
-import { applyDispatchCaveats, createVerificationWiring, dispatchDirectiveText, extractAssistantText, parseRouterVerifyArgs, type DispatchStart } from "./verify/wiring";
-import { appendRouterFooter, buildLateNoticeBlock, buildPendingListBlock } from "./verify/pending";
+import { applyDispatchCaveats, createVerificationWiring, resolvePendingTtlMs, dispatchDirectiveText, extractAssistantText, parseRouterVerifyArgs, type DispatchStart, type HandleReport } from "./verify/wiring";
+import { waitTreeFreeExcept } from "./verify/wiring";
+import { createLeaseSelfExemptions, createPlanTaskVerifier, planTaskGit, planTreeKey } from "./verify/plan-task";
+import { locationOutsideWorkRoots } from "./router/work-roots";
+import { CLAIM_REFRESH_MS, HEAD_LOST_REASON, PENDING_INSTANCES_DIRNAME, PERIMETER_LOST_REASON, type DispatchHeadState, claimPendingSession, createInstanceClaimToken, createPendingFileJournal, foldDormantRecords, refreshPendingClaims, releasePendingClaim, resolvePendingJournalDir, processedKeyOf, appendRouterFooter, buildLateNoticeBlock, buildPendingListBlock, unattributedRisk, type DormantSession, type LateNotice, type PendingEntry, type SettledVerification } from "./verify/pending";
 import { createDeadline } from "./verify/deterministic";
 import {
   DEFAULT_DELEGATE_PROMPT_TIMEOUT_MS,
@@ -168,6 +183,10 @@ import type { AttemptRecorder, DelegationFacts } from "./escalate/attempt-record
 import { createDepthTracker, DEPTH_LOOKUP_RETRY_MS } from "./router/depth";
 import { createDepthGuard } from "./router/depth-guard";
 import { applyEffortOverride, createEffortOverrideStore } from "./escalate/effort-override";
+import { createExecutorAccess, lateRuntime, type ExecutorAccess, type CreateExecutorOptions } from "./executor/create";
+import { executorPlatformSupported, warnExecutorPlatformOnce } from "./executor/platform";
+import { createRouterPlanTool } from "./executor/tool";
+import { createPlanCommand, parsePlanCommand } from "./executor/command";
 
 // ---------------------------------------------------------------------------
 // Re-exports — type-only re-exports for IDE/test consumers.
@@ -266,7 +285,7 @@ function saveEnforcementMode(mode: "off" | "advisory" | "enforced"): void {
  * `/router` dispatch. Decides and persists here; rendering lives in
  * src/commands/output.ts.
  */
-function buildRouterOutput(cfg: RouterConfig, args: string, projectDir?: string, roles?: Iterable<RoleSpec>, approvals = false): string {
+function buildRouterOutput(cfg: RouterConfig, args: string, projectDir?: string, roles?: Iterable<RoleSpec>, approvals = false, plan = false): string {
   const tokens = (args ?? "").trim().split(/\s+/).filter(Boolean);
   const sub = (tokens[0] ?? "").toLowerCase();
 
@@ -300,7 +319,7 @@ function buildRouterOutput(cfg: RouterConfig, args: string, projectDir?: string,
     // `/router stats` is listed only for a config that has a `routing` block: without one `/router` is what it was (QA-2.4-3).
     // #84 P2.2: the role lines, only when the caller hands roles (roles mode on v2); otherwise the help is what it was.
     // Cross-repo P4.7: `/router approve|repos|revoke`, only where they run (SD-P4-10); otherwise the help is what it was.
-    { stats: cfg.routing !== undefined, ...(roles === undefined ? {} : { roles }), ...(approvals ? { approvals: true } : {}) },
+    { stats: cfg.routing !== undefined, ...(roles === undefined ? {} : { roles }), ...(approvals ? { approvals: true } : {}), ...(plan ? { plan: true } : {}) },
   );
 }
 
@@ -376,6 +395,71 @@ const V1_HOST_BUILTIN_AGENTS: Record<string, { mode: string }> = {
 
 const SESSION_ROOT_MEMO_MAX = 500;
 const SESSION_LOOKUP_RETRY_MS = DEPTH_LOOKUP_RETRY_MS;
+
+/** Phase 1.2 (v2 only): bounds of the late-notice buffer behind the `late` turn-state provider. */
+const LATE_BUFFER_PER_SESSION = 50;
+const LATE_BUFFER_SESSIONS = 100;
+
+/**
+ * Late notices retained per session until `router_verify` answers their handle, so a request that fails after the
+ * transform read them does not lose them (the v1 path delivers them once). First-seen order; a repeated handle replaces
+ * its notice in place; the oldest notice and the least recently used session go at the bounds.
+ */
+interface LateBuffer {
+  add(sessionID: string, notices: readonly LateNotice[]): void;
+  list(sessionID: string): LateNotice[];
+  release(sessionID: string, handles: readonly string[]): void;
+  /** Marks the session as most recently used (a render read its notices). */
+  touch(sessionID: string): void;
+  /** Drops the session's buffer (`session.deleted`). */
+  forget(sessionID: string): void;
+}
+
+function createLateBuffer(): LateBuffer {
+  const sessions = new Map<string, Map<string, LateNotice>>();
+  return {
+    add(sessionID, notices) {
+      if (notices.length === 0) return;
+      const buffer = sessions.get(sessionID) ?? new Map<string, LateNotice>();
+      sessions.delete(sessionID);
+      sessions.set(sessionID, buffer);
+      for (const notice of notices) buffer.set(notice.handle, notice);
+      while (buffer.size > LATE_BUFFER_PER_SESSION) buffer.delete(buffer.keys().next().value!);
+      while (sessions.size > LATE_BUFFER_SESSIONS) sessions.delete(sessions.keys().next().value!);
+    },
+    list(sessionID) {
+      return [...(sessions.get(sessionID)?.values() ?? [])];
+    },
+    release(sessionID, handles) {
+      const buffer = sessions.get(sessionID);
+      if (buffer === undefined) return;
+      for (const handle of handles) buffer.delete(handle);
+      if (buffer.size === 0) sessions.delete(sessionID);
+    },
+    touch(sessionID) {
+      const buffer = sessions.get(sessionID);
+      if (buffer === undefined) return;
+      sessions.delete(sessionID);
+      sessions.set(sessionID, buffer);
+    },
+    forget(sessionID) {
+      sessions.delete(sessionID);
+    },
+  };
+}
+
+/**
+ * The handles a router_verify report answers: a verdict, an unknown input, an expired handle. A run that outlived the call
+ * ("elsewhere") and a held background result ("held", QA-2.1-9: its own gate posts the verdict) have no verdict yet.
+ */
+function answeredHandles(items: readonly HandleReport[]): string[] {
+  const handles: string[] = [];
+  for (const item of items) {
+    if (item.kind === "verdict" || item.kind === "expired") handles.push(item.handle);
+    else if (item.kind === "unknown") handles.push(item.input);
+  }
+  return handles;
+}
 
 const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   // Project directory this plugin instance serves. Hosts that run several
@@ -530,6 +614,21 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   // every role branch below is skipped there and both stay byte-identical (§2.7, I1, I8).
   // -------------------------------------------------------------------------
   const isV2Host = ctx.routerHost === "v2";
+  // Phase 5.1 D1: the runtime is resolved at each call, after the adapter's synchronous executor factory runs.
+  const executorInput = isV2Host ? ctx as RouterPluginInput & {
+    routerExecutor?: ExecutorAccess;
+    routerOnPlanAnnotate?: (port: NonNullable<CreateExecutorOptions["annotate"]>) => void;
+  } : undefined;
+  // G-16: the plan executor is Windows-only; elsewhere no executor access exists, so router_plan and /plan are not built.
+  const executorPlatform = isV2Host && executorPlatformSupported();
+  const absentExecutor = executorPlatform ? createExecutorAccess() : undefined;
+  const executorAccess: ExecutorAccess | undefined = absentExecutor === undefined ? undefined : {
+    runtime: () => (executorInput?.routerExecutor ?? absentExecutor).runtime(),
+    unavailable: () => (executorInput?.routerExecutor ?? absentExecutor).unavailable(),
+    set: (runtime) => (executorInput?.routerExecutor ?? absentExecutor).set(runtime),
+    clear: (reason) => (executorInput?.routerExecutor ?? absentExecutor).clear(reason),
+  };
+  const executorRuntime = executorAccess === undefined ? undefined : lateRuntime(executorAccess);
   /**
    * Cross-repo P2e.6 (OD-P2e-2): a dispatch runs the full scope when the host is OpenCode v2 and the effective testScope is
    * "full"; the deferred finish then never treats an empty change set as nothing to run. Always false on v1. Never throws (an
@@ -797,6 +896,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
    * its registered fallback model, P-1) and the bound dispatch budget.
    */
   const roleGuardProfileOf = (sessionID: unknown, agent: unknown): GuardProfile | undefined => {
+    if (typeof sessionID === "string") consumeExecutorChildRound(sessionID);
     const spec = roleSpecOf(agent) ?? roleOfSession(sessionID);
     if (spec === undefined || typeof sessionID !== "string") return undefined;
     const routed = routedGuardOf(sessionID);
@@ -805,8 +905,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       profile = roleGuardProfile(spec, routed.tier, routed.routeBudget);
     } else {
       const record = lookupDispatch(sessionID);
-      const tier = record?.agent === spec.agent && typeof record.tier === "string" && record.tier !== "" ? record.tier : spec.tierRange.floor;
-      profile = roleGuardProfile(spec, tier, currentBinding(sessionID, { maxOf: roleMaxOf })?.budget ?? null);
+      const binding = currentBinding(sessionID, { maxOf: roleMaxOf });
+      const tier = binding?.plan !== undefined && binding.tier !== undefined ? binding.tier
+        : record?.agent === spec.agent && typeof record.tier === "string" && record.tier !== "" ? record.tier : spec.tierRange.floor;
+      profile = roleGuardProfile(spec, tier, binding?.budget ?? null);
     }
     // QA-G-A3-2-2 (§2.6): the cumulative limit spans the child's rounds, so it follows the LARGEST round budget the child had
     // (a later round with a smaller budget never shrinks it below what earlier rounds were allowed).
@@ -870,6 +972,30 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   resolveRouting(cfg, ctx.routerHost === "v2" ? "v2" : "v1", logger); // v1 + engine != static: log the notice once, at startup (QA-1.1-8)
   // #84 P2.1 (handoff 1): v1 + any roles key: the "roles delegation requires OpenCode v2" notice, once, at startup.
   resolveRolesRouting(cfg, ctx.routerHost === "v2" ? "v2" : "v1", logger);
+  // QA-4.1-9: on v1 the executor validation issues are not logged; the notice below names the keys.
+  setConfigNoticeHost(isV2Host ? "v2" : "v1");
+  if (!isV2Host) {
+    // Phase 2.1: the background and lease keys exist on v2 only; a v1 host does nothing with them. QA-2.1-12 (AGENTS.md: at most
+    // one notice per process for a v2-only feature): one notice names every configured key, and no later instance logs another.
+    // QA-4.1-9: the keys as written (the merged layers), so a value validation dropped is still named.
+    const keys = [...configuredV2OnlyKeys(configAsWritten(cfg))];
+    if (keys.length > 0 && warnedV2OnlyKeys.size === 0) {
+      for (const key of keys) warnedV2OnlyKeys.add(key);
+      // QA-2.1-32: the notice names the features actually configured (leases alone are not "background dispatch").
+      // QA-4.1-19: a block that is not an object is named whole (`routing.executor`).
+      const names = (block: string): boolean => keys.some((key) => key === `routing.${block}` || key.startsWith(`routing.${block}.`));
+      const background = names("background");
+      const leases = names("leases");
+      const executor = names("executor");
+      const features = [background ? "background dispatch" : "", leases ? "leases" : "", executor ? "the plan executor" : ""].filter((f) => f !== "");
+      const subject = features.length === 0
+        ? "background dispatch requires"
+        : features.length === 1
+          ? `${features[0]} ${leases && !background && !executor ? "require" : "requires"}`
+          : `${features.slice(0, -1).join(", ")} and ${features[features.length - 1]} require`;
+      logger.warn(`[router] ${subject} OpenCode v2; ignored: ${keys.join(", ")}`);
+    }
+  }
   const depthTracker = createDepthTracker({
     async getParent(id) {
       if (sessionRootMemo.get(id) === true) return null;
@@ -893,6 +1019,36 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     }).mode,
     logger: routerWarn,
   });
+  // State-changing executor actions require depth 0, even for an exactly bound plan child.
+  const planRootCallerAllowed = async (sessionID: unknown): Promise<boolean> => {
+    if (!isV2Host || typeof sessionID !== "string" || sessionID === "") return false;
+    try {
+      return await depthTracker.depthOf(sessionID) === 0;
+    } catch {
+      return false;
+    }
+  };
+  const planReadCallerAllowed = (sessionID: unknown, planId: unknown): boolean => {
+    if (!isV2Host || typeof sessionID !== "string" || sessionID === "" || typeof planId !== "string") return false;
+    try {
+      const binding = currentBinding(sessionID, { maxOf: roleMaxOf });
+      return binding?.kind === "exact" && binding.plan !== undefined && binding.plan.planId === planId.trim();
+    } catch {
+      return false;
+    }
+  };
+  // Only this allowlist is read-only; new or unknown actions remain root-only. `/plan inbox` parses as status.
+  const planActionCallerAllowed = async (sessionID: unknown, action: unknown, planId: unknown): Promise<boolean> =>
+    await planRootCallerAllowed(sessionID) ||
+    ((action === "status" || action === "ready" || action === "export") && planReadCallerAllowed(sessionID, planId));
+  const planCallerRefusal = "refused: plan actions require a root orchestrator session; bound plan children may only read their own plan.";
+  const routerPlan = executorRuntime === undefined ? undefined : createRouterPlanTool(executorRuntime, {
+    approve: () => resolveRouting(loadConfig(projectDir), "v2").executor.approve,
+  });
+  const planCommand = executorRuntime === undefined ? undefined : createPlanCommand(executorRuntime);
+  const planCommandMarker = Symbol.for("opencode-model-router.plan-command");
+  let userPlanCommandDefined = false;
+  let warnedPlanCommandConflict = false;
   const effortOverrides = createEffortOverrideStore({ logger: routerWarn });
   let warnedGraderParams = false;
   const depthBanners = new Map<string, string>();
@@ -924,26 +1080,240 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     }
   };
 
+  // Phase 2.1 (v2 only): pending.jsonl in the durable per-user state directory, never the temp directory (QA-2.1-8).
+  // On v1 there is no journal, no held state and no restore.
+  const pendingDir = isV2Host
+    ? resolvePendingJournalDir({ homedir: homedir(), platform: process.platform, xdgStateHome: process.env.XDG_STATE_HOME })
+    : undefined;
+  /**
+   * QA-2.1-27: the journal compacts and reloads with the resolved `enforcement.verify.pendingTtlMs`, the TTL the pending
+   * registry restores with (a longer configured TTL must not lose entries at the second restart).
+   */
+  const pendingJournalTtlMs = resolvePendingTtlMs(cfg);
+  const pendingFile = pendingDir === undefined
+    ? undefined
+    : createPendingFileJournal(join(pendingDir, "pending.jsonl"), {
+        ttlMs: pendingJournalTtlMs,
+        // QA-2.1-22: a failed start-up compaction is told once (the journal stays as it was).
+        warn: (message) => logger.warn(`[router] ${message}`),
+      });
+  /** Section 11.3: the exclusive per-session claim files of the journal's sessions (v2 only). */
+  const pendingClaimsDir = pendingDir === undefined ? undefined : join(pendingDir, "pending.claims");
+  /** DF-1-10: the beat files of the live plugin instances, which every module copy loaded into one host process can read. */
+  const pendingBeatsDir = pendingDir === undefined ? undefined : join(pendingDir, PENDING_INSTANCES_DIRNAME);
+  /** QA-2.1-33: the v2 adapter's live attempts and holds (`FinishApi.setAdapterSnapshot`); none before it attaches. */
+  let adapterSnapshot: (() => readonly PersistedRecord[]) | undefined;
+  /**
+   * QA-2.1-16/-33: every record a later restore needs from this instance: the live pending entries, the sessions not
+   * adopted yet, and the adapter's live attempts and holds. Registered on the journal (next to `dormantSessions`, once that
+   * state exists), so a `recreate` by any instance of this process on the same path writes this instance's records too.
+   */
+  function journalSnapshot(): PersistedRecord[] {
+    const dormant: PersistedRecord[] = [];
+    for (const session of dormantSessions.values()) dormant.push(...session.holds, ...session.inflight);
+    return [...pending.persistedRecords(), ...dormant, ...(adapterSnapshot?.() ?? [])];
+  }
+  /** QA-2.1-13: the sessions whose claim this process took at adoption; re-stamped while held, released on delete and dispose. */
+  const claimedSessions = new Set<string>();
+  let claimRefreshTimer: ReturnType<typeof setInterval> | undefined;
+  function stopClaimRefresh(): void {
+    if (claimRefreshTimer === undefined) return;
+    clearInterval(claimRefreshTimer);
+    claimRefreshTimer = undefined;
+  }
+  /**
+   * QA-2.1-13/-34: a live owner re-stamps its claims every CLAIM_REFRESH_MS (unref'd timer, stopped when it holds no claim
+   * and on dispose), well within CLAIM_STALE_MS, so they never read as a reused pid's; a crashed owner's claims go stale
+   * within minutes, even when its pid is reused.
+   */
+  function trackPendingClaim(sessionID: string): void {
+    claimedSessions.add(sessionID);
+    if (claimRefreshTimer !== undefined || pendingClaimsDir === undefined) return;
+    const claimsDir = pendingClaimsDir;
+    claimRefreshTimer = setInterval(() => {
+      refreshPendingClaims(claimsDir, claimedSessions, { pid: process.pid, now: Date.now(), ...(instanceClaim === undefined ? {} : { token: instanceClaim.token }) });
+      // DF-1-10: the instance beat stays fresh while this instance holds a claim (a sibling module copy checks it).
+      instanceClaim?.beat();
+    }, CLAIM_REFRESH_MS);
+    claimRefreshTimer.unref?.();
+  }
+  function releasePendingClaimOf(sessionID: string): void {
+    if (!claimedSessions.delete(sessionID) || pendingClaimsDir === undefined) return;
+    releasePendingClaim(pendingClaimsDir, sessionID, instanceClaim?.token);
+    if (claimedSessions.size === 0) stopClaimRefresh();
+  }
+  function releaseAllPendingClaims(): void {
+    stopClaimRefresh();
+    if (pendingClaimsDir !== undefined) for (const sessionID of claimedSessions) releasePendingClaim(pendingClaimsDir, sessionID, instanceClaim?.token);
+    claimedSessions.clear();
+    // QA-2.1-19: from now on another instance of this process may take this instance's (remaining) claims.
+    instanceClaim?.release();
+  }
+  /**
+   * QA-2.1-19 (v2 only): this instance's claim token. Its claims are refused to every other live instance (of this
+   * process: the token; of another process: the pid) until it disposes. DF-1-10: its beat file in `pending.instances`
+   * makes the token visible to instances of this process that run another copy of the plugin modules.
+   */
+  const instanceClaim = pendingClaimsDir === undefined ? undefined : createInstanceClaimToken(pendingBeatsDir);
+  /**
+   * QA-2.1-19: takes the claim of `sessionID` for this instance (pid + token), once. The live owner claims at its first
+   * `inflight`/`hold` write; `adopt` claims before handing dormant records over. False when another live instance holds
+   * it (or the claim file cannot be written).
+   */
+  function claimSessionOnce(sessionID: string): boolean {
+    if (claimedSessions.has(sessionID)) return true;
+    if (pendingClaimsDir === undefined || instanceClaim === undefined) return false;
+    try {
+      const pidAliveNow = (pid: number): boolean => {
+        try {
+          process.kill(pid, 0);
+          return true;
+        } catch (error) {
+          return (error as NodeJS.ErrnoException).code === "EPERM";
+        }
+      };
+      // DF-1-10: the beat is fresh before the claim lands, so a sibling copy of the module never reads it as orphaned.
+      if (claimRefreshTimer === undefined) instanceClaim.beat();
+      if (!claimPendingSession(pendingClaimsDir, sessionID, {
+        pid: process.pid, now: Date.now(), isAlive: pidAliveNow, token: instanceClaim.token,
+        ...(pendingBeatsDir === undefined ? {} : { beatsDir: pendingBeatsDir }),
+      })) return false;
+    } catch (error) {
+      logger.warn("[router] the pending session claim could not be taken", { sessionID, error: describeError(error) });
+      return false;
+    }
+    trackPendingClaim(sessionID);
+    return true;
+  }
+  /** Late-bound: the lease guard exists only once the v2 adapter attaches (FinishAttach `leaseGate`); the wiring reads it per use. */
+  let leaseGateRef: Pick<LeaseGuard, "waitTreeFree"> | undefined;
+  /** Phase 5.1 D11 (v2 only): the plan-task gates' own holders, exempt from the lease wait in their own slot tree. */
+  const planTaskLeaseExemptions = createLeaseSelfExemptions((root) => planTreeKey(root));
   const {
     graderSessions, dispatchGrader, buildGateDeps, disposeChildSession,
-    prepareVerification, startReferenceGc,
+    prepareVerification, startReferenceGc, beginVerificationBounded,
     sweepVerification, disposeVerification,
-    startDispatch, takeDispatch, isDeferred: wiringIsDeferred, finishDeferred, applyLineage, pending,
+    startDispatch, takeDispatch, isDeferred: wiringIsDeferred, directivesFor, finishDeferred, applyLineage, pending,
     verifyHandles,
     // 2.4.5: undefined unless `background: true` at plugin start (pending.ts R14).
     background,
   } = createVerificationWiring({
     client: ctx.client,
+    observations: isV2Host ? ctx.routerObservations : undefined,
     childRunner: ctx.routerChildRunner,
     onChildSessionCreated: (sid, creator) => depthTracker.recordPluginChild(sid, creator),
     directory: ctx.directory,
     getConfig: () => cfg,
     logger,
+    ...(pendingFile === undefined ? {} : {
+      pending: { persist: pendingFile, onVerdict: (entry: PendingEntry, result: SettledVerification) => postHeldVerdict(entry, result) },
+      pendingRestore: pendingFile.load(),
+      // v2 only. Delegating: the guard arrives with the adapter's attach; until then (or without `leases: enforce`) nothing waits.
+      leaseGate: {
+        waitTreeFree: async (tree, owner, deadlineMs, signal) => {
+          if (leaseGateRef === undefined) return { waitedMs: 0, holders: [], fileCount: 0 };
+          // Phase 5.1 D11: a plan-task gate does not wait for its own task's holders in its own slot tree.
+          const exempt = planTaskLeaseExemptions.exemptFor(tree);
+          if (exempt.size === 0) return leaseGateRef.waitTreeFree(tree, owner, deadlineMs, signal);
+          const gate = leaseGateRef;
+          let fileCount = 0;
+          const probe: Pick<LeaseGuard, "waitTreeFree"> = {
+            waitTreeFree: async (...args) => { const r = await gate.waitTreeFree(...args); fileCount = r.fileCount; return r; },
+          };
+          const wait = await waitTreeFreeExcept(probe, tree, owner, exempt, deadlineMs, signal);
+          return { waitedMs: wait.waitedMs, holders: wait.holders, fileCount: wait.holders.length === 0 ? 0 : fileCount };
+        },
+      },
+    }),
   });
   // 2.1.5b: sweep reference dirs a crashed instance left behind. Fire-and-forget; never throws.
   // QA-2.1-11: deferred (unref'd timer), so plugin start never holds the project directory with a
   // git child; dispose cancels it.
-  const stopReferenceGc = startReferenceGc();
+  // DF-1-1 (v2 only): with `routing.workRoots` configured and non-empty, a location outside every entry is not the plan's:
+  // the start-up reference GC is skipped (it would run git in, and write to, that repository). Unset or empty: unchanged.
+  const outsideWorkRoots = isV2Host && locationOutsideWorkRoots(ctx.directory, cfg.routing?.workRoots);
+  if (outsideWorkRoots) logger.info?.(`[router] ${ctx.directory} is outside routing.workRoots: the start-up reference GC is skipped`);
+  const stopReferenceGc = outsideWorkRoots ? (): void => undefined : startReferenceGc();
+  // Phase 5.1 D8 (v2 only): plan tasks are verified by this instance's dispatch verification engine; v2.ts hands the verifier to
+  // the adapter's executor seam. Nothing is built or handed over on v1.
+  if (isV2Host) {
+    const planTaskVerifier = createPlanTaskVerifier({
+      changedFileStore,
+      beginVerificationBounded,
+      prepareVerification,
+      buildGateDeps,
+      captureBudget: (childSessionID, capReached) => captureBudget(childSessionID, capReached),
+      readCapReached: (childSessionID) => sessionStore.readCapReached(childSessionID),
+      onVerdict: (childSessionID, verdict) => ingest?.onVerdict(childSessionID, verdictOf(verdict), verdictGraderOf(verdict)),
+      abortSession: async (sessionID) => { await ctx.client.session.abort({ path: { id: sessionID } }); },
+      getConfig: () => cfg,
+      git: planTaskGit(),
+      exemptions: planTaskLeaseExemptions,
+      log: (message, detail) => logger.warn(`[verify] ${message}`, detail === undefined ? undefined : { error: describeError(detail) }),
+    });
+    (ctx as RouterPluginInput & { routerOnSlotVerifier?: (verifier: typeof planTaskVerifier) => void }).routerOnSlotVerifier?.(planTaskVerifier);
+  }
+
+  // Phase 1.2 (v2 only): the turn-state registry the adapter injects. Without it (v1, or a v2 host that injects none) nothing
+  // below is registered or buffered, and the system transform keeps pushing the pending list and the late notices.
+  // The registry arrives through the ROUTER_TURN_STATE_ATTACH hook the v2 adapter calls (the only channel); the hook
+  // returns whether the registry was accepted.
+  let turnState: TurnStateRegistry | undefined;
+  const lateBuffer: LateBuffer | undefined = isV2Host ? createLateBuffer() : undefined;
+  const unregisterTurnStateProviders: Array<() => void> = [];
+  let warnedSecondRegistry = false;
+  const attachTurnState = (registry: TurnStateRegistry): boolean => {
+    if (turnState !== undefined) {
+      if (turnState !== registry && !warnedSecondRegistry) {
+        warnedSecondRegistry = true;
+        logger.warn("[router] turn state: a second registry was ignored");
+      }
+      return turnState === registry;
+    }
+    turnState = registry;
+    if (lateBuffer === undefined) return true;
+    try {
+      // Late notices of background runs that did not pass: buffered before the block is built (a builder throw loses
+      // nothing) and kept until router_verify answers their handle.
+      unregisterTurnStateProviders.push(turnState.registerTurnStateProvider({
+        name: "late",
+        order: 10,
+        render(sid) {
+          if (background === undefined) return undefined;
+          lateBuffer.add(sid, background.takeNotices(sid));
+          lateBuffer.touch(sid);
+          return buildLateNoticeBlock(lateBuffer.list(sid));
+        },
+        active(sid) {
+          return lateBuffer.list(sid).length > 0;
+        },
+      }));
+      // This orchestrator's still-unverified delegations (the same arguments the v1 transform passes).
+      unregisterTurnStateProviders.push(turnState.registerTurnStateProvider({
+        name: "pending",
+        order: 20,
+        render(sid) {
+          return buildPendingListBlock(pending.listPending(sid, { verifying: background !== undefined }));
+        },
+        active(sid) {
+          return pending.listPending(sid, { verifying: background !== undefined }).length > 0;
+        },
+      }));
+    } catch (error) {
+      logger.warn("[router] turn state: late/pending providers not registered", { error: scrubText(String(error)) });
+      // Nothing stays half registered: the system transform keeps delivering through the system array.
+      for (const unregister of unregisterTurnStateProviders.splice(0)) {
+        try {
+          unregister();
+        } catch (unregisterError) {
+          logger.warn("[router] turn state: unregistering a provider failed", { error: scrubText(String(unregisterError)) });
+        }
+      }
+      turnState = undefined;
+      return false;
+    }
+    return true;
+  };
 
   // Best-effort, secret-free delegate scorecard dump (counts only).
   const dumpDelegateScorecard = (
@@ -969,7 +1339,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   // #84 P2.1: the v2 adapter's role path reads the bypass state (the router gate does not run while bypassed, S10/P-9).
   (ctx as RouterPluginInput & { routerOnBypassState?: (read: () => boolean) => void }).routerOnBypassState?.(() => bypassed);
   /** QA-P21-1-3: the budget snapshot of a role child as the signals AND the adapter's budget notice read it (guard + read cap). */
-  const roleBudgetSnapshot = (childSessionID: string) => captureBudget(childSessionID, sessionStore.readCapReached(childSessionID));
+  const roleBudgetSnapshot = (childSessionID: string) => {
+    consumeExecutorChildRound(childSessionID);
+    return captureBudget(childSessionID, sessionStore.readCapReached(childSessionID));
+  };
   (ctx as RouterPluginInput & { routerOnBudgetSnapshot?: (read: typeof roleBudgetSnapshot) => void }).routerOnBudgetSnapshot?.(roleBudgetSnapshot);
   /**
    * QA-G-A3-2 (§2.9 E6, R7 REFUSAL_CAP): a role child's call refused where the guard's before-hook never sees it — the v2
@@ -1091,6 +1464,28 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     });
     return annotateRuntime;
   };
+  if (isV2Host) {
+    executorInput?.routerOnPlanAnnotate?.(async (steps) => {
+      const current = loadConfig(projectDir);
+      const runtime = annotatePlanRuntime();
+      const prepared = await runtime?.prepare(current);
+      const routing = prepared?.routing ?? resolveRouting(current, "v2");
+      const classifyDeps = prepared && runtime ? runtime.classifyDeps(prepared) : {
+        cfg: current, settings: { ...routing.classifier, backend: "rules" as const },
+        minClassConfidence: routing.minClassConfidence, backend: null, logger,
+      };
+      let agents: HostAgentInfo[] | null = null;
+      if (prepared && ctx.routerAgents !== undefined) {
+        try { agents = agentInfosForPlan(await ctx.routerAgents()); }
+        catch (error) { logger.warn("[router] executor: the agent list is unavailable; tiers are annotated without it", { error: describeError(error) }); }
+      }
+      return annotateSteps(steps, {
+        cfg: current, routing, agents, store: prepared?.store ?? null, logger,
+        ...(prepared ? { pricing: (model) => prepared.catalog.pricing(model), session: prepared.session } : {}),
+        classifyMany: (inputs) => classifyPlanSteps(inputs, { ...classifyDeps, routeLinePositions: "any" }),
+      });
+    });
+  }
   // v1 only (A28): the host's agent list for the text-only roles line, read through `client.app.agents()` and never fetched unless
   // `routing.roles` is set explicitly. It is refreshed IN THE BACKGROUND (QA-2.4-13): a turn never waits for it. The first turn after start
   // has no list yet and gets the baseline prompt; later turns use the last list, stale while the next one is fetched (every minute). A
@@ -1292,6 +1687,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   // v1 the set is exactly the previous one (router_run and router_request_authority are not registered; router_git_* keep their
   // directory resolution). Switching to roles mode registers them on the next start.
   const rolesAtStart = rolesNow().size > 0;
+  // G-16: on v2 off Windows, one notice per process, only for a config that asks for the executor (roles mode at start with
+  // enforced leases and verification not disabled: the prerequisites v2.ts's executor discovery checks).
+  if (isV2Host && !executorPlatform && rolesAtStart && resolveRouting(cfg, "v2").leases.mode === "enforce"
+    && cfg.enforcement?.verify?.require !== "never") warnExecutorPlatformOnce(logger);
   const dynamicRolesAtStart = [...rolesNow().values()].some((spec) => spec.authority.mode === "dynamic");
   /**
    * Cross-repo 3b.4 (SD-3b-1): `router_git_*` declare `root` only on v2, in roles mode, with `routing.repoParents` non-empty at start
@@ -1352,6 +1751,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   };
   /** A fresh role child's first call: its exact binding names the dispatch's call, whose cap is registered once. */
   const applyPendingRoleCap = (child: string): void => {
+    consumeExecutorChildRound(child);
     if (pendingRoleCaps.size === 0) return;
     const binding = currentBinding(child, { maxOf: roleMaxOf });
     const callID = binding?.kind === "exact" ? binding.candidates[0] : undefined;
@@ -1361,14 +1761,56 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     registerRoleCap(child, pending.agent, pending.cap);
   };
   /**
+   * QA-PDF21-2-11: an executor budget resume (a launch with `req.resume`) opens a new guard round and a new read-cap round for
+   * its child, exactly as a routed resume does (`noteRoleDispatch`): the per-dispatch budget and the read counter restart, the
+   * cumulative ceiling stays. A cap the launch prompt names replaces the child's previous one.
+   */
+  const beginExecutorResumeRound = (child: string, agent: string, prompt: string): void => {
+    publishExecutorChildRound(child, agent, executorLineCap(prompt), true);
+    consumeExecutorChildRound(child);
+  };
+  /**
+   * QA-PDF21-2-20: the read cap of a plan child's launch prompt is the executor's own cap line ONLY (`EXECUTOR_READ_CAP_LINE`,
+   * right after the "PLAN CONTEXT" line, DF-2-9), parsed by `parseCapDirective`. A prompt without it (a non-editing task, a
+   * resume) names no cap: plan text — even a `CAP` token split across lines, which the line-bound neutralization misses — never
+   * sets one.
+   */
+  const executorLineCap = (prompt: string): Cap | null =>
+    prompt.startsWith(`PLAN CONTEXT\n${EXECUTOR_READ_CAP_LINE}\n`) ? parseCapDirective(EXECUTOR_READ_CAP_LINE) : null;
+  /**
+   * QA-PDF21-2-20: a plan child the executor just bound gets the read cap of its launch prompt's cap line, through the state a
+   * routed role dispatch uses (`registerRoleCap`). A plan child has no parent `task` call, so `applyPendingRoleCap` never
+   * reaches it, and its role agent is no tier, so `registerFromChatMessage` does not either.
+   */
+  const applyExecutorChildCap = (child: string, agent: string, prompt: string): void => {
+    publishExecutorChildRound(child, agent, executorLineCap(prompt), false);
+    consumeExecutorChildRound(child);
+  };
+  const executorRoundsSeen = new Map<string, number>();
+  const consumeExecutorChildRound = (child: string): void => {
+    if (!isV2Host) return;
+    const published = executorChildRound(child);
+    if (published === undefined || executorRoundsSeen.get(child) === published.round) return;
+    setBounded(executorRoundsSeen, child, published.round);
+    rememberRoleSession(child, published.agent);
+    sessionStore.markChildSession(child);
+    guardStore.beginDispatch(child);
+    if (!sessionStore.resumeRoleSession(child, published.cap) && published.cap !== null) registerRoleCap(child, published.agent, published.cap);
+  };
+  // QA-PDF21-2-11/-20: the v2 adapter's executor bookkeeping reaches the guard store and the read-cap state through these.
+  (ctx as RouterPluginInput & { routerOnExecutorChildGuard?: (port: ExecutorChildGuardPort) => void }).routerOnExecutorChildGuard?.({
+    beginResumeRound: beginExecutorResumeRound,
+    applyCap: applyExecutorChildCap,
+  });
+  /**
    * #84 P3.3 DF2-F1: where the `task` call `callID` is verified. A routed role dispatch (`routedRoleOf`, kept until the adapter's
    * `execute.after` is done) in its `verifyRoot` — the grant's work root (a resume keeps the child's bound root, QA-P33F1-1-1), else
    * its canonical session directory (QA-P33F1-1-3); the requested cwd (`requestedVerificationCwd`: the call's `cwd`, else the
    * block's `cwd:`, the order the dispatch-time detection uses, nit 3) still wins inside it, by P2.3's rule (QA-P33F1-1-2); one
    * outside it is refused by the gate. Every other dispatch: the explicit cwd, as before (I1).
    */
-  const verificationScopeOf = (callID: unknown, args: Record<string, unknown> | undefined, dod: { cwd?: string }): VerificationScope =>
-    verificationScope(requestedVerificationCwd(args?.cwd, dod.cwd), typeof callID === "string" ? routedRoleOf(callID)?.verifyRoot : undefined);
+  const verificationScopeOf = (callID: unknown, args: Record<string, unknown> | undefined, dod: { cwd?: string }, restoredWorkRoot?: string): VerificationScope =>
+    verificationScope(requestedVerificationCwd(args?.cwd, dod.cwd), (typeof callID === "string" ? routedRoleFor(callID)?.verifyRoot : undefined) ?? restoredWorkRoot);
   /** The prompt as the orchestrator wrote it: without the router's role dispatch header (P2g.3, OD6) and its nonce line (handoff 18). */
   const withoutNonceLine = (prompt: string): string => stripDispatchHeader(prompt).replace(/\r?\n?OMR_NONCE=[A-Za-z0-9_-]+\s*$/, "");
   /**
@@ -1483,28 +1925,43 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     roleBudgetPeaks.delete(sessionID);
     for (const [callID, sent] of roleDispatchTexts) if (sent.parentSessionID === sessionID) roleDispatchTexts.delete(callID);
   };
-  return {
+  const routerHooks: Awaited<ReturnType<Plugin>> = {
     // Warnings post to /log fire-and-forget, which loses the message when the
     // process is about to exit — `opencode run` and `opencode debug` are short
     // enough for that to be the normal case. Verified against opencode 1.18.16
     // that dispose is both called and awaited, so flushing here is enough.
     dispose: async () => {
       stopReferenceGc();
+      // Phase 1.2: the turn-state providers of this instance leave the (adapter-owned) registry.
+      for (const unregister of unregisterTurnStateProviders.splice(0)) unregister();
+      // QA-2.1-21 (v2 only): the held gates this instance started (and their verdict posts) end before the pending registry
+      // and the verification wiring go; bounded, a gate still running then ends through the disposals below.
+      await waitHeldGates(HELD_GATES_DISPOSE_BOUND_MS);
       // Stop new advisor work and finish state/claim writes and lock removal before teardown.
       await advisorNotifier?.dispose();
       // 2.4.5: abort a background run and drop its queue and notices before the registry goes.
       background?.dispose();
       // 2.4.2b: evict every pending delegation; in-flight router_verify runs resolve (pending.ts R5).
       pending.dispose();
+      // QA-2.1-13 (v2 only): stop re-stamping and give back every session claim this process took at adoption.
+      releaseAllPendingClaims();
       // 2.2.3: settle batched testsPass requests and kill running batches (never rejects).
       await disposeVerification();
       // 2.1.3: flush and release the outcome bundle held by this instance (never rejects).
       await ingest?.dispose();
       await annotateRuntime?.dispose();
       await attemptRecorder?.dispose();
+      // QA-2.1-22 (v2 only): after the last append of this instance; the last journal of the path removes this process's writer mark.
+      await pendingFile?.dispose();
       await logger.flush();
     },
     tool: {
+      ...(rolesAtStart && routerPlan !== undefined ? { router_plan: {
+        ...routerPlan,
+        execute: async (args, context) => await planActionCallerAllowed(context?.sessionID, args?.action, args?.planId)
+          ? routerPlan.execute(args, context)
+          : `[router_plan] ${planCallerRefusal}`,
+      } } : {}),
       // QA-G-A2-2: a role session's work root must belong to the repository its dispatch listed the worktrees in (this directory's).
       ...gitTools(rolesAtStart ? {
         resolveWorkRoot: resolveWorkRootFor("router_git"), ...(ctx.directory ? { dispatchRepository: ctx.directory } : {}),
@@ -1876,7 +2333,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               let verification;
               try {
                 // Cross-repo P3a (D23 as amended, QA C1): the dispatch's own start, the `since` of W's ignored-module listing.
-                verification = await prepareVerification(changedFileStore, baselineID, producerSid, effectiveCwd, gateDeadline, dispatchStart?.dispatchedAt);
+                verification = await prepareVerification(changedFileStore, baselineID, producerSid, effectiveCwd, gateDeadline, dispatchStart?.dispatchedAt, undefined, isV2Host ? toolCtx?.sessionID : undefined);
               } catch (error) {
                 gateDeadline.dispose();
                 throw error;
@@ -2148,6 +2605,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             // R6: handles are scoped by the calling session; without one, every handle is unknown.
             const sessionID = typeof toolCtx?.sessionID === "string" ? toolCtx.sessionID : "";
             const report = await verifyHandles(sessionID, target, toolCtx?.abort !== undefined ? { signal: toolCtx.abort } : {});
+            // Phase 1.2 (v2 only): the late notices this report answers stop being retained for the turn-state tail.
+            lateBuffer?.release(sessionID, answeredHandles(report.items));
             return report.text;
           } catch (error) {
             logger.warn("[verify] router_verify failed", { error: scrubText(String(error)) });
@@ -2334,6 +2793,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     // non-subagent sessions or when enforcement is off (GA-1 preserved).
     // -----------------------------------------------------------------------
     "tool.execute.before": async (input: any, output: any) => {
+      if (typeof input?.sessionID === "string") consumeExecutorChildRound(input.sessionID);
+      rememberTaskArgs(input, output); // phase 2.1 (v2 only; a no-op on v1)
       // #84 P2.1: a role child's own call names its role agent (the v2 adapter passes the calling agent). Remembered even while
       // bypassed (the work-root resolver and the authority tool are authority, not routing), and marked a child session: role
       // agents are subagents, so the guard engages from their first call. Never on v1 / in tiers mode (no role table).
@@ -2525,6 +2986,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     // treats them as ground truth rather than advisory system noise.
     // -----------------------------------------------------------------------
     "tool.execute.after": async (input: any, output: any) => {
+      if (typeof input?.sessionID === "string") consumeExecutorChildRound(input.sessionID);
       if (input?.tool === "grep" && typeof output.output === "string") {
         const tier = input.agent ?? pluginAgentSessions.get(input.sessionID) ?? sessionStore.getTier(input.sessionID);
         const definition = tier && getActiveTiers(cfg)[tier];
@@ -2629,252 +3091,9 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       // Option (i): verify-dispatch around the built-in `task` tool (advisory-grade —
       // we observe the finished task result and append a forcing note if it is not
       // accepted; we cannot retry a task call that already finished).
-      if (typeof input?.tool === "string") {
-        let mode = "off";
-        try {
-          mode = resolveEnforcementMode({ config: cfg, env: process.env }).mode;
-        } catch {
-          // fall through with mode "off"
-        }
-        const requireMode = cfg.enforcement?.verify?.require;
-        if (shouldVerifyTask(input.tool, mode, requireMode)) {
-          try {
-            // pending.ts R11: the producer's changes landed by now.
-            const returnedAt = Date.now();
-            const { finalReturnText, childSessionID } = parseTaskResult(unbannered ? { ...output, output: unbannered.output } : output);
-            const producerTier =
-              typeof input?.args?.subagent_type === "string"
-                ? input.args.subagent_type
-                : "";
-            const dod = buildDelegationDoD({
-              prompt: input?.args?.prompt,
-              description: input?.args?.description,
-            });
-            // DF2-F1: a role dispatch is verified in its verification root (capture, change set, checks, deferral); a requested
-            // cwd outside that root is refused by the gate below, never deferred to run there later.
-            const scope = verificationScopeOf(input.callID, input?.args, dod);
-            const cwdSource = requestedVerificationCwdSource(input?.args?.cwd, dod.cwd);
-            const effectiveCwd = scope.cwd;
-            const dispatchID = `task:${input.sessionID}:${input.callID}`;
-            // #84 QA-G-B-2-1: a routed role dispatch keeps its child's verification lineage; a resume that CARRIES the acceptance of an
-            // earlier attempt is gated at once (never deferred) on the child's cumulative change set (roleAttemptVerification).
-            const routedRole = typeof input.callID === "string" ? routedRoleOf(input.callID) : undefined;
-            const carriedRole = routedRole?.carried === true && childSessionID !== null && routedRole.resumeID === childSessionID;
-            // Cross-repo P2a.3 (v2 only): where each check of a routed role dispatch runs. Tier dispatches resolve nothing.
-            // P2e.6: valid per-check `cwd=`/`scope=` keys may be deferred (the placements travel with the handle, and router_verify
-            // runs each check where it was placed); only a refusal is verified at once, below.
-            const placement = routedRole === undefined ? undefined : resolveCheckPlacements(dod, scope, { inReadSet: roleReadSetFor(routedRole) });
-            // P2b.7 (OD1=B, v2 only): a tier dispatch with a per-check `cwd=` is unverifiable (the gate refuses it); it is never deferred.
-            const tierRefusal = routedRole === undefined && ctx.routerHost === "v2" ? tierCheckCwdRefusal(dod) : undefined;
-            // P2e.6: a refused placement or the OD1 tier refusal is certain now: verified at once, never deferred.
-            const placementRefused = tierRefusal !== undefined || placement?.refused !== undefined;
-            const orchestratorSessionID = typeof input.sessionID === "string" ? input.sessionID : "";
-            const taskPrompt = typeof input?.args?.prompt === "string" ? input.args.prompt : undefined;
-            const taskDescription = typeof input?.args?.description === "string" ? input.args.description : undefined;
-            // 2.4.2b: the mode the orchestrator chose at dispatch (never the subagent's text).
-            const start = takeDispatch(dispatchID, dispatchDirectiveText(taskPrompt, taskDescription));
-            const trivial = childSessionID
-              ? sessionStore.isTrivial(childSessionID)
-              : false;
-            // QA-2.4-10: `trivial` as the gate sees it below; a dispatch the gate would skip is not
-            // deferred (isDeferred). QA-2.4-2: only a proven root orchestrator defers.
-            // B2: the reason a deferred finish refused for a branch switch, carried into the artefact below.
-            let deferredSwitch: string | undefined;
-            if (!scope.outside && !carriedRole && !placementRefused && isDeferred(dod, start.directives, trivial) && await isProvenRootCaller(orchestratorSessionID)) {
-              // Section 1.5-16: no gate, no test process; the result goes back now with the
-              // footer, which is appended last and never says accepted or verified.
-              const finish = await finishDeferred(changedFileStore, {
-                dispatchID,
-                orchestratorSessionID,
-                producerSessionID: childSessionID ?? "",
-                producerTier,
-                description: taskDescription?.trim() ? taskDescription : (taskPrompt ?? ""),
-                cwd: effectiveCwd,
-                // I2 (P2.3): the change observation stays in W; the registration's cwd above is the check base (F5).
-                ...(scope.workRoot !== undefined ? { captureRoot: captureRootOf(scope) } : {}),
-                // #84 P3.3 DF2-F1 (fix-1 review nit): router_verify's gate re-checks containment in the role's work root.
-                ...(scope.workRoot !== undefined ? { workRoot: scope.workRoot } : {}),
-                dod,
-                dispatchedAt: start.dispatchedAt,
-                // Handoff 24, R7 (I1/I8 exemption: the I7 budget-incomplete rule): router_verify judges the budget at return.
-                budget: captureBudget(childSessionID ?? "", childSessionID ? sessionStore.readCapReached(childSessionID) : undefined),
-                // Cross-repo P2e.6: the checks' placements (registered with the handle), and the full scope on v2 (OD-P2e-2).
-                ...(placement?.placements !== undefined ? { placements: placement.placements } : {}),
-                ...(fullScopeOf(cfg) ? { fullScope: true } : {}),
-              });
-              if (finish.deferred) {
-                output.output = appendRouterFooter(typeof output.output === "string" ? output.output : "", finish.footer);
-                // The dispatch record is cleared by finishDeferred once its capture settled.
-                if (childSessionID) changedFileStore.clear(childSessionID);
-                return;
-              }
-              if (finish.reason === "branch-switched") deferredSwitch = finish.detail;
-              // QA-2.4-4 / QA-2.4-10: not deferred after all; today's required gate runs below.
-            }
-            // Same bound as the delegate gate: one deadline per invocation,
-            // a withTimeout ceiling, and abort-on-reject so a hung check or
-            // grader cannot hold the after-hook (and its process tree) open.
-            // The deadline exists before prepareVerification (T2 P0,
-            // QA-2.1-4), so preparation counts against gateBudgetMs.
-            const { gateBudgetMs } = resolveVerifyBudget(cfg);
-            const gateDeadline = createDeadline(gateBudgetMs);
-            let verification;
-            try {
-              // Cross-repo P3a (D23 as amended, QA C1): the dispatch's start (takeDispatch), the `since` of W's ignored-module
-              // listing. A start that was never remembered reads as now (the return), which lists nothing older: never stale inputs.
-              verification = await prepareVerification(changedFileStore, dispatchID, childSessionID ?? "", captureRootOf(scope), gateDeadline, start.dispatchedAt);
-            } catch (error) {
-              gateDeadline.dispose();
-              throw error;
-            }
-            // QA2 F4: a switch the deferred finish saw (and this gate's own read missed) is part of this attempt before the role
-            // lineage records it; its change set may hold the other branch's commits, so it is unavailable.
-            if (deferredSwitch !== undefined && verification.branchSwitch === undefined) {
-              verification = { ...verification, branchSwitch: deferredSwitch, changeBaseline: "unavailable" as const };
-            }
-            // #84 QA-G-B-2-1: the role child's lineage — this attempt starts it (its own block) or is judged on everything the child
-            // changed since the attempt that introduced the carried block, against that attempt's reference.
-            if (routedRole !== undefined && childSessionID) verification = roleAttemptVerification(childSessionID, verification, { carried: carriedRole });
-            // #84 P2.1: a role agent follows the return contract (handoff 26; roles mode only).
-            const roleProducer = roleSpecOf(producerTier) !== undefined;
-            const artefact = {
-              changedFiles: verification.changedFiles,
-              changeBaseline: verification.changeBaseline,
-              ...(verification.snapshot?.root !== undefined ? { changeRoot: verification.snapshot.root } : {}),
-              ...((verification.branchSwitch ?? deferredSwitch) !== undefined ? { branchSwitch: verification.branchSwitch ?? deferredSwitch } : {}),
-              ...(verification.unattributedWriters !== undefined && verification.unattributedWriters.length > 0
-                ? { unattributedWriters: verification.unattributedWriters } : {}),
-              ...(verification.perimeter !== undefined ? { perimeter: verification.perimeter } : {}),
-              finalReturnText,
-              declaredOutputs: dod.deliverable ? [dod.deliverable] : [],
-              producerSessionID: childSessionID ?? "",
-              producerTier,
-              ...(roleProducer ? { returnContract: true } : {}),
-              // Handoff 24, R7 (I1/I8 exemption: the I7 budget-incomplete rule; every mode): the guard's budget state when the task
-              // returned, not when the gate runs. Without a stop it judges like the live read it replaces.
-              budget: captureBudget(childSessionID ?? "", childSessionID ? sessionStore.readCapReached(childSessionID) : undefined),
-            };
-
-            // Read-only / research delegation: an auto-inferred, criteria-only DoD on a
-            // native Task() that changed no files is exploration, not implementation.
-            // There is nothing concrete to verify, so skip rather than grade the
-            // findings against the task's own summary, which otherwise appends false
-            // "not accepted" notes to legitimate read-only research delegations.
-            // Explicit [acceptance] blocks (source != "inferred") and inferred
-            // deterministic checks (dod.kind === "deterministic") still verify normally.
-            if (
-              dod.source === "inferred" &&
-              dod.kind === "checker" &&
-              artefact.changedFiles.length === 0
-            ) {
-              gateDeadline.dispose();
-              if (childSessionID) changedFileStore.clear(childSessionID);
-              changedFileStore.clear(dispatchID);
-              return;
-            }
-
-            const gateGraderSessions = new Set<string>();
-            const completedFailures: string[] = [];
-            // Keep the native grader unparented on the backend; only depth tracking uses its caller.
-            const gateDeps = buildGateDeps(undefined, gateGraderSessions, verification, gateDeadline, false, orchestratorSessionID || null);
-            gateDeps.deterministic.onFailure = reason => completedFailures.push(reason);
-            // #84 QA-G-B-2-1: a carried acceptance never passes on a testsPass/lintClean that ran no process.
-            if (carriedRole) gateDeps.deterministic.noAffectedUnverifiable = CARRIED_NO_PROCESS_REASON;
-            let res;
-            try {
-              res = await withTimeout(
-                accept(
-                  {
-                    dod,
-                    trivial,
-                    mode: "modeA",
-                    // Native task has no cwd argument; the acceptance block can supply it.
-                    ...(scope.requested ? { cwd: scope.requested } : {}),
-                    ...(scope.workRoot !== undefined ? { workRoot: scope.workRoot } : {}),
-                    ...(scope.refused !== undefined ? { refusedCwd: scope.refused } : {}),
-                    // Fix-1 review nit: a refusal names where the cwd came from (the call's `cwd`, else the block's `cwd:`).
-                    ...(scope.workRoot !== undefined && cwdSource !== undefined ? { cwdSource } : {}),
-                    // Cross-repo P2b.5 (v2 only): where each check of a routed role dispatch runs, or the check the router refused.
-                    ...(placement?.placements !== undefined ? { checkPlacements: placement.placements } : {}),
-                    ...(placement?.refused !== undefined ? { refusedCheck: placement.refused } : tierRefusal !== undefined ? { refusedCheck: tierRefusal } : {}),
-                  },
-                  artefact,
-                  gateDeps,
-                ),
-                // What preparation left of the gate budget (QA-2.1-4).
-                gateDeadline.remaining(),
-                "verification gate",
-              );
-            } catch (error) {
-              gateDeadline.abort(
-                error instanceof RouterTimeoutError ? "verification gate timed out" : "verification gate failed",
-              );
-              if (error instanceof RouterTimeoutError) {
-                for (const gsid of gateGraderSessions) {
-                  try {
-                    await ctx.client.session.abort({ path: { id: gsid } });
-                  } catch {
-                    // best-effort: the gate result stands either way
-                  }
-                }
-              }
-              res = unverifiableGateResult(
-                error instanceof RouterTimeoutError
-                  ? `verification gate timed out after ${gateBudgetMs}ms`
-                  : `verification unavailable: ${scrubText(String(error))}`,
-                dod.source,
-                cfg.enforcement?.verify?.strictUnverifiable,
-                completedFailures,
-              );
-            } finally {
-              gateDeadline.dispose();
-            }
-            // pending.ts R11: a proven-introduced rejection is recorded for this session; a pass
-            // on ids an earlier rejection introduced becomes unverifiable (never a new pass/fail).
-            res = applyLineage(res, {
-              orchestratorSessionID,
-              root: verification.snapshot?.root,
-              dispatchID,
-              dispatchedAt: start.dispatchedAt,
-              returnedAt,
-              strictUnverifiable: cfg.enforcement?.verify?.strictUnverifiable,
-            });
-            // QA-3.1-2 / QA-3.1-3: concurrent delegations in this tree; a tool that discarded the baseline.
-            res = applyDispatchCaveats(res, verification);
-            // M6 (2.1.3): a real verdict of a registered child dispatch feeds the outcome store (v2, engine != static).
-            // #84 P3.3 fix 2 (plan §2.6, I6): a grader's verdict is a grader signal of a role dispatch, never a deterministic one.
-            if (childSessionID && !res.verdict.skipped) ingest?.onVerdict(childSessionID, verdictOf(res.verdict), verdictGraderOf(res.verdict));
-            if (!res.accepted && !res.verdict.skipped) {
-              const ladder = cfg.enforcement?.escalate?.ladder ?? ["fast", "medium", "heavy"];
-              const li = ladder.indexOf(producerTier);
-              const nextTier = res.verdict.outcome !== "unverifiable" && li >= 0 && li < ladder.length - 1 ? ladder[li + 1] : null;
-              // Handoff 25, R7 (I1/I8 exemption: the I7 budget-incomplete rule): absent when false, so the note is unchanged.
-              const incomplete = isIncompleteVerdict(res.verdict);
-              let note = scrubText(buildForcingNote(res.verdict.reasons, { producerTier, nextTier, ...(incomplete ? { incomplete: true } : {}) }));
-              // P-8 (handoff 39): a role agent is resumed on a higher tier of its range, never re-run on a tier agent.
-              // QA-P21-1-4: only after a FAIL (an unverifiable result keeps the generic line: there is nothing to escalate on).
-              // QA-P21-2-2: the hint promises the raise, and records it for this parent's next resume of the child.
-              const roleHint = roleProducer && !incomplete && res.verdict.outcome === "fail" && childSessionID
-                ? roleEscalationAfterFail(cfg, childSessionID, orchestratorSessionID) : null;
-              const genericNext = "NEXT: address the above and re-run the delegation; do not treat the prior result as complete.";
-              if (roleHint !== null && note.endsWith(genericNext)) note = note.slice(0, note.length - genericNext.length) + scrubText(roleHint);
-              output.output =
-                typeof output.output === "string"
-                  ? output.output + "\n\n" + note
-                  : note;
-            }
-            // QA-3.1-18: a clean pass also gets a line (`[router ✓ verified: …]`); a skipped
-            // check stays silent unless it carries caveats or notes.
-            if (res.accepted && (!res.verdict.skipped || res.verdict.caveats?.length || res.verdict.notes?.length)) {
-              output.output += buildAcceptedSuffix(res.verdict.method, res.verdict.outcome, res.verdict.caveats, res.verdict.notes);
-            }
-            if (childSessionID) changedFileStore.clear(childSessionID);
-            changedFileStore.clear(dispatchID);
-          } catch {
-            // fail-closed: a verification error must NEVER throw out of the after-hook
-          }
-        }
-      }
+      await finishDispatch(input, output, unbannered);
+      // QA-SYNC1-14: a foreground finish settled here; a background call's arguments stay for its finish (child end).
+      if (input?.tool === "task" && typeof input.callID === "string" && !backgroundCalls.has(input.callID)) forgetTaskArgs(input.callID);
     },
 
     // -----------------------------------------------------------------------
@@ -2922,12 +3141,18 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               if (key.startsWith(`${id}:`)) depthBanners.delete(key);
             }
             warnedNoCallID.delete(id);
+            lateBuffer?.forget(id);
             forgetRoleSession(id); // #84 P2.1 (the binding and authority registries are evicted by the v2 adapter)
             forgetWorkingSet(id); // cross-repo P1.4: the orchestrator's bound repository locations
             // 2.4.2b: a deleted orchestrator's handles, tombstones and lineage records go with it.
             // 2.4.5: so do its background requests and late notices; its run in flight is aborted.
             background?.forgetSession(id);
             pending.forgetSession(id);
+            // QA-2.1-13 (v2 only): its held texts go, and its adoption claim is given back.
+            forgetHeldTexts(id);
+            // QA-SYNC1-14: its calls' arguments and routed-role copies go too.
+            forgetSessionTaskArgs(id);
+            releasePendingClaimOf(id);
           }
         } catch {
           // best-effort: cleanup must never crash a real session
@@ -3161,6 +3386,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
 
       // Register commands
       opencodeConfig.command ??= {};
+      // Remember the host command the hook sees; our v2 registration is marked so reloads are not conflicts.
+      userPlanCommandDefined = opencodeConfig.command.plan !== undefined && opencodeConfig.command.plan?.[planCommandMarker] !== true;
       opencodeConfig.command["tiers"] = {
         template: "",
         description: "Show model delegation tiers and rules",
@@ -3228,6 +3455,16 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
         description:
           "Model-router controls (e.g., /router enforce off|advisory|enforced, /router overrides, /router models)",
       };
+      if (rolesAtStart && planCommand !== undefined) {
+        if (userPlanCommandDefined) {
+          if (!warnedPlanCommandConflict) {
+            warnedPlanCommandConflict = true;
+            logger.warn("[router] /plan command conflict: preserving the user-defined /plan; router_plan remains available");
+          }
+        } else {
+          opencodeConfig.command.plan = { template: "$ARGUMENTS", description: planCommand.description, [planCommandMarker]: true };
+        }
+      }
     },
 
     // -----------------------------------------------------------------------
@@ -3299,7 +3536,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       try { enfOn = resolveEnforcementMode({ config: cfg, env: process.env }).mode !== "off"; } catch {}
       // #84 P2.1 (T2.1.3): v2 roles mode carries the roles protocol (P2.2); "" (v1, tiers mode, no enabled role) keeps today's prompt.
       const rolesPrompt = isV2Host ? assembleRolesSystemPrompt(cfg, rolesNow(), orchestratorModel, enfOn) : "";
-      let systemPrompt = rolesPrompt !== "" ? rolesPrompt : assembleSystemPrompt(cfg, orchestratorModel, enfOn);
+      let systemPrompt = rolesPrompt !== "" ? rolesPrompt : assembleSystemPrompt(cfg, orchestratorModel, enfOn, isV2Host ? "v2" : "v1");
       // A28 (D1): on v1 only, and only with an explicit `routing.roles`, the `R:` line lists those agents as destinations (prose; no model
       // override). Anything else leaves `systemPrompt` the very string it is: the v1 protocol stays byte-identical.
       // Any failure leaves the baseline prompt (QA-2.4-13): the line is an extra, never a reason to lose the protocol.
@@ -3319,27 +3556,34 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       // a system part that changes would cost the orchestrator its prompt cache (QA-2.4-9).
       advisorNotifier?.poll();
 
-      // 2.4.4, section 1.5-20: this orchestrator's still-unverified delegations (at most 5 shown,
-      // newest first), as one short block. Nothing is pushed when the list is empty, so the prompt
-      // does not grow for sessions that never defer. Orchestrator path only: every child returned
-      // above. With background mode on, an entry the queue is verifying right now is still
-      // unverified to the orchestrator, so it stays listed until its run settles.
-      try {
-        // QA-2.4-3: plus background verdicts that did not pass, until router_verify replays them.
-        const open = pending.listPending(sessionID, { verifying: background !== undefined });
-        const block = buildPendingListBlock(open);
-        if (block !== undefined) output.system.push(block);
-      } catch (error) {
-        logger.warn("[verify] pending list not injected", { error: scrubText(String(error)) });
-      }
-      // 2.4.5, section 1.5-19 (`background: true` only): late notices of background runs that did
-      // not pass, each delivered once (takeNotices marks them delivered).
-      if (background !== undefined) {
+      if (turnState !== undefined) {
+        // Phase 1.2 (v2 only): the pending list, the late notices and the route hint are rendered into the turn-state tail
+        // by the context hook, never into the system array (which stays byte-identical between requests). This point is
+        // reached for root sessions only (every child returned above): the flag tells the hook to build the tail.
+        output[TURN_STATE_ROOT] = true;
+      } else {
+        // 2.4.4, section 1.5-20: this orchestrator's still-unverified delegations (at most 5 shown,
+        // newest first), as one short block. Nothing is pushed when the list is empty, so the prompt
+        // does not grow for sessions that never defer. Orchestrator path only: every child returned
+        // above. With background mode on, an entry the queue is verifying right now is still
+        // unverified to the orchestrator, so it stays listed until its run settles.
         try {
-          const late = buildLateNoticeBlock(background.takeNotices(sessionID));
-          if (late !== undefined) output.system.push(late);
+          // QA-2.4-3: plus background verdicts that did not pass, until router_verify replays them.
+          const open = pending.listPending(sessionID, { verifying: background !== undefined });
+          const block = buildPendingListBlock(open);
+          if (block !== undefined) output.system.push(block);
         } catch (error) {
-          logger.warn("[verify] late notices not injected", { error: scrubText(String(error)) });
+          logger.warn("[verify] pending list not injected", { error: scrubText(String(error)) });
+        }
+        // 2.4.5, section 1.5-19 (`background: true` only): late notices of background runs that did
+        // not pass, each delivered once (takeNotices marks them delivered).
+        if (background !== undefined) {
+          try {
+            const late = buildLateNoticeBlock(background.takeNotices(sessionID));
+            if (late !== undefined) output.system.push(late);
+          } catch (error) {
+            logger.warn("[verify] late notices not injected", { error: scrubText(String(error)) });
+          }
         }
       }
     },
@@ -3348,6 +3592,31 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     // Handle /tiers, /preset, and /budget commands
     // -----------------------------------------------------------------------
     "command.execute.before": async (input: any, output: any) => {
+      if (input.command === "plan") {
+        if (!isV2Host) {
+          // Best-effort on v1 (the command is deliberately unregistered); share the configured-key notice's process guard.
+          if (!userPlanCommandDefined && warnedV2OnlyKeys.size === 0) {
+            warnedV2OnlyKeys.add("routing.executor");
+            logger.warn("[router] the plan executor requires OpenCode v2; ignored: /plan");
+          }
+          return; // No model-visible part on v1.
+        }
+        if (!rolesAtStart || userPlanCommandDefined) return; // Leave unregistered or user-defined /plan commands alone.
+        if (planCommand !== undefined) {
+          const args: string = input.arguments ?? "";
+          const parsed = parsePlanCommand(args);
+          const allowed = parsed.kind !== "call" || await planActionCallerAllowed(
+            input.sessionID, parsed.call.action, "planId" in parsed.call ? parsed.call.planId : undefined,
+          );
+          const text = !allowed
+            ? `[router_plan] ${planCallerRefusal}`
+            : executorAccess?.runtime() === null
+              ? `[router_plan] ${executorAccess.unavailable()}`
+              : planCommand.execute(args);
+          output.parts.push({ type: "text" as const, text });
+        }
+        return;
+      }
       if (input.command === "tiers") {
         try {
           cfg = loadConfig(projectDir);
@@ -3495,7 +3764,11 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           }
         } else {
           // #84 P2.2: `/router` lists the roles in roles mode on v2 (`rolesNow()` is empty in tiers mode and on v1).
-          text = buildRouterOutput(cfg, args, projectDir, rolesNow().size > 0 ? rolesNow().values() : undefined, approvalsAvailable);
+          // Match registration at start and v2.ts's executor discovery prerequisites; never advertise an unregistered command.
+          const planAvailable = rolesAtStart && planCommand !== undefined && !userPlanCommandDefined && resolveRolesRouting(cfg, "v2").delegation === "roles"
+            && resolveRouting(cfg, "v2").leases.mode === "enforce" && cfg.enforcement?.verify?.require !== "never"
+            && !locationOutsideWorkRoots(ctx.directory, cfg.routing?.workRoots);
+          text = buildRouterOutput(cfg, args, projectDir, rolesNow().size > 0 ? rolesNow().values() : undefined, approvalsAvailable, planAvailable);
           // On the bare status view, surface stale or missing models inline.
           if (sub === "") {
             text += "\n" + routerStatusLines(cfg, ctx.routerHost === "v2" ? "v2" : "v1", logger, projectDir).join("\n");
@@ -3528,6 +3801,931 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       }
     },
   };
+  /**
+   * What the verification of a finished `task` call ended in (phase 2.1.4.a). The foreground hook ignores it.
+   */
+  type FinishOutcome =
+    | { kind: "none" }
+    | { kind: "deferred"; handle: string }
+    // QA-DF1-16: `gate` is the gate's own verdict (method, outcome, reasons, caveats, notes); a held entry settles with it,
+    // QA-DF1-29: with its pass/outcome set from `verdict` (the tag the gate's decision gives; see heldSettlementOf).
+    | { kind: "required"; verdict: "PASS" | "FAIL" | "UNVERIFIABLE"; detail: string; gate: HeldSettlement }
+    // QA-2.1-1: the gate was not run on purpose (a read-only delegation) or failed; neither is a verdict.
+    | { kind: "skipped"; reason: string }
+    | { kind: "error"; reason: string };
+
+  /**
+   * Phase 2.1.4.a: the verification of a finished `task` call, extracted unchanged from the legacy
+   * `tool.execute.after`. It rewrites `output.output` (footer, forcing note, accepted suffix) exactly as before;
+   * the hook calls it in the foreground, and the v2 finish API (below) calls it for background completions.
+   */
+  async function finishDispatch(
+    input: any,
+    output: any,
+    unbannered: { output: unknown } | undefined,
+    // QA-SYNC1-2: `workRoot`, the journaled work root of a dispatch restored after a restart (its routed-role record is gone).
+    // QA-SYNC1-3: `unattributedWriters`, those a restored held entry journaled (the live tally is gone after a restart).
+    extra?: {
+      delta?: DispatchDelta; dod?: ReturnType<typeof buildDelegationDoD>; graderParentSessionID?: string; workRoot?: string;
+      unattributedWriters?: readonly string[];
+      /** QA-SYNC1-3: the journaled dispatch-time head of a restored held entry; the branch check compares it as before. */
+      restoredHead?: DispatchHeadState;
+      /**
+       * QA-SYNC1-3: never deferred. A restored held entry was held because its verification was required at dispatch (only a
+       * required verification is held); it settles in place, never re-classified under the restarted process into a deferral.
+       */
+      noDefer?: true;
+    },
+  ): Promise<FinishOutcome> {
+    let outcome: FinishOutcome = { kind: "none" };
+    if (typeof input?.tool === "string") {
+      let mode = "off";
+      try {
+        mode = resolveEnforcementMode({ config: cfg, env: process.env }).mode;
+      } catch {
+        // fall through with mode "off"
+      }
+      const requireMode = cfg.enforcement?.verify?.require;
+      if (shouldVerifyTask(input.tool, mode, requireMode)) {
+        try {
+          // pending.ts R11: the producer's changes landed by now.
+          const returnedAt = Date.now();
+          const { finalReturnText, childSessionID } = parseTaskResult(unbannered ? { ...output, output: unbannered.output } : output);
+          const producerTier =
+            typeof input?.args?.subagent_type === "string"
+              ? input.args.subagent_type
+              : "";
+          // QA-2.1-17 (v2 only): a gate re-run after a restart verifies the DoD its restored pending entry persisted.
+          const dod = extra?.dod ?? buildDelegationDoD({
+            prompt: input?.args?.prompt,
+            description: input?.args?.description,
+          });
+          // DF2-F1: a role dispatch is verified in its verification root (capture, change set, checks, deferral); a requested
+          // cwd outside that root is refused by the gate below, never deferred to run there later.
+          const scope = verificationScopeOf(input.callID, input?.args, dod, extra?.workRoot);
+          const cwdSource = requestedVerificationCwdSource(input?.args?.cwd, dod.cwd);
+          const effectiveCwd = scope.cwd;
+          const dispatchID = `task:${input.sessionID}:${input.callID}`;
+          // #84 QA-G-B-2-1: a routed role dispatch keeps its child's verification lineage; a resume that CARRIES the acceptance of an
+          // earlier attempt is gated at once (never deferred) on the child's cumulative change set (roleAttemptVerification).
+          // QA-SYNC1-1: a background finish runs after the adapter forgot its record; the copy taken with the call's arguments stands in.
+          const routedRole = typeof input.callID === "string" ? routedRoleFor(input.callID) : undefined;
+          const carriedRole = routedRole?.carried === true && childSessionID !== null && routedRole.resumeID === childSessionID;
+          // Cross-repo P2a.3 (v2 only): where each check of a routed role dispatch runs. Tier dispatches resolve nothing.
+          // P2e.6: valid per-check `cwd=`/`scope=` keys may be deferred (the placements travel with the handle, and router_verify
+          // runs each check where it was placed); only a refusal is verified at once, below.
+          const placement = routedRole === undefined ? undefined : resolveCheckPlacements(dod, scope, { inReadSet: roleReadSetFor(routedRole) });
+          // P2b.7 (OD1=B, v2 only): a tier dispatch with a per-check `cwd=` is unverifiable (the gate refuses it); it is never deferred.
+          const tierRefusal = routedRole === undefined && ctx.routerHost === "v2" ? tierCheckCwdRefusal(dod) : undefined;
+          // P2e.6: a refused placement or the OD1 tier refusal is certain now: verified at once, never deferred.
+          const placementRefused = tierRefusal !== undefined || placement?.refused !== undefined;
+          const orchestratorSessionID = typeof input.sessionID === "string" ? input.sessionID : "";
+          const taskPrompt = typeof input?.args?.prompt === "string" ? input.args.prompt : undefined;
+          const taskDescription = typeof input?.args?.description === "string" ? input.args.description : undefined;
+          // 2.4.2b: the mode the orchestrator chose at dispatch (never the subagent's text).
+          const start = takeDispatch(dispatchID, dispatchDirectiveText(taskPrompt, taskDescription));
+          const trivial = childSessionID
+            ? sessionStore.isTrivial(childSessionID)
+            : false;
+          // QA-2.4-10: `trivial` as the gate sees it below; a dispatch the gate would skip is not
+          // deferred (isDeferred). QA-2.4-2: only a proven root orchestrator defers.
+          // B2: the reason a deferred finish refused for a branch switch, carried into the artefact below.
+          let deferredSwitch: string | undefined;
+          if (extra?.noDefer !== true && !scope.outside && !carriedRole && !placementRefused && isDeferred(dod, start.directives, trivial) && await isProvenRootCaller(orchestratorSessionID)) {
+            // Section 1.5-16: no gate, no test process; the result goes back now with the
+            // footer, which is appended last and never says accepted or verified.
+            const finish = await finishDeferred(changedFileStore, {
+              dispatchID,
+              orchestratorSessionID,
+              producerSessionID: childSessionID ?? "",
+              producerTier,
+              description: taskDescription?.trim() ? taskDescription : (taskPrompt ?? ""),
+              cwd: effectiveCwd,
+              // I2 (P2.3): the change observation stays in W; the registration's cwd above is the check base (F5).
+              ...(scope.workRoot !== undefined ? { captureRoot: captureRootOf(scope) } : {}),
+              // #84 P3.3 DF2-F1 (fix-1 review nit): router_verify's gate re-checks containment in the role's work root.
+              ...(scope.workRoot !== undefined ? { workRoot: scope.workRoot } : {}),
+              dod,
+              dispatchedAt: start.dispatchedAt,
+              // Handoff 24, R7 (I1/I8 exemption: the I7 budget-incomplete rule): router_verify judges the budget at return.
+              budget: captureBudget(childSessionID ?? "", childSessionID ? sessionStore.readCapReached(childSessionID) : undefined),
+              // Cross-repo P2e.6: the checks' placements (registered with the handle), and the full scope on v2 (OD-P2e-2).
+              ...(placement?.placements !== undefined ? { placements: placement.placements } : {}),
+              ...(fullScopeOf(cfg) ? { fullScope: true } : {}),
+              // Phase 2.1.4.b: the change set frozen at child end (background completions only).
+              ...(extra?.delta !== undefined ? { delta: extra.delta } : {}),
+            });
+            if (finish.deferred) {
+              output.output = appendRouterFooter(typeof output.output === "string" ? output.output : "", finish.footer);
+              // The dispatch record is cleared by finishDeferred once its capture settled.
+              if (childSessionID) changedFileStore.clear(childSessionID);
+              outcome = { kind: "deferred", handle: finish.handle };
+              return outcome;
+            }
+            if (finish.reason === "branch-switched") deferredSwitch = finish.detail;
+            // QA-2.4-4 / QA-2.4-10: not deferred after all; today's required gate runs below.
+          }
+          // Same bound as the delegate gate: one deadline per invocation,
+          // a withTimeout ceiling, and abort-on-reject so a hung check or
+          // grader cannot hold the after-hook (and its process tree) open.
+          // The deadline exists before prepareVerification (T2 P0,
+          // QA-2.1-4), so preparation counts against gateBudgetMs.
+          const { gateBudgetMs } = resolveVerifyBudget(cfg);
+          const gateDeadline = createDeadline(gateBudgetMs);
+          let verification;
+          try {
+            // Cross-repo P3a (D23 as amended, QA C1): the dispatch's start (takeDispatch), the `since` of W's ignored-module
+            // listing. A start that was never remembered reads as now (the return), which lists nothing older: never stale inputs.
+            verification = await prepareVerification(changedFileStore, dispatchID, childSessionID ?? "", captureRootOf(scope), gateDeadline, start.dispatchedAt, extra?.restoredHead, isV2Host ? orchestratorSessionID : undefined);
+          } catch (error) {
+            gateDeadline.dispose();
+            throw error;
+          }
+          // QA2 F4: a switch the deferred finish saw (and this gate's own read missed) is part of this attempt before the role
+          // lineage records it; its change set may hold the other branch's commits, so it is unavailable.
+          if (deferredSwitch !== undefined && verification.branchSwitch === undefined) {
+            verification = { ...verification, branchSwitch: deferredSwitch, changeBaseline: "unavailable" as const };
+          }
+          // QA-SYNC1-3: a restored held entry's journaled unattributed writers count as the lineage's own.
+          const restoredWriters = extra?.unattributedWriters;
+          if (restoredWriters !== undefined && restoredWriters.length > 0) {
+            verification = { ...verification, unattributedWriters: [...new Set([...(verification.unattributedWriters ?? []), ...restoredWriters])].sort() };
+          }
+          // #84 QA-G-B-2-1: the role child's lineage — this attempt starts it (its own block) or is judged on everything the child
+          // changed since the attempt that introduced the carried block, against that attempt's reference.
+          if (routedRole !== undefined && childSessionID) verification = roleAttemptVerification(childSessionID, verification, { carried: carriedRole });
+          // #84 P2.1: a role agent follows the return contract (handoff 26; roles mode only).
+          const roleProducer = roleSpecOf(producerTier) !== undefined;
+          const artefact = {
+            changedFiles: verification.changedFiles,
+            changeBaseline: verification.changeBaseline,
+            ...(verification.snapshot?.root !== undefined ? { changeRoot: verification.snapshot.root } : {}),
+            ...((verification.branchSwitch ?? deferredSwitch) !== undefined ? { branchSwitch: verification.branchSwitch ?? deferredSwitch } : {}),
+            ...(verification.unattributedWriters !== undefined && verification.unattributedWriters.length > 0
+              ? { unattributedWriters: verification.unattributedWriters } : {}),
+            ...(verification.perimeter !== undefined ? { perimeter: verification.perimeter } : {}),
+            finalReturnText,
+            declaredOutputs: dod.deliverable ? [dod.deliverable] : [],
+            producerSessionID: childSessionID ?? "",
+            producerTier,
+            ...(roleProducer ? { returnContract: true } : {}),
+            // Handoff 24, R7 (I1/I8 exemption: the I7 budget-incomplete rule; every mode): the guard's budget state when the task
+            // returned, not when the gate runs. Without a stop it judges like the live read it replaces.
+            budget: captureBudget(childSessionID ?? "", childSessionID ? sessionStore.readCapReached(childSessionID) : undefined),
+          };
+
+          // Read-only / research delegation: an auto-inferred, criteria-only DoD on a
+          // native Task() that changed no files is exploration, not implementation.
+          // There is nothing concrete to verify, so skip rather than grade the
+          // findings against the task's own summary, which otherwise appends false
+          // "not accepted" notes to legitimate read-only research delegations.
+          // Explicit [acceptance] blocks (source != "inferred") and inferred
+          // deterministic checks (dod.kind === "deterministic") still verify normally.
+          if (
+            dod.source === "inferred" &&
+            dod.kind === "checker" &&
+            artefact.changedFiles.length === 0
+          ) {
+            gateDeadline.dispose();
+            if (childSessionID) changedFileStore.clear(childSessionID);
+            changedFileStore.clear(dispatchID);
+            outcome = { kind: "skipped", reason: "read-only delegation: no files changed and no explicit acceptance to verify" };
+            return outcome;
+          }
+
+          const gateGraderSessions = new Set<string>();
+          const completedFailures: string[] = [];
+          // Keep the native grader unparented on the backend; only depth tracking uses its caller. DF-1-3 (v2 finish API only,
+          // absent on the v1 after-hook): a background completion names the parent whose retained context launches the grader.
+          const gateDeps = buildGateDeps(extra?.graderParentSessionID, gateGraderSessions, verification, gateDeadline, false, orchestratorSessionID || null);
+          gateDeps.deterministic.onFailure = reason => completedFailures.push(reason);
+          // #84 QA-G-B-2-1: a carried acceptance never passes on a testsPass/lintClean that ran no process.
+          if (carriedRole) gateDeps.deterministic.noAffectedUnverifiable = CARRIED_NO_PROCESS_REASON;
+          let res;
+          try {
+            res = await withTimeout(
+              accept(
+                {
+                  dod,
+                  trivial,
+                  mode: "modeA",
+                  // Native task has no cwd argument; the acceptance block can supply it.
+                  ...(scope.requested ? { cwd: scope.requested } : {}),
+                  ...(scope.workRoot !== undefined ? { workRoot: scope.workRoot } : {}),
+                  ...(scope.refused !== undefined ? { refusedCwd: scope.refused } : {}),
+                  // Fix-1 review nit: a refusal names where the cwd came from (the call's `cwd`, else the block's `cwd:`).
+                  ...(scope.workRoot !== undefined && cwdSource !== undefined ? { cwdSource } : {}),
+                  // Cross-repo P2b.5 (v2 only): where each check of a routed role dispatch runs, or the check the router refused.
+                  ...(placement?.placements !== undefined ? { checkPlacements: placement.placements } : {}),
+                  ...(placement?.refused !== undefined ? { refusedCheck: placement.refused } : tierRefusal !== undefined ? { refusedCheck: tierRefusal } : {}),
+                },
+                artefact,
+                gateDeps,
+              ),
+              // What preparation left of the gate budget (QA-2.1-4).
+              gateDeadline.remaining(),
+              "verification gate",
+            );
+          } catch (error) {
+            gateDeadline.abort(
+              error instanceof RouterTimeoutError ? "verification gate timed out" : "verification gate failed",
+            );
+            if (error instanceof RouterTimeoutError) {
+              for (const gsid of gateGraderSessions) {
+                try {
+                  await ctx.client.session.abort({ path: { id: gsid } });
+                } catch {
+                  // best-effort: the gate result stands either way
+                }
+              }
+            }
+            res = unverifiableGateResult(
+              error instanceof RouterTimeoutError
+                ? `verification gate timed out after ${gateBudgetMs}ms`
+                : `verification unavailable: ${scrubText(String(error))}`,
+              dod.source,
+              cfg.enforcement?.verify?.strictUnverifiable,
+              completedFailures,
+            );
+          } finally {
+            gateDeadline.dispose();
+          }
+          // pending.ts R11: a proven-introduced rejection is recorded for this session; a pass
+          // on ids an earlier rejection introduced becomes unverifiable (never a new pass/fail).
+          res = applyLineage(res, {
+            orchestratorSessionID,
+            root: verification.snapshot?.root,
+            dispatchID,
+            dispatchedAt: start.dispatchedAt,
+            returnedAt,
+            strictUnverifiable: cfg.enforcement?.verify?.strictUnverifiable,
+          });
+          // QA-3.1-2 / QA-3.1-3: concurrent delegations in this tree; a tool that discarded the baseline.
+          res = applyDispatchCaveats(res, verification);
+          // M6 (2.1.3): a real verdict of a registered child dispatch feeds the outcome store (v2, engine != static).
+          // #84 P3.3 fix 2 (plan §2.6, I6): a grader's verdict is a grader signal of a role dispatch, never a deterministic one.
+          if (childSessionID && !res.verdict.skipped) ingest?.onVerdict(childSessionID, verdictOf(res.verdict), verdictGraderOf(res.verdict));
+          // A gated child must not stay on medium when its return gate cannot verify it, even if accepted with a caveat.
+          // Strict children and incomplete returns keep their existing behaviour and text.
+          if (isV2Host && routedRole?.gated === true && childSessionID && !res.verdict.skipped &&
+              res.verdict.outcome === "unverifiable" && !isIncompleteVerdict(res.verdict)) {
+            roleEscalationAfterFail(cfg, childSessionID, orchestratorSessionID);
+          }
+          if (!res.accepted && !res.verdict.skipped) {
+            const ladder = cfg.enforcement?.escalate?.ladder ?? ["fast", "medium", "heavy"];
+            const li = ladder.indexOf(producerTier);
+            const nextTier = res.verdict.outcome !== "unverifiable" && li >= 0 && li < ladder.length - 1 ? ladder[li + 1] : null;
+            // Handoff 25, R7 (I1/I8 exemption: the I7 budget-incomplete rule): absent when false, so the note is unchanged.
+            const incomplete = isIncompleteVerdict(res.verdict);
+            let note = scrubText(buildForcingNote(res.verdict.reasons, { producerTier, nextTier, ...(incomplete ? { incomplete: true } : {}) }));
+            // P-8 (handoff 39): a role agent is resumed on a higher tier of its range, never re-run on a tier agent.
+            // QA-P21-1-4: only after a FAIL (an unverifiable result keeps the generic line: there is nothing to escalate on).
+            // QA-P21-2-2: the hint promises the raise, and records it for this parent's next resume of the child.
+            const roleHint = roleProducer && !incomplete && res.verdict.outcome === "fail" && childSessionID
+              ? roleEscalationAfterFail(cfg, childSessionID, orchestratorSessionID) : null;
+            const genericNext = "NEXT: address the above and re-run the delegation; do not treat the prior result as complete.";
+            if (roleHint !== null && note.endsWith(genericNext)) note = note.slice(0, note.length - genericNext.length) + scrubText(roleHint);
+            output.output =
+              typeof output.output === "string"
+                ? output.output + "\n\n" + note
+                : note;
+          }
+          // QA-3.1-18: a clean pass also gets a line (`[router ✓ verified: …]`); a skipped
+          // check stays silent unless it carries caveats or notes.
+          if (res.accepted && (!res.verdict.skipped || res.verdict.caveats?.length || res.verdict.notes?.length)) {
+            output.output += buildAcceptedSuffix(res.verdict.method, res.verdict.outcome, res.verdict.caveats, res.verdict.notes);
+          }
+          if (childSessionID) changedFileStore.clear(childSessionID);
+          changedFileStore.clear(dispatchID);
+          outcome = {
+            kind: "required",
+            // DF-1-3: the tag follows the outcome; an accepted unverifiable result (gate.ts, not strictUnverifiable) is UNVERIFIABLE.
+            verdict: res.verdict.outcome === "unverifiable" ? "UNVERIFIABLE" : res.accepted ? "PASS" : "FAIL",
+            detail: res.verdict.reasons.join("; "),
+            // QA-DF1-16: the gate's real verdict, so router_verify on a held handle reports what the posted text says.
+            gate: { verdict: res.verdict, retryable: false },
+          };
+        } catch (error) {
+          // fail-closed: a verification error must NEVER throw out of the after-hook. QA-2.1-1: it is logged and reported as an
+          // `error` outcome, so a held dispatch posts UNVERIFIABLE with this reason instead of a PASS.
+          logger.warn("[router] verification failed in the after-hook", { tool: input?.tool, error: describeError(error) });
+          outcome = { kind: "error", reason: `verification unavailable: ${scrubText(String(error))}` };
+        }
+      }
+    }
+    return outcome;
+  }
+
+  /**
+   * Phase 2.1.4.a (v2 only): the `task` arguments of a call in flight, kept for FinishApi.verificationFor / finish. QA-SYNC1-14:
+   * forgotten when the call's finish settles (foreground, held, deferred or immediate) and with its parent session.
+   */
+  /**
+   * QA-SYNC1-14 (test seam): `routerTaskArgsBounds` overrides the two bounds below (positive integers, `hard` ≥ `max`); anything
+   * else keeps the production defaults.
+   */
+  const taskArgsBounds = (ctx as RouterPluginInput & { routerTaskArgsBounds?: { max?: number; hard?: number } }).routerTaskArgsBounds;
+  const boundOr = (value: number | undefined, fallback: number): number =>
+    typeof value === "number" && Number.isInteger(value) && value > 0 ? value : fallback;
+  const MAX_TASK_ARGS = boundOr(taskArgsBounds?.max, 1000);
+  /** QA-SYNC1-14: the bound past which even a call with a background record is evicted (= MAX_HOLDS_GLOBAL, background.ts). */
+  const MAX_TASK_ARGS_HARD = Math.max(MAX_TASK_ARGS, boundOr(taskArgsBounds?.hard, 10_000));
+  const taskArgsByCall = new Map<string, Record<string, unknown>>();
+  /** QA-2.1-7: the parent session of a call in flight (same keys and bound), so captureDelta finds the dispatch record. */
+  const taskParentByCall = new Map<string, string>();
+  /**
+   * QA-SYNC1-1/-2: the routed-role record of a call in flight (same keys and bound), copied when its arguments are remembered.
+   * The adapter forgets its own record once a background acknowledgement returns; the finish (child end) still needs it.
+   */
+  const routedRoleByCall = new Map<string, RoutedRoleSnapshot>();
+  /**
+   * QA-SYNC1-1: the routed-role record of `callID`: the dispatch module's while it keeps it, else the copy kept until the finish.
+   * QA-SYNC1-13: after a restart, the snapshot a restored held entry journaled (finishRestored puts it in `routedRoleByCall`).
+   */
+  function routedRoleFor(callID: string): RoutedRoleSnapshot | undefined {
+    return routedRoleOf(callID) ?? routedRoleByCall.get(callID);
+  }
+  /**
+   * QA-SYNC1-6: finishDispatch verifies this dispatch at once, never deferred: a cwd outside the role's verification root, a refused
+   * check placement, or (v2) a tier dispatch's per-check `cwd=` (OD1=B). The same rules as there; a failed read counts as at once.
+   * QA-SYNC1-12: a carried resume too (finishDispatch never defers it; its resumeID is known at dispatch).
+   */
+  function verifiedAtOnce(callID: string, args: Record<string, unknown>, dod: ReturnType<typeof buildDelegationDoD>): boolean {
+    try {
+      const routed = routedRoleFor(callID);
+      if (routed === undefined) return ctx.routerHost === "v2" && tierCheckCwdRefusal(dod) !== undefined;
+      if (routed.carried === true) return true;
+      const scope = verificationScopeOf(callID, args, dod);
+      if (scope.outside) return true;
+      return resolveCheckPlacements(dod, scope, { inReadSet: roleReadSetFor(routed) }).refused !== undefined;
+    } catch (error) {
+      logger.warn("[router] the check placements of a dispatch could not be read", { callID, error: describeError(error) });
+      return true;
+    }
+  }
+  function rememberTaskArgs(input: any, output: any): void {
+    if (!isV2Host || input?.tool !== "task" || typeof input.callID !== "string") return;
+    const args = output?.args;
+    if (typeof args !== "object" || args === null) return;
+    taskArgsByCall.set(input.callID, { ...(args as Record<string, unknown>) });
+    if (typeof input.sessionID === "string") taskParentByCall.set(input.callID, input.sessionID);
+    // QA-SYNC1-1: route() ran before this hook (v2 adapter), so the routed-role record is current here.
+    const routed = routedRoleOf(input.callID);
+    if (routed === undefined) routedRoleByCall.delete(input.callID);
+    else routedRoleByCall.set(input.callID, routed);
+    // QA-SYNC1-14: oldest first, but never a call that still has a held or in-flight background record (its finish needs the
+    // arguments and the routed copy), nor the call just remembered; those are bounded by the background bounds instead.
+    while (taskArgsByCall.size > MAX_TASK_ARGS) {
+      let oldest: string | undefined;
+      for (const key of taskArgsByCall.keys()) {
+        if (key !== input.callID && !backgroundCalls.has(key)) { oldest = key; break; }
+      }
+      // A hard ceiling still holds (= MAX_HOLDS_GLOBAL): past it the oldest background call goes too, as before.
+      if (oldest === undefined && taskArgsByCall.size > MAX_TASK_ARGS_HARD) {
+        for (const key of taskArgsByCall.keys()) {
+          if (key !== input.callID) { oldest = key; break; }
+        }
+        if (oldest !== undefined) backgroundCalls.delete(oldest);
+      }
+      if (oldest === undefined) break;
+      taskArgsByCall.delete(oldest);
+      taskParentByCall.delete(oldest);
+      routedRoleByCall.delete(oldest);
+    }
+  }
+  /**
+   * QA-SYNC1-14: the calls with a held or in-flight background record (the adapter reserved a held slot for them, or read their
+   * dispatch to journal an acknowledged background attempt); the FIFO bound above skips them. Forgotten with the call's arguments.
+   */
+  const backgroundCalls = new Set<string>();
+  function forgetTaskArgs(callID: string): void {
+    taskArgsByCall.delete(callID);
+    taskParentByCall.delete(callID);
+    routedRoleByCall.delete(callID);
+    backgroundCalls.delete(callID);
+  }
+  /** QA-SYNC1-14: a deleted session's calls are never finished; their arguments and routed copies go with it. */
+  function forgetSessionTaskArgs(sessionID: string): void {
+    for (const [callID, parent] of [...taskParentByCall]) if (parent === sessionID) forgetTaskArgs(callID);
+  }
+
+  // ---- Phase 2.1.4.a (v2 only): the finish API ------------------------------------------------------
+  /**
+   * The foreground-equivalent text of a held dispatch, kept from the end of its gate until onVerdict posts it. QA-2.1-13:
+   * bounded (oldest first; an evicted hold posts the generic verdict line) and forgotten with its parent session.
+   * QA-DF1-16: `post` is the tag and reason the held gate posts with its text (its settled verdict keeps every reason).
+   */
+  type HeldPost = { readonly verdict: "PASS" | "FAIL" | "UNVERIFIABLE"; readonly reason?: string };
+  const heldTexts = new Map<string, { readonly sessionID: string; readonly text: string; readonly post?: HeldPost }>();
+  /** = MAX_HOLDS_GLOBAL (background.ts): there are never more live holds than this. */
+  const MAX_HELD_TEXTS = 10_000;
+  function rememberHeldText(handle: string, sessionID: string, text: string, post?: HeldPost): void {
+    heldTexts.delete(handle);
+    heldTexts.set(handle, { sessionID, text, ...(post === undefined ? {} : { post }) });
+    while (heldTexts.size > MAX_HELD_TEXTS) {
+      const oldest = heldTexts.keys().next();
+      if (oldest.done === true) break;
+      heldTexts.delete(oldest.value);
+    }
+  }
+  function forgetHeldTexts(sessionID: string): void {
+    for (const [handle, held] of heldTexts) if (held.sessionID === sessionID) heldTexts.delete(handle);
+  }
+  let heldSink: HeldSink | undefined;
+  /**
+   * QA-2.1-21: the held gates `finish` starts without awaiting them, each with its verdict post. `finishApi.idle` (the
+   * adapter's settled seam) and `dispose` (bounded) wait for them.
+   */
+  const heldGates = new Set<Promise<void>>();
+  /** QA-2.1-21: how long `dispose` waits for running held gates before the registry and the wiring go. */
+  const HELD_GATES_DISPOSE_BOUND_MS = 5_000;
+  function trackHeldGate(gate: Promise<unknown>): void {
+    const tracked = gate.then(
+      () => undefined,
+      (error: unknown) => logger.warn("[router] held gate failed", { error: describeError(error) }),
+    );
+    heldGates.add(tracked);
+    void tracked.finally(() => heldGates.delete(tracked));
+  }
+  /** Resolves once no held gate runs (a gate started meanwhile is waited for too). Never rejects. */
+  async function heldGatesIdle(): Promise<void> {
+    while (heldGates.size > 0) await Promise.allSettled([...heldGates]);
+  }
+  async function waitHeldGates(boundMs: number): Promise<void> {
+    if (heldGates.size === 0) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([heldGatesIdle(), new Promise<void>((resolve) => { timer = setTimeout(resolve, boundMs); })]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  /** pending.onVerdict: a held entry's verdict goes to the parent through the HeldSink (v2 adapter). */
+  function postHeldVerdict(entry: PendingEntry, result: SettledVerification): void {
+    // QA-2.1-31: settled by `settleHeldDirect` after the adapter posted the verdict itself.
+    if (directlySettled.has(entry.handle)) return;
+    if (entry.hold === undefined || heldSink === undefined) return;
+    // QA-DF1-16: a held gate's text posts with the tag and reason it was written for (unchanged by its full settled verdict).
+    const held = heldTexts.get(entry.handle);
+    const verdict = held?.post?.verdict ?? heldVerdictKind(result.verdict.outcome, result.verdict.pass);
+    const reason = held?.post !== undefined ? held.post.reason : result.verdict.reasons[0];
+    const text = held?.text ?? `[router] ${entry.handle}: verification ended ${verdict}${reason !== undefined ? ` — ${scrubText(reason)}` : ""}`;
+    heldTexts.delete(entry.handle);
+    heldSink.verdict(entry.handle, { verdict, text, ...(reason !== undefined ? { reason } : {}) }).catch((error: unknown) => {
+      logger.warn("[router] held verdict not posted", { handle: entry.handle, error: describeError(error) });
+    });
+  }
+
+  function heldVerdictKind(outcome: string | undefined, pass: boolean): "PASS" | "FAIL" | "UNVERIFIABLE" {
+    if (outcome === "unverifiable") return "UNVERIFIABLE";
+    return pass ? "PASS" : "FAIL";
+  }
+
+  /**
+   * QA-2.1-1: the verdict a held dispatch posts for what its gate ended in. Only a `required` outcome carries a gate verdict;
+   * every other outcome is UNVERIFIABLE with its reason, and `line` is the router line appended to the posted text.
+   */
+  function heldOutcomeOf(outcome: FinishOutcome): { verdict: "PASS" | "FAIL" | "UNVERIFIABLE"; reasons: string[]; line?: string } {
+    if (outcome.kind === "required") return { verdict: outcome.verdict, reasons: outcome.detail !== "" ? [outcome.detail] : [] };
+    const reason =
+      outcome.kind === "skipped" ? `not verified: ${outcome.reason}`
+        : outcome.kind === "error" ? outcome.reason
+          : outcome.kind === "deferred" ? `not verified: deferred to router_verify as ${outcome.handle}`
+            : "not verified: verification is not required for this dispatch";
+    const scrubbed = scrubText(reason);
+    return { verdict: "UNVERIFIABLE", reasons: [scrubbed], line: `[router] UNVERIFIABLE — ${scrubbed}` };
+  }
+
+  /** The `task` result the host would have handed the hook: the child's id and its final text. */
+  function taskOutputText(childSessionID: string, text: string): string {
+    return `task_id: ${childSessionID} (for resuming to continue this task if needed)\n\n<task_result>\n${text}\n</task_result>`;
+  }
+
+  // ONE journal (memo §11): the same `pending.jsonl` the pending store and the held results append to. Absent on v1 (accepts and forgets).
+  const processedKeys = new Set<string>();
+  let dormantSessions = new Map<string, DormantSession>();
+  // QA-2.1-33: registered only now that `pending` and `dormantSessions` exist: another instance's recreate may call it at any time.
+  pendingFile?.setSnapshotProvider(journalSnapshot);
+  const sharedJournal: InflightJournal = {
+    async append(record, opts) {
+      if (record.kind === "processed") {
+        const key = processedKeyOf(record);
+        if (key !== undefined) processedKeys.add(key);
+      }
+      if (pendingFile === undefined) return;
+      // QA-2.1-19: the live owner claims the parent session (pid + instance token) at its first `inflight`/`hold` write, so
+      // no other instance or process adopts it (and posts or wakes for a child that is still running here).
+      if (record.kind === "inflight" || record.kind === "hold") {
+        const parent = typeof record.parentSessionID === "string" ? record.parentSessionID : typeof record.parent === "string" ? record.parent : undefined;
+        if (parent !== undefined && !claimSessionOnce(parent)) {
+          logger.warn("[router] background: another live instance holds the claim of this session", { sessionID: parent });
+        }
+      }
+      // `inflight` and `hold` records are fsync'd (memo §11.2); the rest only when the caller asks.
+      const fsync = opts?.fsync === true || record.kind === "inflight" || record.kind === "hold";
+      // QA-2.1-23: a vanished journal (or state directory) fails the append; it is never recreated behind the reload's back
+      // (QA-2.1-16: `recreateJournal` rewrites it from the in-memory state).
+      await pendingFile.append(record, fsync ? { fsync: true } : undefined);
+    },
+    hasProcessed: (key) => processedKeys.has(key),
+  };
+  /** QA-2.1-17: an UNVERIFIABLE line for a finish after a restart that has nothing to verify with. */
+  const RESTART_DATA_LOST = "verification data lost in restart";
+  /** QA-SYNC1-3: how long a held registration waits for the dispatch-time head read (started at dispatch, normally settled). */
+  const HELD_HEAD_READ_MS = 2_000;
+  /** QA-2.1-31: handles whose restored pending entry the adapter settled after posting the verdict itself (no second post). */
+  const directlySettled = new Set<string>();
+  type HeldClaim = Extract<ReturnType<typeof pending.markVerifying>, { kind: "claimed" }>;
+  type HeldSettlement = Parameters<HeldClaim["settle"]>[0];
+  type HeldScratch = { output: string; title: string; metadata: Record<string, unknown> };
+  /**
+   * QA-DF1-16: what a held entry settles with: a gate verdict as the gate reached it (method, reasons, caveats, notes), anything
+   * else as `heldVerification`. QA-DF1-29: its `pass`/`outcome` are those of the posted tag (the gate's decision, `accepted`, which
+   * a trivial skip or `strictUnverifiable` sets apart from the raw verdict), so every reader that re-derives a tag from them
+   * (router_verify through `gateResult`, the restart re-post and the onVerdict fallback through `heldVerdictKind`) reads the
+   * posted one. Done here, once, not by each reader: a reader cannot re-derive a trivial skip's acceptance (gate.ts accepts it
+   * outside `gateResult`), and `strictUnverifiable` read after a restart need not be the value the gate decided under.
+   */
+  function heldSettlementOf(outcome: FinishOutcome, held: { verdict: "PASS" | "FAIL" | "UNVERIFIABLE"; reasons: string[] }): HeldSettlement {
+    if (outcome.kind !== "required") return heldVerification(held.verdict, held.reasons);
+    const tag = outcome.verdict;
+    return {
+      ...outcome.gate,
+      verdict: { ...outcome.gate.verdict, pass: tag === "PASS", outcome: tag === "PASS" ? "pass" : tag === "FAIL" ? "fail" : "unverifiable" },
+    };
+  }
+  /**
+   * A deterministic, non-retryable result for a held entry whose outcome is not a gate verdict (QA-DF1-16): the held gate's
+   * none/deferred/skipped/error outcomes (verification not required, a read-only skip, a deferral, a gate failure), a restart
+   * that lost the verification data (`finishRestored`), and a verdict the adapter posted itself (`settleHeldDirect`: only its
+   * tag and reason cross the finish API). A gate verdict settles with the gate's own verdict (see `heldSettlementOf`).
+   */
+  function heldVerification(verdict: "PASS" | "FAIL" | "UNVERIFIABLE", reasons: string[]): HeldSettlement {
+    return {
+      verdict: {
+        pass: verdict === "PASS",
+        outcome: verdict === "PASS" ? "pass" : verdict === "FAIL" ? "fail" : "unverifiable",
+        method: "deterministic",
+        reasons,
+        caveats: [],
+      },
+      retryable: false,
+    };
+  }
+  /** QA-2.1-17: the `task` arguments a journaled dispatch stands in for after a restart. */
+  function restoredTaskArgs(restored: RestoredDispatch): Record<string, unknown> {
+    return {
+      ...(restored.prompt === undefined ? {} : { prompt: restored.prompt }),
+      ...(restored.description === undefined ? {} : { description: restored.description }),
+      ...(restored.subagentType === undefined ? {} : { subagent_type: restored.subagentType }),
+      ...(restored.cwd === undefined || restored.cwd === ctx.directory ? {} : { cwd: restored.cwd }),
+    };
+  }
+  /** The verification mode of a dispatch's arguments under the current config (as `verificationFor`). */
+  function verificationModeOfArgs(args: Record<string, unknown>): "none" | "required" | "deferred" {
+    const prompt = typeof args.prompt === "string" ? args.prompt : undefined;
+    const description = typeof args.description === "string" ? args.description : undefined;
+    let mode = "off";
+    try {
+      mode = resolveEnforcementMode({ config: cfg, env: process.env }).mode;
+    } catch (error) {
+      logger.warn("[router] the enforcement mode could not be read; verification off", { error: describeError(error) });
+    }
+    if (!shouldVerifyTask("task", mode, cfg.enforcement?.verify?.require)) return "none";
+    const dod = buildDelegationDoD({ prompt, description });
+    return isDeferred(dod, directivesFor(dispatchDirectiveText(prompt, description)), false) ? "deferred" : "required";
+  }
+  /** A held verdict posted straight through the sink (no claimable pending entry carries the hold). Never rejects. */
+  function postHeldDirect(handle: string, verdict: "PASS" | "FAIL" | "UNVERIFIABLE", text: string, reason: string | undefined): Promise<void> {
+    if (heldSink === undefined) return Promise.resolve();
+    heldTexts.delete(handle);
+    return heldSink.verdict(handle, { verdict, text, ...(reason !== undefined ? { reason } : {}) }).catch((error: unknown) => {
+      logger.warn("[router] held verdict not posted", { handle, error: describeError(error) });
+    });
+  }
+  /**
+   * The held gate: the same required gate the foreground path runs. `finish` does not await it; QA-2.1-21: it is tracked
+   * (with its verdict post) for `idle` and `dispose`. Its verdict is posted through pending.onVerdict, or straight through
+   * the sink when no claimable entry carries the hold. `preClaim`: the entry is already claimed (a restored hold).
+   */
+  function runHeldGate(
+    fin: FinishInput,
+    handle: string,
+    callInput: { tool: string; sessionID: string; callID: string; args: Record<string, unknown> },
+    scratch: HeldScratch,
+    extra: {
+      delta?: DispatchDelta; dod?: ReturnType<typeof buildDelegationDoD>; workRoot?: string; unattributedWriters?: readonly string[];
+      restoredHead?: DispatchHeadState; noDefer?: true;
+    } | undefined,
+    preClaim: HeldClaim | undefined,
+  ): void {
+    const settleHeld = (outcome: FinishOutcome): Promise<void> | undefined => {
+      // QA-SYNC1-14: the held finish settled; its call's arguments and routed-role copy are no longer needed.
+      forgetTaskArgs(fin.callID);
+      const claim = preClaim ?? pending.markVerifying(fin.parentSessionID, handle);
+      // QA-2.1-1: only a gate verdict is a verdict; none/deferred/skipped/error post UNVERIFIABLE with their reason.
+      const held = heldOutcomeOf(outcome);
+      const text = held.line === undefined ? scratch.output : `${scratch.output.trimEnd()}\n\n${held.line}`;
+      const reason = held.reasons[0];
+      if (claim.kind !== "claimed") return postHeldDirect(handle, held.verdict, text, reason);
+      rememberHeldText(handle, fin.parentSessionID, text, { verdict: held.verdict, ...(reason !== undefined ? { reason } : {}) });
+      // QA-DF1-16: a gate verdict settles as the gate reached it (method, outcome, reasons, caveats, notes).
+      observeV2(isV2Host ? ctx.routerObservations : undefined, () => ({ family: "completion-effect", effect: "verification-settle", source: "held-gate", handle,
+        parentSessionID: fin.parentSessionID, callID: fin.callID, childSessionID: fin.childSessionID }));
+      claim.settle(heldSettlementOf(outcome, held));
+      // onVerdict posts only for an entry that carries its hold.
+      return claim.entry.hold === undefined ? postHeldDirect(handle, held.verdict, text, reason) : undefined;
+    };
+    // DF-1-3: the held gate's grader launches from the orchestrator's retained context too (C14 launcher A).
+    observeV2(isV2Host ? ctx.routerObservations : undefined, () => ({ family: "completion-effect", effect: "verification-enqueue", source: "held-gate", handle,
+      parentSessionID: fin.parentSessionID, callID: fin.callID, childSessionID: fin.childSessionID }));
+    trackHeldGate(finishDispatch(callInput, scratch, undefined, { ...extra, graderParentSessionID: fin.parentSessionID }).then(settleHeld, (error: unknown) => {
+      logger.warn("[router] held verification failed", { handle, error: describeError(error) });
+      return settleHeld({ kind: "error", reason: `verification unavailable: ${scrubText(String(error))}` });
+    }));
+  }
+  /**
+   * QA-2.1-17: a finish after a restart. A verdict reached before it (the restored entry's `state` record) is posted again,
+   * never recomputed; a restored held entry re-runs the gate on its persisted DoD and changed files; anything else that
+   * needs verification ends UNVERIFIABLE "verification data lost in restart" (the live change set and reference are gone).
+   * Undefined: no verification applies, the plain path finishes it.
+   */
+  function finishRestored(fin: FinishInput, args: Record<string, unknown>, scratch: HeldScratch): FinishResult | undefined {
+    const lostLine = `[router] UNVERIFIABLE — ${RESTART_DATA_LOST}`;
+    const lost = (): FinishResult => ({
+      outputText: `${fin.outputText}\n\n${lostLine}`, suffix: `\n\n${lostLine}`,
+      verification: { kind: "required", verdict: "UNVERIFIABLE" }, metadata: {},
+    });
+    const handle = fin.heldHandle;
+    if (handle === undefined) return verificationModeOfArgs(args) === "none" ? undefined : lost();
+    const heldResult: FinishResult = { outputText: fin.outputText, suffix: "", verification: { kind: "held", handle }, metadata: {} };
+    const claim = pending.markVerifying(fin.parentSessionID, handle);
+    if (claim.kind === "settled") {
+      const verdict = heldVerdictKind(claim.result.verdict.outcome, claim.result.verdict.pass);
+      const reason = claim.result.verdict.reasons[0];
+      const line = `[router] ${verdict}${reason === undefined ? "" : ` — ${scrubText(reason)}`}`;
+      trackHeldGate(postHeldDirect(handle, verdict, `${scratch.output.trimEnd()}\n\n${line}`, reason));
+      return heldResult;
+    }
+    if (claim.kind === "joined") {
+      // A router_verify run of this entry is under way; its settle posts the verdict through onVerdict.
+      trackHeldGate(claim.run);
+      return heldResult;
+    }
+    // No restored entry: the child ended after the restart, so its change set was never persisted.
+    if (claim.kind !== "claimed") return lost();
+    const entry = claim.entry;
+    const prompt = typeof args.prompt === "string" ? args.prompt : undefined;
+    const description = typeof args.description === "string" ? args.description : undefined;
+    const dod = entry.dod ?? (prompt === undefined ? undefined : buildDelegationDoD({ prompt, description }));
+    const settleLost = (reason: string): FinishResult => {
+      const text = `${scratch.output.trimEnd()}\n\n[router] UNVERIFIABLE — ${reason}`;
+      rememberHeldText(handle, fin.parentSessionID, text);
+      observeV2(isV2Host ? ctx.routerObservations : undefined, () => ({ family: "completion-effect", effect: "verification-settle", source: "held-lost", handle,
+        parentSessionID: fin.parentSessionID, callID: fin.callID, childSessionID: fin.childSessionID }));
+      claim.settle(heldVerification("UNVERIFIABLE", [reason]));
+      if (entry.hold === undefined) trackHeldGate(postHeldDirect(handle, "UNVERIFIABLE", text, reason));
+      return heldResult;
+    };
+    if (dod === undefined || entry.changedFiles === "unavailable") return settleLost(RESTART_DATA_LOST);
+    // QA-SYNC1-3: the perimeter (I4) and the dispatch-time head the gate checked before the restart are not journaled, so a
+    // re-run gate would PASS with fewer checks: an entry that had a perimeter, or whose head cannot be confirmed, is UNVERIFIABLE.
+    if (entry.perimeterLost === true) return settleLost(PERIMETER_LOST_REASON);
+    if (entry.headLost === true) return settleLost(HEAD_LOST_REASON);
+    changedFileStore.seed(fin.childSessionID, entry.changedFiles.map((file) => ({ path: file.path, status: file.status ?? "modified" })));
+    const gateArgs = typeof args.cwd === "string" || entry.cwd === ctx.directory ? args : { ...args, cwd: entry.cwd };
+    // QA-SYNC1-2: the journaled work root stands in for the routed-role record the restart lost.
+    const workRoot = fin.restored?.workRoot;
+    // QA-SYNC1-13: so does the journaled routed-role snapshot (routedRoleFor reads it until the held finish settles): the gate
+    // places the checks in the role's root and applies the carried-resume and lineage rules, never the tier `cwd=` refusal.
+    const routedSnapshot = fin.restored?.routed;
+    if (routedSnapshot !== undefined && routedRoleFor(fin.callID) === undefined) routedRoleByCall.set(fin.callID, routedSnapshot);
+    const writers = entry.unattributedWriters;
+    const restoredHead = entry.dispatchHead;
+    runHeldGate(fin, handle, { tool: "task", sessionID: fin.parentSessionID, callID: fin.callID, args: gateArgs }, scratch, {
+      dod, ...(workRoot === undefined ? {} : { workRoot }), ...(writers === undefined ? {} : { unattributedWriters: writers }),
+      ...(restoredHead === undefined ? {} : { restoredHead }),
+      // QA-SYNC1-3: a held entry settles in place: without a dispatch record a re-deferral would register an unattributed
+      // change set (risk high) and post "deferred" instead of the held verdict, which no live held gate does.
+      noDefer: true,
+    }, claim);
+    return heldResult;
+  }
+  const finishApi: FinishApi = {
+    journal: sharedJournal,
+    // QA-2.1-7: the change-set store keys a dispatch by `task:<parent>:<callID>` (finishDispatch), never by the bare call id.
+    // The background path passes the key (it knows the parent); the foreground path maps the parent through `taskParentByCall`.
+    captureDelta: async (callID, childSessionID, dispatchID) => {
+      if (dispatchID !== undefined) return changedFileStore.captureDelta(callID, childSessionID, dispatchID);
+      const parent = taskParentByCall.get(callID);
+      return changedFileStore.captureDelta(callID, childSessionID, parent === undefined ? undefined : `task:${parent}:${callID}`);
+    },
+    async reload() {
+      if (pendingFile === undefined) return;
+      const folded = foldDormantRecords(await pendingFile.load(), { now: Date.now(), ttlMs: pendingJournalTtlMs });
+      dormantSessions = folded.sessions;
+      for (const key of folded.processed) processedKeys.add(key);
+    },
+    adopt(sessionID): AdoptedRecords | AdoptionRefused | undefined {
+      const session = dormantSessions.get(sessionID);
+      if (session === undefined || pendingClaimsDir === undefined) return undefined;
+      // QA-2.1-19: a session another live instance (pid, token) claimed is not adopted, and its dormant records stay: they
+      // are that instance's running dispatches, or they wait for a later adoption once its claim is gone.
+      // QA-2.1-34: told apart from "nothing to adopt", so the adapter tries again at a later sighting.
+      if (!claimSessionOnce(sessionID)) return ADOPTION_REFUSED;
+      dormantSessions.delete(sessionID);
+      return { holds: session.holds, inflight: session.inflight };
+    },
+    verificationFor(callID) {
+      const args = taskArgsByCall.get(callID);
+      if (args === undefined) return undefined;
+      const prompt = typeof args.prompt === "string" ? args.prompt : undefined;
+      const description = typeof args.description === "string" ? args.description : undefined;
+      const dod = buildDelegationDoD({ prompt, description });
+      const acceptance = {
+        testsPass: dod.checks.some(c => c.kind === "testsPass"),
+        buildPasses: dod.checks.some(c => c.kind === "buildPasses"),
+      };
+      let mode = "off";
+      try {
+        mode = resolveEnforcementMode({ config: cfg, env: process.env }).mode;
+      } catch {
+        mode = "off";
+      }
+      if (!shouldVerifyTask("task", mode, cfg.enforcement?.verify?.require)) return { mode: "none", acceptance };
+      // QA-SYNC1-6: a dispatch finishDispatch verifies at once (a refused placement or cwd, the tier per-check `cwd=` refusal)
+      // is never classified deferred, so it is held like any other required verification.
+      if (verifiedAtOnce(callID, args, dod)) return { mode: "required", acceptance };
+      const directives = directivesFor(dispatchDirectiveText(prompt, description));
+      return { mode: isDeferred(dod, directives, false) ? "deferred" : "required", acceptance };
+    },
+    canHold(parentSessionID) {
+      return pending.hasSlot(parentSessionID);
+    },
+    reserveHeld(parentSessionID, callID) {
+      // QA-SYNC1-14: a held call keeps its arguments and routed copy until its finish settles.
+      if (taskArgsByCall.has(callID)) backgroundCalls.add(callID);
+      return pending.reserveHandle(parentSessionID);
+    },
+    // QA-2.1-14: a held dispatch that ends without a registered entry (failed, interrupted, ack failed) frees its slot at once.
+    releaseHeld(handle) {
+      pending.releaseHandle(handle);
+    },
+    async recreateJournal(records) {
+      if (pendingFile === undefined) return;
+      // QA-2.1-16: every record a later restore needs: the live pending entries, the sessions not adopted yet, and the
+      // adapter's live attempts and holds. `recreate` resets the vanished state once the file is back.
+      // QA-2.1-33: `recreate` adds the snapshot of every other instance of this process on the same journal
+      // (`journalSnapshot`, registered below), so their records survive this instance's rewrite.
+      await pendingFile.recreate([...journalSnapshot(), ...records]);
+    },
+    setAdapterSnapshot(provider) {
+      adapterSnapshot = provider;
+    },
+    idle: () => heldGatesIdle(),
+    settleHeldDirect(parentSessionID, handle, v) {
+      const claim = pending.markVerifying(parentSessionID, handle);
+      if (claim.kind !== "claimed") return;
+      // QA-2.1-31: the verdict already reached the parent; settling must not post it a second time (onVerdict is synchronous).
+      directlySettled.add(handle);
+      try {
+        observeV2(isV2Host ? ctx.routerObservations : undefined, () => ({ family: "completion-effect", effect: "verification-settle", source: "held-direct", handle,
+          ...completionIdentity(parentSessionID, claim.entry.dispatchID, claim.entry.producerSessionID) }));
+        claim.settle(heldVerification(v.verdict, v.reason === undefined ? [] : [scrubText(v.reason)]));
+      } finally {
+        directlySettled.delete(handle);
+      }
+    },
+    dispatchOf(callID) {
+      const args = taskArgsByCall.get(callID);
+      if (args === undefined) return undefined;
+      // QA-SYNC1-14: the adapter reads the dispatch of an acknowledged background attempt; it keeps its arguments until its finish.
+      backgroundCalls.add(callID);
+      const text = (value: unknown): string | undefined => (typeof value === "string" ? value : undefined);
+      const prompt = text(args.prompt);
+      const description = text(args.description);
+      const subagentType = text(args.subagent_type);
+      let workRoot: string | undefined;
+      try {
+        workRoot = verificationScopeOf(callID, args, buildDelegationDoD({ prompt, description })).workRoot;
+      } catch (error) {
+        logger.warn("[router] the work root of a dispatch could not be read", { callID, error: describeError(error) });
+      }
+      // QA-SYNC1-13: the routed-role facts the gate reads, journaled so a restored held gate verifies it as a role dispatch.
+      const routedRole = routedRoleFor(callID);
+      const routed: RoutedRoleSnapshot | undefined = routedRole === undefined ? undefined : {
+        verifyRoot: routedRole.verifyRoot, parentSessionID: routedRole.parentSessionID, resumeID: routedRole.resumeID,
+        ...(routedRole.carried === true ? { carried: true as const } : {}),
+        ...(routedRole.gated === true ? { gated: true as const } : {}),
+      };
+      return {
+        ...(prompt === undefined ? {} : { prompt }),
+        ...(description === undefined ? {} : { description }),
+        ...(subagentType === undefined ? {} : { subagentType }),
+        cwd: text(args.cwd) ?? ctx.directory,
+        ...(workRoot === undefined ? {} : { workRoot }),
+        ...(routed === undefined ? {} : { routed }),
+      };
+    },
+    async finish(fin: FinishInput): Promise<FinishResult> {
+      // QA-2.1-17: after a restart the in-memory call arguments are gone; the journaled dispatch stands in for them.
+      const args: Record<string, unknown> = taskArgsByCall.get(fin.callID) ?? (fin.restored === undefined ? {} : restoredTaskArgs(fin.restored));
+      const callInput = { tool: "task", sessionID: fin.parentSessionID, callID: fin.callID, args };
+      const delta = fin.delta as DispatchDelta | undefined;
+      const scratch = { output: taskOutputText(fin.childSessionID, fin.outputText), title: "", metadata: { sessionId: fin.childSessionID } as Record<string, unknown> };
+      const base = scratch.output.trimEnd();
+      const suffixOf = (): string => (scratch.output.startsWith(base) ? scratch.output.slice(base.length) : "");
+      if (fin.status !== "succeeded") {
+        // QA-2.1-5: a failed, interrupted or unknown child produced no result to verify; the gate never runs on it. The
+        // change-set records of the dispatch are dropped here, as finishDispatch would have.
+        changedFileStore.clear(`task:${fin.parentSessionID}:${fin.callID}`);
+        changedFileStore.clear(fin.childSessionID);
+        forgetTaskArgs(fin.callID);
+        return { outputText: fin.outputText, suffix: "", verification: { kind: "none" }, metadata: {} };
+      }
+      if (fin.restored !== undefined) {
+        const restored = finishRestored(fin, args, scratch);
+        if (restored !== undefined) return restored;
+      }
+      if (fin.heldHandle !== undefined) {
+        const handle = fin.heldHandle;
+        const dod = buildDelegationDoD({
+          prompt: typeof args.prompt === "string" ? args.prompt : undefined,
+          description: typeof args.description === "string" ? args.description : undefined,
+        });
+        // QA-SYNC1-3: what the held gate checks that a restart loses (the perimeter, the dispatch-time head) is journaled as a
+        // fact, and the unattributed writers as they are, so a restored entry is never re-gated with fewer checks.
+        const dispatchKey = `task:${fin.parentSessionID}:${fin.callID}`;
+        const writers = changedFileStore.unattributedWritersOf(dispatchKey, fin.childSessionID);
+        const headRead = changedFileStore.baselineHead(dispatchKey);
+        const startHead = headRead === undefined ? undefined
+          : await withTimeout(headRead, HELD_HEAD_READ_MS, "dispatch head").catch(() => undefined);
+        // The head the gate compares the tree with (as prepareVerification: the head read, else the dispatch snapshot's head and
+        // branch) is journaled as plain data, so the gate re-run after a restart runs the same branch check. A head reader whose
+        // read gave nothing (the gate fails closed on it too) is journaled as the fact alone (`hadHead`, restored as headLost).
+        const baseline = changedFileStore.baselineSnapshot(dispatchKey);
+        const dispatchHead: DispatchHeadState | undefined = startHead !== undefined && startHead !== "none"
+          ? { root: startHead.root, head: startHead.head, branch: startHead.branch, ...(startHead.reflog !== undefined ? { reflog: startHead.reflog } : {}) }
+          : startHead === undefined && baseline !== undefined && baseline.branch !== undefined && typeof baseline.head === "string" && baseline.head !== ""
+            ? { root: baseline.root ?? baseline.cwd, head: baseline.head, branch: baseline.branch }
+            : undefined;
+        const heldHead = dispatchHead === undefined && startHead === undefined && headRead !== undefined;
+        observeV2(isV2Host ? ctx.routerObservations : undefined, () => ({ family: "completion-effect", effect: "deferred-register", source: "held-register", handle,
+          parentSessionID: fin.parentSessionID, callID: fin.callID, childSessionID: fin.childSessionID }));
+        const reg = pending.register({
+          orchestratorSessionID: fin.parentSessionID,
+          dispatchID: fin.callID,
+          producerSessionID: fin.childSessionID,
+          producerTier: typeof args.subagent_type === "string" ? args.subagent_type : "",
+          description: typeof args.description === "string" ? args.description : "",
+          cwd: typeof args.cwd === "string" ? args.cwd : ctx.directory,
+          root: undefined,
+          dispatchedAt: fin.endedAt,
+          dod,
+          reference: Promise.resolve({ kind: "none", reason: "held dispatch: the required gate captures its own reference" }),
+          changedFiles: delta === undefined || delta.files === "unavailable" ? "unavailable" : delta.files.map(f => ({ path: f.path, status: f.status })),
+          risk: unattributedRisk(),
+          handle,
+          hold: { childSessionID: fin.childSessionID, callID: fin.callID },
+          ...(writers.length > 0 ? { unattributedWriters: writers } : {}),
+          ...(changedFileStore.perimeterOf(dispatchKey) !== undefined ? { heldPerimeter: true as const } : {}),
+          ...(heldHead ? { heldHead: true as const } : {}),
+          ...(dispatchHead !== undefined ? { dispatchHead } : {}),
+        });
+        if (!reg.ok) logger.warn("[router] held dispatch not registered", { code: reg.code, detail: reg.detail });
+        runHeldGate(fin, handle, callInput, scratch, delta === undefined ? undefined : { delta }, undefined);
+        return { outputText: fin.outputText, suffix: "", verification: { kind: "held", handle }, metadata: {} };
+      }
+      // DF-1-3: a background completion has no tool context of the orchestrator; its grader launches from the retained context of
+      // the parent (C14 launcher A), never from whatever context is current (a role child's denies `subagent`).
+      const restoredWorkRoot = taskArgsByCall.has(fin.callID) ? undefined : fin.restored?.workRoot;
+      const outcome = await finishDispatch(callInput, scratch, undefined, {
+        ...(delta === undefined ? {} : { delta }), graderParentSessionID: fin.parentSessionID,
+        ...(restoredWorkRoot === undefined ? {} : { workRoot: restoredWorkRoot }),
+      });
+      const suffix = suffixOf();
+      const verification: FinishResult["verification"] =
+        outcome.kind === "deferred" ? { kind: "deferred", handle: outcome.handle }
+          : outcome.kind === "required" ? { kind: "required", verdict: outcome.verdict }
+            : { kind: "none" };
+      forgetTaskArgs(fin.callID);
+      return { outputText: fin.outputText + suffix, suffix, verification, metadata: {} };
+    },
+  };
+  const attachFinish: FinishAttach = ({ held, leaseGate }) => {
+    heldSink = held;
+    leaseGateRef = leaseGate;
+    return finishApi;
+  };
+
+  if (isV2Host) {
+    // Phase 1.2 (v2 only): non-enumerable, so spreading or enumerating the hooks never sees it.
+    Object.defineProperty(routerHooks, ROUTER_TURN_STATE_ATTACH, { value: attachTurnState, enumerable: false });
+    // Phase 2.1.4.a (v2 only): the finish API the v2 adapter attaches to; absent on v1.
+    Object.defineProperty(routerHooks, ROUTER_FINISH_ATTACH, { value: attachFinish, enumerable: false });
+  }
+  return routerHooks;
 };
 
 export default ModelRouterPlugin;

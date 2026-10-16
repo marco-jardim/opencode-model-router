@@ -734,7 +734,8 @@ describe("QA-2 F-1: a workspaces segment is prepared once, and an impossible one
     expect(await workspaceDirs(app, pattern, 64)).toEqual([]);
     expect(performance.now() - started).toBeLessThan(500);
     expect((await workspaceListing(app, "p/a*", 64, SITE_PACKAGES_ENTRIES_MAX)).listed).toBe(entries);
-  });
+    // No spawn and no wait: creating 2000 files (untimed setup) on a Windows runner's slow, scanned disk exceeds the 5 s default.
+  }, 30_000);
 
   it("prepares a segment of at most WORKSPACE_SEGMENT_LITERALS_MAX literals; the one-shot matcher keeps its semantics", () => {
     expect(WORKSPACE_SEGMENT_LITERALS_MAX).toBe(255);

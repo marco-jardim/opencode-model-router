@@ -1232,6 +1232,26 @@ With `routing.delegation: "roles"` the orchestrator stops picking tiers: it disp
 
 Put `{ "routing": { "delegation": "roles" } }` in the global override file and **restart OpenCode** (roles mode is decided at plugin start); restore the previous file and restart to go back. OpenCode v1 keeps the tier model. Guide: [`docs/ROLES.md`](docs/ROLES.md); decision record: [`docs/adr/0006-role-tier-assurance-delegation.md`](docs/adr/0006-role-tier-assurance-delegation.md).
 
+## Executing plans
+
+On **OpenCode v2 in roles mode selected at start**, `/plan run <path>` asks the orchestrator to compile a Markdown plan into a durable task ledger and
+dependency graph through `router_plan`. It shows the task count, critical path, expected makespan and manual tasks.
+With the default `routing.executor.approve: "ask"`, compilation **does not start work**: review the summary, then use
+`/plan approve <planId>` or explicitly approve that plan after seeing its summary. A request to run it is not approval;
+the model never approves on its own. Global `approve: "auto"` is an explicit opt-in.
+
+Ready tasks run in parallel in isolated git worktree slots, are verified there, then integrate serially through checks.
+`/plan status [planId]` shows progress, inbox and metrics; `/plan inbox` lists decisions and `/plan answer <id> <text>`
+answers one. Use `/plan pause <planId>` to stop new launches, `/plan resume <planId>` to continue, and `/plan land <planId>`
+to request fast-forward landing into a clean checkout. The ledger survives a restart; it is not conversation state.
+
+The executor requires roles mode selected at start, enforced leases, a git repository and an available plan-task
+verifier (`enforcement.verify.require` must not be `"never"`). OpenCode v1 registers no executor tool or command.
+`router_plan` and `/plan` are registered only in roles mode at start, like `router_run`; tiers mode registers neither.
+See [the executor guide](docs/EXECUTOR.md) for setup, every command/action/config key, the safety model, Windows notes,
+recovery, troubleshooting, metrics and the owner checklist; [ADR 0007](docs/adr/0007-critical-path-execution.md) records
+the decisions. `/annotate-plan` below only annotates a plan; it does not execute it.
+
 ## TUI status (OpenCode v2)
 
 On OpenCode v2 (2.0.24 or later) the package also ships a TUI entry, `tui.ts`, that shows which model and effort the router's sessions run with:

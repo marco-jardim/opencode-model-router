@@ -403,7 +403,7 @@ describe("depth and effort bump config — overrides and purity", () => {
         const cfg = loadConfig();
         expect(resolveDepthLimit(cfg)).toBe(2);
         expect(resolveEffortBump(cfg)).toEqual({ enabled: false, max: "low" });
-        expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining(`ignoring ${projectPath}`));
+        expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining(`dropped override layer ${projectPath}`));
       });
     } finally {
       warnSpy.mockRestore();

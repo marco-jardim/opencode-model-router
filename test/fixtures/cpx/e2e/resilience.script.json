@@ -1,0 +1,175 @@
+{
+  "schemaVersion": 1,
+  "plan": "resilience.md",
+  "executor": { "maxParallel": 4, "crossPhase": "inferred" },
+  "defaults": {
+    "content": "{\"complete\":true}\n",
+    "completion": "DONE: declared artifact written; local checks pass.",
+    "qa": { "findings": [] }
+  },
+  "tasks": {
+    "1.1.1": { "durationMs": 12000, "writePath": "node-pnpm/artifacts/a.json" },
+    "1.1.2": { "durationMs": 8000, "writePath": "node-pnpm/artifacts/b.json" },
+    "1.1.3": {
+      "durationMs": 10000,
+      "turns": [
+        { "tool": "write", "input": { "path": "node-pnpm/artifacts/b.json", "content": "{\"hiddenOverlap\":true}\n" } },
+        { "tool": "write", "input": { "path": "node-pnpm/artifacts/c.json", "content": "{\"complete\":true}\n" } },
+        { "text": "DONE: hidden write was refused by the lease guard; declared artifact written." }
+      ]
+    },
+    "1.1.4": { "durationMs": 6000, "writePath": "node-pnpm/artifacts/d.json" },
+    "1.1.5": { "durationMs": 4000, "writePath": "node-pnpm/artifacts/e.json" },
+    "1.1.QA": { "durationMs": 3000 },
+    "1.2.1": { "durationMs": 11000, "writePath": "node-npm/artifacts/a.json" },
+    "1.2.2": { "durationMs": 7000, "writePath": "node-npm/artifacts/b.json" },
+    "1.2.3": {
+      "durationMs": 9000,
+      "turns": [
+        { "tool": "write", "input": { "path": "node-npm/artifacts/c.json", "content": "{\"complete\":true}\n" } },
+        { "tool": "write", "input": { "path": "node-npm/src/index.js", "content": "export function total(values) {\n  return Math.max(0, values.reduce((sum, value) => sum + value, 0));\n}\n" } },
+        { "text": "DONE: artifact written; node --test test/index.test.js passes." }
+      ]
+    },
+    "1.2.4": { "durationMs": 5000, "writePath": "node-npm/artifacts/d.json" },
+    "1.2.5": { "durationMs": 4000, "writePath": "node-npm/artifacts/e.json" },
+    "1.2.QA": { "durationMs": 3000 },
+    "2.1.1": { "durationMs": 12000, "writePath": "py-pip/artifacts/a.json" },
+    "2.1.2": { "durationMs": 8000, "writePath": "py-pip/artifacts/b.json", "content": "{\"complete\":true,\"reviewed\":false}\n" },
+    "2.1.3": { "durationMs": 6000, "escalation": "human: confirm the audit marker before writing the third Python artifact." },
+    "2.1.4": { "durationMs": 5000, "writePath": "py-pip/artifacts/d.json" },
+    "2.1.5": { "durationMs": 4000, "writePath": "py-pip/artifacts/e.json" },
+    "2.1.QA": {
+      "durationMs": 3000,
+      "findings": {
+        "findings": [
+          { "id": "review-marker", "severity": "major", "files": ["py-pip/artifacts/b.json"], "problem": "The second artifact has reviewed=false.", "fix": "Set reviewed=true, preserving complete=true." },
+          { "id": "audit-marker", "severity": "major", "files": ["py-pip/artifacts/c.json"], "problem": "The approved third artifact has audited=false.", "fix": "Set audited=true, preserving complete=true." }
+        ]
+      }
+    },
+    "2.2.1": { "durationMs": 10000, "writePath": "node-pnpm/release/a.json" },
+    "2.2.2": { "durationMs": 8000, "writePath": "node-pnpm/release/b.json" },
+    "2.2.3": { "durationMs": 6000, "writePath": "node-pnpm/release/c.json" },
+    "2.2.4": { "durationMs": 5000, "writePath": "node-pnpm/release/d.json" },
+    "2.2.5": { "durationMs": 4000, "writePath": "node-pnpm/release/e.json" },
+    "2.2.QA": { "durationMs": 3000 }
+  },
+  "phaseSuites": {
+    "1.1": [
+      { "cwd": "node-pnpm", "command": "pnpm", "args": ["run", "typecheck"] },
+      { "cwd": "node-pnpm", "command": "pnpm", "args": ["test"] }
+    ],
+    "1.2": [{ "cwd": "node-npm", "command": "npm", "args": ["test"] }],
+    "2.1": [{ "cwd": "py-pip", "command": "python", "args": ["-m", "pytest", "tests"] }],
+    "2.2": [
+      { "cwd": "node-pnpm", "command": "pnpm", "args": ["run", "typecheck"] },
+      { "cwd": "node-pnpm", "command": "pnpm", "args": ["test"] },
+      { "cwd": "node-npm", "command": "npm", "args": ["test"] },
+      { "cwd": "py-pip", "command": "python", "args": ["-m", "pytest", "tests"] }
+    ]
+  },
+  "localChecks": {
+    "1.2": [{ "cwd": "node-npm", "command": "node", "args": ["--test", "test/index.test.js"] }]
+  },
+  "injections": [
+    {
+      "kind": "hidden-overlap",
+      "task": "1.1.3",
+      "holder": "1.1.2",
+      "path": "node-pnpm/artifacts/b.json",
+      "checkpoint": "1.1.2:lease-acquired",
+      "holdUntil": "1.1.3:first-write-refused",
+      "expectedToolResult": "lease-conflict"
+    },
+    {
+      "kind": "phase-only-regression",
+      "task": "1.2.3",
+      "checkpoint": "1.2.3:phase-suite-failed",
+      "expectedLocalExit": 0,
+      "expectedPhaseExit": 1,
+      "recovery": {
+        "durationMs": 4000,
+        "turns": [
+          { "tool": "write", "input": { "path": "node-npm/artifacts/c.json", "content": "{\"complete\":true}\n" } },
+          { "tool": "write", "input": { "path": "node-npm/src/index.js", "content": "export function total(values) {\n  return values.reduce((sum, value) => sum + value, 0);\n}\n" } },
+          { "text": "DONE: restored negative totals; local and phase suites pass." }
+        ]
+      }
+    },
+    {
+      "kind": "human-escalation",
+      "task": "2.1.3",
+      "checkpoint": "2.1.3:waiting-human",
+      "answer": "Confirm the audit marker; retry the task with the scripted approved content.",
+      "independentTask": "2.1.4",
+      "recovery": { "durationMs": 2000, "writePath": "py-pip/artifacts/c.json", "content": "{\"complete\":true,\"audited\":false}\n" }
+    },
+    {
+      "kind": "qa-findings",
+      "task": "2.1.QA",
+      "checkpoint": "2.1.QA:findings-recorded",
+      "fixTasks": ["2.1.FIX1-1", "2.1.FIX1-2"],
+      "reviewTask": "2.1.QA2"
+    },
+    {
+      "kind": "rate-limit",
+      "task": "1.2.2",
+      "checkpoint": "1.2.2:before-first-request",
+      "fault": "rate-limit",
+      "options": { "times": 3, "retryAfterSeconds": 1 },
+      "faultDelayMs": 0
+    },
+    {
+      "kind": "host-restart",
+      "task": "2.1.4",
+      "checkpoint": "2.1.1:integrated-and-2.1.4:running",
+      "resumeCommand": "/plan resume",
+      "baseline": "same-script-without-host-restart",
+      "recovery": { "durationMs": 5000, "writePath": "py-pip/artifacts/d.json" }
+    },
+    { "kind": "ad-hoc-background", "dispatch": "adhoc-background", "checkpoint": "2.2.2:running" },
+    { "kind": "user-backgrounded", "dispatch": "user-backgrounded", "checkpoint": "2.2.2:running" },
+    { "kind": "required-verification", "dispatch": "required-held", "checkpoint": "2.2.2:running", "onlyWhen": ["C4", "C15"], "otherwise": "foreground" }
+  ],
+  "generatedTasks": {
+    "2.1.FIX1-1": { "durationMs": 2000, "writePath": "py-pip/artifacts/b.json", "content": "{\"complete\":true,\"reviewed\":true}\n" },
+    "2.1.FIX1-2": { "durationMs": 2000, "writePath": "py-pip/artifacts/c.json", "content": "{\"complete\":true,\"audited\":true}\n" },
+    "2.1.QA2": { "durationMs": 1000 }
+  },
+  "backgroundDispatches": [
+    {
+      "id": "adhoc-background",
+      "background": true,
+      "verify": "deferred",
+      "prompt": "CPX_E2E_CALL=adhoc-background\nVERIFY:deferred\nWrite the declared artifact offline.\nWrites: `node-npm/background/adhoc.json`\nReads: none.\n[acceptance]\ncheck: testsPass\ncriteria: the artifact contains complete=true\n[/acceptance]\nReturn DONE.",
+      "script": { "durationMs": 6000, "writePath": "node-npm/background/adhoc.json" }
+    },
+    {
+      "id": "user-backgrounded",
+      "background": false,
+      "verify": "required",
+      "userAction": "background-while-running",
+      "prompt": "CPX_E2E_CALL=user-backgrounded\nVERIFY:required\nWrite the declared artifact offline.\nWrites: `node-npm/background/user.json`\nReads: none.\n[acceptance]\ncheck: fileExists path=node-npm/background/user.json\ncriteria: the artifact contains complete=true\n[/acceptance]\nReturn DONE.",
+      "script": { "durationMs": 7000, "writePath": "node-npm/background/user.json" }
+    },
+    {
+      "id": "required-held",
+      "background": true,
+      "verify": "required",
+      "prompt": "CPX_E2E_CALL=required-held\nVERIFY:required\nWrite the declared artifact offline.\nWrites: `node-npm/background/held.json`\nReads: none.\n[acceptance]\ncriteria: node-npm/background/held.json contains complete=true\n[/acceptance]\nReturn DONE.",
+      "script": { "durationMs": 8000, "writePath": "node-npm/background/held.json" },
+      "holdVerdictUntil": "context-and-compaction-placeholder-observed"
+    }
+  ],
+  "tailAssertions": [
+    "hidden-overlap-has-no-compiler-edge", "hidden-write-refused-by-lease", "leased-file-unchanged",
+    "local-check-pass-phase-suite-fail", "integration-head-always-green", "corrective-attempt-passes",
+    "human-queue-item-once", "independent-progress-during-human-wait", "human-approved-retry-completes",
+    "two-qa-findings", "two-generated-fixes", "one-clean-re-review", "three-429s-replies-not-consumed", "rate-limited-task-completes",
+    "restart-equivalent-to-baseline", "no-duplicate-integration-or-completion-effects", "no-abandoned-leases",
+    "adhoc-not-a-plan-task", "adhoc-tail-annotation-once", "user-backgrounded-verification-at-completion-once",
+    "C4-and-C15-held-through-context-and-compaction", "no-output-before-verdict", "one-verdict-delivery-and-parent-wake", "otherwise-foreground-fallback",
+    "final-suites-and-four-phase-gates-pass", "no-live-leases-or-background-calls"
+  ]
+}

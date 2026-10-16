@@ -8,8 +8,10 @@ import {
   writeFileSync,
 } from "node:fs";
 import { availableParallelism, homedir } from "node:os";
-import { dirname, isAbsolute, join, resolve as resolvePath } from "node:path";
+import { dirname, isAbsolute, join, posix, resolve as resolvePath, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
+import { executorPlatformSupported } from "../executor/platform";
+import { EXECUTOR_LIMITS, type ExecutorConfig, type RunCommandRef } from "../executor/types";
 import { formatRouterLine } from "./build-info";
 import { parseJsonc } from "./jsonc";
 import type { DelegateInstructionsPolicy } from "./instructions";
@@ -315,7 +317,39 @@ export interface AdvisorConfig {
   notify?: boolean;
 }
 
+/** `routing.background.mode`: `auto` (router decides), `model` (the model decides), `off`. OpenCode v2 only. */
+export type BackgroundMode = "auto" | "model" | "off";
+/** `routing.leases.mode`: `enforce` or `off`. OpenCode v2 only. */
+export type LeasesMode = "enforce" | "off";
+/** `routing.leases.run`: how `router_run` treats a leased target. OpenCode v2 only. */
+export type LeasesRunPolicy = "annotate" | "refuse";
+
+export interface BackgroundConfig {
+  mode?: BackgroundMode;
+  /** Predicted duration (ms) from which `auto` runs a dispatch in the background. 0..3600000. */
+  minPredictedMs?: number;
+}
+
+export interface LeasesConfig {
+  mode?: LeasesMode;
+  run?: LeasesRunPolicy;
+}
+
+/**
+ * `routing.executor` (OpenCode v2 only), as written: every field optional. The trusted keys
+ * (`slotsDir`, `integrationChecks`, `phaseSuite`, `provision`, `python`) are global only (D18).
+ */
+export type ExecutorOverrides = Partial<Omit<ExecutorConfig, "circuitBreaker">> & {
+  circuitBreaker?: Partial<ExecutorConfig["circuitBreaker"]>;
+};
+
+export type RoleFloorMode = "strict" | "gated";
+
 export interface RoutingConfig {
+  background?: BackgroundConfig;
+  leases?: LeasesConfig;
+  /** OpenCode v2 only; v1 ignores the block (see configuredV2OnlyKeys). */
+  executor?: ExecutorOverrides;
   engine?: RoutingEngine;
   profile?: RoutingProfile;
   margin?: number;
@@ -329,6 +363,8 @@ export interface RoutingConfig {
   advisor?: AdvisorConfig;
   /** `tiers` (default) or `roles`; global and project layers. Inert on v1. */
   delegation?: DelegationMode;
+  /** Global only. Authority floor policy; default strict. Inert on v1. */
+  roleFloor?: RoleFloorMode;
   /** Global only. `rate` 0..0.2, default 0; `requireDetection` is fixed. Inert on v1. */
   exploration?: Partial<ExplorationConfig>;
   /** Global only. `router_run` allow-list. Inert on v1. */
@@ -519,6 +555,16 @@ function normalizeProjectDir(dir?: string): string {
 export interface ConfigNotice {
   source?: string;
   message: string;
+  /** About a key OpenCode v2 alone reads (QA-4.1-9): a v1 host does not log it, see {@link setConfigNoticeHost}. */
+  v2Only?: boolean;
+}
+
+/** The host whose plugin logs the config notices; `undefined` until index.ts sets it (logs them all). */
+let configNoticeHost: RouterHost | undefined;
+
+/** Set by index.ts at startup: on `v1` the `v2Only` notices are not logged (QA-4.1-9). */
+export function setConfigNoticeHost(host: RouterHost | undefined): void {
+  configNoticeHost = host;
 }
 
 /**
@@ -527,7 +573,8 @@ export interface ConfigNotice {
  * the like. Empty when there are none. `/router` lists them.
  */
 export function getConfigNotices(dir?: string): readonly ConfigNotice[] {
-  return _configCaches.get(normalizeProjectDir(dir))?.notices ?? [];
+  const notices = _configCaches.get(normalizeProjectDir(dir))?.notices ?? [];
+  return configNoticeHost === "v1" ? notices.filter((notice) => notice.v2Only !== true) : notices;
 }
 
 /**
@@ -1773,6 +1820,340 @@ function validateRoles(routing: Record<string, unknown>): Record<string, string[
   return out;
 }
 
+const BACKGROUND_MODES: readonly BackgroundMode[] = ["auto", "model", "off"];
+const LEASES_MODES: readonly LeasesMode[] = ["enforce", "off"];
+const LEASES_RUN_POLICIES: readonly LeasesRunPolicy[] = ["annotate", "refuse"];
+const BACKGROUND_MIN_PREDICTED_MAX_MS = 3_600_000;
+
+interface TolerantBlock<T> {
+  readonly value: T | undefined;
+  readonly issues: string[];
+}
+
+function showTolerant(value: unknown): string {
+  const text = typeof value === "string" ? JSON.stringify(value) : (JSON.stringify(value) ?? String(value));
+  return text.length <= 60 ? text : `${text.slice(0, 59)}…`;
+}
+
+/** One tolerant enum key: an invalid value yields an issue and no value (the default applies). */
+function tolerantEnum<T extends string>(
+  block: Record<string, unknown>,
+  key: string,
+  path: string,
+  allowed: readonly T[],
+  fallback: T,
+  issues: string[],
+): T | undefined {
+  const raw = block[key];
+  if (raw === undefined) return undefined;
+  const hit = pickEnum(allowed, raw);
+  if (hit !== undefined) return hit;
+  issues.push(`${path}.${key} must be ${allowed.join("|")} (got ${showTolerant(raw)}); using ${fallback}`);
+  return undefined;
+}
+
+/**
+ * `routing.background` (OpenCode v2 only). Tolerant like the roles keys: an invalid
+ * entry never throws, it is reported in `issues` and the default applies.
+ */
+function sanitizeBackground(value: unknown): TolerantBlock<BackgroundConfig> {
+  const issues: string[] = [];
+  if (value === undefined) return { value: undefined, issues };
+  if (!isPlainObject(value)) {
+    issues.push(`routing.background must be an object (got ${showTolerant(value)}); ignored`);
+    return { value: undefined, issues };
+  }
+  const out: BackgroundConfig = {};
+  const mode = tolerantEnum(value, "mode", "routing.background", BACKGROUND_MODES, ROUTING_DEFAULTS.background.mode, issues);
+  if (mode !== undefined) out.mode = mode;
+  const ms = value.minPredictedMs;
+  if (ms !== undefined) {
+    if (typeof ms === "number" && Number.isInteger(ms) && ms >= 0 && ms <= BACKGROUND_MIN_PREDICTED_MAX_MS) {
+      out.minPredictedMs = ms;
+    } else {
+      issues.push(
+        `routing.background.minPredictedMs must be an integer from 0 to ${BACKGROUND_MIN_PREDICTED_MAX_MS} (got ${showTolerant(ms)}); using ${ROUTING_DEFAULTS.background.minPredictedMs}`,
+      );
+    }
+  }
+  return { value: out, issues };
+}
+
+/** `routing.roleFloor` (v2 roles only): an invalid value fails closed to strict, with an issue. */
+export function sanitizeRoleFloor(value: unknown): TolerantBlock<RoleFloorMode> {
+  const issues: string[] = [];
+  const mode = tolerantEnum({ roleFloor: value }, "roleFloor", "routing", ["strict", "gated"] as const, "strict", issues);
+  return { value: mode ?? (value === undefined ? undefined : "strict"), issues };
+}
+
+/** `routing.leases` (OpenCode v2 only); tolerant, see {@link sanitizeBackground}. */
+function sanitizeLeases(value: unknown): TolerantBlock<LeasesConfig> {
+  const issues: string[] = [];
+  if (value === undefined) return { value: undefined, issues };
+  if (!isPlainObject(value)) {
+    issues.push(`routing.leases must be an object (got ${showTolerant(value)}); ignored`);
+    return { value: undefined, issues };
+  }
+  const out: LeasesConfig = {};
+  const mode = tolerantEnum(value, "mode", "routing.leases", LEASES_MODES, ROUTING_DEFAULTS.leases.mode, issues);
+  if (mode !== undefined) out.mode = mode;
+  const run = tolerantEnum(value, "run", "routing.leases", LEASES_RUN_POLICIES, ROUTING_DEFAULTS.leases.run, issues);
+  if (run !== undefined) out.run = run;
+  return { value: out, issues };
+}
+
+const EXECUTOR_APPROVE_MODES = ["ask", "auto"] as const;
+const EXECUTOR_CROSS_PHASE_MODES = ["gate", "inferred"] as const;
+const EXECUTOR_LAND_MODES = ["ff-when-clean", "manual"] as const;
+const EXECUTOR_INTEGER_KEYS = [
+  "maxParallel",
+  "batchMax",
+  "maxAttempts",
+  "qaMaxRounds",
+  "sharedContextChars",
+  "capacityCooldownMs",
+  "capacityPauseMs",
+  "wakeDebounceMs",
+] as const;
+const EXECUTOR_BREAKER_INTEGER_KEYS = ["minAttempts", "consecutiveFailures"] as const;
+const UNSAFE_OBJECT_KEYS: readonly string[] = ["__proto__", "constructor", "prototype"];
+
+/** An inclusive-range number key; an invalid value yields an issue and no value (the default applies). */
+function tolerantRange(
+  block: Record<string, unknown>,
+  key: string,
+  path: string,
+  range: readonly [number, number],
+  fallback: number,
+  integer: boolean,
+  issues: string[],
+): number | undefined {
+  const raw = block[key];
+  if (raw === undefined) return undefined;
+  if (typeof raw === "number" && Number.isFinite(raw) && (!integer || Number.isInteger(raw)) && raw >= range[0] && raw <= range[1]) {
+    return raw;
+  }
+  issues.push(
+    `${path}.${key} must be ${integer ? "an integer" : "a number"} from ${range[0]} to ${range[1]} (got ${showTolerant(raw)}); using ${fallback}`,
+  );
+  return undefined;
+}
+
+/**
+ * Repo-independent rules for `routing.executor.slotsDir`: an absolute drive path (`C:\…`), not a
+ * drive root, not UNC / device, and free of `*`. Returns the problem, or `undefined` when valid.
+ * The repository-relative rules are {@link validateSlotsDir}.
+ */
+export function slotsDirProblem(value: string): string | undefined {
+  if (value.includes("*")) return "must not contain '*'";
+  if (/^[\\/]{2}/.test(value)) return "must not be a UNC or device path";
+  if (!/^[A-Za-z]:[\\/]/.test(value)) return "must be an absolute path on a drive (like C:\\.omr-slots)";
+  if (/^[A-Za-z]:[\\/]*$/.test(win32.normalize(value))) return "must not be a drive root";
+  // QA-4.1-4: Win32 strips a trailing dot or space from a segment and expands an 8.3 short name,
+  // so such a spelling can name another directory than the one the repository rules compared.
+  const segments = value.slice(2).split(/[\\/]+/).filter((s) => s !== "");
+  if (segments.some((s) => s.endsWith(".") || s.endsWith(" "))) return "must not have a path segment ending in '.' or a space";
+  if (segments.some((s) => /~[0-9]+(\.[^.]*)?$/.test(s))) return "must not use an 8.3 short name (a '~N' segment)";
+  return undefined;
+}
+
+/**
+ * Resolve links of the longest existing prefix of `p`; the missing tail is appended unchanged.
+ * `realpathSync.native` (QA-4.1-4): on win32 it also resolves junctions and 8.3 short names.
+ */
+function realpathOfExistingPrefix(p: string): string {
+  const tail: string[] = [];
+  let current = p;
+  for (;;) {
+    try {
+      return tail.length === 0 ? realpathSync.native(current) : join(realpathSync.native(current), ...tail.reverse());
+    } catch {
+      const parent = dirname(current);
+      if (parent === current) return p;
+      tail.push(current.slice(parent.length).replace(/^[\\/]+/, ""));
+      current = parent;
+    }
+  }
+}
+
+export type SlotsDirCheck = { readonly ok: true } | { readonly ok: false; readonly reason: string };
+
+/**
+ * The repository-relative rules for `routing.executor.slotsDir` (D18), for approval, where the
+ * repository is known (the approve-time call comes with the release that registers the executor,
+ * Phase 5.1): `slotsDir` must pass {@link slotsDirProblem}, sit on the repository's drive, and be
+ * neither inside nor an ancestor of `toplevel` (the repository's top-level directory). Native
+ * realpaths (junctions, 8.3 names resolved) are compared, case-insensitively on win32.
+ */
+export function validateSlotsDir(slotsDir: string, toplevel: string): SlotsDirCheck {
+  const base = slotsDirProblem(slotsDir);
+  if (base !== undefined) return { ok: false, reason: base };
+  const fold = (p: string): string => (process.platform === "win32" ? p.toLowerCase() : p);
+  const pathApi = process.platform === "win32" ? win32 : posix;
+  const slots = fold(pathApi.resolve(realpathOfExistingPrefix(slotsDir)));
+  const repo = fold(pathApi.resolve(realpathOfExistingPrefix(toplevel)));
+  if (fold(pathApi.parse(slots).root) !== fold(pathApi.parse(repo).root)) {
+    return { ok: false, reason: "must be on the repository's drive" };
+  }
+  const within = (outer: string, inner: string): boolean => {
+    const rel = pathApi.relative(outer, inner);
+    return rel === "" || !(rel === ".." || rel.startsWith(`..${pathApi.sep}`) || pathApi.isAbsolute(rel));
+  };
+  if (within(repo, slots)) return { ok: false, reason: "must not be inside the repository" };
+  if (within(slots, repo)) return { ok: false, reason: "must not be an ancestor of the repository" };
+  return { ok: true };
+}
+
+/** A `[{script, args}]` list (a `router_run`-style reference); `undefined` when any entry is malformed. */
+function parseRunRefs(value: unknown): RunCommandRef[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const out: RunCommandRef[] = [];
+  for (const entry of value as unknown[]) {
+    if (!isPlainObject(entry) || typeof entry.script !== "string" || entry.script.trim() === "") return undefined;
+    const args = entry.args === undefined ? [] : entry.args;
+    if (!Array.isArray(args) || !(args as unknown[]).every((a) => typeof a === "string")) return undefined;
+    out.push({ script: entry.script, args: [...(args as string[])] });
+  }
+  return out;
+}
+
+/** `{ <manager>: string[][] }` (argv arrays); `undefined` when malformed. */
+function parseProvision(value: unknown): Record<string, string[][]> | undefined {
+  if (!isPlainObject(value)) return undefined;
+  const out: Record<string, string[][]> = {};
+  for (const [manager, argvs] of Object.entries(value)) {
+    if (manager === "" || UNSAFE_OBJECT_KEYS.includes(manager) || !Array.isArray(argvs)) return undefined;
+    const list: string[][] = [];
+    for (const argv of argvs as unknown[]) {
+      if (!Array.isArray(argv) || argv.length === 0) return undefined;
+      if (!(argv as unknown[]).every((a) => typeof a === "string") || (argv as string[])[0] === "") return undefined;
+      list.push([...(argv as string[])]);
+    }
+    out[manager] = list;
+  }
+  return out;
+}
+
+/**
+ * `routing.executor` (OpenCode v2 only), tolerant like {@link sanitizeBackground}: an invalid entry
+ * never throws, it is reported in `issues` and the default applies. The trusted keys are dropped
+ * from a project layer before this runs (`GLOBAL_ONLY_ROUTING_KEYS`).
+ */
+function sanitizeExecutor(value: unknown): TolerantBlock<ExecutorOverrides> {
+  const issues: string[] = [];
+  if (value === undefined) return { value: undefined, issues };
+  if (!isPlainObject(value)) {
+    issues.push(`routing.executor must be an object (got ${showTolerant(value)}); ignored`);
+    return { value: undefined, issues };
+  }
+  const p = "routing.executor";
+  const d = ROUTING_DEFAULTS.executor;
+  const out: ExecutorOverrides = {};
+
+  for (const key of EXECUTOR_INTEGER_KEYS) {
+    const v = tolerantRange(value, key, p, EXECUTOR_LIMITS[key], d[key], true, issues);
+    if (v !== undefined) out[key] = v;
+  }
+  const approve = tolerantEnum(value, "approve", p, EXECUTOR_APPROVE_MODES, d.approve, issues);
+  if (approve !== undefined) out.approve = approve;
+  const crossPhase = tolerantEnum(value, "crossPhase", p, EXECUTOR_CROSS_PHASE_MODES, d.crossPhase, issues);
+  if (crossPhase !== undefined) out.crossPhase = crossPhase;
+  const land = tolerantEnum(value, "land", p, EXECUTOR_LAND_MODES, d.land, issues);
+  if (land !== undefined) out.land = land;
+
+  const slotsDir = value.slotsDir;
+  if (slotsDir !== undefined) {
+    const problem = slotsDir === null ? undefined : typeof slotsDir !== "string" ? "must be a string or null" : slotsDirProblem(slotsDir);
+    if (problem === undefined) out.slotsDir = slotsDir as string | null;
+    else issues.push(`${p}.slotsDir ${problem} (got ${showTolerant(slotsDir)}); using ${d.slotsDir}`);
+  }
+
+  const checks = value.integrationChecks;
+  if (checks !== undefined) {
+    const refs = checks === "auto" ? "auto" : parseRunRefs(checks);
+    if (refs !== undefined) out.integrationChecks = refs;
+    else issues.push(`${p}.integrationChecks must be "auto" or an array of {script, args} (got ${showTolerant(checks)}); using ${d.integrationChecks}`);
+  }
+  const suite = value.phaseSuite;
+  if (suite !== undefined) {
+    const refs = suite === "auto" || suite === "off" ? suite : parseRunRefs(suite);
+    if (refs !== undefined) out.phaseSuite = refs;
+    else issues.push(`${p}.phaseSuite must be "auto", "off" or an array of {script, args} (got ${showTolerant(suite)}); using ${d.phaseSuite}`);
+  }
+  const provision = value.provision;
+  if (provision !== undefined) {
+    const parsed = provision === "auto" ? "auto" : parseProvision(provision);
+    if (parsed !== undefined) out.provision = parsed;
+    else issues.push(`${p}.provision must be "auto" or an object of argv arrays per manager (got ${showTolerant(provision)}); using ${d.provision}`);
+  }
+  const python = value.python;
+  if (python !== undefined) {
+    if (typeof python === "string" && (python === "auto" || (isAbsolute(python) && !python.includes("\0")))) out.python = python;
+    else issues.push(`${p}.python must be "auto" or an absolute path (got ${showTolerant(python)}); using ${d.python}`);
+  }
+
+  const breaker = value.circuitBreaker;
+  if (breaker !== undefined) {
+    if (!isPlainObject(breaker)) {
+      issues.push(`${p}.circuitBreaker must be an object (got ${showTolerant(breaker)}); ignored`);
+    } else {
+      const bp = `${p}.circuitBreaker`;
+      const b: Partial<ExecutorConfig["circuitBreaker"]> = {};
+      const ratio = tolerantRange(breaker, "failureRatio", bp, EXECUTOR_LIMITS.failureRatio, d.circuitBreaker.failureRatio, false, issues);
+      if (ratio !== undefined) b.failureRatio = ratio;
+      for (const key of EXECUTOR_BREAKER_INTEGER_KEYS) {
+        const v = tolerantRange(breaker, key, bp, EXECUTOR_LIMITS[key], d.circuitBreaker[key], true, issues);
+        if (v !== undefined) b[key] = v;
+      }
+      out.circuitBreaker = b;
+    }
+  }
+  return { value: out, issues };
+}
+
+/**
+ * The v2-only `routing` keys the raw config configures, as dotted paths in a fixed order.
+ * `raw` is the config as written (its `routing` block is read) or the `routing` block
+ * itself. A key counts when it is present and not `undefined`, whether or not its value is
+ * valid. On v1, where they are ignored, `index.ts` logs ONE notice per process that names
+ * every configured key (QA-2.1-32). A `routing.executor` that is not an object is named as
+ * `routing.executor` (QA-4.1-19): v1 does not log its validation issue.
+ */
+export function configuredV2OnlyKeys(raw: unknown): string[] {
+  const routing = isPlainObject(raw) && isPlainObject(raw.routing) ? raw.routing : isPlainObject(raw) ? raw : undefined;
+  if (routing === undefined) return [];
+  const keys: string[] = [];
+  const candidates: ReadonlyArray<readonly [string, readonly string[]]> = [
+    ["background", ["mode", "minPredictedMs"]],
+    ["leases", ["mode", "run"]],
+  ];
+  for (const [block, children] of candidates) {
+    const value = routing[block];
+    if (!isPlainObject(value)) continue;
+    for (const child of children) {
+      if (Object.hasOwn(value, child) && value[child] !== undefined) keys.push(`routing.${block}.${child}`);
+    }
+  }
+  const executor = routing.executor;
+  if (!isPlainObject(executor)) {
+    // QA-4.1-19: an executor that is not an object is named whole; its validation issue is v2-only.
+    if (Object.hasOwn(routing, "executor") && executor !== undefined) keys.push("routing.executor");
+  } else {
+    for (const child of ROUTING_KNOWN_KEYS.executor!) {
+      if (!Object.hasOwn(executor, child) || executor[child] === undefined) continue;
+      const nested = executor[child];
+      if (child === "circuitBreaker" && isPlainObject(nested)) {
+        for (const leaf of ROUTING_KNOWN_KEYS.circuitBreaker!) {
+          if (Object.hasOwn(nested, leaf) && nested[leaf] !== undefined) keys.push(`routing.executor.circuitBreaker.${leaf}`);
+        }
+      } else {
+        keys.push(`routing.executor.${child}`);
+      }
+    }
+  }
+  return keys;
+}
+
 /**
  * Validate `routing` and return a snapshot of the validated values (or
  * `undefined` when absent). Defaults are NOT applied here; see resolveRouting.
@@ -1826,6 +2207,8 @@ function validateRouting(value: unknown): RoutingConfig | undefined {
   // Roles keys (#84): tolerant per entry, never throw (see roles-config.ts).
   const delegation = sanitizeDelegation(routing.delegation).value;
   if (delegation !== undefined) out.delegation = delegation;
+  const roleFloor = sanitizeRoleFloor(routing.roleFloor).value;
+  if (roleFloor !== undefined) out.roleFloor = roleFloor;
   const exploration = sanitizeExploration(routing.exploration).value;
   if (exploration !== undefined) out.exploration = exploration;
   const run = sanitizeRun(routing.run).value;
@@ -1840,6 +2223,14 @@ function validateRouting(value: unknown): RoutingConfig | undefined {
   if (repoExclude !== undefined) out.repoExclude = repoExclude;
   const repoApprovalDays = sanitizeRepoApprovalDays(routing.repoApprovalDays).value;
   if (repoApprovalDays !== undefined) out.repoApprovalDays = repoApprovalDays;
+
+  // Phase 2.1 keys (OpenCode v2 only): tolerant, issues surface as notices.
+  const background = sanitizeBackground(routing.background).value;
+  if (background !== undefined) out.background = background;
+  const leases = sanitizeLeases(routing.leases).value;
+  if (leases !== undefined) out.leases = leases;
+  const executor = sanitizeExecutor(routing.executor).value;
+  if (executor !== undefined) out.executor = executor;
 
   const outcomes = readBlock(routing, "outcomes", "routing");
   if (outcomes !== undefined) {
@@ -2227,10 +2618,18 @@ const GLOBAL_ONLY_ROUTING_KEYS: ReadonlyArray<readonly [block: string, key: stri
   ["classifier", "apiKeyEnv"],
   ["classifier", "presets"],
   ["outcomes", "path"],
+  // D18: the plan executor runs these in the user's checkout and on its drive; a repository
+  // must not choose its own slot directory, check commands, provisioning argv or interpreter.
+  ["executor", "slotsDir"],
+  ["executor", "integrationChecks"],
+  ["executor", "phaseSuite"],
+  ["executor", "provision"],
+  ["executor", "python"],
 ];
 
 /** Roles keys (#84) a project layer must not carry; `routing.delegation` is allowed there. */
 const GLOBAL_ONLY_ROLES_ROUTING_KEYS = [
+  "roleFloor",
   "exploration",
   "run",
   "workRoots",
@@ -2259,12 +2658,24 @@ function stripGlobalOnlyRolesKeys(data: Record<string, unknown>): string[] {
   return dropped;
 }
 
-/** Remove the global-only `routing` keys from a project layer; returns what was dropped. */
+/**
+ * Remove the global-only `routing` keys from a project layer, and a `routing.executor` that is not
+ * a plain object (QA-4.1-2); returns what was dropped.
+ */
 function stripGlobalOnlyRoutingKeys(data: Record<string, unknown>): string[] {
   const routing = data.routing;
   if (!isPlainObject(routing)) return [];
   const dropped: string[] = [];
   const touched = new Set<string>();
+  // QA-4.1-2: an `executor` that is not a plain object (`null`, `[]`, a scalar) would replace the
+  // lower layer's block wholesale in deepMerge, and tolerant validation would then reset every
+  // trusted executor key to its default. The project layer may not do that; the block goes.
+  // QA-4.1-18: `executor` only. A non-object `classifier` or `outcomes` still fails validation,
+  // which drops the project layer (fail closed, the v1 behaviour).
+  if (Object.hasOwn(routing, "executor") && routing.executor !== undefined && !isPlainObject(routing.executor)) {
+    delete routing.executor;
+    dropped.push("routing.executor");
+  }
   for (const [block, key] of GLOBAL_ONLY_ROUTING_KEYS) {
     const target = routing[block];
     if (isPlainObject(target) && Object.hasOwn(target, key)) {
@@ -2302,11 +2713,12 @@ function collectOverrideLayers(
     if (!data) continue;
     if (project) {
       const dropped = stripGlobalOnlyRoutingKeys(data);
-      if (dropped.length > 0) {
-        notices?.push({
-          source: p,
-          message: `ignoring ${dropped.join(", ")} from ${p}: only the global override may set it`,
-        });
+      // QA-4.1-19: the executor keys get their own notice, flagged v2-only (a v1 host ignores the block).
+      const isExecutorKey = (key: string): boolean => key === "routing.executor" || key.startsWith("routing.executor.");
+      for (const [keys, v2Only] of [[dropped.filter((k) => !isExecutorKey(k)), false], [dropped.filter(isExecutorKey), true]] as const) {
+        if (keys.length === 0) continue;
+        const message = `ignoring ${keys.join(", ")} from ${p}: only the global override may set it`;
+        notices?.push(v2Only ? { source: p, message, v2Only } : { source: p, message });
       }
       // #84: a repository may pick `routing.delegation`, but not customise role agents, grant
       // exploration, define `router_run` commands or widen the work roots.
@@ -2335,6 +2747,18 @@ function collectOverrideLayers(
 /** The notices of the build that produced each config object (the cache hands the same object back until a reload). */
 const noticesByConfig = new WeakMap<RouterConfig, readonly ConfigNotice[]>();
 
+/** The merged config as written (before validation) behind each built config object; see {@link configAsWritten}. */
+const rawByConfig = new WeakMap<RouterConfig, unknown>();
+
+/**
+ * The config `cfg` was validated from, as written: tiers.json with the override layers merged
+ * (after the project-layer trust rules), or `cfg` itself when it was not built by loadConfig.
+ * Validation drops an invalid tolerant entry from `cfg`; this still has it (QA-4.1-9).
+ */
+export function configAsWritten(cfg: RouterConfig): unknown {
+  return rawByConfig.has(cfg) ? rawByConfig.get(cfg) : cfg; // not built here (a test's literal): as validated
+}
+
 /** Notice texts already logged in this process (bounded); see {@link warnConfigNotices}. */
 const loggedNoticeTexts = new Set<string>();
 
@@ -2352,6 +2776,7 @@ export function warnConfigNotices(
 ): void {
   if (cfg === undefined) return;
   for (const notice of noticesByConfig.get(cfg) ?? []) {
+    if (configNoticeHost === "v1" && notice.v2Only === true) continue; // QA-4.1-9: the v1 notice names the key instead
     if (loggedNoticeTexts.has(notice.message)) continue;
     if (loggedNoticeTexts.size >= 256) loggedNoticeTexts.clear();
     loggedNoticeTexts.add(notice.message);
@@ -2539,6 +2964,7 @@ const ROUTING_KNOWN_KEYS: Readonly<Record<string, readonly string[]>> = {
     "sessionReuse",
     "advisor",
     "delegation",
+    "roleFloor",
     "exploration",
     "run",
     "workRoots",
@@ -2546,7 +2972,32 @@ const ROUTING_KNOWN_KEYS: Readonly<Record<string, readonly string[]>> = {
     "repoDepth",
     "repoExclude",
     "repoApprovalDays",
+    "background",
+    "leases",
+    "executor",
   ],
+  background: ["mode", "minPredictedMs"],
+  leases: ["mode", "run"],
+  executor: [
+    "maxParallel",
+    "slotsDir",
+    "approve",
+    "crossPhase",
+    "land",
+    "batchMax",
+    "maxAttempts",
+    "qaMaxRounds",
+    "integrationChecks",
+    "phaseSuite",
+    "provision",
+    "python",
+    "sharedContextChars",
+    "capacityCooldownMs",
+    "capacityPauseMs",
+    "wakeDebounceMs",
+    "circuitBreaker",
+  ],
+  circuitBreaker: ["failureRatio", "minAttempts", "consecutiveFailures"],
   detection: ["deterministic", "grader", "none"],
   classifier: ["backend", "model", "baseUrl", "apiKeyEnv", "timeoutMs", "samples", "maxStateChars", "presets"],
   preset: ["backend", "model"],
@@ -2569,9 +3020,16 @@ export function findUnknownRoutingKeys(routing: unknown): string[] {
     }
   };
   check(routing, ROUTING_KNOWN_KEYS.routing!, "routing");
-  for (const block of ["detection", "classifier", "outcomes", "sessionReuse", "advisor"] as const) {
+  for (const block of ["detection", "classifier", "outcomes", "sessionReuse", "advisor", "background", "leases"] as const) {
     const value = routing[block];
     if (isPlainObject(value)) check(value, ROUTING_KNOWN_KEYS[block]!, `routing.${block}`);
+  }
+  const executor = routing.executor;
+  if (isPlainObject(executor)) {
+    check(executor, ROUTING_KNOWN_KEYS.executor!, "routing.executor");
+    if (isPlainObject(executor.circuitBreaker)) {
+      check(executor.circuitBreaker, ROUTING_KNOWN_KEYS.circuitBreaker!, "routing.executor.circuitBreaker");
+    }
   }
   const classifier = routing.classifier;
   const presets = isPlainObject(classifier) ? classifier.presets : undefined;
@@ -2599,10 +3057,37 @@ export const ROUTING_RESERVED_AGENTS = ["build", "plan", "title", "summary", "co
  * validated config.
  */
 export function collectRoutingNotices(rawRouting: unknown, cfg: RouterConfig): string[] {
+  return collectTaggedRoutingNotices(rawRouting, cfg).map((notice) => notice.message);
+}
+
+/** The v2-only `routing` blocks: a v1 host ignores them, and logs one notice naming their keys instead. */
+const V2_ONLY_ROUTING_BLOCKS = ["background", "leases", "executor"] as const;
+
+/**
+ * {@link collectRoutingNotices}, each message tagged `v2Only` when it is about a v2-only block
+ * (QA-4.1-9, QA-4.1-19): its validation issues and its unknown keys, which get their own message.
+ */
+function collectTaggedRoutingNotices(rawRouting: unknown, cfg: RouterConfig): Array<{ message: string; v2Only: boolean }> {
+  const tagged: Array<{ message: string; v2Only: boolean }> = [];
   const messages: string[] = [];
+  const unknownMessage = (keys: readonly string[]): string =>
+    `ignoring unknown routing key${keys.length === 1 ? "" : "s"}: ${keys.join(", ")}`;
+  const inV2OnlyBlock = (key: string): boolean => V2_ONLY_ROUTING_BLOCKS.some((block) => key.startsWith(`routing.${block}.`));
   const unknown = findUnknownRoutingKeys(rawRouting);
-  if (unknown.length > 0) {
-    messages.push(`ignoring unknown routing key${unknown.length === 1 ? "" : "s"}: ${unknown.join(", ")}`);
+  const unknownShared = unknown.filter((key) => !inV2OnlyBlock(key));
+  const unknownV2Only = unknown.filter(inV2OnlyBlock);
+  if (unknownShared.length > 0) tagged.push({ message: unknownMessage(unknownShared), v2Only: false });
+  if (unknownV2Only.length > 0) tagged.push({ message: unknownMessage(unknownV2Only), v2Only: true });
+  if (isPlainObject(rawRouting)) {
+    for (const message of [
+      ...sanitizeRoleFloor(rawRouting.roleFloor).issues,
+      ...sanitizeBackground(rawRouting.background).issues,
+      ...sanitizeLeases(rawRouting.leases).issues,
+      // QA-62C-2: the plan executor is inert off Windows (G-16), so its values are not validated there.
+      ...(executorPlatformSupported() ? sanitizeExecutor(rawRouting.executor).issues : []),
+    ]) {
+      tagged.push({ message, v2Only: true });
+    }
   }
   for (const [taskClass, agents] of Object.entries(cfg.routing?.roles ?? {})) {
     for (const agent of agents) {
@@ -2630,7 +3115,7 @@ export function collectRoutingNotices(rawRouting: unknown, cfg: RouterConfig): s
       );
     }
   }
-  return messages;
+  return [...tagged, ...messages.map((message) => ({ message, v2Only: false }))];
 }
 /**
  * `routing.roles` is replaced wholesale by the highest-priority layer that sets
@@ -2649,10 +3134,113 @@ function replaceRolesWholesale(merged: unknown, layers: readonly OverrideLayer[]
   return merged;
 }
 
-/** Merge an override while keeping project classifier budgets within the lower layers' bounds. */
+/** An inclusive-range number as {@link tolerantRange} accepts it. */
+function inRange(value: unknown, range: readonly [number, number], integer: boolean): value is number {
+  return typeof value === "number" && Number.isFinite(value) && (!integer || Number.isInteger(value))
+    && value >= range[0] && value <= range[1];
+}
+
+/** The tightest value of each `routing.executor` mode key: the only one a project layer may pick (A-4.1-2). */
+const EXECUTOR_TIGHTEST_MODES = [
+  ["approve", EXECUTOR_APPROVE_MODES, "ask"],
+  ["land", EXECUTOR_LAND_MODES, "manual"],
+  ["crossPhase", EXECUTOR_CROSS_PHASE_MODES, "gate"],
+] as const;
+
+/** The `routing.executor` budgets a project layer may only lower (A-4.1-2); the timing keys are not budgets. */
+const EXECUTOR_BUDGET_KEYS = ["maxParallel", "batchMax", "maxAttempts", "qaMaxRounds", "sharedContextChars"] as const;
+
+/**
+ * A-4.1-2 (the A35 precedent of the classifier budgets): a project layer may tighten the plan
+ * executor's approval, landing, cross-phase, budget and circuit-breaker keys, never loosen them.
+ * `merged` is the executor block after deepMerge, `requested` the project layer's block,
+ * `inherited` the lower layers' block. A value counts as what sanitizeExecutor makes of it (an
+ * invalid one is the default); a loosening one is dropped, so the lower-layer value stays, and
+ * reported once per key. Returns a copy: deepMerge can share an override-only block.
+ */
+function boundProjectExecutor(
+  merged: Record<string, unknown>,
+  requested: Record<string, unknown>,
+  inherited: unknown,
+  path: string,
+  notices: ConfigNotice[],
+): Record<string, unknown> {
+  const lower = isPlainObject(inherited) ? inherited : {};
+  const out: Record<string, unknown> = { ...merged };
+  const d = ROUTING_DEFAULTS.executor;
+  const drop = (target: Record<string, unknown>, source: Record<string, unknown>, key: string, name: string): void => {
+    if (Object.hasOwn(source, key) && source[key] !== undefined) target[key] = source[key];
+    else delete target[key];
+    notices.push({
+      source: path,
+      message: `A18: ignoring routing.executor.${name} from ${path}: project overrides may only tighten the lower-layer value (A-4.1-2)`,
+      v2Only: true,
+    });
+  };
+  // Every budget and breaker value is tighter when lower: min(lower layer, project value).
+  const bound = (
+    target: Record<string, unknown>,
+    source: Record<string, unknown>,
+    block: Record<string, unknown>,
+    key: string,
+    name: string,
+    range: readonly [number, number],
+    integer: boolean,
+    fallback: number,
+  ): void => {
+    const value = block[key];
+    if (value === undefined) return;
+    const ceiling = inRange(source[key], range, integer) ? source[key] : fallback;
+    const effective = inRange(value, range, integer) ? value : fallback;
+    if (effective > ceiling) drop(target, source, key, name);
+  };
+
+  for (const key of EXECUTOR_BUDGET_KEYS) bound(out, lower, requested, key, key, EXECUTOR_LIMITS[key], true, d[key]);
+  for (const [key, modes, tightest] of EXECUTOR_TIGHTEST_MODES) {
+    const value = requested[key];
+    if (value === undefined) continue;
+    const valid = (v: unknown): v is string => typeof v === "string" && (modes as readonly string[]).includes(v);
+    const ceiling = valid(lower[key]) ? lower[key] : d[key];
+    const effective = valid(value) ? value : d[key];
+    if (effective !== tightest && effective !== ceiling) drop(out, lower, key, key);
+  }
+
+  const breaker = requested.circuitBreaker;
+  if (breaker !== undefined) {
+    if (!isPlainObject(breaker)) {
+      // sanitizeExecutor would ignore the block, so the defaults would replace the lower values.
+      if (lower.circuitBreaker !== undefined) drop(out, lower, "circuitBreaker", "circuitBreaker");
+    } else {
+      const lowerBreaker = isPlainObject(lower.circuitBreaker) ? lower.circuitBreaker : {};
+      const b: Record<string, unknown> = isPlainObject(out.circuitBreaker) ? { ...out.circuitBreaker } : {};
+      const db = d.circuitBreaker;
+      bound(b, lowerBreaker, breaker, "failureRatio", "circuitBreaker.failureRatio", EXECUTOR_LIMITS.failureRatio, false, db.failureRatio);
+      for (const key of EXECUTOR_BREAKER_INTEGER_KEYS) {
+        bound(b, lowerBreaker, breaker, key, `circuitBreaker.${key}`, EXECUTOR_LIMITS[key], true, db[key]);
+      }
+      out.circuitBreaker = b;
+    }
+  }
+  return out;
+}
+
+/** Merge an override while keeping project classifier budgets and executor keys within the lower layers' bounds. */
 function mergeOverrideLayer(lower: unknown, layer: OverrideLayer, notices: ConfigNotice[]): unknown {
   const merged = deepMerge(lower, layer.data);
   if (!layer.project || !isPlainObject(merged) || !isPlainObject(merged.routing)) return merged;
+  const projectRouting = layer.data.routing;
+  const lowerRouting = isPlainObject(lower) ? lower.routing : undefined;
+  const projectExecutor = isPlainObject(projectRouting) ? projectRouting.executor : undefined;
+  const mergedExecutor = merged.routing.executor;
+  const executorBounded = isPlainObject(mergedExecutor) && isPlainObject(projectExecutor)
+    ? { ...merged, routing: { ...merged.routing, executor: boundProjectExecutor(mergedExecutor, projectExecutor, isPlainObject(lowerRouting) ? lowerRouting.executor : undefined, layer.path, notices) } }
+    : merged;
+  return boundProjectClassifier(executorBounded, lower, layer, notices);
+}
+
+/** Keep the project classifier budgets within the lower layers' bounds (A35); `merged` already holds the project layer. */
+function boundProjectClassifier(merged: Record<string, unknown>, lower: unknown, layer: OverrideLayer, notices: ConfigNotice[]): unknown {
+  if (!isPlainObject(merged.routing)) return merged;
   const classifier = merged.routing.classifier;
   const projectRouting = layer.data.routing;
   const projectClassifier = isPlainObject(projectRouting) ? projectRouting.classifier : undefined;
@@ -2697,21 +3285,27 @@ function buildConfig(
   let rawUsed: unknown = base;
 
   if (layers.length > 0) {
-    const merge = (ls: OverrideLayer[]): unknown =>
+    // The merge notices (A18 clamps) of one attempt; only the attempt whose result is used
+    // reports them, so a fallback merge does not push them twice (QA-4.1-21).
+    const merge = (ls: OverrideLayer[], attemptNotices: ConfigNotice[]): unknown =>
       replaceRolesWholesale(
-        ls.reduce<unknown>((acc, l) => mergeOverrideLayer(acc, l, notices), base),
+        ls.reduce<unknown>((acc, l) => mergeOverrideLayer(acc, l, attemptNotices), base),
         ls,
       );
 
     try {
-      const merged = merge(layers);
+      const attemptNotices: ConfigNotice[] = [];
+      const merged = merge(layers, attemptNotices);
       cfg = validateConfig(merged);
       rawUsed = merged;
+      notices.push(...attemptNotices);
     } catch (err) {
       // A bad override must never brick startup, and one broken file must not
-      // discard a good one. Fall back to the highest-priority layer that
-      // validates on its own (so a broken personal/global file still lets a
-      // shared project file apply), else the bundled defaults.
+      // discard a good one. Fall back to one layer that validates on its own,
+      // else the bundled defaults. QA-4.1-21: the global layer is tried first, so
+      // a project file cannot force a conflict with a value valid on its own and
+      // so drop the user's whole global layer; a broken global file still lets a
+      // project file apply.
       console.warn(
         `[model-router] combined overrides are invalid (${(err as Error).message}); dropping conflicting layer(s)`,
       );
@@ -2720,11 +3314,17 @@ function buildConfig(
         source: layerPaths,
         message: `${layerPaths}: combined overrides are invalid — ${(err as Error).message}`,
       });
-      for (let i = layers.length - 1; i >= 0; i--) {
+      const order = [
+        ...layers.map((_, i) => i).filter((i) => !layers[i]!.project).reverse(),
+        ...layers.map((_, i) => i).filter((i) => layers[i]!.project === true).reverse(),
+      ];
+      for (const i of order) {
         try {
-          const single = merge([layers[i]!]);
+          const attemptNotices: ConfigNotice[] = [];
+          const single = merge([layers[i]!], attemptNotices);
           cfg = validateConfig(single);
           rawUsed = single;
+          notices.push(...attemptNotices);
           for (let j = 0; j < layers.length; j++) {
             if (j !== i) {
               console.warn(`[model-router] dropped override layer ${layers[j]!.path}`);
@@ -2789,12 +3389,17 @@ function buildConfig(
 
   applyTierDefaults(cfg);
   const rawRouting = isPlainObject(rawUsed) ? rawUsed.routing : undefined;
-  for (const message of collectRoutingNotices(rawRouting, cfg)) notices.push({ message });
+  // QA-4.1-9, QA-4.1-19: a notice about a v2-only block (background, leases, executor) is not logged on v1
+  // (warnConfigNotices); index.ts names the configured keys in its one notice instead.
+  for (const { message, v2Only } of collectTaggedRoutingNotices(rawRouting, cfg)) {
+    notices.push(v2Only ? { message, v2Only } : { message });
+  }
   const rawRoleAgents = isPlainObject(rawUsed) ? rawUsed.roleAgents : undefined;
   for (const issue of collectRolesIssues(rawRouting, rawRoleAgents)) notices.push({ message: issue.message });
   dropIgnoredCandidates(cfg);
   applyPluginAgents(cfg, layers, notices);
   applyRoleNotices(cfg, notices);
+  rawByConfig.set(cfg, rawUsed);
   return cfg;
 }
 
@@ -3073,6 +3678,29 @@ export const ROUTING_DEFAULTS = Object.freeze({
   outcomes: Object.freeze({ path: null, halfLifeDays: 14, maxEffectiveSamples: 50 }),
   sessionReuse: Object.freeze({ maxContextFraction: 0.6 }),
   advisor: Object.freeze({ enabled: true, noticeIntervalHours: 24, notify: true }),
+  // OpenCode v2 only; v1 ignores both blocks (see configuredV2OnlyKeys).
+  background: Object.freeze({ mode: "auto" as BackgroundMode, minPredictedMs: 45_000 }),
+  leases: Object.freeze({ mode: "enforce" as LeasesMode, run: "annotate" as LeasesRunPolicy }),
+  // OpenCode v2 only (plan executor); v1 ignores the block (see configuredV2OnlyKeys). Ranges: EXECUTOR_LIMITS.
+  executor: Object.freeze({
+    maxParallel: 4,
+    slotsDir: null as string | null,
+    approve: "ask" as ExecutorConfig["approve"],
+    crossPhase: "gate" as ExecutorConfig["crossPhase"],
+    land: "ff-when-clean" as ExecutorConfig["land"],
+    batchMax: 4,
+    maxAttempts: 3,
+    qaMaxRounds: 3,
+    integrationChecks: "auto" as ExecutorConfig["integrationChecks"],
+    phaseSuite: "auto" as ExecutorConfig["phaseSuite"],
+    provision: "auto" as ExecutorConfig["provision"],
+    python: "auto",
+    sharedContextChars: 12_000,
+    capacityCooldownMs: 120_000,
+    capacityPauseMs: 900_000,
+    wakeDebounceMs: 5_000,
+    circuitBreaker: Object.freeze({ failureRatio: 0.4, minAttempts: 5, consecutiveFailures: 3 }),
+  }),
 });
 
 export interface ResolvedClassifier {
@@ -3111,6 +3739,10 @@ export interface ResolvedRouting {
   readonly outcomes: Readonly<{ path: string | null; halfLifeDays: number; maxEffectiveSamples: number }>;
   readonly sessionReuse: Readonly<Required<SessionReuseConfig>>;
   readonly advisor: Readonly<Required<AdvisorConfig>>;
+  readonly background: Readonly<Required<BackgroundConfig>>;
+  readonly leases: Readonly<Required<LeasesConfig>>;
+  /** Plan executor (v2 only); the defaults on v1, where the block is ignored. */
+  readonly executor: Readonly<ExecutorConfig>;
   readonly applied: RoutingApplied;
 }
 
@@ -3122,11 +3754,71 @@ function expandHomePath(value: string | null): string | null {
 }
 
 let warnedEngineIgnoredOnV1 = false;
+const warnedRoutingIssues = new Set<string>();
 
 /** Test-only: re-arm the once-per-process "engine ignored on v1" notice. */
 export function resetRoutingWarnings(): void {
   warnedEngineIgnoredOnV1 = false;
+  warnedRoutingIssues.clear();
   loggedNoticeTexts.clear();
+}
+
+const freezeRunRefs = (refs: ExecutorConfig["integrationChecks"]): ExecutorConfig["integrationChecks"] =>
+  refs === "auto" ? refs : (Object.freeze(refs.map((ref) => Object.freeze({ script: ref.script, args: Object.freeze([...ref.args]) }))) as unknown as RunCommandRef[]);
+
+/**
+ * `routing.executor` with the defaults applied: deeply frozen, never aliasing the config. An invalid
+ * value warns once per process (like `background`) and its default applies. `undefined` = all defaults.
+ */
+function resolveExecutor(
+  raw: ExecutorOverrides | undefined,
+  logger: Pick<PluginLogger, "warn"> | undefined,
+): Readonly<ExecutorConfig> {
+  const d = ROUTING_DEFAULTS.executor;
+  const sanitized = sanitizeExecutor(raw);
+  // QA-62C-2: off Windows the executor is inert (G-16): invalid values still fall back to their defaults, silently.
+  for (const issue of executorPlatformSupported() ? sanitized.issues : []) {
+    if (warnedRoutingIssues.has(issue)) continue;
+    warnedRoutingIssues.add(issue);
+    if (logger) logger.warn(issue);
+    else console.warn(`[model-router] ${issue}`);
+  }
+  const e = sanitized.value ?? {};
+  const provision = e.provision ?? d.provision;
+  const phaseSuite = e.phaseSuite ?? d.phaseSuite;
+  return Object.freeze({
+    maxParallel: e.maxParallel ?? d.maxParallel,
+    slotsDir: e.slotsDir ?? d.slotsDir,
+    approve: e.approve ?? d.approve,
+    crossPhase: e.crossPhase ?? d.crossPhase,
+    land: e.land ?? d.land,
+    batchMax: e.batchMax ?? d.batchMax,
+    maxAttempts: e.maxAttempts ?? d.maxAttempts,
+    qaMaxRounds: e.qaMaxRounds ?? d.qaMaxRounds,
+    integrationChecks: freezeRunRefs(e.integrationChecks ?? d.integrationChecks),
+    phaseSuite: phaseSuite === "off" ? phaseSuite : freezeRunRefs(phaseSuite),
+    provision:
+      provision === "auto"
+        ? provision
+        : (Object.freeze(
+            Object.fromEntries(
+              Object.entries(provision).map(([manager, argvs]) => [
+                manager,
+                Object.freeze(argvs.map((argv) => Object.freeze([...argv]))),
+              ]),
+            ),
+          ) as unknown as Record<string, string[][]>),
+    python: e.python ?? d.python,
+    sharedContextChars: e.sharedContextChars ?? d.sharedContextChars,
+    capacityCooldownMs: e.capacityCooldownMs ?? d.capacityCooldownMs,
+    capacityPauseMs: e.capacityPauseMs ?? d.capacityPauseMs,
+    wakeDebounceMs: e.wakeDebounceMs ?? d.wakeDebounceMs,
+    circuitBreaker: Object.freeze({
+      failureRatio: e.circuitBreaker?.failureRatio ?? d.circuitBreaker.failureRatio,
+      minAttempts: e.circuitBreaker?.minAttempts ?? d.circuitBreaker.minAttempts,
+      consecutiveFailures: e.circuitBreaker?.consecutiveFailures ?? d.circuitBreaker.consecutiveFailures,
+    }),
+  });
 }
 
 /** Roles as fresh, de-duplicated, frozen arrays; never aliases the config. */
@@ -3165,6 +3857,21 @@ export function resolveRouting(
     if (logger) logger.warn(ROUTING_ENGINE_IGNORED_ON_V1);
     else console.warn(`[model-router] ${ROUTING_ENGINE_IGNORED_ON_V1}`);
   }
+
+  // routing.background / routing.leases: an invalid value warns once and the default applies.
+  const sanitizedBackground = sanitizeBackground(r.background);
+  const sanitizedLeases = sanitizeLeases(r.leases);
+  const background = sanitizedBackground.value;
+  const leases = sanitizedLeases.value;
+  for (const issue of [...sanitizedBackground.issues, ...sanitizedLeases.issues]) {
+    if (warnedRoutingIssues.has(issue)) continue;
+    warnedRoutingIssues.add(issue);
+    if (logger) logger.warn(issue);
+    else console.warn(`[model-router] ${issue}`);
+  }
+
+  // routing.executor: v2 only. On v1 the block is ignored (one notice names the configured keys).
+  const executor = resolveExecutor(host === "v2" ? r.executor : undefined, host === "v2" ? logger : undefined);
 
   const c: ClassifierConfig = r.classifier ?? {};
   const presets: Record<string, Readonly<ClassifierPresetOverride>> = {};
@@ -3210,6 +3917,15 @@ export function resolveRouting(
       noticeIntervalHours: r.advisor?.noticeIntervalHours ?? d.advisor.noticeIntervalHours,
       notify: r.advisor?.notify ?? d.advisor.notify,
     }),
+    background: Object.freeze({
+      mode: background?.mode ?? d.background.mode,
+      minPredictedMs: background?.minPredictedMs ?? d.background.minPredictedMs,
+    }),
+    leases: Object.freeze({
+      mode: leases?.mode ?? d.leases.mode,
+      run: leases?.run ?? d.leases.run,
+    }),
+    executor,
     applied: Object.freeze({ host, requestedEngine, engineCoerced, rolesSource }),
   });
 }
@@ -3217,6 +3933,7 @@ export function resolveRouting(
 /** The roles keys with their defaults applied, for one host (#84). Never mutates `cfg`. */
 export interface ResolvedRolesRouting {
   readonly delegation: DelegationMode;
+  readonly roleFloor: RoleFloorMode;
   readonly exploration: Readonly<ExplorationConfig>;
   readonly run: Readonly<RunConfig>;
   readonly workRoots: readonly string[];
@@ -3238,9 +3955,9 @@ export function resetRolesWarnings(): void {
 }
 
 /**
- * Defaults for `routing.delegation`, `exploration`, `run` and `workRoots`. On v1 (`routerHost`
+ * Defaults for `routing.delegation`, `roleFloor`, `exploration`, `run` and `workRoots`. On v1 (`routerHost`
  * `v1`) delegation is always `tiers`, and one notice says so when any of delegation `roles`,
- * `roleAgents`, `exploration`, `run` or `workRoots` was set. Exploration is off (rate 0) unless
+ * `roleAgents`, `roleFloor`, `exploration`, `run` or `workRoots` was set. Exploration is off (rate 0) unless
  * the effective delegation is `roles`. Switching `delegation` is only a config value here;
  * registration follows a hot reload elsewhere. The plugin logs the v1 notice at start-up by
  * calling this with its logger next to `resolveRouting` (wired with the roles runtime, #84 P2.1).
@@ -3255,7 +3972,7 @@ export function resolveRolesRouting(
   const touched = requested === "roles" || cfg?.roleAgents !== undefined || r.exploration !== undefined
     || r.run !== undefined || r.workRoots !== undefined
     || r.repoParents !== undefined || r.repoDepth !== undefined || r.repoExclude !== undefined
-    || r.repoApprovalDays !== undefined;
+    || r.repoApprovalDays !== undefined || r.roleFloor !== undefined;
   const inert = host === "v1" && touched;
   if (inert && !warnedRolesInertOnV1) {
     warnedRolesInertOnV1 = true;
@@ -3265,6 +3982,7 @@ export function resolveRolesRouting(
   const delegation: DelegationMode = host === "v1" ? "tiers" : requested;
   return Object.freeze({
     delegation,
+    roleFloor: host === "v1" ? "strict" : (r.roleFloor ?? "strict"),
     exploration: Object.freeze({
       rate: delegation === "roles" ? (r.exploration?.rate ?? 0) : 0,
       requireDetection: "deterministic" as const,

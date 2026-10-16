@@ -199,9 +199,18 @@ export function sanitizeRun(value: unknown): Sanitized<Partial<RunConfig>> {
  * canonical long form: a segment like `PROGRA~1` is an 8.3 short name that can alias another
  * directory (R6/P-11).
  */
+/**
+ * QA-DF1-25: where the first glob character of a `routing.workRoots` entry is (`*`, `?`, `[`, `]`, `{`, `}`), or -1. Shared
+ * by the entry rules here, the `external_directory` patterns (`workRootPattern`) and the location matcher (`work-roots.ts`),
+ * so all three cut an entry's static prefix at the same place.
+ */
+export function workRootGlobIndex(entry: string): number {
+  return entry.search(/[*?[\]{}]/);
+}
+
 export function workRootProblem(entry: string): string | undefined {
   if (entry === "") return "is empty";
-  const globAt = entry.search(/[*?[\]{}]/);
+  const globAt = workRootGlobIndex(entry);
   const prefix = globAt === -1 ? entry : entry.slice(0, globAt);
   const normalised = prefix.replace(/\\/g, "/");
   let rest: string;

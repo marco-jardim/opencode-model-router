@@ -5,8 +5,9 @@
  * of the role table as a router-defined agent with the role's MAX policy: deny-by-default, only
  * the role's actions under their host names, `execute`/`subagent`/`task`/`delegate`/`shell`
  * denied explicitly, the read-only tiers' sensitive-read asks, and `external_directory` allowed
- * only for the repository's worktree roots (listed at registration) and the `routing.workRoots`
- * patterns. The definitions carry the plugin-agent marker, so the v2 adapter publishes them like
+ * only for the repository's worktree roots (listed at registration), configured work roots and
+ * the trusted executor slots root, with the executor home denied after every allow.
+ * The definitions carry the plugin-agent marker, so the v2 adapter publishes them like
  * #81 plugin agents (inherited denies only) and `protectedAgent()` holds for each of them (P-19):
  * the router's evaluate and context hooks then enforce the policy under a granting parent too.
  *
@@ -14,16 +15,21 @@
  * anything (I1/I8). A failure while resolving or building the roles registers no role agent at
  * all (fail closed); tier agents are never touched.
  */
-import { realpathSync } from "node:fs";
-import { join } from "node:path";
-import { resolveActiveTiers, resolveRolesRouting, type RouterConfig, type TierConfig } from "./config";
-import { GIT_TOOL_NAMES, gitEnvironment, gitExecutable, hardeningArgs, inheritedSafeDirectoryArgs, spawnBounded } from "./git-tools";
+import { lstatSync, realpathSync, statSync } from "node:fs";
+import { join, posix, resolve as resolvePath, win32 } from "node:path";
+import { EXECUTOR_HOME_DIRNAME, resolveExecutorHome } from "../executor/paths";
+import { resolveActiveTiers, resolveRolesRouting, resolveRouting, slotsDirProblem, type RouterConfig, type TierConfig } from "./config";
+import {
+  GIT_TOOL_NAMES, gitEnvironment, gitExecutable, gitPointers, hardeningArgs, inheritedSafeDirectoryArgs, nearestRepository, spawnBounded,
+  workRootGuards,
+} from "./git-tools";
 import { positiveBudget, REFUSAL_CAP, ROUTE_BUDGET_RAISE_MAX, TIER_GUARD_BUDGET } from "./guard-profile";
 import { PLUGIN_AGENT, pluginAgentMarker, pluginAgentPolicy, type PluginAgentMarker } from "./plugin-agents";
 import { CONTEXT7_DOC_TOOLS, permissionMatches, type PermissionMap } from "./read-only";
 import { isApprovalValid, type RepoApproval } from "../routing/roles/approvals";
 import { ACTION_CLASS, HOST_NATIVE_ROLE_NAMES, resolveRoleTable, SHIPPED_ROLE_SPECS, type AuthorityAction, type RoleSpec, type RoleTable } from "./roles";
-import { workRootProblem } from "./roles-config";
+import { workRootGlobIndex, workRootProblem } from "./roles-config";
+import { locationOutsideWorkRoots } from "./work-roots";
 
 /**
  * Steps above the largest guard budget a role dispatch can reach. The guard's `NEED MORE: budget`
@@ -84,20 +90,28 @@ export function roleHasLocalActions(spec: Pick<RoleSpec, "authority">): boolean 
 /**
  * A role's max permission policy (v2 action names, ordered, last match wins): `* deny` first,
  * then an allow per {@link roleHostActions}, then `external_directory` allows for `externalDirectory`
- * (local roles only; a bare `*` is never written), then the {@link ROLE_DENIED_ACTIONS} denies;
+ * (local roles only; a bare `*` is never written), then `externalDirectoryDeny` after every allow
+ * and the {@link ROLE_DENIED_ACTIONS} denies;
  * the `read` rules are rebuilt by the plugin-agent policy with the sensitive-read asks after the
  * grant (a role without `read` gets `read: { "*": "deny" }`).
  */
 export function roleMaxPermission(
   spec: Pick<RoleSpec, "authority">,
-  opts: { context7: boolean; externalDirectory: readonly string[] },
+  opts: { context7: boolean; externalDirectory: readonly string[]; externalDirectoryDeny?: readonly string[] },
 ): PermissionMap {
   const own: PermissionMap = { "*": "deny" };
   for (const name of roleHostActions(spec, opts)) own[name] = "allow";
   const patterns = roleHasLocalActions(spec)
     ? [...new Set(opts.externalDirectory)].filter((pattern) => pattern !== "" && !/^[*?]+$/.test(pattern))
     : [];
-  if (patterns.length > 0) own.external_directory = Object.fromEntries(patterns.map((pattern) => [pattern, "allow" as const]));
+  const denied = [...new Set(opts.externalDirectoryDeny ?? [])].filter((pattern) => pattern !== "");
+  if (patterns.length > 0 || denied.length > 0) {
+    // Drop overlapping keys from the allows too: updating a key would retain its earlier insertion order.
+    own.external_directory = Object.fromEntries([
+      ...patterns.filter((pattern) => !denied.includes(pattern)).map((pattern) => [pattern, "allow" as const]),
+      ...denied.map((pattern) => [pattern, "deny" as const]),
+    ]);
+  }
   for (const action of ROLE_DENIED_ACTIONS) own[action] = "deny";
   return pluginAgentPolicy({ permission: own }, { context7: opts.context7, host: "v2" }).permission;
 }
@@ -126,7 +140,7 @@ function validModel(model: unknown): model is string {
 export function buildRoleAgentDefinition(
   spec: RoleSpec,
   floor: Pick<TierConfig, "model" | "variant">,
-  opts: { context7: boolean; externalDirectory: readonly string[] },
+  opts: { context7: boolean; externalDirectory: readonly string[]; externalDirectoryDeny?: readonly string[] },
 ): Record<string, unknown> {
   if (!validModel(floor.model)) throw new Error(`role ${spec.agent}: floor tier ${spec.tierRange.floor} has no provider/model reference`);
   const steps = roleAgentSteps(spec);
@@ -173,7 +187,8 @@ const WORKTREE_LIST_TIMEOUT_MS = 10_000;
  */
 export async function listWorktrees(directory: string): Promise<string[]> {
   const started = performance.now();
-  const executable = gitExecutable();
+  // QA-62F-4: the executable is chosen outside the listed directory's work root, like the executor-home lookup.
+  const executable = gitExecutable(workRootGuards(directory));
   const trusted = await inheritedSafeDirectoryArgs(executable, WORKTREE_LIST_TIMEOUT_MS);
   const result = await spawnBounded(executable, [...hardeningArgs(), ...trusted, "worktree", "list", "--porcelain"], directory, {
     env: gitEnvironment(), timeoutMs: Math.max(1, WORKTREE_LIST_TIMEOUT_MS - (performance.now() - started)), maxBytes: 1024 * 1024,
@@ -229,6 +244,87 @@ export function approvedRootPattern(path: string, realpath: Realpath = nativeRea
 }
 
 /**
+ * QA-62C-1, QA-62C-13: the git common directory of the repository holding `directory`, read from disk without running
+ * git (used off Windows, where the executor never runs but a Windows host sharing the repository may). The nearest
+ * checkout ({@link nearestRepository}) is read by the hardened {@link gitPointers}: `.git` and `commondir` at most 4 KiB,
+ * regular files only, opened non-blocking, a linked `.git` and a network or device pointer refused. `common` is the
+ * git directory's `commondir` target when present, else the git directory (`<checkout>/.git` or what `gitdir:` names).
+ * `{}` when no repository is found or its `.git` names no git directory; `problem` when the pointers are refused or unreadable.
+ */
+function gitCommonDirOnDisk(directory: string): { common?: string; problem?: string } {
+  const checkout = nearestRepository(resolvePath(directory));
+  if (checkout === undefined) return {};
+  try {
+    const pointers = gitPointers(checkout);
+    return pointers === undefined ? {} : { common: pointers.common };
+  } catch (error) {
+    return { problem: errorText(error) };
+  }
+}
+
+/** Executor directories may not exist yet; only ENOENT permits using a canonical parent and the literal basename. */
+function executorDirectoryRoot(path: string, realpath: Realpath, requireSame = true): { root?: string; problem?: string } {
+  const problem = workRootProblem(path);
+  if (problem !== undefined) return { problem };
+  if (workRootGlobIndex(path) !== -1) return { problem: "must be a literal directory, not a glob" };
+  let canonical: string;
+  try {
+    canonical = realpath(path);
+    const same = process.platform === "win32" ? canonical.toLowerCase() === path.toLowerCase() : canonical === path;
+    if (requireSame && !same) return { problem: `resolves to ${canonical}, not the configured path` };
+  } catch (error) {
+    if (!(error instanceof Error) || !("code" in error) || error.code !== "ENOENT") {
+      return { problem: "does not resolve to a directory" };
+    }
+    const api = /^[A-Za-z]:[\\/]/.test(path) ? win32 : posix;
+    try {
+      canonical = api.join(realpath(api.dirname(path)), api.basename(path));
+    } catch {
+      return { problem: "parent does not resolve to a directory" };
+    }
+  }
+  const after = workRootProblem(canonical);
+  if (after !== undefined) return { problem: `canonical form ${canonical} ${after}` };
+  if (workRootGlobIndex(canonical) !== -1) return { problem: "canonical directory contains a glob character" };
+  return { root: canonical };
+}
+
+/** D6: reject overlap with non-slot worktrees, but existing executor worktrees must not block future slots. */
+function executorSlotsRootPattern(path: string, worktrees: readonly string[], realpath: Realpath): { pattern?: string; problem?: string } {
+  const problem = slotsDirProblem(path);
+  if (problem !== undefined) return { problem };
+  const canonical = executorDirectoryRoot(path, realpath);
+  if (canonical.root === undefined) return { problem: canonical.problem };
+  const after = slotsDirProblem(canonical.root);
+  if (after !== undefined) return { problem: `canonical form ${canonical.root} ${after}` };
+  for (const [index, worktree] of worktrees.entries()) {
+    let root: string;
+    try {
+      root = realpath(worktree);
+    } catch {
+      // Git can retain deleted (even locked) linked worktrees. Only a missing entry is harmless;
+      // an existing path without a canonical form, and the main checkout, must still fail closed.
+      if (index > 0) {
+        try {
+          lstatSync(worktree);
+        } catch (error) {
+          if (error instanceof Error && "code" in error && error.code === "ENOENT") continue;
+        }
+      }
+      return { problem: `worktree ${worktree} has no canonical long form` };
+    }
+    // Executor worktrees live at <root>/<plan>/slot-N, integration or ci.
+    // Never exempt the first (main) checkout, or ordinary non-slot descendants.
+    const relative = dirKey(root).slice(dirKey(canonical.root).length + 1);
+    if (index > 0 && isOrContains(canonical.root, root) && /^[^/]+\/(?:slot-[1-9]\d{0,2}|integration|ci)$/.test(relative)) continue;
+    if ([path, canonical.root].some((slots) => [worktree, root].some((tree) => isOrContains(slots, tree) || isOrContains(tree, slots)))) {
+      return { problem: `is inside or an ancestor of worktree ${worktree}` };
+    }
+  }
+  return { pattern: join(canonical.root, "*") };
+}
+
+/**
  * The `external_directory` allow pattern of one `routing.workRoots` entry (P-11): the static
  * directory before the first wildcard in its canonical long form, then the glob tail verbatim
  * (`D:/git/omr-rta-*` → `D:\git\omr-rta-*`); an entry without a wildcard is a root (`<root>\*`).
@@ -238,7 +334,7 @@ export function approvedRootPattern(path: string, realpath: Realpath = nativeRea
 export function workRootPattern(entry: string, realpath: Realpath = nativeRealpath): { pattern?: string; problem?: string } {
   const problem = workRootProblem(entry);
   if (problem !== undefined) return { problem };
-  const globAt = entry.search(/[*?[\]{}]/);
+  const globAt = workRootGlobIndex(entry);
   if (globAt === -1) {
     const pattern = worktreeRootPattern(entry, realpath);
     return pattern === undefined ? { problem: "does not resolve to a directory in canonical long form" } : { pattern };
@@ -374,18 +470,25 @@ export interface RoleRegistration {
   readonly replaced: readonly string[];
   /** `external_directory` allow patterns written into local roles. */
   readonly externalDirectory: readonly string[];
+  /** `external_directory` deny patterns written after every allow. */
+  readonly externalDirectoryDenied: readonly string[];
   /** True when registration failed and no role agent was registered. */
   readonly failed: boolean;
 }
 
 const NONE: RoleRegistration = Object.freeze({
-  registered: Object.freeze([]), removed: Object.freeze([]), replaced: Object.freeze([]), externalDirectory: Object.freeze([]), failed: false,
+  registered: Object.freeze([]), removed: Object.freeze([]), replaced: Object.freeze([]), externalDirectory: Object.freeze([]),
+  externalDirectoryDenied: Object.freeze([]), failed: false,
 });
 
 export interface RoleRegistrationOptions {
   /** The context7 MCP server is configured (its documentation tools become direct tools). */
   context7: boolean;
-  /** The project directory: its repository's worktrees are listed. */
+  /**
+   * The project directory: its repository's worktrees are listed. When `routing.workRoots` is set and the directory lies
+   * outside every entry (`locationOutsideWorkRoots`), the executor slots root is not granted (QA-5.1-5) and the
+   * executor-home lookup runs only when worktrees were listed, to deny the home their allows cover (QA-62F-1).
+   */
   directory: string;
   /** The host's own agents at setup (name → seed definition); a removed #81 entry falls back to it. */
   seed: Readonly<Record<string, Record<string, unknown>>>;
@@ -400,6 +503,16 @@ export interface RoleRegistrationOptions {
   listWorktrees?: (directory: string) => Promise<string[]>;
   resolveTable?: (cfg: RouterConfig, host: "v1" | "v2", opts: { context7?: boolean }) => RoleTable;
   realpath?: Realpath;
+  /** Replaces the executor-home lookup; its result is still canonicalized before granting slots access. */
+  executorHome?: (directory: string) => Promise<string>;
+  /**
+   * G-16: false when the plan executor cannot run on this platform (the caller asks `executorPlatformSupported`): the
+   * executor is treated as disabled, so no executor-home lookup runs and no slots root is granted. The executor home in
+   * the git common directory (found on disk by {@link gitCommonDirOnDisk}, no git) is still denied whenever that directory
+   * resolves, even before the home exists (QA-62C-1, QA-62C-14: a Windows host may run the executor on a repository
+   * shared with WSL). Absent: true.
+   */
+  executorPlatform?: boolean;
   /** Clock in epoch ms for the approval expiry; default `Date.now`. */
   now?: () => number;
 }
@@ -439,14 +552,22 @@ export async function registerRoleAgents(
   let built: Map<string, Record<string, unknown>>;
   let table: RoleTable;
   let externalDirectory: string[] = [];
+  let externalDirectoryDenied: string[] = [];
   try {
     table = (opts.resolveTable ?? resolveRoleTable)(cfg, "v2", { context7: opts.context7 });
     const tiers = resolveActiveTiers(cfg);
+    const hasLocalActions = [...table.roles.values()].some(roleHasLocalActions);
     let worktrees: string[] = [];
-    if ([...table.roles.values()].some(roleHasLocalActions)) {
+    let worktreeListingProblem: string | undefined;
+    // G-12: the worktrees are listed whatever `routing.workRoots` contains (a glob for later-created worktrees must not
+    // drop the existing ones). Outside every configured work root the executor home is still denied when worktrees were
+    // listed or the listing failed (QA-62F-1, QA-62F-9); only the executor slots-root grant is skipped there.
+    const outside = locationOutsideWorkRoots(opts.directory, routing.workRoots, process.platform, opts.realpath ?? nativeRealpath);
+    if (hasLocalActions) {
       try {
         worktrees = await (opts.listWorktrees ?? listWorktrees)(opts.directory);
       } catch (error) {
+        worktreeListingProblem = errorText(error);
         opts.warn("roles:worktrees", `${PREFIX}the repository's worktrees could not be listed (${errorText(error)}); role agents get no worktree external_directory rule`);
       }
     }
@@ -454,12 +575,97 @@ export async function registerRoleAgents(
     const found = externalDirectoryPatterns(worktrees, routing.workRoots, opts.realpath ?? nativeRealpath, routing.repoParents, approved.paths);
     for (const problem of [...approved.problems, ...found.problems]) opts.warn(`roles:external:${problem}`, `${PREFIX}${problem}`);
     externalDirectory = found.patterns;
+    // slotsDir is trusted here: the project-controlled value was stripped before the config merge (D18).
+    const executorRouting = resolveRouting(cfg, "v2");
+    const slotsDir = executorRouting.executor.slotsDir;
+    const executorEnabled = opts.executorPlatform !== false
+      && executorRouting.leases.mode === "enforce" && cfg.enforcement?.verify?.require !== "never";
+    const executorProblems: Array<readonly [key: string, message: string]> = [];
+    // QA-62F-1, QA-62F-9: outside every work root, listed worktrees or configured roots can still cover the executor
+    // home in the git common directory, even when listing failed. Resolve the home (one read-only, guarded rev-parse)
+    // and deny it there; the slots-root grant below stays inside the work roots only.
+    if (executorEnabled && table.roles.size > 0 && (!outside || worktrees.length > 0 || worktreeListingProblem !== undefined)) {
+      const realpath = opts.realpath ?? nativeRealpath;
+      const homeDirectory = worktrees[0] ?? opts.directory;
+      let home: string | undefined;
+      try {
+        const resolved = await (opts.executorHome ?? resolveExecutorHome)(homeDirectory);
+        const canonical = executorDirectoryRoot(resolved, realpath, false);
+        if (canonical.root === undefined) throw new Error(canonical.problem ?? "has no canonical long form");
+        home = canonical.root;
+        externalDirectoryDenied = [join(home, "*")];
+      } catch (error) {
+        const problem = errorText(error);
+        // D7: Git's non-repository diagnostic means there is no executor to grant or protect. Other failures
+        // (including other exit-128 errors such as dubious ownership) still fail closed with one warning.
+        let notRepository = /(?:^|:\s*)(?:fatal:\s*)?not a git repository\b/i.test(problem);
+        if (!notRepository && opts.executorHome === undefined) {
+          // A missing/non-directory cwd prevents Git from starting, so it cannot emit its non-repository diagnostic.
+          // Only probe native lookups: an injected resolver may model a repository without creating it on disk.
+          try {
+            notRepository = !statSync(homeDirectory).isDirectory();
+          } catch (directoryError) {
+            notRepository = directoryError instanceof Error && "code" in directoryError
+              && (directoryError.code === "ENOENT" || directoryError.code === "ENOTDIR");
+          }
+        }
+        if (!notRepository) {
+          executorProblems.push(["roles:executor-home", `${PREFIX}the executor home could not be resolved (${problem}); the executor home is not denied and role agents get no slots external_directory rule`]);
+        }
+      }
+      // An unresolved home cannot be protected by a final deny: do not grant the slots root either (D6).
+      if (!outside && home !== undefined && hasLocalActions && (slotsDir !== null || process.platform === "win32")) {
+        // Match create.ts's location toplevel, not Git's first (main) worktree on another drive.
+        let toplevel: string | undefined;
+        try {
+          const directory = realpath(opts.directory);
+          for (const worktree of worktrees) {
+            try {
+              const tree = realpath(worktree);
+              if (isOrContains(tree, directory) && tree.length > (toplevel?.length ?? 0)) toplevel = tree;
+            } catch { /* Unresolved entries cannot select a drive; the slots overlap check still fails closed. */ }
+          }
+        } catch { /* A missing canonical location cannot select a default drive. */ }
+        const drive = /^([A-Za-z]):[\\/]/.exec(toplevel ?? "");
+        const root = slotsDir ?? (drive === null ? undefined : `${drive[1]}:\\.omr-slots`);
+        const slots = worktreeListingProblem !== undefined
+          ? { problem: `the worktree listing failed (${worktreeListingProblem})` }
+          : root === undefined
+          ? { problem: "the repository toplevel is not on a drive-letter path" }
+          : executorSlotsRootPattern(root, worktrees, realpath);
+        if (slots.pattern === undefined) {
+          executorProblems.push(["roles:executor-slots", `${PREFIX}executor slots root ${root ?? "(default)"} ${slots.problem ?? "is not usable"}; not granted`]);
+        } else if (!externalDirectory.includes(slots.pattern)) {
+          externalDirectory.push(slots.pattern);
+        }
+      }
+    } else if (opts.executorPlatform === false && table.roles.size > 0
+      && (!outside || worktrees.length > 0 || worktreeListingProblem !== undefined)) {
+      // QA-62C-1: the executor does not run on this platform, but a Windows host sharing the repository (WSL) may run it.
+      // Deny the executor home in the common directory, found on disk without running git, whether or not it exists yet
+      // (QA-62C-14: a deny on a missing path is harmless, and the Windows host may create it later); never grant the slots
+      // root here. A home that does not exist yet gets its canonical parent and the literal name, like the win32 branch.
+      const found = gitCommonDirOnDisk(worktrees[0] ?? opts.directory);
+      if (found.problem !== undefined) {
+        executorProblems.push(["roles:executor-home", `${PREFIX}the git common directory could not be read (${found.problem}); the executor home is not denied`]);
+      } else if (found.common !== undefined) {
+        const home = join(found.common, EXECUTOR_HOME_DIRNAME);
+        const canonical = executorDirectoryRoot(home, opts.realpath ?? nativeRealpath, false);
+        if (canonical.root !== undefined) {
+          externalDirectoryDenied = [join(canonical.root, "*")];
+        } else {
+          executorProblems.push(["roles:executor-home", `${PREFIX}the executor home ${home} ${canonical.problem ?? "has no canonical long form"}; the executor home is not denied`]);
+        }
+      }
+    }
     built = new Map();
     for (const [name, spec] of table.roles) {
       const floor = tiers[spec.tierRange.floor];
       if (floor === undefined) throw new Error(`role ${name}: floor tier ${spec.tierRange.floor} is not in the active preset`);
-      built.set(name, buildRoleAgentDefinition(spec, floor, { context7: opts.context7, externalDirectory }));
+      built.set(name, buildRoleAgentDefinition(spec, floor, { context7: opts.context7, externalDirectory, externalDirectoryDeny: externalDirectoryDenied }));
     }
+    // Registration failure already emits its single notice; executor warnings apply only to registered definitions.
+    for (const [key, message] of executorProblems) opts.warn(key, message);
   } catch (error) {
     return fail(agents, opts, error);
   }
@@ -483,6 +689,7 @@ export async function registerRoleAgents(
     removed: Object.freeze(removed),
     replaced: Object.freeze([...table.replacedRoles]),
     externalDirectory: Object.freeze([...externalDirectory]),
+    externalDirectoryDenied: Object.freeze([...externalDirectoryDenied]),
     failed: false,
   });
 }

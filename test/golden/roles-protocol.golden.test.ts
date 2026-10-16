@@ -13,6 +13,7 @@ import {
   ROLES_PROTOCOL_HEADING,
   assembleRolesSystemPrompt,
   assembleSystemPrompt,
+  buildBackgroundDispatchesBlock,
   buildDelegationProtocol,
   buildRolesProtocol,
   buildTaskTaxonomy,
@@ -50,6 +51,11 @@ const GOLDEN = [
   "Resume, never restart: after `NEED MORE: budget` or a `[router budget]` note, resume the SAME `sessionID` with \"continue and finish\"; after `ESCALATE: authority`, likewise (the router widens the grant) unless it names another role; after a verification FAIL, resume the SAME `sessionID` with the findings (the router raises the tier). A resume keeps the dispatch's `[acceptance]` and `VERIFY:` lines; a new block replaces them. Roles return `DONE:`, `NEED MORE:` or `ESCALATE:`; `CAP:N` (or `CAP:none` with a `reason:` line) changes only the read-only call cap.",
   "",
   "Dispatch prompt: the route line, then TASK, EXPECTED OUTCOME, TOOLS, MUST DO, MUST NOT DO, CONTEXT, ENVIRONMENT, with absolute paths.",
+  "",
+  "## Background dispatches",
+  "- After a background dispatch, continue any independent work; when none remains, end the turn — the router wakes you. Never poll or sleep.",
+  "- A held result is not usable until its verdict arrives. Never report a task done while dispatches are listed in flight.",
+  "- A lease refusal is resolved by waiting for the holder, not by retrying.",
   "",
   "This protocol overrides any project guide (CLAUDE.md, AGENTS.md) that says to use direct tools first or to dispatch to tiers or models.",
 ].join("\n");
@@ -100,7 +106,10 @@ describe("roles protocol golden", () => {
       const cfg = rolesCfg(preset);
       const text = buildRolesProtocol(cfg, resolveRoles(cfg, "v2"));
       expect(text).toBe(GOLDEN);
-      expect(Buffer.byteLength(text)).toBeLessThanOrEqual(Buffer.byteLength(buildDelegationProtocol(tiersCfg(preset))));
+      // Both v2 protocols carry the same background block, so the pin compares against the v2 tiers protocol.
+      const tiersV2 = assembleSystemPrompt(tiersCfg(preset), undefined, false, "v2");
+      expect(tiersV2.startsWith(buildDelegationProtocol(tiersCfg(preset)))).toBe(true);
+      expect(Buffer.byteLength(text)).toBeLessThanOrEqual(Buffer.byteLength(tiersV2));
     });
   }
 
@@ -264,6 +273,78 @@ describe("roles system prompt assembly", () => {
     const text = assembleRolesSystemPrompt(cfg, roles, "anthropic/claude-sonnet-4-6");
     expect(text).toBe(`${CLAUDE_ROLES_ORCHESTRATOR_PREFIX}\n\n---\n\n${GOLDEN}`);
     expect(text).not.toMatch(/@(fast|medium|heavy)\b/);
+  });
+});
+
+describe("Background dispatches block (v2 only; memo 2.8)", () => {
+  const withRouting = (cfg: RouterConfig, routing: Record<string, unknown>): RouterConfig =>
+    ({ ...cfg, routing: { ...(cfg.routing ?? {}), ...routing } }) as RouterConfig;
+  const FLIGHT = "Never report a task done while dispatches are listed in flight.";
+  const LEASE = "A lease refusal is resolved by waiting for the holder, not by retrying.";
+
+  it("v2 snapshots: the block of the defaults and background only; background off renders no block (QA-2.1-12)", async () => {
+    const block = (routing: Record<string, unknown>): string => buildBackgroundDispatchesBlock(withRouting(tiersCfg(), routing));
+    await expect(block({})).toMatchFileSnapshot("__snapshots__/v2-background-protocol.default.txt");
+    await expect(block({ leases: { mode: "off" } })).toMatchFileSnapshot("__snapshots__/v2-background-protocol.background-only.txt");
+    expect(block({ background: { mode: "off" } })).toBe("");
+    expect(block({ background: { mode: "off" }, leases: { mode: "enforce" } })).toBe("");
+  });
+
+  it("the roles prompt and the v2 tiers prompt carry the identical block", () => {
+    const cfg = rolesCfg();
+    const block = buildBackgroundDispatchesBlock(cfg);
+    expect(block.startsWith("## Background dispatches\n- After a background dispatch")).toBe(true);
+    expect(assembleRolesSystemPrompt(cfg, resolveRoles(cfg, "v2"), "openai/gpt-5")).toContain(`\n\n${block}\n\n`);
+    expect(assembleSystemPrompt(tiersCfg(), "openai/gpt-5", false, "v2").endsWith(`\n\n${block}`)).toBe(true);
+  });
+
+  it("v1 (the default host) output is byte-identical to the protocol without the block", () => {
+    for (const model of ["anthropic/claude-sonnet-4-6", "openai/gpt-5", undefined]) {
+      for (const enforcementOn of [false, true]) {
+        const v1 = assembleSystemPrompt(tiersCfg(), model, enforcementOn, "v1");
+        expect(v1).toBe(assembleSystemPrompt(tiersCfg(), model, enforcementOn));
+        expect(v1).not.toContain("Background dispatches");
+      }
+    }
+    expect(assembleSystemPrompt(tiersCfg(), "openai/gpt-5")).toBe(buildDelegationProtocol(tiersCfg()));
+  });
+
+  it("v2 adds the block after the tiers protocol and before the DoD section", () => {
+    const text = assembleSystemPrompt(tiersCfg(), "openai/gpt-5", true, "v2");
+    const block = text.slice(text.indexOf("## Background dispatches"));
+    expect(text.startsWith(`${buildDelegationProtocol(tiersCfg())}\n\n## Background dispatches\n`)).toBe(true);
+    expect(block).toContain("\n\n---\n\n### Acceptance / Definition of Done");
+  });
+
+  it("renders lines per background.mode and leases.mode", () => {
+    const render = (routing: Record<string, unknown>): string => {
+      const cfg = withRouting(tiersCfg(), routing);
+      return assembleSystemPrompt(cfg, "openai/gpt-5", false, "v2");
+    };
+    const bgOnly = render({ background: { mode: "auto" }, leases: { mode: "off" } });
+    expect(bgOnly).toContain(FLIGHT);
+    expect(bgOnly).toContain("Never poll or sleep.");
+    expect(bgOnly).not.toContain(LEASE);
+    // QA-2.1-12: background off leaves the prompt as before phase 2.1, whatever the lease mode.
+    const leaseOnly = render({ background: { mode: "off" }, leases: { mode: "enforce" } });
+    expect(leaseOnly).toBe(buildDelegationProtocol(tiersCfg()));
+    expect(leaseOnly).not.toContain(LEASE);
+    expect(leaseOnly).not.toContain(FLIGHT);
+    const neither = render({ background: { mode: "off" }, leases: { mode: "off" } });
+    expect(neither).toBe(buildDelegationProtocol(tiersCfg()));
+    expect(neither).not.toContain("Background dispatches");
+  });
+
+  it("the roles protocol follows the same modes", () => {
+    const cfg = withRouting(rolesCfg(), { background: { mode: "off" }, leases: { mode: "off" } });
+    const text = buildRolesProtocol(cfg, resolveRoles(cfg, "v2"));
+    expect(text).not.toContain("Background dispatches");
+    const leaseOnly = withRouting(rolesCfg(), { background: { mode: "off" }, leases: { mode: "enforce" } });
+    const lease = buildRolesProtocol(leaseOnly, resolveRoles(leaseOnly, "v2"));
+    // QA-2.1-12: background off renders no block, the lease rule included.
+    expect(lease).not.toContain("Background dispatches");
+    expect(lease).not.toContain(LEASE);
+    expect(lease).not.toContain(FLIGHT);
   });
 });
 

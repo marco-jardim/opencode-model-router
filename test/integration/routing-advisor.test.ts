@@ -7,16 +7,19 @@
  */
 import { spawnSync } from "node:child_process";
 import { supportsPlainNodeTypeScript } from "../helpers/node-typescript";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import ModelRouterPlugin from "../../src/index";
+import { PLAN_HELP_LINES } from "../../src/commands/output";
+import * as platformModule from "../../src/executor/platform";
 import type { RouterPluginInput } from "../../src/compat/child-session";
-import { invalidateConfigCache, loadConfig, overridePath, routerStatusLines, validateConfig } from "../../src/router/config";
-import { DECISIONS_FILE, acquireOutcomes, makeKey } from "../../src/routing/outcomes";
-import type { DecisionRow } from "../../src/routing/outcomes";
+import { invalidateConfigCache, loadConfig, overridePath, resolveRolesRouting, routerStatusLines, validateConfig } from "../../src/router/config";
+import { locationOutsideWorkRoots } from "../../src/router/work-roots";
+import { DECISIONS_FILE, acquireOutcomes, createSideLogs, makeKey, nodePersistDeps } from "../../src/routing/outcomes";
+import type { DecisionRow, DispatchTimingRow, OrchestratorTurnRow } from "../../src/routing/outcomes";
 import { readLastCheckpoint } from "../../src/routing/commands/stats";
 import { advisorSettings, createAdvisorNotifier, noticeFiles } from "../../src/routing/advisor";
 import type { AdvisorFs, AdvisorNotifierDeps, AdvisorSettings } from "../../src/routing/advisor";
@@ -653,11 +656,166 @@ describe("D18 /router stats and the checkpoint line", { timeout: 60_000 }, () =>
     expect(text).toContain("| Dispatches | 2 |"); // D0 is outside the window
     expect(text).toContain("| Kept for lack of evidence (A27, fresh dispatches) | 1 of 1 fresh routed dispatches |"); // D2 resumes a child (A30): outside the figure
     expect(text).toContain("| Orchestrator resumes (task_id / sessionID; not a ladder step, never switched, outside every routing metric) | 1 of 2 routed dispatches |");
-    expect(text).toContain(`| ${KEY_EXPLORE.replace(/\|/g, "\\|")} | 1 |`); // the trace.argmin table (A27, DF3)
+    expect(text).toContain(`| ${KEY_EXPLORE.replace(/\\/g, "\\\\").replace(/\|/g, "\\|")} | 1 |`); // the trace.argmin table (A27, DF3)
     expect(text).toContain("cover trusted classes only"); // QA-2.1-10
     // no window: all three rows; and the JSON form is the script's too
     expect(`${await ask(hooks, "stats")}\n`).toBe(script("--dir", store).stdout);
     expect(`${await ask(hooks, "stats --json")}\n`).toBe(script("--dir", store, "--json").stdout);
+  });
+
+  // 1.1.4: the dispatch-duration table and the cache-read share line, from the side logs of the same directory.
+  it.skipIf(!supportsPlainNodeTypeScript())("D18: with seeded timing and turn rows both renderers print the same text, and the base output is unchanged", async () => {
+    seed(...ROWS);
+    const hooks = await plugin({ engine: "shadow", outcomes: { path: store } });
+    const since = "2026-10-06T00:00:00Z";
+    const without = script("--dir", store, "--since", since).stdout;
+    expect(without).not.toContain("Dispatch durations");
+    expect(without).not.toContain("cache-read share");
+    expect(`${await ask(hooks, `stats --since ${since}`)}\n`).toBe(without);
+
+    const logs = createSideLogs(store, nodePersistDeps({ warn: () => undefined }));
+    const timing = (n: number, role: string, durationMs: number, over: Partial<DispatchTimingRow> = {}): DispatchTimingRow => ({
+      kind: "dispatch-timing",
+      v: 1,
+      ts: "2026-10-06T12:00:00.000Z",
+      parentSessionID: "s1",
+      childSessionID: `c${n}`,
+      callID: `call${n}`,
+      role,
+      class: "implement",
+      scope: "single",
+      tier: "medium",
+      model: "anthropic/claude-sonnet-5-5",
+      background: false,
+      startedAt: Date.parse("2026-10-06T12:00:00.000Z"),
+      endedAt: Date.parse("2026-10-06T12:00:00.000Z") + durationMs,
+      durationMs,
+      outcome: "succeeded",
+      capacity: null,
+      ...over,
+    });
+    const turn = (n: number, ts: string, input: number, cacheRead: number, cacheWrite: number): OrchestratorTurnRow => ({
+      kind: "orchestrator-turn",
+      v: 1,
+      ts,
+      sessionID: "s1",
+      turn: n,
+      steps: 1,
+      input,
+      cacheRead,
+      cacheWrite,
+    });
+    await logs.appendTimings([
+      timing(1, "builder", 10_000),
+      timing(2, "builder", 20_000),
+      timing(3, "builder", 30_000),
+      timing(4, "builder", 90_000, { outcome: "failed" }), // not succeeded: excluded
+      timing(5, "builder", 900_000, { capacity: "rate-limit" }), // capacity: excluded
+      timing(6, "reviewer", 4_000),
+      timing(7, "builder", 500_000, { ts: "2026-10-05T12:00:00.000Z" }), // before the window
+    ]);
+    await logs.appendTurns([
+      turn(1, "2026-10-06T12:00:00.000Z", 100, 900, 0), // 90 %
+      turn(2, "2026-10-06T13:00:00.000Z", 500, 500, 0), // 50 %
+      turn(3, "2026-10-06T14:00:00.000Z", 0, 0, 0), // zero denominator: excluded
+      turn(4, "2026-10-05T14:00:00.000Z", 1, 0, 99), // before the window
+    ]);
+
+    const reference = script("--dir", store, "--since", since);
+    expect(reference.status).toBe(0);
+    const text = await ask(hooks, `stats --since ${since}`);
+    expect(`${text}\n`).toBe(reference.stdout);
+    expect(reference.stdout.startsWith(without)).toBe(true); // the new rows only append
+    expect(text).toContain("### Dispatch durations");
+    expect(text).toContain("| builder | 20.0s | 30.0s | 3 |");
+    expect(text).toContain("| reviewer | 4.0s | 4.0s | 1 |");
+    expect(text).toContain("Orchestrator cache-read share: p50 50.0%, p10 50.0% over 2 turns");
+    expect(`${await ask(hooks, "stats --json")}\n`).toBe(script("--dir", store, "--json").stdout);
+
+    // v1 never renders the new sections.
+    const v1 = await plugin({ engine: "shadow", outcomes: { path: store } }, "v1");
+    const v1Text = await ask(v1, `stats --since ${since}`);
+    expect(v1Text).not.toContain("Dispatch durations");
+    expect(v1Text).not.toContain("cache-read share");
+    expect(`${v1Text}\n`).toBe(without);
+  });
+
+  // QA-1.1-12, QA-1.1-13: the --json keys, a window, and the notes of the side logs.
+  it.skipIf(!supportsPlainNodeTypeScript())("--json: durations (ms) and cacheShare (0-1) appear only with rows and follow --until; side logs count as outcome data and report skipped lines", async () => {
+    seed(ROWS[1]!);
+    const bare = JSON.parse(script("--dir", store, "--json").stdout) as Record<string, unknown>;
+    expect("durations" in bare).toBe(false);
+    expect("cacheShare" in bare).toBe(false);
+
+    const hooks = await plugin({ engine: "shadow", outcomes: { path: store } });
+    const logs = createSideLogs(store, nodePersistDeps({ warn: () => undefined }));
+    const t = (day: string): number => Date.parse(`2026-10-${day}T12:00:00.000Z`);
+    const timing = (n: number, day: string, durationMs: number): DispatchTimingRow => ({
+      kind: "dispatch-timing",
+      v: 1,
+      ts: new Date(t(day)).toISOString(),
+      parentSessionID: "s1",
+      childSessionID: `c${n}`,
+      callID: `call${n}`,
+      role: "builder",
+      class: "implement",
+      scope: "single",
+      tier: "medium",
+      model: "anthropic/claude-sonnet-5-5",
+      background: false,
+      startedAt: t(day),
+      endedAt: t(day) + durationMs,
+      durationMs,
+      outcome: "succeeded",
+      capacity: null,
+    });
+    const turn = (n: number, day: string, input: number, cacheRead: number): OrchestratorTurnRow => ({
+      kind: "orchestrator-turn",
+      v: 1,
+      ts: new Date(t(day)).toISOString(),
+      sessionID: "s1",
+      turn: n,
+      steps: 1,
+      input,
+      cacheRead,
+      cacheWrite: 0,
+    });
+    await logs.appendTimings([timing(1, "06", 10_000), timing(2, "06", 30_000), timing(3, "08", 50_000)]);
+    await logs.appendTurns([turn(1, "06", 100, 900), turn(2, "06", 500, 500), turn(3, "08", 0, 100)]);
+
+    const all = JSON.parse(script("--dir", store, "--json").stdout) as { durations?: unknown; cacheShare?: unknown };
+    expect(all.durations).toEqual([{ role: "builder", p50: 30_000, p90: 50_000, n: 3 }]); // milliseconds
+    expect(all.cacheShare).toEqual({ p50: 0.9, p10: 0.5, turns: 3 }); // shares, 0..1
+
+    const until = "2026-10-07T00:00:00Z";
+    const early = JSON.parse(script("--dir", store, "--until", until, "--json").stdout) as { durations?: unknown; cacheShare?: unknown };
+    expect(early.durations).toEqual([{ role: "builder", p50: 10_000, p90: 30_000, n: 2 }]);
+    expect(early.cacheShare).toEqual({ p50: 0.5, p10: 0.5, turns: 2 });
+    expect(JSON.parse(await ask(hooks, `stats --until ${until} --json`))).toEqual(early);
+
+    // a window without rows drops the keys again
+    const none = JSON.parse(script("--dir", store, "--until", "2026-10-01", "--json").stdout) as Record<string, unknown>;
+    expect("durations" in none).toBe(false);
+    expect("cacheShare" in none).toBe(false);
+
+    // side-log notes, like the decision log's
+    const fsMod = await import("node:fs");
+    fsMod.appendFileSync(join(store, "timings.jsonl"), 'not json\n{"kind":"dispatch-timing","v":2}\n');
+    fsMod.appendFileSync(join(store, "turns.jsonl"), "also not json\n");
+    const noted = script("--dir", store);
+    expect(noted.stderr).toContain("routing-stats: skipped 1 unreadable timing-log line(s)");
+    expect(noted.stderr).toContain("routing-stats: skipped 1 timing-log row(s) written by a newer version");
+    expect(noted.stderr).toContain("routing-stats: skipped 1 unreadable turn-log line(s)");
+
+    // a directory that holds only side logs is not "no outcome data"
+    const sideOnly = join(home, "side-only");
+    const onlyLogs = createSideLogs(sideOnly, nodePersistDeps({ warn: () => undefined }));
+    await onlyLogs.appendTimings([timing(9, "06", 5_000)]);
+    const only = script("--dir", sideOnly);
+    expect(only.stderr).not.toContain("no outcome data");
+    expect(only.stdout).toContain("### Dispatch durations");
+    const nothing = script("--dir", join(home, "nothing-here"));
+    expect(nothing.stderr).toContain("no outcome data");
   });
 
   it("flushes the rows still queued in memory first, so the table is current", async () => {
@@ -1793,6 +1951,60 @@ describe("cost doctor in the plugin", { timeout: 60_000 }, () => {
     expect(host.agentCalls()).toBe(0);
     expect(host.catalogCalls()).toBe(0);
     expect(host.providerCalls()).toBe(1); // the model check `/router` always made: one call, as before
+  });
+
+  it("G-2: v2 with executor-capable routing lists every plan help line", async () => {
+    // G-16: the executor (and its help) is Windows-only; drive the platform seam to Windows on every CI runner.
+    const platform = vi.spyOn(platformModule, "executorPlatformSupported").mockReturnValue(true);
+    // QA-62C-6: a supported platform logs no executor platform notice (reset first, so an earlier notice cannot hide one).
+    platformModule.resetExecutorPlatformNotice();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const { hooks, host } = await plugin({ routing: { delegation: "roles", leases: { mode: "enforce" }, outcomes: { path: store } } });
+      const text = await ask(hooks);
+      for (const line of PLAN_HELP_LINES) expect(text).toContain(line);
+      const notice = (message: unknown): boolean => JSON.stringify(message).includes(platformModule.EXECUTOR_PLATFORM_NOTICE);
+      expect(warn.mock.calls.filter(notice)).toEqual([]);
+      expect(host.logs.filter(notice)).toEqual([]);
+    } finally {
+      warn.mockRestore();
+      platform.mockRestore();
+      platformModule.resetExecutorPlatformNotice();
+    }
+  });
+
+  it("G-16: off Windows the same executor-capable routing lists no plan help line", async () => {
+    const platform = vi.spyOn(platformModule, "executorPlatformSupported").mockReturnValue(false);
+    try {
+      const { hooks } = await plugin({ routing: { delegation: "roles", leases: { mode: "enforce" }, outcomes: { path: store } } });
+      const text = await ask(hooks);
+      for (const line of PLAN_HELP_LINES) expect(text).not.toContain(line);
+    } finally {
+      platform.mockRestore();
+    }
+  });
+
+  it.each([
+    {},
+    { delegation: "tiers", leases: { mode: "enforce" } },
+    { delegation: "roles", leases: { mode: "off" } },
+  ])("G-2: routing that cannot assemble an executor does not list plan help: %j", async routing => {
+    const { hooks } = await plugin({ routing: { ...routing, outcomes: { path: store } } });
+    expect(await ask(hooks)).not.toContain(PLAN_HELP_LINES[0]);
+  });
+
+  it("G-2: a v2 location outside the executor work roots does not list plan help", async () => {
+    const directory = join(home, "another-location");
+    mkdirSync(directory);
+    // Windows TEMP can contain an 8.3 component; workRoots deliberately refuses that spelling.
+    // Use a real, canonical entry and prove it survived config loading before testing the gate.
+    const workRoot = realpathSync.native(directory);
+    const { hooks } = await plugin({ routing: { delegation: "roles", leases: { mode: "enforce" },
+      workRoots: [workRoot], outcomes: { path: store } } });
+    const routing = resolveRolesRouting(loadConfig(home), "v2");
+    expect(routing.workRoots).toEqual([workRoot]);
+    expect(locationOutsideWorkRoots(home, routing.workRoots)).toBe(true);
+    expect(await ask(hooks)).not.toContain(PLAN_HELP_LINES[0]);
   });
 
   it("QA-2.4-3: with a routing block the doctor reads the SAME config.providers() call as the model check, never routerCatalog", async () => {

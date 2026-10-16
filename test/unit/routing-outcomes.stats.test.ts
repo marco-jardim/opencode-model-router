@@ -9,6 +9,7 @@ import {
   USAGE,
   d17Mode,
   parseStatsArgs,
+  renderDurationsMarkdown,
   renderMarkdown,
   runStatsCli,
   summarize,
@@ -152,6 +153,15 @@ function shuffled<T>(items: readonly T[], seed: number): T[] {
 // ---------------------------------------------------------------------------
 // summarize
 // ---------------------------------------------------------------------------
+
+describe("markdown table cells (CodeQL js/incomplete-sanitization)", () => {
+  it("escapes a backslash before the pipe, so a value ending in \\ cannot reopen a column", () => {
+    const text = renderDurationsMarkdown([{ role: "a\\|b\\", p50: 1000, p90: 2000, n: 1 }]);
+    const row = text.split("\n").find((line) => line.startsWith("| a"));
+    expect(row).toBeDefined();
+    expect(row!.startsWith("| a\\\\\\|b\\\\ |")).toBe(true);
+  });
+});
 
 describe("D17 final dogfood mode", () => {
   it.each(["pass", "fail", "unverifiable"] as const)("D17: a switched enforced dispatch with %s chooses mode from the failed-switch count", (outcome) => {

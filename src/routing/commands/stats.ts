@@ -20,7 +20,7 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveRouting, type RouterConfig } from "../../router/config";
-import { acquireOutcomes, createPersister, nodePersistDeps, resolveOutcomesDir, runStatsCli } from "../outcomes";
+import { acquireOutcomes, createPersister, createSideLogs, nodePersistDeps, resolveOutcomesDir, runStatsCli } from "../outcomes";
 import { ingestSettings } from "../outcomes/ingest";
 import type { OutcomesBundle } from "../outcomes";
 
@@ -85,7 +85,7 @@ export async function runStatsCommand(args: string, deps: StatsCommandDeps): Pro
       stderr: (text) => {
         stderr += text;
       },
-    });
+    }, deps.host === "v2" ? { open: (dir) => createSideLogs(dir, persistDeps) } : undefined); // 1.1.4: the side-log sections are v2 only
     return { stdout, stderr, exit };
   } catch (error) {
     deps.logger.warn("[router] /router stats failed", { error: describeError(error) });

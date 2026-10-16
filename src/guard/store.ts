@@ -65,7 +65,9 @@ export function createGuardStore(options: GuardStoreOptions = {}) {
      * Start a new dispatch round for an existing session: reset the
      * per-dispatch tool-call count while preserving cumulative totals,
      * redundancy fingerprints and deliverable state. No-op for sessions
-     * that were never guarded (nothing to reset).
+     * that were never guarded (nothing to reset). Every resume opens one:
+     * a routed task-tool resume, a tier `chat.message` resume and an
+     * executor budget resume (QA-PDF21-2-11, `DispatchBookkeeping.beginResumeRound`).
      */
     beginDispatch(sessionID: string): void {
       const s = states.get(sessionID);

@@ -1,0 +1,780 @@
+/**
+ * test/integration/v2-leases.test.ts
+ *
+ * Phase 2.1 (task 2.1.8): file leases over the real plugin behind the real v2 adapter (`routing.leases.mode: "enforce"`), driven
+ * through a fake host (test/helpers/v2-bg-host.ts). A child session takes a lease on the files it edits until its execution ends;
+ * the orchestrator (a root session) takes none.
+ */
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { acquireLeaseRegistry, createLeaseGuard, peekLeaseRegistry, LEASE_LOOKUP_NEGATIVE_TTL_MS } from "../../src/compat/background";
+import { createLeaseRegistry } from "../../src/router/leases";
+import { leaseRepoKeyOf, SESSION_KIND_NEGATIVE_TTL_MS } from "../../src/compat/v2-hooks";
+import { bindPlanChild, evict as evictBinding } from "../../src/routing/roles/binding";
+import { bootBgHost, restoreEnv, type BgHost, type ToolEvent } from "../helpers/v2-bg-host";
+import { removeDirWhenReleased } from "../helpers/remove-dir";
+
+let host: BgHost | undefined;
+const planChildren: string[] = [];
+
+afterEach(async () => {
+  await host?.dispose();
+  host = undefined;
+  for (const child of planChildren.splice(0)) evictBinding(child);
+  restoreEnv();
+});
+
+const ROOT = "orch";
+const A = "child-a";
+const B = "child-b";
+const C = "child-c";
+
+async function boot(run: "annotate" | "refuse" = "annotate", extra: Record<string, unknown> = {}): Promise<BgHost> {
+  host = await bootBgHost({
+    overrides: { routing: { leases: { mode: "enforce", run }, background: { mode: "auto" } }, ...extra },
+    sessions: { [ROOT]: {}, [A]: { parentID: ROOT, agent: "general" }, [B]: { parentID: ROOT, agent: "general" } },
+  });
+  return host;
+}
+
+let seq = 0;
+function tool(sessionID: string, name: string, input: unknown, extra: Partial<ToolEvent> = {}): ToolEvent {
+  seq += 1;
+  return { sessionID, agent: sessionID === ROOT ? "build" : "general", messageID: `m${seq}`, id: `call-${seq}`, tool: name, input, ...extra };
+}
+
+function file(h: BgHost, name: string): string {
+  const path = join(h.project, name);
+  mkdirSync(h.project, { recursive: true });
+  writeFileSync(path, "x\n");
+  return path;
+}
+
+const edit = (sessionID: string, path: string) => tool(sessionID, "edit", { filePath: path, path, oldString: "x", newString: "y" });
+const read = (sessionID: string, path: string) => tool(sessionID, "read", { filePath: path, path });
+
+function end(h: BgHost, sessionID: string, kind: "succeeded" | "failed" | "interrupted"): Promise<void> {
+  h.emit({ type: `session.execution.${kind}`, id: `ev-${seq++}`, created: 1, data: { sessionID } });
+  return h.drain();
+}
+
+describe("leases: writers", () => {
+  it("two implementers writing one file: the second is refused and the refusal names the holder", async () => {
+    const h = await boot();
+    const f = file(h, "shared.ts");
+    await h.before(edit(A, f));
+    await expect(h.before(edit(B, f))).rejects.toThrow(/Refused: .*shared\.ts is being edited by session child-a/);
+    await expect(h.before(edit(B, f))).rejects.toThrow(/NEED MORE: lease/);
+    await expect(h.before(edit(B, f))).rejects.toThrow(/Do not retry: the lease ends when that session ends/);
+  });
+
+  it("the holder itself may edit its file again", async () => {
+    const h = await boot();
+    const f = file(h, "own.ts");
+    await h.before(edit(A, f));
+    await expect(h.before(edit(A, f))).resolves.toBeDefined();
+  });
+
+  it("different files do not conflict", async () => {
+    const h = await boot();
+    await h.before(edit(A, file(h, "a.ts")));
+    await expect(h.before(edit(B, file(h, "b.ts")))).resolves.toBeDefined();
+  });
+});
+
+describe("leases: readers and runs", () => {
+  it("a reader in the same tree is refused while the file is under edit", async () => {
+    const h = await boot();
+    const f = file(h, "busy.ts");
+    await h.before(edit(A, f));
+    await expect(h.before(read(B, f))).rejects.toThrow(/Refused: .*busy\.ts is under edit by session child-a/);
+  });
+
+  it("a read of a file nobody edits is allowed", async () => {
+    const h = await boot();
+    await h.before(edit(A, file(h, "one.ts")));
+    await expect(h.before(read(B, file(h, "two.ts")))).resolves.toBeDefined();
+  });
+
+  it("a router_run in the tree is annotated with the contamination note under run: annotate", async () => {
+    const h = await boot("annotate");
+    await h.before(edit(A, file(h, "w.ts")));
+    const run = tool(B, "router_run", { script: "test", cwd: h.project });
+    await h.before(run);
+    const after = await h.after({ ...run, status: "completed", result: { content: [{ type: "text", text: "ok" }] } });
+    const text = JSON.stringify(after.result);
+    expect(text).toContain("[router] ran while ");
+    expect(text).toContain("edits 1 file(s); result may be contaminated");
+  });
+
+  it("a router_run in the tree is refused under run: refuse, naming the holder", async () => {
+    const h = await boot("refuse");
+    await h.before(edit(A, file(h, "w.ts")));
+    await expect(h.before(tool(B, "router_run", { script: "test", cwd: h.project }))).rejects.toThrow(
+      /Refused: router_run in .* while session child-a edits 1 file\(s\) there/,
+    );
+  });
+
+  it("a router_run with no one editing is untouched", async () => {
+    const h = await boot("refuse");
+    const run = tool(B, "router_run", { script: "test", cwd: h.project });
+    await h.before(run);
+    const after = await h.after({ ...run, status: "completed", result: { content: [{ type: "text", text: "ok" }] } });
+    expect(JSON.stringify(after.result)).not.toContain("contaminated");
+  });
+});
+
+describe("leases: trees", () => {
+  it("in another worktree both are allowed", async () => {
+    const h = await boot();
+    const other = join(h.home, "worktree-2");
+    mkdirSync(other, { recursive: true });
+    h.sessions.set(B, { parentID: ROOT, agent: "general", directory: other });
+    const fa = file(h, "same-name.ts");
+    const fb = join(other, "same-name.ts");
+    writeFileSync(fb, "x\n");
+    await h.before(edit(A, fa));
+    await expect(h.before(edit(B, fb))).resolves.toBeDefined();
+    await expect(h.before(read(B, fb))).resolves.toBeDefined();
+  });
+});
+
+describe("leases: linked worktrees of one repository (DF-1.1-4)", () => {
+  let scratch: string | undefined;
+
+  afterEach(async () => {
+    // This hook runs before the file's top-level one: the host is disposed here first, so nothing holds the repository.
+    await host?.dispose();
+    host = undefined;
+    const dir = scratch;
+    scratch = undefined;
+    if (dir !== undefined) await removeDirWhenReleased(dir);
+  }, 15_000);
+
+  /** A temp repository with one commit (`src/same.ts`) and a linked worktree made by a real `git worktree add`. */
+  function linkedWorktrees(): { main: string; linked: string } {
+    const base = realpathSync.native(mkdtempSync(join(tmpdir(), "omr-df114-")));
+    scratch = base;
+    const main = join(base, "main");
+    const linked = join(base, "linked");
+    mkdirSync(join(main, "src"), { recursive: true });
+    writeFileSync(join(main, "src", "same.ts"), "x\n");
+    // Isolated from the caller's git environment and configuration (as test/integration/executor-integrate-git.test.ts).
+    const emptyGlobal = join(base, "empty.gitconfig");
+    writeFileSync(emptyGlobal, "");
+    const env: NodeJS.ProcessEnv = {};
+    for (const [k, v] of Object.entries(process.env)) if (!k.toUpperCase().startsWith("GIT_")) env[k] = v;
+    Object.assign(env, { GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: emptyGlobal });
+    const git = (...args: string[]): void => {
+      execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false", ...args], {
+        cwd: main,
+        env,
+        stdio: "pipe",
+        windowsHide: true,
+      });
+    };
+    git("init", "-q");
+    git("add", "-A");
+    git("commit", "-q", "-m", "init");
+    git("worktree", "add", "-q", "--detach", linked);
+    return { main, linked };
+  }
+
+  it("two children editing one repo-relative path in two linked worktrees are both allowed", async () => {
+    const { main, linked } = linkedWorktrees();
+    const h = await boot();
+    h.sessions.set(A, { parentID: ROOT, agent: "general", directory: main });
+    h.sessions.set(B, { parentID: ROOT, agent: "general", directory: linked });
+    h.sessions.set(C, { parentID: ROOT, agent: "general", directory: main });
+    const fa = join(main, "src", "same.ts");
+    const fb = join(linked, "src", "same.ts");
+    await h.before(edit(A, fa));
+    await expect(h.before(edit(B, fb))).resolves.toBeDefined();
+    await expect(h.before(edit(A, fa))).resolves.toBeDefined();
+    await expect(h.before(read(B, fb))).resolves.toBeDefined();
+    // Within one checkout the write key still collides.
+    await expect(h.before(edit(C, fa))).rejects.toThrow(/Refused: .*same\.ts is being edited by session child-a/);
+    await expect(h.before(edit(C, fb))).rejects.toThrow(/Refused: .*same\.ts is being edited by session child-b/);
+  });
+
+  // The guard and registry the v2 adapter builds (its `repoKeyOf` seam), with two plan tasks bound to two slots of one plan.
+  it("two plan tasks of one plan editing one repo-relative path in two slots: the second is refused", async () => {
+    const { main, linked } = linkedWorktrees();
+    const seams = { realpath: (path: string) => realpathSync.native(path), repoKeyOf: leaseRepoKeyOf, now: () => 1 };
+    const registry = createLeaseRegistry(seams, { runMode: "annotate" });
+    const slots: Record<string, { planId: string; taskId: string; slot: string }> = {
+      "plan-t1": { planId: "plan-x", taskId: "T1", slot: main },
+      "plan-t2": { planId: "plan-x", taskId: "T2", slot: linked },
+    };
+    const dirs: Record<string, string> = { "plan-t1": main, "plan-t2": linked, "plain-main": main, "plain-linked": linked };
+    const guard = createLeaseGuard({
+      registry, sessionKind: async () => "child", sessionDir: async (sid) => dirs[sid] ?? main, gitRootOf: (dir) => dir,
+      holderLabel: (id) => `session ${id}`, planTaskOf: (sid) => slots[sid], events: { onRelease: () => () => undefined },
+    });
+    const editIn = (sessionID: string, dir: string) =>
+      guard.before({ sessionID, tool: "edit", args: { filePath: join(dir, "src", "same.ts") }, callID: `call-${sessionID}` });
+    await expect(editIn("plan-t1", main)).resolves.toEqual({});
+    const second = await editIn("plan-t2", linked);
+    expect(second.refuse).toMatch(/Refused: .*same\.ts is being edited by session plan-t1/);
+    // QA-PDF13-7: the text names the holder's file (in its slot); the lease to ask for is the requester's, repo-relative.
+    expect(second.refuse).toContain(`Refused: ${join(main, "src", "same.ts")} is being edited by session plan-t1.`);
+    expect(second.refuse).toContain("return `NEED MORE: lease src/same.ts`.");
+    // An ordinary child is keyed by its checkout: free in the other worktree, refused in the plan task's own.
+    await expect(editIn("plain-linked", linked)).resolves.toEqual({});
+    expect((await editIn("plain-main", main)).refuse).toMatch(/Refused: .*same\.ts is being edited by session plan-t1/);
+    // The repository-wide key survives a restart (the snapshot keeps the shared repository of the plan task's lease).
+    const restarted = createLeaseRegistry(seams, { runMode: "annotate" });
+    expect(restarted.restore(registry.snapshot(), { dropCompleteHolders: true })).toEqual({ ok: true, leases: 1 });
+    const holder = { holderID: "plan-t2", tree: linked, isChild: true, taskRef: "plan-x:T2", scope: "until-integrated" } as const;
+    expect(restarted.acquireWrite(holder, join(linked, "src", "same.ts"))).toMatchObject({ ok: false, reason: "held" });
+  });
+
+  it("separate module copies enforce repository-wide plan leases until releaseTask, not child end or adapter release", async () => {
+    const { main, linked } = linkedWorktrees();
+    const options = { runMode: "annotate" as const, snapshotPath: join(main, "leases.json"), logger: { warn: vi.fn() },
+      seams: { realpath: (path: string) => realpathSync.native(path), repoKeyOf: leaseRepoKeyOf, now: () => 1 } };
+    const one = acquireLeaseRegistry(options);
+    vi.resetModules();
+    const copy = await import("../../src/compat/background");
+    expect(copy.acquireLeaseRegistry).not.toBe(acquireLeaseRegistry);
+    const two = copy.acquireLeaseRegistry(options);
+    try {
+      expect(two.registry).toBe(one.registry);
+      expect(copy.peekLeaseRegistry(options.snapshotPath)).toBe(one.registry);
+      const guardFor = (module: { createLeaseGuard: typeof createLeaseGuard }, handle: typeof one, taskId: string, slot: string) =>
+        module.createLeaseGuard({ registry: handle.registry, sessionKind: async () => "child", sessionDir: async () => slot,
+          gitRootOf: (dir) => dir, holderLabel: (id) => `session ${id}`,
+          planTaskOf: () => ({ planId: "plan-copies", taskId, slot }), events: handle });
+      const first = guardFor({ createLeaseGuard }, one, "T1", main);
+      const second = guardFor(copy, two, "T2", linked);
+      const editIn = (guard: typeof first, sessionID: string, slot: string) =>
+        guard.before({ sessionID, tool: "edit", args: { filePath: join(slot, "src", "same.ts") }, callID: `call-${seq++}` });
+      await expect(editIn(first, "plan-first", main)).resolves.toEqual({});
+      expect(two.registry.planHolderOf(linked, "src/same.ts")).toMatchObject({ holderID: "plan-first", taskRef: "plan-copies:T1", scope: "until-integrated" });
+      const refusal = `Refused: ${join(main, "src", "same.ts")} is being edited by session plan-first.`;
+      expect((await editIn(second, "plan-second", linked)).refuse).toContain(refusal);
+      first.releaseChild("plan-first");
+      one.notifyReleased();
+      expect((await editIn(second, "plan-second", linked)).refuse).toContain(refusal);
+      await one.release(); // The other module still owns the same live registry.
+      expect((await editIn(second, "plan-second", linked)).refuse).toContain(refusal);
+      expect(two.registry.releaseTask("plan-copies:T1")).toEqual({ released: 1, holders: ["plan-first"] });
+      two.notifyReleased();
+      await expect(editIn(second, "plan-second", linked)).resolves.toEqual({});
+      expect(two.registry.planHolderOf(main, "src/same.ts")).toMatchObject({ holderID: "plan-second", taskRef: "plan-copies:T2" });
+    } finally {
+      await one.release();
+      await two.release();
+    }
+    expect(copy.peekLeaseRegistry(options.snapshotPath)).toBeUndefined();
+  });
+
+  // QA-PDF13-5: the plan's home checkout is no slot, so its writers are keyed by it alone (landing refuses a dirty home
+  // checkout). The repository-wide query still finds the plan task's lease from there.
+  it("a root and a plain child in the home checkout may edit a path a plan task holds in its slot", async () => {
+    const { main, linked } = linkedWorktrees();
+    const seams = { realpath: (path: string) => realpathSync.native(path), repoKeyOf: leaseRepoKeyOf, now: () => 1 };
+    const registry = createLeaseRegistry(seams, { runMode: "annotate" });
+    const guard = createLeaseGuard({
+      registry,
+      sessionKind: async (sid) => (sid === "orch-main" ? "root" : "child"),
+      sessionDir: async (sid) => (sid === "plan-t2" ? linked : main),
+      gitRootOf: (dir) => dir,
+      holderLabel: (id) => `session ${id}`,
+      planTaskOf: (sid) => (sid === "plan-t2" ? { planId: "plan-x", taskId: "T2", slot: linked } : undefined),
+      events: { onRelease: () => () => undefined },
+    });
+    const editIn = (sessionID: string, dir: string) =>
+      guard.before({ sessionID, tool: "edit", args: { filePath: join(dir, "src", "same.ts") }, callID: `call-${sessionID}` });
+    await expect(editIn("plan-t2", linked)).resolves.toEqual({});
+    await expect(editIn("orch-main", main)).resolves.toEqual({});
+    await expect(editIn("plain-main", main)).resolves.toEqual({});
+    expect(registry.planHolderOf(main, "src/same.ts")?.holderID).toBe("plan-t2");
+  });
+});
+
+describe("leases: the orchestrator", () => {
+  it("a root session's edits take no lease and never block a child", async () => {
+    const h = await boot();
+    const f = file(h, "root-edit.ts");
+    await h.before(edit(ROOT, f));
+    await expect(h.before(edit(A, f))).resolves.toBeDefined();
+    await expect(h.before(read(B, f))).rejects.toThrow(/under edit by session child-a/);
+  });
+
+  it("a root session's reads are never refused", async () => {
+    const h = await boot();
+    const f = file(h, "root-read.ts");
+    await h.before(edit(A, f));
+    await expect(h.before(read(ROOT, f))).resolves.toBeDefined();
+  });
+
+  it("a root write of a file a child holds is refused with the wait message", async () => {
+    const h = await boot();
+    const f = file(h, "held-by-child.ts");
+    await h.before(edit(A, f));
+    await expect(h.before(edit(ROOT, f))).rejects.toThrow(/Refused: .*held-by-child\.ts is being edited by .*Wait for that session to end/);
+  });
+});
+
+describe("leases: search results", () => {
+  async function grepAfter(h: BgHost, warmUp: boolean) {
+    const leased = file(h, "leased.ts");
+    const free = file(h, "free.ts");
+    await h.before(edit(A, leased));
+    if (warmUp) await h.before(read(B, free)); // the guard resolves the child's actor on its first file / run tool call
+    const grep = tool(B, "grep", { pattern: "needle" });
+    await h.before(grep);
+    const after = await h.after({
+      ...grep,
+      status: "completed",
+      result: {
+        content: [{ type: "text", text: `${leased}:3:needle\n${free}:5:needle` }],
+        output: [{ entry: { path: leased }, line: 3 }, { entry: { path: free }, line: 5 }],
+      },
+    });
+    return { leased, free, text: JSON.stringify(after.result) };
+  }
+
+  // D1: afterSearch resolves the child's actor itself, so a grep that is the child's first tool call is filtered too.
+  it("D1: a grep result is filtered even when it is the child's first tool call", async () => {
+    const h = await boot();
+    const { leased, text } = await grepAfter(h, false);
+    expect(text).not.toContain(leased.replace(/\\/g, "\\\\"));
+  });
+
+  it("a grep result is filtered of files under edit by another holder, with a count", async () => {
+    const h = await boot();
+    const leased = file(h, "leased.ts");
+    const free = file(h, "free.ts");
+    await h.before(edit(A, leased));
+    await h.before(read(B, free)); // the guard resolves the child's actor on its first file / run tool call
+    const grep = tool(B, "grep", { pattern: "needle" });
+    await h.before(grep);
+    const after = await h.after({
+      ...grep,
+      status: "completed",
+      result: {
+        content: [{ type: "text", text: `${leased}:3:needle\n${free}:5:needle` }],
+        output: [{ entry: { path: leased }, line: 3 }, { entry: { path: free }, line: 5 }],
+      },
+    });
+    const result = after.result as { content: Array<{ text: string }>; output: Array<{ entry: { path: string } }> };
+    const joined = result.content.map((p) => p.text).join("\n");
+    expect(joined).toContain(free);
+    expect(joined).not.toContain(leased);
+    expect(joined).toContain("[router] 1 result(s) omitted: under edit by session child-a.");
+    expect(result.output.map((m) => m.entry.path)).toEqual([free]);
+  });
+
+  it("a grep with no leased hit is left as the host sent it", async () => {
+    const h = await boot();
+    const free = file(h, "free.ts");
+    const grep = tool(B, "grep", { pattern: "needle" });
+    await h.before(grep);
+    const original = { content: [{ type: "text", text: `${free}:5:needle` }], output: [{ entry: { path: free }, line: 5 }] };
+    const after = await h.after({ ...grep, status: "completed", result: original });
+    expect(JSON.stringify(after.result)).not.toContain("omitted");
+  });
+});
+
+describe("leases: release", () => {
+  for (const kind of ["succeeded", "interrupted", "failed"] as const) {
+    it(`the lease ends when the holder's execution ${kind}`, async () => {
+      const h = await boot();
+      const f = file(h, `rel-${kind}.ts`);
+      await h.before(edit(A, f));
+      await expect(h.before(edit(B, f))).rejects.toThrow(/being edited by/);
+      await end(h, A, kind);
+      await expect(h.before(edit(B, f))).resolves.toBeDefined();
+    });
+  }
+
+  it("a release of one holder leaves the other holder's lease in place", async () => {
+    const h = await boot();
+    const fa = file(h, "fa.ts");
+    const fb = file(h, "fb.ts");
+    const c = "child-c";
+    h.sessions.set(c, { parentID: ROOT, agent: "general" });
+    await h.before(edit(A, fa));
+    await h.before(edit(B, fb));
+    await end(h, A, "succeeded");
+    await expect(h.before(edit(c, fa))).resolves.toBeDefined();
+    await expect(h.before(edit(c, fb))).rejects.toThrow(/being edited by session child-b/);
+  });
+});
+
+describe("leases: unknown targets", () => {
+  // D6 (memo 14.1/17): `toolTargets` reports `gitRootRequired` for a router_git_* call when no git root is known, and the
+  // guard refuses it as an unknown target while another child edits files. Here the session directory is not inside a
+  // git repository (gitRootOf -> undefined) and child A holds a write lease.
+  it("D6: a router_git_* call without a git root names no file the router can check, while another child edits", async () => {
+    const h = await boot();
+    await h.before(edit(A, file(h, "g.ts")));
+    await expect(h.before(tool(B, "router_git_diff", {}))).rejects.toThrow(/names no file the router can check, and session child-a is editing files/);
+    await expect(h.before(tool(B, "router_git_diff", {}))).rejects.toThrow(/NEED MORE: lease/);
+  });
+
+  it("the same call with nobody editing is allowed", async () => {
+    const h = await boot();
+    await expect(h.before(tool(B, "router_git_diff", {}))).resolves.toBeDefined();
+  });
+});
+
+describe("acquireLeaseRegistry: the process-wide registry (ref-counted)", () => {
+  const seams = { realpath: (path: string) => path, repoKeyOf: () => undefined, now: () => 1 };
+  const logger = { warn: vi.fn() };
+
+  it("two holders of one snapshot path share a registry; the last release discards it", async () => {
+    const one = acquireLeaseRegistry({ runMode: "annotate", seams, snapshotPath: "snap-a", logger });
+    const two = acquireLeaseRegistry({ runMode: "refuse", seams, snapshotPath: "snap-a", logger });
+    expect(two.registry).toBe(one.registry); // the first acquirer's registry (and run mode) win
+    await one.release();
+    await one.release(); // idempotent
+    const still = acquireLeaseRegistry({ runMode: "annotate", seams, snapshotPath: "snap-a", logger });
+    expect(still.registry).toBe(two.registry);
+    await two.release();
+    await still.release();
+    const fresh = acquireLeaseRegistry({ runMode: "annotate", seams, snapshotPath: "snap-a", logger });
+    expect(fresh.registry).not.toBe(two.registry);
+    await fresh.release();
+  });
+
+  it("different snapshot paths do not share", async () => {
+    const a = acquireLeaseRegistry({ runMode: "annotate", seams, snapshotPath: "snap-b", logger });
+    const b = acquireLeaseRegistry({ runMode: "annotate", seams, snapshotPath: "snap-c", logger });
+    expect(a.registry).not.toBe(b.registry);
+    await a.release();
+    await b.release();
+  });
+
+  it("notifyReleased calls every subscriber, survives one that throws, and honours the unsubscribe", async () => {
+    const warn = vi.fn();
+    const handle = acquireLeaseRegistry({ runMode: "annotate", seams, snapshotPath: "snap-d", logger: { warn } });
+    const calls: string[] = [];
+    handle.onRelease(() => {
+      throw new Error("listener broke");
+    });
+    const off = handle.onRelease(() => calls.push("second"));
+    handle.notifyReleased();
+    expect(calls).toEqual(["second"]);
+    expect(warn).toHaveBeenCalledWith("[router] lease release listener failed", { error: "listener broke" });
+    off();
+    handle.notifyReleased();
+    expect(calls).toEqual(["second"]);
+    await handle.release();
+  });
+});
+
+describe("leases: adapter registry observation and restoration across module copies", () => {
+  it.each([
+    ["null", null, "auto", "annotate"],
+    ["undefined", undefined, "off", "refuse"],
+    ["partial", { initializing: false }, "off", "annotate"],
+    ["invalid registry", { initializing: false, refs: 1, listeners: new Set(), logger: { warn() {} }, registry: {} }, "auto", "refuse"],
+  ] as const)("fails closed for enforced tools when the per-path entry is %s", async (_label, malformed, background, run) => {
+    const home = mkdtempSync(join(tmpdir(), "omr-v2-malformed-lease-"));
+    const snapshotPath = join(home, "outcomes", "leases.json");
+    const key = Symbol.for("opencode-model-router.leases@1");
+    const saved: unknown = Reflect.get(globalThis, key);
+    const registries = new Map<string, unknown>([[snapshotPath, malformed]]);
+    const state = { version: 1, registries };
+    Reflect.set(globalThis, key, state);
+    try {
+      const h = host = await bootBgHost({ home,
+        overrides: { routing: { leases: { mode: "enforce", run }, background: { mode: background } } },
+        sessions: { [ROOT]: {}, [A]: { parentID: ROOT, agent: "general" }, [B]: { parentID: ROOT, agent: "general" } },
+      });
+      const path = file(h, "unchecked.ts");
+      for (const session of [ROOT, A, B]) {
+        for (const event of [
+          edit(session, path), read(session, path),
+          tool(session, "write", { filePath: path, content: "changed" }),
+          tool(session, "patch", { patchText: "" }),
+          tool(session, "glob", { pattern: "**/*.ts" }),
+          tool(session, "grep", { pattern: "needle" }),
+          tool(session, "router_git_diff", {}),
+          tool(session, "router_git_ls_files", {}),
+          tool(session, "router_run", { script: "test", cwd: h.project }),
+        ]) {
+          await expect(h.before(event)).rejects.toThrow("Refused: enforced lease checks are unavailable because the lease registry could not start");
+        }
+      }
+      await expect(h.before(tool(A, "todowrite", { todos: [] }))).resolves.toBeDefined();
+      expect(peekLeaseRegistry(snapshotPath)).toBeUndefined();
+      expect(Reflect.get(globalThis, key)).toBe(state);
+      expect(registries.has(snapshotPath)).toBe(true);
+      expect(registries.get(snapshotPath)).toBe(malformed);
+      await h.dispose();
+      host = undefined;
+      expect(registries.get(snapshotPath)).toBe(malformed);
+    } finally {
+      await host?.dispose();
+      host = undefined;
+      if (saved === undefined) Reflect.deleteProperty(globalThis, key);
+      else Reflect.set(globalThis, key, saved);
+      await removeDirWhenReleased(home);
+    }
+  });
+
+  it("a fresh adapter restores plan leases, drops old ad-hoc leases, and retains the restored plan lease through child end", async () => {
+    const h = await boot();
+    const planned = file(h, "planned.ts");
+    const adHoc = file(h, "ad-hoc.ts");
+    const snapshotPath = join(h.home, "outcomes", "leases.json");
+    const registry = peekLeaseRegistry(snapshotPath);
+    if (registry === undefined) throw new Error("adapter created no lease registry");
+    expect(registry.acquireWrite({ holderID: C, tree: h.project, isChild: true, taskRef: "saved:T1", scope: "until-integrated" }, planned).ok).toBe(true);
+    await h.before(edit(A, adHoc));
+    const snapshot = registry.snapshot();
+    expect(snapshot.leases).toHaveLength(2);
+    await h.dispose();
+    host = undefined;
+    expect(peekLeaseRegistry(snapshotPath)).toBeUndefined();
+    mkdirSync(join(h.home, "outcomes"), { recursive: true });
+    writeFileSync(snapshotPath, JSON.stringify(snapshot));
+    host = await bootBgHost({ home: h.home, overrides: { routing: { leases: { mode: "enforce" }, background: { mode: "off" } } },
+      sessions: { [ROOT]: {}, [B]: { parentID: ROOT, agent: "general" }, [C]: { parentID: ROOT, agent: "general" } } });
+    const restored = peekLeaseRegistry(snapshotPath);
+    expect(restored).not.toBe(registry);
+    expect(restored?.snapshot().leases).toEqual([expect.objectContaining({ holderID: C })]);
+    await expect(host.before(edit(B, planned))).rejects.toThrow(/planned\.ts is being edited by session child-c/);
+    await end(host, C, "succeeded");
+    await expect(host.before(edit(B, planned))).rejects.toThrow(/planned\.ts is being edited by session child-c/);
+    restored?.releaseTask("saved:T1");
+    await expect(host.before(edit(B, planned))).resolves.toBeDefined();
+    await expect(host.before(edit(B, adHoc))).resolves.toBeDefined();
+  });
+
+  it("the non-creating probe sees actual guard leases; a later adapter cannot restore an empty snapshot over them", async () => {
+    const writer = `adapter-writer-${seq++}`, contender = `adapter-contender-${seq++}`;
+    const options = { overrides: { routing: { leases: { mode: "enforce" }, background: { mode: "off" } } },
+      sessions: { [ROOT]: {}, [writer]: { parentID: ROOT, agent: "general" }, [contender]: { parentID: ROOT, agent: "general" } } };
+    const h = host = await bootBgHost(options);
+    for (const [childSessionID, taskId] of [[writer, "T1"], [contender, "T2"]] as const) {
+      bindPlanChild({ childSessionID, role: "implementer", agent: "general", workRoot: h.project,
+        grant: ["edit"], planId: "adapter-copies", taskId, attempt: 1 });
+      planChildren.push(childSessionID);
+    }
+    const f = file(h, "live.ts");
+    await h.before(edit(writer, f));
+    const snapshotPath = join(h.home, "outcomes", "leases.json");
+    vi.resetModules();
+    const copy = await import("../../src/compat/background");
+    expect(copy.acquireLeaseRegistry).not.toBe(acquireLeaseRegistry);
+    const observed = copy.peekLeaseRegistry(snapshotPath);
+    expect(observed).toBeDefined();
+    expect(observed).toBe(peekLeaseRegistry(snapshotPath));
+    expect(observed?.snapshot().leases).toEqual([expect.objectContaining({ holderID: writer })]);
+    expect(observed?.snapshot().holders).toEqual([expect.objectContaining({ holderID: writer, taskRef: "adapter-copies:T1", scope: "until-integrated" })]);
+    mkdirSync(join(h.home, "outcomes"), { recursive: true });
+    writeFileSync(snapshotPath, JSON.stringify({ version: 1, takenAt: 1, holders: [], leases: [] }));
+    const otherModule = await import("../helpers/v2-bg-host");
+    expect(otherModule.bootBgHost).not.toBe(bootBgHost);
+    const other = await otherModule.bootBgHost({ ...options, home: h.home });
+    try {
+      expect(copy.peekLeaseRegistry(snapshotPath)).toBe(observed);
+      expect(observed?.snapshot().leases).toEqual([expect.objectContaining({ holderID: writer })]);
+      await expect(other.before(edit(contender, f))).rejects.toThrow(`live.ts is being edited by session ${writer}`);
+      await end(h, writer, "succeeded");
+      await expect(other.before(edit(contender, f))).rejects.toThrow(`live.ts is being edited by session ${writer}`);
+      observed?.releaseTask("adapter-copies:T1");
+      await expect(other.before(edit(contender, f))).resolves.toBeDefined();
+    } finally {
+      await other.dispose();
+    }
+    expect(copy.peekLeaseRegistry(snapshotPath)).toBe(observed);
+    await h.dispose();
+    host = undefined;
+    expect(copy.peekLeaseRegistry(snapshotPath)).toBeUndefined(); // Observation held no reference.
+  });
+});
+
+describe("leases: a host lookup that never answers (memo 14.1)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("a session kind lookup that hangs is bounded: the call proceeds with root semantics and the lookup is warned once", async () => {
+    vi.useFakeTimers();
+    const dir = join(tmpdir(), "omr-lease-hang");
+    const registry = createLeaseRegistry({ realpath: (path) => path, repoKeyOf: () => undefined, now: () => 1 }, { runMode: "annotate" });
+    const warn = vi.fn();
+    const guard = createLeaseGuard({
+      registry, sessionKind: () => new Promise<"root" | "child">(() => undefined), sessionDir: async () => dir, gitRootOf: () => undefined,
+      holderLabel: (id) => `session ${id}`, planTaskOf: () => undefined, events: { onRelease: () => () => undefined }, logger: { warn },
+    });
+    const pending = guard.before({ sessionID: "ses_hang", tool: "edit", args: { filePath: join(dir, "a.txt") }, callID: "call-1" });
+    await vi.advanceTimersByTimeAsync(5_100);
+    await expect(pending).resolves.toEqual({});
+    expect(warn).toHaveBeenCalledWith("[router] lease session kind lookup failed; treating as root", expect.objectContaining({ error: expect.stringContaining("timed out") }));
+  });
+
+  it("a session directory lookup that hangs is bounded: no lease check, the call is not refused", async () => {
+    vi.useFakeTimers();
+    const registry = createLeaseRegistry({ realpath: (path) => path, repoKeyOf: () => undefined, now: () => 1 }, { runMode: "annotate" });
+    const guard = createLeaseGuard({
+      registry, sessionKind: async () => "child", sessionDir: () => new Promise<string>(() => undefined), gitRootOf: () => undefined,
+      holderLabel: (id) => `session ${id}`, planTaskOf: () => undefined, events: { onRelease: () => () => undefined },
+    });
+    const pending = guard.before({ sessionID: "ses_hang2", tool: "edit", args: { filePath: "a.txt" }, callID: "call-2" });
+    await vi.advanceTimersByTimeAsync(5_100);
+    await expect(pending).resolves.toEqual({});
+  });
+
+  it("QA-2.1-11: one host lookup per session; a failed directory lookup is not repeated within the negative TTL", async () => {
+    const dir = join(tmpdir(), "omr-lease-cache");
+    const registry = createLeaseRegistry({ realpath: (path) => path, repoKeyOf: () => undefined, now: () => 1 }, { runMode: "annotate" });
+    let clock = 1_000;
+    let kindCalls = 0;
+    let dirCalls = 0;
+    let failDir = true;
+    const guard = createLeaseGuard({
+      registry,
+      sessionKind: async () => {
+        kindCalls += 1;
+        return "child";
+      },
+      sessionDir: async () => {
+        dirCalls += 1;
+        if (failDir) throw new Error("host busy");
+        return dir;
+      },
+      gitRootOf: () => undefined, holderLabel: (id) => `session ${id}`, planTaskOf: () => undefined,
+      events: { onRelease: () => () => undefined }, now: () => clock,
+    });
+    const call = (n: number) => guard.before({ sessionID: "ses_cache", tool: "edit", args: { filePath: join(dir, "a.txt") }, callID: `call-${n}` });
+    await expect(call(1)).resolves.toEqual({});
+    await expect(call(2)).resolves.toEqual({});
+    expect(dirCalls).toBe(1);
+    clock += LEASE_LOOKUP_NEGATIVE_TTL_MS;
+    failDir = false;
+    await call(3);
+    expect(dirCalls).toBe(2);
+    await call(4);
+    await call(5);
+    expect(dirCalls).toBe(2);
+    expect(kindCalls).toBe(2);
+  });
+
+  it("QA-2.1-11: a kind lookup that answers unknown keeps root semantics but gets the child's wording", async () => {
+    const tree = join(tmpdir(), "omr-lease-wording");
+    const target = join(tree, "a.ts");
+    const guardOf = (kind: "root" | "unknown") => {
+      const registry = createLeaseRegistry({ realpath: (path) => path, repoKeyOf: () => undefined, now: () => 1 }, { runMode: "annotate" });
+      registry.acquireWrite({ holderID: "holder", tree, isChild: true, scope: "until-complete" }, target);
+      return createLeaseGuard({
+        registry, sessionKind: async () => kind, sessionDir: async () => tree, gitRootOf: () => undefined,
+        holderLabel: (id) => `session ${id}`, planTaskOf: () => undefined, events: { onRelease: () => () => undefined },
+      });
+    };
+    const root = await guardOf("root").before({ sessionID: "ses_kind", tool: "edit", args: { filePath: target }, callID: "call-r" });
+    expect(root.refuse).toContain("Wait for that session to end.");
+    const unknown = await guardOf("unknown").before({ sessionID: "ses_kind", tool: "edit", args: { filePath: target }, callID: "call-u" });
+    expect(unknown.refuse).toContain("Finish without that file");
+    expect(unknown.refuse).not.toContain("Wait for that session to end.");
+  });
+
+  // QA-2.1-25: the fake host's `session.get` fails for A (kind and directory alike); only the fake Date moves (no sleeps).
+  it("QA-2.1-25: a failed kind lookup means no lease only for a short window; after it the child's write takes its lease", async () => {
+    expect(SESSION_KIND_NEGATIVE_TTL_MS).toBeLessThanOrEqual(2_000);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const h = await boot();
+    const early = file(h, "early.ts");
+    const later = file(h, "later.ts");
+    h.failingSessionLookups.add(A);
+    // The host lookups fail: whatever the call itself does, A is no known child and takes no lease (root semantics).
+    await Promise.allSettled([h.before(edit(A, early))]);
+    await expect(h.before(edit(B, early))).resolves.toBeDefined();
+    h.failingSessionLookups.delete(A);
+    vi.setSystemTime(Date.now() + SESSION_KIND_NEGATIVE_TTL_MS);
+    // The short window is over (with the old 30 s it was not): the lookup is made again, A is a child and takes its lease.
+    await h.before(edit(A, later));
+    await expect(h.before(edit(B, later))).rejects.toThrow(/Refused: .*later\.ts is being edited by session child-a/);
+  });
+});
+
+describe("leases: verification deferral (waitTreeFree, memo 14.4)", () => {
+  const TREE = join(tmpdir(), "omr-lease-wait");
+
+  function guardWithHolder() {
+    const registry = createLeaseRegistry({ realpath: (path) => path, repoKeyOf: () => undefined, now: () => 1 }, { runMode: "annotate" });
+    registry.acquireWrite({ holderID: "holder", tree: TREE, isChild: true, scope: "until-complete" }, join(TREE, "a.ts"));
+    const listeners = new Set<() => void>();
+    let clock = 0;
+    const guard = createLeaseGuard({
+      registry, sessionKind: async () => "child", sessionDir: async () => TREE, gitRootOf: () => undefined,
+      holderLabel: (id) => `session ${id}`, planTaskOf: () => undefined,
+      events: { onRelease: (cb) => { listeners.add(cb); return () => void listeners.delete(cb); } },
+      now: () => clock,
+    });
+    return { guard, listeners, tick: (ms: number) => { clock += ms; } };
+  }
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("returns at once when nobody edits the tree", async () => {
+    const { guard } = guardWithHolder();
+    const result = await guard.waitTreeFree(join(tmpdir(), "omr-lease-other-tree"), { producer: "p" }, 10_000, new AbortController().signal);
+    expect(result.holders).toEqual([]);
+    expect(result.fileCount).toBe(0);
+  });
+
+  it("waits for a release, then runs with no remaining holders", async () => {
+    vi.useFakeTimers();
+    const { guard, listeners } = guardWithHolder();
+    const waiting = guard.waitTreeFree(TREE, { producer: "verify-owner" }, 60_000, new AbortController().signal);
+    await vi.advanceTimersByTimeAsync(100);
+    guard.releaseChild("holder");
+    for (const cb of [...listeners]) cb(); // the event loop's notifyReleased
+    await vi.advanceTimersByTimeAsync(10);
+    const result = await waiting;
+    expect(result.holders).toEqual([]);
+  });
+
+  it("at the deadline it gives up and reports the holders that remain (the run then carries the caveat)", async () => {
+    vi.useFakeTimers();
+    const { guard, tick } = guardWithHolder();
+    const waiting = guard.waitTreeFree(TREE, { producer: "verify-owner" }, 6_000, new AbortController().signal);
+    tick(6_001);
+    await vi.advanceTimersByTimeAsync(6_100);
+    const result = await waiting;
+    expect(result.holders).toEqual(["holder"]);
+    expect(result.fileCount).toBe(1);
+  });
+
+  it("a zero deadline does not wait at all", async () => {
+    const { guard } = guardWithHolder();
+    const result = await guard.waitTreeFree(TREE, { producer: "verify-owner" }, 0, new AbortController().signal);
+    expect(result.holders).toEqual(["holder"]);
+    expect(result.waitedMs).toBe(0);
+  });
+
+  it("an aborted wait returns promptly and never throws", async () => {
+    vi.useFakeTimers();
+    const { guard } = guardWithHolder();
+    const abort = new AbortController();
+    const waiting = guard.waitTreeFree(TREE, { producer: "verify-owner" }, 600_000, abort.signal);
+    await vi.advanceTimersByTimeAsync(10);
+    abort.abort();
+    await vi.advanceTimersByTimeAsync(10);
+    await expect(waiting).resolves.toBeDefined();
+  });
+});
+
+describe("leases: off", () => {
+  it("with routing.leases.mode off nothing is checked", async () => {
+    host = await bootBgHost({
+      overrides: { routing: { leases: { mode: "off" } } },
+      sessions: { [ROOT]: {}, [A]: { parentID: ROOT }, [B]: { parentID: ROOT } },
+    });
+    const f = file(host, "x.ts");
+    await host.before(edit(A, f));
+    await expect(host.before(edit(B, f))).resolves.toBeDefined();
+  });
+});

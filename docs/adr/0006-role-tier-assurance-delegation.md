@@ -72,6 +72,18 @@ floor, `escalate.floorTier`, the running rung on a resume and a raise recorded a
 scope are raise-only from the route line. Write authority reaches the cheapest tier only behind checks the router runs
 itself in the dispatch's work root; edit + execution never runs on `fast`.
 
+**Amendment (2026-10-15): opt-in gated floor.** `routing.roleFloor: "strict" | "gated"` defaults to `strict`, is global-only
+(a project cannot lower its own floor), and is inert on OpenCode v1 with the existing single v2-required notice.
+`gated` changes exactly one authority-floor cell: write + exec with effective detection `grader` and effective risk
+other than `high` may use `medium` instead of `heavy`, only when verification actually runs at return (not deferred,
+with acceptance other than `none`) and the next tier above `medium` within the role's ceiling and active tier order
+is `heavy`. A ceiling below heavy, a missing tier, or an intermediate rung keeps the strict floor. The bounds record
+`gated:authority` only when gating lowers the final floor compared with strict. Every strict cell, every other floor
+source, and the non-role paths are unchanged. The FAIL → heavy safety net stays: a verification FAIL of the child
+running on `medium` records `raise:verification-fail:heavy` for its next resume. For gated children, UNVERIFIABLE at
+return also records the same raise (grader timeout or error, gate budget, or no fitting criterion), even when accepted
+with a caveat. Strict children's UNVERIFIABLE behaviour is unchanged; incomplete returns do not escalate.
+
 ### D5 — Detection is effective, never claimed
 
 Detection has three inputs only: whether the router's own gate will run the acceptance checks for the dispatch in its

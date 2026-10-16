@@ -12,6 +12,7 @@ import {
   ROUTING_RESERVED_AGENTS,
   ROUTING_TASK_CLASSES,
   collectRoutingNotices,
+  configuredV2OnlyKeys,
   deepMerge,
   findUnknownRoutingKeys,
   getConfigNotices,
@@ -160,6 +161,27 @@ const V2_DEFAULTS = {
   outcomes: { path: null, halfLifeDays: 14, maxEffectiveSamples: 50 },
   sessionReuse: { maxContextFraction: 0.6 },
   advisor: { enabled: true, noticeIntervalHours: 24, notify: true },
+  background: { mode: "auto", minPredictedMs: 45_000 },
+  leases: { mode: "enforce", run: "annotate" },
+  executor: {
+    maxParallel: 4,
+    slotsDir: null,
+    approve: "ask",
+    crossPhase: "gate",
+    land: "ff-when-clean",
+    batchMax: 4,
+    maxAttempts: 3,
+    qaMaxRounds: 3,
+    integrationChecks: "auto",
+    phaseSuite: "auto",
+    provision: "auto",
+    python: "auto",
+    sharedContextChars: 12000,
+    capacityCooldownMs: 120000,
+    capacityPauseMs: 900000,
+    wakeDebounceMs: 5000,
+    circuitBreaker: { failureRatio: 0.4, minAttempts: 5, consecutiveFailures: 3 },
+  },
   applied: { host: "v2", requestedEngine: "static", engineCoerced: false, rolesSource: "default" },
 };
 
@@ -257,6 +279,118 @@ describe("resolveRouting — defaults (documented, per host)", () => {
   });
 });
 
+describe("routing.background and routing.leases (Phase 2.1, OpenCode v2 only)", () => {
+  beforeEach(() => resetRoutingWarnings());
+
+  const logger = () => ({ warn: vi.fn() });
+
+  it("defaults: background auto/45000, leases enforce/annotate, on both hosts", () => {
+    expect(ROUTING_DEFAULTS.background).toEqual({ mode: "auto", minPredictedMs: 45_000 });
+    expect(ROUTING_DEFAULTS.leases).toEqual({ mode: "enforce", run: "annotate" });
+    for (const host of ["v1", "v2"] as const) {
+      const resolved = resolveRouting(cfgOf(), host);
+      expect(resolved.background).toEqual({ mode: "auto", minPredictedMs: 45_000 });
+      expect(resolved.leases).toEqual({ mode: "enforce", run: "annotate" });
+    }
+  });
+
+  it.each(["auto", "model", "off"] as const)("accepts background.mode %s", (mode) => {
+    const log = logger();
+    const cfg = cfgOf({ routing: { background: { mode } } });
+    expect(cfg.routing?.background).toEqual({ mode });
+    expect(resolveRouting(cfg, "v2", log).background).toEqual({ mode, minPredictedMs: 45_000 });
+    expect(log.warn).not.toHaveBeenCalled();
+  });
+
+  it.each([0, 1, 45_000, 3_600_000])("accepts background.minPredictedMs %i", (minPredictedMs) => {
+    const log = logger();
+    const cfg = cfgOf({ routing: { background: { minPredictedMs } } });
+    expect(resolveRouting(cfg, "v2", log).background).toEqual({ mode: "auto", minPredictedMs });
+    expect(log.warn).not.toHaveBeenCalled();
+  });
+
+  it.each(["enforce", "off"] as const)("accepts leases.mode %s", (mode) => {
+    const resolved = resolveRouting(cfgOf({ routing: { leases: { mode } } }), "v2");
+    expect(resolved.leases).toEqual({ mode, run: "annotate" });
+  });
+
+  it.each(["annotate", "refuse"] as const)("accepts leases.run %s", (run) => {
+    const resolved = resolveRouting(cfgOf({ routing: { leases: { run } } }), "v2");
+    expect(resolved.leases).toEqual({ mode: "enforce", run });
+  });
+
+  it("an invalid value is dropped by validation (no throw) and reported as a notice", () => {
+    const routing = {
+      background: { mode: "sometimes", minPredictedMs: 1.5 },
+      leases: { mode: "maybe", run: "block" },
+    };
+    const cfg = cfgOf({ routing });
+    expect(cfg.routing?.background).toEqual({});
+    expect(cfg.routing?.leases).toEqual({});
+    const notices = collectRoutingNotices(routing, cfg);
+    expect(notices).toHaveLength(4);
+    expect(notices.join("\n")).toContain("routing.background.mode must be auto|model|off");
+    expect(notices.join("\n")).toContain("routing.background.minPredictedMs must be an integer from 0 to 3600000");
+    expect(notices.join("\n")).toContain("routing.leases.mode must be enforce|off");
+    expect(notices.join("\n")).toContain("routing.leases.run must be annotate|refuse");
+  });
+
+  it.each([-1, 3_600_001, 1.5, Number.NaN, "45000", null])(
+    "an out-of-range minPredictedMs (%j) warns once and falls back to 45000",
+    (bad) => {
+      const log = logger();
+      const cfg: RouterConfig = { ...cfgOf(), routing: { background: { minPredictedMs: bad as number } } };
+      expect(resolveRouting(cfg, "v2", log).background.minPredictedMs).toBe(45_000);
+      resolveRouting(cfg, "v2", log);
+      expect(log.warn).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("an invalid enum warns once per text and falls back to the default", () => {
+    const log = logger();
+    const cfg: RouterConfig = {
+      ...cfgOf(),
+      routing: {
+        background: { mode: "bogus" as "auto" },
+        leases: { mode: "bogus" as "off", run: "bogus" as "refuse" },
+      },
+    };
+    const resolved = resolveRouting(cfg, "v2", log);
+    expect(resolved.background.mode).toBe("auto");
+    expect(resolved.leases).toEqual({ mode: "enforce", run: "annotate" });
+    resolveRouting(cfg, "v2", log);
+    expect(log.warn).toHaveBeenCalledTimes(3);
+  });
+
+  it("the new keys are known: no unknown-key notice, a typo is noticed", () => {
+    expect(
+      findUnknownRoutingKeys({ background: { mode: "off", minPredictedMs: 0 }, leases: { mode: "off", run: "refuse" } }),
+    ).toEqual([]);
+    expect(findUnknownRoutingKeys({ background: { mod: "off" }, leases: { runs: "refuse" } })).toEqual([
+      "routing.background.mod",
+      "routing.leases.runs",
+    ]);
+  });
+
+  it("configuredV2OnlyKeys lists the configured v2-only keys, from a config or its routing block", () => {
+    expect(configuredV2OnlyKeys(undefined)).toEqual([]);
+    expect(configuredV2OnlyKeys({})).toEqual([]);
+    expect(configuredV2OnlyKeys({ routing: { engine: "enforce" } })).toEqual([]);
+    expect(configuredV2OnlyKeys({ routing: { background: {}, leases: null } })).toEqual([]);
+    expect(
+      configuredV2OnlyKeys({
+        routing: { background: { mode: "off", minPredictedMs: 0 }, leases: { run: "refuse", mode: undefined } },
+      }),
+    ).toEqual(["routing.background.mode", "routing.background.minPredictedMs", "routing.leases.run"]);
+    expect(configuredV2OnlyKeys({ leases: { mode: "off" }, background: { mode: "model" } })).toEqual([
+      "routing.background.mode",
+      "routing.leases.mode",
+    ]);
+    // An invalid value is still a configured key.
+    expect(configuredV2OnlyKeys({ routing: { leases: { mode: "bogus" } } })).toEqual(["routing.leases.mode"]);
+  });
+});
+
 describe("resolveRouting — configured values", () => {
   beforeEach(() => resetRoutingWarnings());
 
@@ -305,6 +439,9 @@ describe("resolveRouting — configured values", () => {
       outcomes: { path: ABS_PATH, halfLifeDays: 30, maxEffectiveSamples: 50 },
       sessionReuse: { maxContextFraction: 0.95 },
       advisor: { enabled: false, noticeIntervalHours: 24, notify: true },
+      background: { mode: "auto", minPredictedMs: 45_000 },
+      leases: { mode: "enforce", run: "annotate" },
+      executor: V2_DEFAULTS.executor,
       applied: { host: "v2", requestedEngine: "enforce", engineCoerced: false, rolesSource: "default" },
     });
   });

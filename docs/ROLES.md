@@ -27,6 +27,8 @@ with `routing.delegation: "tiers"` (the default) and on OpenCode v1 nothing on t
 - [Outcome signals](#outcome-signals)
 - [Exploration](#exploration)
 - [`router_run`](#router_run)
+- [Background dispatches](#background-dispatches)
+- [File leases](#file-leases)
 - [Roles mode is decided at plugin start](#roles-mode-is-decided-at-plugin-start)
 - [OpenCode v1 fallback](#opencode-v1-fallback)
 - [Migration from `subagentTiers` and `agents`](#migration-from-subagenttiers-and-agents)
@@ -64,7 +66,7 @@ In the global override file `~/.config/opencode/opencode-model-router.overrides.
 {
   "routing": {
     "delegation": "roles",
-    // only when role dispatches work in git worktrees created after OpenCode started (see Work roots)
+    // only for later-created worktrees outside the trusted executor slots root (see Work roots)
     "workRoots": ["D:/git/my-repo-wt-*"]
   }
 }
@@ -172,7 +174,10 @@ name. At dispatch time a grant that would mix them loses its egress, with a note
 
 Every role dispatch has exactly one **work root**: the session directory, or a git worktree of the same repository
 named on the route line with `root=<absolute path>` (and repeated in ENVIRONMENT). `read`, `glob`, `grep`,
-`router_git_*`, `edit` and `router_run` work inside it only; any other path is denied.
+`router_git_*`, `edit` and `router_run` work inside it only; any other path is denied. A role child gets its task
+without the route line, so the role prompt says: "The router's `Working directory:` line and the work root in this
+dispatch's ENVIRONMENT win over the working directory in the host's environment block." The host's block can name the
+parent's directory.
 
 - **Resolution.** The `root=` text is normalised and compared with the session directory and with every entry of
   `git worktree list --porcelain` before any filesystem call on it; a match becomes its canonical long form. Anything
@@ -190,8 +195,24 @@ named on the route line with `root=<absolute path>` (and repeated in ENVIRONMENT
   trailing dots and spaces and an NTFS `:stream` suffix; a link or junction into `.git` counts).
 - **Registration.** The role agents' max policy allows `external_directory` for the worktree roots git lists when the
   agents are registered, plus the `routing.workRoots` globs (global layer only, default `[]`), never `*`. A worktree
-  created after the plugin started is covered only by a matching `routing.workRoots` glob (or a restart). Roles
-  without local actions (`researcher`) get no `external_directory` rule.
+  created after the plugin started outside the trusted executor slots root is covered only by a matching
+  `routing.workRoots` glob (or a restart). Roles without local actions (`researcher`) get no `external_directory`
+  rule.
+- **Executor slots root.** On v2, role agents with local actions may work under the trusted slots root:
+  `routing.executor.slotsDir` from the bundled configuration or global override, or `<repo drive>:\.omr-slots` by
+  default. Each plan uses `<root>\<planId>`. `routing.workRoots` is not needed for it, including slots created after
+  registration. This registered allowance does not widen a dispatch: each child still works only in its own validated
+  work root. The executor home (`<git common dir>\omr-executor`) is denied, even if another directory allowance would
+  cover it. A project-local `slotsDir` is ignored; a repository cannot grant itself an external slots root. If the
+  executor home cannot be resolved, no slots-root allowance is added (fail closed). When the directory OpenCode was
+  started in lies outside every `routing.workRoots` entry, the worktrees are still listed and the executor home is still
+  denied, but there is no executor slots-root allowance. See [Assembly and lifecycle](./EXECUTOR.md#assembly-and-lifecycle).
+  The plan executor is Windows only in this release: on other platforms it is inert, so role agents get no
+  slots-root allowance and no executor-home lookup runs. The executor home in the git common directory (a Windows host
+  runs the executor on a repository shared with, for example, WSL) is still denied, whether or not it exists yet: starting
+  at the listed worktree, else the directory OpenCode was started in, the router walks up to the nearest repository and
+  reads its `.git` (and its `commondir`; each at most 4 KiB, regular files only, a linked `.git` refused) to find
+  `<git common dir>/omr-executor` on disk, without running git. When no repository is found, nothing is denied.
 - **Canonical long form.** Write `routing.workRoots` entries in their canonical long spelling: an 8.3 short segment
   (`PROGRA~1`) is refused, because the host compares spellings and a short name can alias another directory.
 - **Over-match.** `*` crosses separators: `D:/git/omr-rta-*` allows every directory starting with `omr-rta-`, nested
@@ -424,10 +445,11 @@ has room for, and when a placement or a v2 tier per-check `cwd=` is refused (a r
 
 **Limits.**
 
-- A worktree outside the parents (for example under `%TEMP%`) is admitted by rule 2, but the registered policy ends in
+- A worktree outside the parents and the trusted executor slots root (for example under `%TEMP%`) is admitted by rule
+  2, but the registered policy ends in
   a catch-all `deny` that the hook-level allow cannot override, so it still needs a `routing.workRoots` glob in long
-  form or a restart; the same holds for a worktree of the session repository created after registration. Creating
-  worktrees below a parent avoids this.
+  form or a restart; the same holds for a worktree of the session repository created after registration outside the
+  trusted slots root. Creating worktrees below a parent or using executor slots avoids this.
 - Changing `routing.repoParents` needs a restart.
 - The role header is built only for a routed role dispatch (not for a delegate's) and names the work root and location
   the router bound; a role still cannot read or write outside its grant.
@@ -539,7 +561,7 @@ file <file> is invalid (<reason>); no approvals apply until it is fixed or remov
 
 - Worktrees of an approved repository outside its main tree are admitted by rule 2 once the repository is bound, but
   the host's directory permission covers only `<path>\*`, so they still need a `routing.workRoots` glob or a restart
-  (Q7), as for any worktree outside the parents.
+   (Q7), as for any worktree outside the parents and the trusted executor slots root.
 - The root commits change on an orphan-branch checkout, a deepened shallow clone or rewritten history; the approval is
   then lost and must be given again.
 - At most 32 approvals and 256 KiB. Two OpenCode instances writing the store at the same time can lose one write; the
@@ -573,6 +595,7 @@ The window of a role dispatch is `[floor, ceiling]`:
 - a route-line `tier=` pin is honoured inside the window; below the floor it is lifted (reason `lift:authority` or
   `lift:floor`), above the ceiling it is clamped (`clamp:ceiling`).
 
+**Strict floor (`routing.roleFloor: "strict"`, the default).**
 `authorityFloor(grant, detection, risk, scope)` — the effective detection decides the column:
 
 <!-- authority-floor-table -->
@@ -586,6 +609,33 @@ Write authority goes to the cheapest tier only behind checks the router runs its
 edit + execution never runs on `fast`: an edit can change what a script does, so write + exec is treated like running
 code the agent wrote. After a verification FAIL the router raises the child's floor for its next resume itself; the
 orchestrator never sets `tier=` or `model` for that.
+
+**Gated floor (`routing.roleFloor: "gated"`, OpenCode v2 only).** The bundled `tiers.json` can set this mode;
+the global override can change it (the code default is `"strict"`). Project overrides cannot set it.
+This table applies only when verification actually runs **at return**: enforcement is on, not bypassed,
+`verify.require` is not `never`, the verification placement is allowed, verification is not deferred, and the
+effective acceptance is not `none`. It also requires that the next tier above `medium` within the role's ceiling and
+active tier order is `heavy`; a ceiling of `medium`, a missing tier, or an intermediate rung does not qualify.
+Otherwise the strict table applies. Effective detection and risk are unchanged;
+in particular, a criteria-only acceptance needs a route-line `d=grader` claim to count as `grader`.
+
+<!-- authority-floor-gated-table -->
+| Grant contains | `deterministic` | `grader` | `none` |
+|---|---|---|---|
+| no write (local, egress or exec only) | `fast` | `fast` | `fast` |
+| write without exec | `fast` if risk `low` and scope `single`, else `medium` | `medium` | `medium`; `heavy` if risk `high` |
+| write + exec | `medium` | `medium`; `heavy` if risk `high` | `heavy` |
+
+Exactly one cell changes: write + exec with effective `grader` detection and risk below `high` has authority floor
+`medium` instead of `heavy`. All other floors, including role ranges, configured floors and running tiers, still
+apply; bounds reason `gated:authority` is recorded only when gating lowers the final floor compared with strict.
+Deferred `testsPass` does not qualify. The FAIL → heavy safety net remains: a verification **FAIL** raises a child that
+ran on `medium` to `heavy` on its next resume (`raise:verification-fail:heavy`). For gated children, **UNVERIFIABLE**
+at return also records the same raise (including a grader timeout or error, an exhausted gate budget, or no fitting
+criterion), even when the result is accepted with a caveat. Strict children's UNVERIFIABLE behaviour is unchanged;
+incomplete returns do not escalate.
+Tier-agent and delegate (non-role) paths stay strict. On OpenCode v1 the key is inert and uses the existing single
+“roles delegation requires OpenCode v2; using tiers” notice.
 
 ## Dynamic authority and the ladder
 
@@ -642,8 +692,9 @@ Reader roles are never denied for "non-producing" reads; producer roles keep the
 only when it carries `CAP:N` or `CAP:none` (or when a `subagentTiers` entry maps the role's name to a tier, see
 [Migration](#migration-from-subagenttiers-and-agents)); without one, only the total budget above bounds it.
 
-**Budgets stop a child only in `enforced` mode.** The router's guard enforces role budgets (and the read-only cap) only
-when the effective `enforcement.mode` is `enforced`. In `advisory` mode (the shipped default) it only warns: the child
+**Budgets stop a child only in `enforced` mode.** The router's guard enforces total role budgets only
+when the effective `enforcement.mode` is `enforced`; numeric read-only caps are advisory banners, not hard stops.
+In `advisory` mode (the shipped default) it only warns: the child
 is never stopped by the router, and only the host's own `steps` limit (above) ends a run that goes on. A child that
 is out of budget (or of refusals) in `advisory` mode and returns `NEED MORE: budget` is still a budget stop: the
 router records a `budget` signal and the parent's result gets the `[router budget]` note. In `off` mode the guard does
@@ -752,9 +803,74 @@ code. It never spawns a shell itself (fixed argv, `shell: false`).
 - **Bounds.** Timeout `routing.run.timeoutMs` (default 600000 ms) with a process-tree kill; output bounded to 64 KiB
   with a notice; best-effort redaction of URL userinfo and credential-like query parameters (not a secret scanner).
 
+## Background dispatches
+
+On OpenCode v2 the roles protocol carries a `Background dispatches` block, the same one the tiers protocol gets,
+so a role orchestrator is told to:
+
+- continue any independent work after dispatching background work, and end the turn when none remains (the router
+  wakes it);
+- never poll or sleep;
+- treat a held result as unusable until its verdict, and never report a task done while dispatches are listed in
+  flight;
+- resolve a lease refusal by waiting for the holder, not by retrying.
+
+The whole block, the lease rule included, is left out when `routing.background.mode` is `off` (leases are still
+enforced; only the prompt line goes), and the lease rule alone when `routing.leases.mode` is `off`.
+
+Whether a `subagent` call to a role agent runs in the background is decided per call by `routing.background.mode`
+(`auto` by default, `model`, `off`) and `routing.background.minPredictedMs` (default `45000`); the rules, the held
+results and the per-turn lists are in [OPENCODE_V2.md](OPENCODE_V2.md#background-dispatches). A role call that
+needs required verification is backgrounded only where its result can be held. A role dispatch that `auto` does not
+select with a thin outcome store gets no `background` key, so the host default applies; with `off` it is sent as
+before (`background: false` for a role-routed call).
+
+For execution of a written plan, see [the plan executor guide](EXECUTOR.md): `/plan` and `router_plan`, human approval,
+isolated slots, [leases and safety invariants](EXECUTOR.md#safety-model), recovery and the
+[owner checklist](EXECUTOR.md#owner-checklist-for-the-next-real-plan). It requires roles mode at start and enforced
+leases; plain role dispatches do not become plan tasks merely by running in the background. The plan executor is
+Windows only in this release: on platforms other than Windows `router_plan` and `/plan` are not registered, and when
+roles mode at start with enforced leases and verification not `never` would assemble it the router logs one notice per
+process, `plan executor requires Windows; router_plan and /plan are not registered`.
+
+## File leases
+
+On OpenCode v2 every child session (a role dispatch or a tier dispatch) takes a lease on the files it writes, for as
+long as it runs. Root orchestrator sessions take none: a root write is refused only while a child holds that file,
+and a root read, search or run is never refused. `routing.leases.mode` (`enforce`, the default, or `off`) switches
+the leases; `routing.leases.run` (`annotate`, the default, or `refuse`) sets what `router_run` does when its work root
+has files under edit by another session. A lease covers the file in its checkout: a child in another linked worktree
+of the repository may edit its own copy of the same path. A plan task's lease also refuses another plan task's edit of
+that path in any worktree of the repository.
+
+What a child sees while another session holds a lease (`<holder>` is `<role> "<description>" (session <id>)`):
+
+| Access | Result |
+| --- | --- |
+| Write to a leased file | `[router] Refused: <path> is being edited by <holder>. Finish without that file, or return `NEED MORE: lease <path>`. Do not retry: the lease ends when that session ends.` |
+| Read of a file under edit | `[router] Refused: <path> is under edit by <holder>. Finish without it, or return `NEED MORE: lease <path>`.` |
+| Write whose target the router cannot name while a holder edits in that checkout (for a plan task: in any worktree of that repository) | `[router] Refused: this <tool> call names no file the router can check, and <holder> is editing files in this checkout. Pass the file path explicitly, or return `NEED MORE: lease <tree>`.` (a plan task's refusal says `in this repository`) |
+| More files leased than the limit | `[router] Refused: too many files are leased (<limit>). Return `NEED MORE: lease <path>`.` |
+| `glob` or `grep` listing files under edit | The listed files are removed and one line is added: `[router] <n> result(s) omitted: under edit by <holders>.` |
+| `router_run` in a tree with files under edit | `annotate`: the result gets `[router] ran while <holder> edits <n> file(s); result may be contaminated`. `refuse`: `[router] Refused: router_run in <tree> while <holder> edits <n> file(s) there. Wait for that session to end, or return `NEED MORE: lease <tree>`.` |
+| Root write to a file a child holds | `[router] Refused: <path> is being edited by <holder>. Wait for that session to end.` |
+
+A refusal is final for that attempt: the lease ends when the holder's execution ends, is interrupted or fails, when
+its session is deleted, or after the six-hour sweep, so a retry in the same turn fails the same way. The child either
+finishes without the file or returns `NEED MORE: lease <path>`, and the orchestrator re-dispatches once the holder
+is done. If the session kind cannot be determined the session is treated as a root, which never blocks the
+orchestrator and never overrides a child's lease. A required verification that would run in a tree where a child is
+editing waits for those leases to end (checked on release, with a five-second poll) up to its deadline, then runs
+with the usual caveat; the producer's own task never makes its own check wait. A lease table that cannot identify its
+holder makes writes fail closed and allows reads and runs with one warning.
+
+A lease protects a file only while its holder runs: once the leases end, the files the child wrote are readable (this
+is also why a held result's text is protected but the files behind it are not). On OpenCode v1 the leases are not
+registered.
+
 ## Roles mode is decided at plugin start
 
-Role agents, `router_run`, `router_request_authority` and the work-root resolver are registered only when the plugin
+Role agents, `router_run`, `router_plan`, `/plan`, `router_request_authority` and the work-root resolver are registered only when the plugin
 **started** with `routing.delegation: "roles"`. Switching the override to `roles` while OpenCode runs logs once
 
 > roles mode (OpenCode v2 only): routing.delegation is now `roles`, but this OpenCode instance started in tiers mode;
@@ -769,7 +885,8 @@ next start: restart OpenCode after either switch.
 On OpenCode v1, `routing.delegation: "roles"`, `roleAgents`, `routing.exploration`, `routing.run` and
 `routing.workRoots` are validated but **inert**, with one log line per process at plugin start:
 `roles delegation requires OpenCode v2; using tiers`. No role agent, tool, hook or prompt change is registered; v1
-keeps the tier model.
+keeps the tier model. `routing.background` and `routing.leases` are likewise OpenCode v2 only: v1 has no background
+policy, held results or leases, and its protocol has no `Background dispatches` block.
 
 ## Migration from `subagentTiers` and `agents`
 

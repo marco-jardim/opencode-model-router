@@ -8,6 +8,8 @@ import type { RouterConfig } from "../../src/router/config";
 import * as routerConfig from "../../src/router/config";
 import ModelRouterPlugin from "../../src/index";
 import { ResumeRejectedError, type RouterPluginInput } from "../../src/compat/child-session";
+import { createV2Observations } from "../../src/compat/v2-observations";
+import { servicePairs } from "../helpers/service-observations";
 
 function fixture() {
   const execute = vi.fn(async (_input: unknown, context: ToolContext) => {
@@ -39,6 +41,142 @@ function fixture() {
   } as unknown as ToolContext;
   return { context, runtime, toolContext, execute };
 }
+
+describe("v2 runner: retained context identity and detached runs (3.1.5)", () => {
+  const withCall = (runtime: ReturnType<typeof createV2Runtime>, base: ToolContext, over: Record<string, unknown> = {}) =>
+    runtime.withToolContext({ ...base, ...over } as unknown as ToolContext, async () => undefined);
+  const detachedRequest = (context: { bootID: string; epoch: number; callID: string }, over: Record<string, unknown> = {}) => ({
+    parentSessionID: "parent", prompt: "do it", agent: "coder",
+    model: { providerID: "p", modelID: "m", variant: null },
+    cwd: "/work/slot", signal: new AbortController().signal, detached: true as const, context,
+    onCreated: vi.fn(async () => {}),
+    ...over,
+  });
+
+  it("raw recovery grader dispatch rejects before lookup/execution/onCreated without its parent's real capture", async () => {
+    const { runtime, context, toolContext, execute } = fixture();
+    const onCreated = vi.fn(async () => {});
+    const request = { parentSessionID: "parent", prompt: "grade recovered attempt 2", onCreated };
+    await expect(runtime.childRunner.run(request)).rejects.toThrow(/active tool context or a retained context matching its parent/);
+    await runtime.withToolContext({ ...toolContext, sessionID: "different-root" } as ToolContext, async () => {
+      await expect(runtime.childRunner.run(request)).rejects.toThrow(/retained context matching its parent/);
+    });
+    expect(context.tool.list).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+    expect(onCreated).not.toHaveBeenCalled();
+    await runtime.withToolContext(toolContext, async () => undefined);
+    await expect(runtime.childRunner.run(request)).resolves.toMatchObject({ sessionID: "child" });
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(execute.mock.calls[0]?.[1]).toMatchObject({ sessionID: "parent", id: "call", messageID: "message" });
+    expect(onCreated).toHaveBeenCalledTimes(1);
+  });
+
+  it("records epoch, capturedAt and bootID per capture and notifies listeners synchronously", async () => {
+    const { context, toolContext } = fixture();
+    const runtime = createV2Runtime(context as unknown as Plugin.Context, { bootID: "0123456789abcdef", now: () => Date.parse("2026-02-03T04:05:06.000Z") });
+    const seen: unknown[] = [];
+    const off = runtime.childRunner.onContextCaptured((info) => { seen.push(info); });
+    runtime.childRunner.onContextCaptured(() => { throw new Error("a listener never breaks the call"); });
+    await withCall(runtime, toolContext);
+    await withCall(runtime, toolContext, { id: "call-2" });
+    expect(runtime.childRunner.bootID).toBe("0123456789abcdef");
+    expect(seen).toEqual([
+      { sessionID: "parent", callID: "call", messageID: "message", agent: "build", capturedAt: "2026-02-03T04:05:06.000Z", bootID: "0123456789abcdef", epoch: 1 },
+      { sessionID: "parent", callID: "call-2", messageID: "message", agent: "build", capturedAt: "2026-02-03T04:05:06.000Z", bootID: "0123456789abcdef", epoch: 2 },
+    ]);
+    expect(runtime.childRunner.retainedContext("parent")).toEqual(seen[1]);
+    expect(runtime.childRunner.retainedContext("nobody")).toBeNull();
+    off();
+    await withCall(runtime, toolContext);
+    expect(seen).toHaveLength(2);
+  });
+
+  it("uses a random 16-hex bootID per instance, and one epoch counter for all sessions", async () => {
+    const a = fixture();
+    const b = fixture();
+    expect(a.runtime.childRunner.bootID).toMatch(/^[0-9a-f]{16}$/);
+    expect(a.runtime.childRunner.bootID).not.toBe(b.runtime.childRunner.bootID);
+    await withCall(a.runtime, a.toolContext, { sessionID: "one" });
+    await withCall(a.runtime, a.toolContext, { sessionID: "two" });
+    expect(a.runtime.childRunner.retainedContext("one")?.epoch).toBe(1);
+    expect(a.runtime.childRunner.retainedContext("two")?.epoch).toBe(2);
+  });
+
+  it("throws ContextSupersededError before any host call when the pinned capture is gone or not current", async () => {
+    const { runtime, context, toolContext, execute } = fixture();
+    const boot = runtime.childRunner.bootID;
+    const pinned = { bootID: boot, epoch: 1, callID: "call" };
+    await expect(runtime.childRunner.run(detachedRequest(pinned))).rejects.toMatchObject({ name: "ContextSupersededError", current: null, requested: pinned });
+    await withCall(runtime, toolContext);
+    await withCall(runtime, toolContext, { id: "newer" });
+    const error = await runtime.childRunner.run(detachedRequest(pinned)).catch((e: unknown) => e);
+    expect(error).toMatchObject({ name: "ContextSupersededError", requested: pinned, current: { bootID: boot, epoch: 2, callID: "newer" } });
+    await expect(runtime.childRunner.run(detachedRequest({ ...pinned, epoch: 2, bootID: "ffffffffffffffff", callID: "newer" })))
+      .rejects.toMatchObject({ name: "ContextSupersededError" });
+    expect(context.tool.list).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("a detached run needs a pinned context and a signal", async () => {
+    const { runtime, context, toolContext } = fixture();
+    await withCall(runtime, toolContext);
+    const { context: _ignored, ...noContext } = detachedRequest({ bootID: runtime.childRunner.bootID, epoch: 1, callID: "call" });
+    await expect(runtime.childRunner.run(noContext as never)).rejects.toThrow(/pinned context/);
+    expect(context.tool.list).not.toHaveBeenCalled();
+  });
+
+  it("a detached run ignores an aborted retained toolContext.signal and never forwards progress to the parent call", async () => {
+    const { runtime, execute, toolContext } = fixture();
+    const callAbort = new AbortController();
+    const call = { ...toolContext, signal: callAbort.signal, progress: vi.fn(async () => {}) } as unknown as ToolContext;
+    let nativeSignal: AbortSignal | undefined;
+    execute.mockImplementation(async (_input: unknown, native: ToolContext) => {
+      nativeSignal = native.signal;
+      callAbort.abort(); // the parent call is cancelled while the detached child runs
+      await native.progress({ sessionID: "child", status: "running" });
+      return { output: { sessionID: "child", status: "completed", output: "detached result" } };
+    });
+    const onCreated = vi.fn(async () => {});
+    const result = await runtime.withToolContext(call, async () => {
+      const info = runtime.childRunner.retainedContext("parent")!;
+      return runtime.childRunner.run(detachedRequest({ bootID: info.bootID, epoch: info.epoch, callID: info.callID }, { onCreated }));
+    });
+    expect(result).toEqual({ sessionID: "child", text: "detached result" });
+    expect(onCreated).toHaveBeenCalledWith("child");
+    expect(nativeSignal?.aborted).toBe(false);
+    expect(call.progress).not.toHaveBeenCalled();
+  });
+
+  it("a non-detached run is unchanged: it still forwards progress and follows the call's signal", async () => {
+    const { runtime, execute, toolContext } = fixture();
+    const call = { ...toolContext, progress: vi.fn(async () => {}) } as unknown as ToolContext;
+    const result = await runtime.withToolContext(call, () => runtime.childRunner.run({
+      parentSessionID: "parent", prompt: "grade", onCreated: async () => {},
+    }));
+    expect(result.text).toBe("verified result");
+    expect(call.progress).toHaveBeenCalled();
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  it("pinned sessions survive the LRU until released", async () => {
+    const { runtime, toolContext } = fixture();
+    await withCall(runtime, toolContext, { sessionID: "s0" });
+    const unpin = runtime.childRunner.pin("s0");
+    const unpinAgain = runtime.childRunner.pin("s0"); // pins nest
+    for (let i = 1; i <= 500; i++) await withCall(runtime, toolContext, { sessionID: `s${i}` });
+    expect(runtime.childRunner.retainedContext("s0")).not.toBeNull();
+    expect(runtime.childRunner.retainedContext("s1")).toBeNull(); // the oldest unpinned went instead
+    expect(runtime.childRunner.retainedContext("s500")).not.toBeNull();
+    unpin();
+    unpin(); // idempotent
+    await withCall(runtime, toolContext, { sessionID: "s501" });
+    expect(runtime.childRunner.retainedContext("s0")).not.toBeNull();
+    unpinAgain();
+    await withCall(runtime, toolContext, { sessionID: "s502" });
+    expect(runtime.childRunner.retainedContext("s0")).toBeNull();
+    expect(runtime.childRunner.retainedContext("s502")).not.toBeNull();
+  });
+});
 
 describe("v2 client compatibility", () => {
   it("wraps session data and forwards identifiers, signals, and bound method receivers", async () => {
@@ -231,6 +369,26 @@ describe("native v2 child runner", () => {
       .rejects.toThrow("matching its parent");
   });
 
+  it("QA-PDF12-7 a context run with `retain: false` serves its own operation but never becomes the parent's retained context", async () => {
+    const { runtime, toolContext, execute } = fixture();
+    const agents: unknown[] = [];
+    execute.mockImplementation(async (_input, context) => {
+      agents.push(context.agent);
+      await context.progress({ sessionID: "child", status: "running" });
+      return { output: { sessionID: "child", status: "completed", output: "verified result" } };
+    });
+    // The parent's real call, retained once it settles.
+    await runtime.withToolContext({ ...toolContext, agent: "build" as ToolContext["agent"] }, async () => {});
+    // A context the plugin rebuilt from journaled data: the grader of its own operation runs in it ...
+    await expect(runtime.withToolContext({ ...toolContext, agent: "rebuilt" as ToolContext["agent"] }, () => runtime.childRunner.run({
+      parentSessionID: "parent", prompt: "rebuilt grading", onCreated: async () => {},
+    }), { retain: false })).resolves.toEqual({ sessionID: "child", text: "verified result" });
+    // ... but a later grader of that parent, outside any scope, still gets the real retained context.
+    await expect(runtime.childRunner.run({ parentSessionID: "parent", prompt: "later grading", onCreated: async () => {} }))
+      .resolves.toEqual({ sessionID: "child", text: "verified result" });
+    expect(agents).toEqual(["rebuilt", "build"]);
+  });
+
   it("bounds retained contexts and refuses evicted or unknown parent identities", async () => {
     const { runtime, toolContext, execute } = fixture();
     for (let i = 0; i < 501; i++) {
@@ -331,6 +489,61 @@ describe("native v2 child runner", () => {
     await wiring.disposeVerification();
   });
 
+  it.each([
+    { failure: false, retryWaitMs: 0 }, { failure: true, retryWaitMs: 0 },
+    { failure: false, retryWaitMs: 7_000 }, { failure: true, retryWaitMs: 7_000 },
+  ])("G8 grading without host retry events is unattributed, not intrinsic service (failure=$failure, retryWaitMs=$retryWaitMs)", async ({ failure, retryWaitMs }) => {
+    const run = async (mode: "off" | "on" | "throw") => {
+      const { runtime, context, toolContext, execute } = fixture();
+      let now = 0;
+      const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
+      const lines: string[] = [];
+      const sink = createV2Observations({ write: line => { lines.push(line); } });
+      if (mode === "throw") sink.record = () => { throw new Error("observer"); };
+      const cfg: RouterConfig = { activePreset: "p", presets: { p: { medium: { model: "p/model" } } }, rules: [], defaultTier: "medium" };
+      const wiring = createVerificationWiring({ client: runtime.client, childRunner: runtime.childRunner, directory: "/project",
+        getConfig: () => cfg, observations: mode === "off" ? undefined : sink });
+      context.tool.list.mockImplementation(async () => { now += 200; return [{ id: "subagent", execute }]; });
+      context.session.move.mockImplementation(async () => { now += 1_000; });
+      context.session.interrupt.mockImplementation(async () => { now += 500; return { interrupted: true }; });
+      execute.mockImplementation(async (_input, native) => {
+        now += 800; // native child creation, before progress
+        await native.progress({ sessionID: "child", status: "running" });
+        now += 5; // first provider execution attempt
+        now += retryWaitMs; // host-internal backoff: this host exposes no retry/attempt events
+        now += 12; // remaining provider execution
+        if (failure) throw new Error("grading failed");
+        return { output: { sessionID: "child", status: "completed", output: "verified result" } };
+      });
+      try {
+        const gate = wiring.buildGateDeps("parent", undefined, undefined, undefined, false, "parent", () => ({
+          planId: "p1", taskId: "T1", attempt: 3, taskIds: ["T1"], phaseId: "p1", entryId: null, component: "verify", candidate: "b".repeat(40),
+        }));
+        const result = await runtime.withToolContext(toolContext, () => gate.checker.dispatchGrader({
+          tier: "medium", system: "Judge the changes", prompt: "inspect", cwd: "/artifact",
+        })).catch((error: unknown) => error instanceof Error ? error.message : String(error));
+        sink.close();
+        return { result, elapsed: now, moved: context.session.move.mock.calls.length, interrupted: context.session.interrupt.mock.calls.length,
+          executes: execute.mock.calls.length, rows: mode === "on" ? servicePairs(lines) : [] };
+      } finally { await wiring.disposeVerification(); sink.close(); clock.mockRestore(); }
+    };
+    const off = await run("off");
+    for (const mode of ["on", "throw"] as const) {
+      const { rows, ...effects } = await run(mode);
+      const { rows: _offRows, ...original } = off;
+      expect(effects).toEqual(original);
+      if (mode === "on") {
+        // Even a run with no actual retry is insufficient: progress alone cannot prove it.
+        expect(rows.filter(r => r.spanKind === "service" && r.stage === "grading")).toEqual([]);
+        expect(rows.filter(r => r.action === "end")).toMatchObject([
+          { spanKind: "service-prep", stage: "grader-startup", durationMs: 2_000, result: "completed" },
+          { spanKind: "service-unattributed", stage: "grading", durationMs: 17 + retryWaitMs, result: failure ? "error" : "completed",
+            planId: "p1", taskId: "T1", attempt: 3, candidate: "b".repeat(40) },
+        ]);
+      }
+    }
+  });
+
   it("drives the shared verified-delegate path through native producer and grader children", async () => {
     const { runtime, context, toolContext, execute } = fixture();
     const cfg: RouterConfig = {
@@ -386,6 +599,53 @@ describe("native v2 child runner", () => {
 });
 
 describe("native v2 child runner: resuming a child (Phase 2.3, D11)", () => {
+  it("R3-4. a superseded run's late rejection neither interrupts nor unregisters its resumed round", async () => {
+    const { runtime, toolContext, execute, context } = fixture();
+    let rejectOld!: (error: Error) => void;
+    const late = new Promise<never>((_resolve, reject) => { rejectOld = reject; });
+    let finish!: () => void;
+    const gate = new Promise<void>((resolve) => { finish = resolve; });
+    let ready!: () => void;
+    const started = new Promise<void>((resolve) => { ready = resolve; });
+    let resumedSignal: AbortSignal | undefined;
+    execute.mockImplementationOnce(async (_input, native) => {
+      await native.progress({ sessionID: "child", status: "running" });
+      ready();
+      return late;
+    });
+    execute.mockImplementationOnce(async (_input, native) => {
+      resumedSignal = native.signal;
+      await gate;
+      native.signal.throwIfAborted();
+      return { output: { sessionID: "child", status: "completed", output: "done" } };
+    });
+    const old = runtime.withToolContext(toolContext, () => runtime.childRunner.run({
+      prompt: "first", system: "old round", onCreated: async () => {},
+    })).catch((error: unknown) => error);
+    await started;
+    const resumed = runtime.withToolContext(toolContext, () => runtime.childRunner.run({
+      prompt: "continue", resumeSessionID: "child", system: "new round", onCreated: async () => {},
+    })).catch((error: unknown) => error);
+    try {
+      await vi.waitFor(() => { expect(resumedSignal).toBeDefined(); });
+      rejectOld(new Error("late rejection"));
+      await old;
+      expect(context.session.interrupt).not.toHaveBeenCalled();
+      expect(resumedSignal?.aborted).toBe(false);
+      const system: SessionContext["system"] = [];
+      runtime.applyChildSystem("child", system);
+      expect(system).toEqual([{ type: "text", text: "new round" }]);
+      // A real client abort still finds the resumed controller: old.finally did not remove its registration.
+      await runtime.client.session.abort({ path: { id: "child" } });
+      expect(resumedSignal?.aborted).toBe(true);
+    } finally {
+      rejectOld(new Error("cleanup"));
+      finish();
+      await Promise.all([old, resumed]);
+      await runtime.dispose();
+    }
+  });
+
   it.each(["failed", "aborted", "timeout"])("R2-2: a named %s result confirms the resumed attempt without progress", async (status) => {
     const { runtime, toolContext, execute } = fixture();
     const onConfirmed = vi.fn(async () => {});

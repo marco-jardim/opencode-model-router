@@ -20,6 +20,13 @@ export interface GitInspectOptions {
    * dispatch) the common directory must be that repository's. QA-G-A2-4: paths and output are limited to the work root.
    */
   role?: { dispatchRepository?: string };
+  /**
+   * Phase 2.1 (leases): a git search lists paths (`ls_files`). With this set, the listed repository-relative paths (`/`-separated, as
+   * git prints them) go through it and only `kept` is shown; a non-empty `note` is appended as the last line. It runs on the
+   * decoded path list (the same names `ls-files -z` reports), so a name git would quote is matched by its real spelling. A throwing
+   * filter fails the call closed (nothing is listed).
+   */
+  filterSearch?: (root: string, paths: readonly string[]) => { kept: readonly string[]; note?: string };
   /** Absolute `Date.now()` deadline shared with the caller (a `root` resolution, SD-3b-8); without it a fresh 15 s budget starts. */
   deadlineAt?: number;
 }
@@ -528,6 +535,8 @@ function killDirect(child: ChildProcess, label: BoundedLabel): void {
 }
 
 export interface BoundedOptions {
+  /** Optional v2 process-lifetime diagnostics; never includes executable/environment/directory preparation. */
+  service?: import("../executor/observations").ServiceExecution;
   signal?: AbortSignal; timeoutMs?: number; maxBytes?: number; env?: NodeJS.ProcessEnv;
   /**
    * Keep running past `maxBytes` (the head) and retain only the last `tailBytes` of
@@ -585,18 +594,43 @@ function rollingWindow(max: number) {
   };
 }
 
+function observeBoundedProcess(options: BoundedOptions, event: "prepare" | "start" | "end", result = "error"): void {
+  try {
+    if (event === "end") options.service?.end(result);
+    else options.service?.[event]();
+  } catch { /* Diagnostics must never affect the process. */ }
+}
+
 /**
  * Spawn with byte, time and abort bounds. Settles on `close`, or shortly after
  * `exit` when helpers that inherited the pipes (MSYS sh/sleep re-parented away
  * from taskkill's tree) keep `close` from firing (G7). Never a shell.
  */
 export function spawnBounded(executable: string, args: readonly string[], cwd: string, options: BoundedOptions = {}): Promise<BoundedResult> {
+  observeBoundedProcess(options, "prepare");
   const label = options.label ?? GIT_LABEL;
-  if (options.signal?.aborted) return Promise.reject(new Error(`${label.message} aborted`));
-  if (!isDirectory(cwd)) return Promise.reject(new Error(`${label.message} directory does not exist`));
+  if (options.signal?.aborted) {
+    observeBoundedProcess(options, "end", "interrupted");
+    return Promise.reject(new Error(`${label.message} aborted`));
+  }
+  if (!isDirectory(cwd)) {
+    observeBoundedProcess(options, "end");
+    return Promise.reject(new Error(`${label.message} directory does not exist`));
+  }
   return new Promise((resolveResult, reject) => {
-    const child = spawn(executable, args, { cwd, env: options.env ?? gitEnvironment(), shell: false, windowsHide: true,
-      detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"] });
+    const launch = () => {
+      const env = options.env ?? gitEnvironment();
+      observeBoundedProcess(options, "start");
+      return spawn(executable, args, { cwd, env, shell: false, windowsHide: true,
+        detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"] });
+    };
+    let child: ReturnType<typeof launch>;
+    try { child = launch(); }
+    catch (error) {
+      observeBoundedProcess(options, "end");
+      reject(error);
+      return;
+    }
     const max = options.maxBytes ?? MAX_BYTES;
     const tailMax = options.tailBytes;
     const errorTail = options.mergeStderr && options.stderrTailBytes !== undefined ? rollingWindow(options.stderrTailBytes) : undefined;
@@ -618,9 +652,10 @@ export function spawnBounded(executable: string, args: readonly string[], cwd: s
       timers.add(timer);
       return timer;
     };
-    const settle = (outcome: () => void) => {
+    const settle = (outcome: () => void, serviceResult = "error") => {
       if (settled) return;
       settled = true;
+      observeBoundedProcess(options, "end", serviceResult);
       for (const timer of timers) clearTimeout(timer);
       timers.clear();
       options.signal?.removeEventListener("abort", abort);
@@ -645,7 +680,8 @@ export function spawnBounded(executable: string, args: readonly string[], cwd: s
     };
     const finish = (code: number | null) => {
       if (settled) return;
-      const done = () => settle(() => failure && !options.settleOnFailure ? reject(new Error(failure)) : resolveResult(result(code)));
+      const done = () => settle(() => failure && !options.settleOnFailure ? reject(new Error(failure)) : resolveResult(result(code)),
+        failure !== undefined ? options.signal?.aborted ? "interrupted" : "timed-out" : truncated ? "fail" : code === 0 ? "pass" : "fail");
       if (!killing) { done(); return; }
       void Promise.race([killing, new Promise(wait => setTimeout(wait, KILL_WAIT_MS))]).then(done);
     };
@@ -957,10 +993,47 @@ async function diffNames(executable: string, argv: string[], root: string, env: 
   return withWarnings(result.truncated ? `${text}[truncated: output exceeds ${MAX_BYTES} bytes]` : text, result);
 }
 
-function nearestRepository(directory: string): string | undefined {
+/**
+ * Phase 2.1: `ls-files` with its listing filtered (leases). The listing is read NUL-separated, so a name git would quote is still
+ * matched by its real spelling; the filter's `kept` paths are printed one per line, then its note. A `[truncated: …]` marker the
+ * bounded runner appended stays last. A throwing filter propagates: the call fails and lists nothing (fail closed).
+ */
+async function filteredListing(executable: string, argv: string[], root: string, env: NodeJS.ProcessEnv, budget: Budget,
+  filter: NonNullable<GitInspectOptions["filterSearch"]>): Promise<string> {
+  const at = argv.indexOf("ls-files");
+  const run = (args: string[]) => runBoundedProcess(executable, args, root, { signal: budget.signal, timeoutMs: budget.timeoutMs(), env });
+  if (at < 0) return await run(argv); // not a listing argv: nothing to filter
+  const raw = await run([...argv.slice(0, at + 1), "-z", ...argv.slice(at + 1)]);
+  const marker = /\n?\[truncated:[^\]]*\]\s*$/.exec(raw);
+  const body = marker === null ? raw : raw.slice(0, marker.index);
+  const listed = body.split("\0").filter(name => name !== "");
+  const { kept, note } = filter(root, listed);
+  const lines = [...kept, ...(note === undefined || note === "" ? [] : [note])];
+  const text = lines.length === 0 ? "" : `${lines.join("\n")}\n`;
+  return marker === null ? text : `${text}${marker[0].replace(/^\n/, "")}`;
+}
+
+export function nearestRepository(directory: string): string | undefined {
   for (let current = directory; ; current = dirname(current)) {
     if (existsSync(join(current, ".git"))) return current;
     if (dirname(current) === current) return undefined;
+  }
+}
+
+/**
+ * Phase 2.1 (`LeaseSeams.repoKeyOf`): the repository and work tree containing `dir`, or undefined outside any (and when its `.git`
+ * cannot be read safely). `repo` is the common git directory, so every linked worktree of one repository shares it; `tree` is the
+ * checkout. Both are real paths. Reads `.git` pointers only (bounded, never followed onto a network or device path); spawns nothing.
+ */
+export function repositoryIdentity(dir: string): { repo: string; tree: string } | undefined {
+  try {
+    const checkout = nearestRepository(dir);
+    if (checkout === undefined) return undefined;
+    const pointers = gitPointers(checkout);
+    if (pointers === undefined) return undefined;
+    return { repo: realpath(pointers.common), tree: realpath(checkout) };
+  } catch {
+    return undefined; // unreadable or refused (link, network/device path): outside any repository for the lease keys
   }
 }
 
@@ -1094,9 +1167,12 @@ export async function inspectGit(operation: GitOperation, input: GitInput, direc
     inspected = { ...input, ref: oid };
   }
   const argv = gitArgv(operation, inspected, root, { config, exclude: linked, ...(scope === undefined ? {} : { scope }) });
-  const raw = operation === "diff" && input.mode === "name-only"
-    ? await diffNames(executable, argv, root, env, budget)
-    : await runBoundedProcess(executable, argv, root, { signal, timeoutMs: budget.timeoutMs(), env });
+  const searchFilter = operation === "ls_files" ? options.filterSearch : undefined;
+  const raw = searchFilter !== undefined
+    ? await filteredListing(executable, argv, root, env, budget, searchFilter)
+    : operation === "diff" && input.mode === "name-only"
+      ? await diffNames(executable, argv, root, env, budget)
+      : await runBoundedProcess(executable, argv, root, { signal, timeoutMs: budget.timeoutMs(), env });
   let output = ["show", "diff", "log"].includes(operation) ? filterSensitiveDiff(raw) : raw;
   if (operation === "show" || operation === "log") output = await annotateWithheld(output, executable, base, root, env, budget, scopeSpec);
   if (linked.length === 0) return output;
@@ -1204,6 +1280,15 @@ export function checkWorkRootAnswer(answer: unknown): WorkRootAnswer {
   throw new Error("Invalid work-root answer: expected { role: false } or { role: true, root }");
 }
 
+/** Phase 2.1: a process-wide filter for the listings of `router_git_ls_files` (leases); installed by the v2 adapter only. */
+export type GitSearchFilter = (e: { sessionID: string; root: string; paths: readonly string[] }) => { kept: readonly string[]; note?: string };
+let installedSearchFilter: GitSearchFilter | undefined;
+/** Install the listing filter; the returned function removes it (only while it is still the installed one). */
+export function installGitSearchFilter(filter: GitSearchFilter): () => void {
+  installedSearchFilter = filter;
+  return () => { if (installedSearchFilter === filter) installedSearchFilter = undefined; };
+}
+
 /** SD-3b-1: appended to every router_git_* description only when a `root` resolver is configured. */
 const GIT_ROOT_DESCRIPTION_SUFFIX = " Role agents may set root to inspect another repository they may read (its absolute top-level path, or its name below routing.repoParents).";
 const GIT_ROOT_ARG_DESCRIPTION = "Another repository to inspect, read-only: its absolute top-level path, or its name below routing.repoParents; path is then relative to it";
@@ -1218,10 +1303,12 @@ function displayRoot(text: string): string {
 
 /**
  * 3b.3: one call with `root` (SD-3b-4, SD-3b-6 to SD-3b-8). Undefined: `root` names the work root, inspect as without it.
- * `root` is only the git cwd, never a git argument; a refusal or a malformed answer spawns nothing.
+ * `root` is only the git cwd, never a git argument; a refusal or a malformed answer spawns nothing. `filtering` (leases, Phase 2.1)
+ * applies to the other repository's listing as to the work root's.
  */
 async function inspectRoot(operation: GitOperation, input: GitInput, value: unknown, resolveRoot: GitRootResolver,
-  executables: readonly string[], sessionID: string, signal: AbortSignal, deadlineAt: number): Promise<string | undefined> {
+  executables: readonly string[], sessionID: string, signal: AbortSignal, deadlineAt: number,
+  filtering: Pick<GitInspectOptions, "filterSearch"> = {}): Promise<string | undefined> {
   if (typeof value !== "string") return "[router_git] error: refused: root must be a string; nothing ran";
   try {
     const answer = checkGitRootAnswer(await resolveRoot(value, { sessionID, signal, deadlineAt }));
@@ -1243,7 +1330,7 @@ async function inspectRoot(operation: GitOperation, input: GitInput, value: unkn
     }
     const output = await inspectGit(operation, input, answer.root, signal, {
       executables, guards: [...workRootGuards(answer.root), ...workRootGuards(answer.workRoot)],
-      role: { dispatchRepository: answer.repository }, deadlineAt,
+      role: { dispatchRepository: answer.repository }, deadlineAt, ...filtering,
     });
     return `${answer.provenance}\n${output}`;
   } catch (error) {
@@ -1272,6 +1359,9 @@ export function gitTools(opts: GitToolsOptions = {}) {
     },
     async execute(input, context) {
       try {
+        const searchFilter = installedSearchFilter;
+        const filtering: Pick<GitInspectOptions, "filterSearch"> = searchFilter === undefined ? {}
+          : { filterSearch: (root, paths) => searchFilter({ sessionID: context.sessionID, root, paths }) };
         // 3b.3: `root` is stripped before the strict parse; without a resolver the input is parsed as given (unchanged, I9).
         let args: unknown = input;
         let deadline: { deadlineAt?: number } = {};
@@ -1282,7 +1372,7 @@ export function gitTools(opts: GitToolsOptions = {}) {
             // SD-3b-8: one 15 s deadline covers resolution and inspection.
             const deadlineAt = Date.now() + DEADLINE_MS;
             deadline = { deadlineAt };
-            const other = await inspectRoot(operation, inputSchema.parse(rest), root, resolveRoot, executables, context.sessionID, context.abort, deadlineAt);
+            const other = await inspectRoot(operation, inputSchema.parse(rest), root, resolveRoot, executables, context.sessionID, context.abort, deadlineAt, filtering);
             if (other !== undefined) return other;
           }
         }
@@ -1295,10 +1385,11 @@ export function gitTools(opts: GitToolsOptions = {}) {
             return await inspectGit(operation, inputSchema.parse(args), answer.root, context.abort, {
               executables, guards: workRootGuards(answer.root),
               role: expected ? { dispatchRepository: expected } : {}, ...deadline,
+              ...filtering,
             });
           }
         }
-        return await inspectGit(operation, inputSchema.parse(args), context.directory, context.abort, { worktree: context.worktree, executables, ...deadline });
+        return await inspectGit(operation, inputSchema.parse(args), context.directory, context.abort, { worktree: context.worktree, executables, ...deadline, ...filtering });
       } catch (error) {
         // G12: report, never throw into the session; messages are credential-redacted.
         return `[router_git] error: ${stripUrlUserinfo(errorMessage(error))}`;

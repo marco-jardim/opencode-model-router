@@ -1,7 +1,8 @@
 /**
  * #84 P2.1 T2.1.3 / T2.1.4: the role runtime wired into the plugin (`src/index.ts`) and the v2 adapter (`src/compat/v2-hooks.ts`):
  * protocol switch, role tools and the one work-root resolver, guard profiles, budget/authority annotations of the parent's result,
- * the authority ladder's resume, session eviction, P-5 foreground, signals with the real guard state. Tiers mode and v1 unchanged.
+ * the authority ladder's resume, session eviction, P-5 foreground, signals with the real guard state. v1 unchanged; v2 tiers
+ * mode unchanged except for the phase 2.1 "Background dispatches" block (v2 only).
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as childProcess from "node:child_process";
@@ -37,7 +38,7 @@ import {
   AUTHORITY_TEXT, markAnnotated, previewAuthority, requestAuthority, requestedAuthority, resetAuthorityForTests,
 } from "../../src/routing/roles/authority";
 import {
-  resetDispatchRouting, roleGateDeferred, roleGateOutsideWorkRoot, roleRouterGate, routedRoleOf, strippedRouteRoot,
+  pendingResumeRaise, resetDispatchRouting, roleGateDeferred, roleGateOutsideWorkRoot, roleRouterGate, routedRoleOf, strippedRouteRoot,
 } from "../../src/routing/wire/dispatch";
 import { canonicalAuthorityPath, requestedVerificationCwd, requestedVerificationCwdSource, verificationScope } from "../../src/routing/roles/work-root";
 import { runSignal } from "../../src/routing/outcomes/signals";
@@ -55,7 +56,8 @@ import { buildForcingNote, createChangedFileStore } from "../../src/verify/dispa
 import { buildEscalatePolicy, newLadderState, nextAction } from "../../src/escalate/ladder";
 import { BUDGET_INCOMPLETE_REASON, incompleteVerdict } from "../../src/verify/checker";
 import { createVerificationWiring } from "../../src/verify/wiring";
-import type { DoD } from "../../src/verify/dod";
+import { CRITERIA_BUDGET_CHARS, type DoD } from "../../src/verify/dod";
+import { routedRoleSnapshotOf } from "../../src/compat/background";
 import { runAdvisor } from "../../src/routing/advisor";
 
 // A pass-through spy on the cost doctor's entry point: the tests read the extras the plugin hands it (P2.2 wiring).
@@ -230,7 +232,12 @@ describe("tiers mode and v1 stay unchanged (I1, I8)", () => {
     const output = { system: [] as string[] };
     await hooks["experimental.chat.system.transform"]({ sessionID: "root", model: { providerID: "openai", modelID: "gpt-x" } }, output);
     const enfOn = resolveEnforcementMode({ config: cfg, env: process.env }).mode !== "off";
-    expect(output.system[0]).toBe(assembleSystemPrompt(cfg, "openai/gpt-x", enfOn));
+    // Today's tiers protocol plus, since phase 2.1, the v2-only "Background dispatches" block — nothing else changes.
+    expect(output.system[0]).toBe(assembleSystemPrompt(cfg, "openai/gpt-x", enfOn, "v2"));
+    expect(output.system[0]).toContain("## Background dispatches");
+    expect(output.system[0]).toContain("- After a background dispatch, continue any independent work;");
+    expect(output.system[0]).toContain("- A held result is not usable until its verdict arrives.");
+    expect(output.system[0]!.replace(/\n\n## Background dispatches\n[\s\S]*?(?=\n\n---\n\n|$)/, "")).toBe(assembleSystemPrompt(cfg, "openai/gpt-x", enfOn));
   });
 
   it("v1 with roles keys: tiers protocol, no role tool, the v2-only notice", async () => {
@@ -447,7 +454,9 @@ describe("role dispatch through the adapter (P2.1-C, P-5)", () => {
     expect(role.input.description).toMatch(/^find parser \[nonce [A-Za-z0-9_-]{16,128}\]$/);
     expect(String(role.input.prompt)).toMatch(/\nOMR_NONCE=[A-Za-z0-9_-]{16,128}$/);
     expect(typeof role.input.model).toBe("string");
-    expect(role.input.background).toBe(false);
+    // Phase 2.1 (D1, `auto` with a thin duration store, verification off): a role dispatch is no longer forced to
+    // `background: false`; it gets no key at all, so it runs in the host's default foreground (role-spikes update).
+    expect(Object.hasOwn(role.input, "background")).toBe(false);
 
     const tiers = home({}, { MODEL_ROUTER_ENFORCE: "0" });
     const tierPlugin = await plugin(tiers.dir);
@@ -1336,9 +1345,24 @@ describe("QA round 1 (P2.1)", () => {
       const event = { sessionID: "d1", agent: "medium", messageID: "m", id: `dc${i}`, tool: "subagent", input };
       await v2.toolHooks["execute.before"](event);
       expect(event.input.model).toBe(rungRef(cfg, "fast")); // implementer floor on the local-only grant
+      // Phase 2.1 D1 row 2 (`!parentIsRoot` → row 1): a child's role-routed dispatch stays `background: false`.
       expect(event.input.background).toBe(false);
       expect(String(event.input.prompt)).toContain("[route tier=heavy]"); // the delegate's prompt is not parsed or rewritten
       expect(event.input.description).toBe("patch"); // no nonce: nothing registered
+    }
+  });
+
+  it("DF-1-9: an unrecorded child's dispatch is never backgrounded as a root's (A-2.1-1, root parents only)", async () => {
+    const { dir, cfg } = home(ROLES, { MODEL_ROUTER_ENFORCE: "0" });
+    const { hooks } = await plugin(dir);
+    // No `session.created` and no `prompt` hook for u1 (a reload, or past the 1000-entry bound): only the host knows its parent.
+    const v2 = host(dir, cfg, { u1: { id: "u1", parentID: "root", agent: "medium", location: { directory: dir } } });
+    await v2.start(hooks);
+    for (const [i, explicit] of [undefined, true].entries()) {
+      const input: Record<string, unknown> = { agent: "implementer", description: "patch", prompt: "Patch the parser", ...(explicit === undefined ? {} : { background: explicit }) };
+      const event = { sessionID: "u1", agent: "medium", messageID: "m", id: `df19-${i}`, tool: "subagent", input };
+      await v2.toolHooks["execute.before"](event);
+      expect(event.input.background).toBe(false); // D1 row 2: `!parentIsRoot` → the pre-2.1 value, before any explicit or `auto` row
     }
   });
 
@@ -1653,6 +1677,119 @@ describe("QA round 1 (P2.1)", () => {
     expect((await resume("f3")).notes.some((note) => note.startsWith("raise:"))).toBe(false); // consumed once
   }, 60_000);
 
+  it("gated floor safety net: a real criteria gate FAIL records raise:verification-fail:heavy and the resume runs on heavy", async () => {
+    const { dir, cfg } = home({ routing: { delegation: "roles", engine: "enforce", roleFloor: "gated" } }, { MODEL_ROUTER_ENFORCE: "1" });
+    const runner = {
+      run: vi.fn(async () => ({ sessionID: "gated-grader", text: '{"pass":false,"reasons":["the change is not minimal"]}' })),
+      dispose: vi.fn(async () => {}),
+    };
+    const { hooks, ingest } = await plugin(dir, "v2", { routerChildRunner: runner });
+    const onVerdict = vi.spyOn(ingest!, "onVerdict");
+    const sessions: Record<string, Record<string, unknown>> = {};
+    const v2 = host(dir, cfg, sessions);
+    await v2.start(hooks);
+    const fresh = {
+      sessionID: "root", agent: "build", messageID: "m", id: "gated-fail", tool: "subagent",
+      input: {
+        agent: "implementer", description: "change x",
+        prompt: "[route class=implement risk=medium scope=single needs=shell,edit d=grader]\nVERIFY:required\nchange x\n[acceptance]\ncriteria: the change is minimal\n[/acceptance]",
+      } as Record<string, unknown>,
+    };
+    await v2.toolHooks["execute.before"](fresh);
+    const first = routedRoleOf(fresh.id)!;
+    expect(first).toMatchObject({ tier: "medium", detection: "grader", window: { floor: "medium" } });
+    expect(first.gated).toBe(true);
+    sessions["gated-child"] = { id: "gated-child", parentID: "root", agent: "implementer", title: fresh.input.description, location: { directory: dir } };
+    await v2.toolHooks["execute.before"]({ sessionID: "gated-child", agent: "implementer", messageID: "m", id: "gated-read", tool: "read", input: { path: join(dir, "x.ts") } });
+    const finished = parentCall(fresh.id, "gated-child", "implementer", "DONE: updated x", fresh.input);
+    await v2.toolHooks["execute.after"](finished);
+    expect(runner.run).toHaveBeenCalledTimes(1);
+    expect(onVerdict).toHaveBeenCalledWith("gated-child", "fail", { tier: "heavy", model: getActiveTiers(cfg).heavy!.model });
+    expect(resultText(finished)).toContain("NOT ACCEPTED");
+    expect(resultText(finished)).toContain("the router raises it to heavy");
+    expect(pendingResumeRaise("gated-child", "root")).toBe("heavy");
+
+    const resume = {
+      sessionID: "root", agent: "build", messageID: "m", id: "gated-resume", tool: "subagent",
+      input: { agent: "implementer", sessionID: "gated-child", prompt: "address the findings" } as Record<string, unknown>,
+    };
+    await v2.toolHooks["execute.before"](resume);
+    const raised = routedRoleOf(resume.id)!;
+    expect(raised).toMatchObject({ tier: "heavy", window: { floor: "heavy" } });
+    expect(raised.gated).toBeUndefined();
+    expect(raised.notes).toContain("raise:verification-fail:heavy");
+    expect(raised.grant.actions.has("edit")).toBe(true);
+    expect(raised.grant.actions.has("router_run")).toBe(true);
+    expect(String(resume.input.model).split("#")[0]).toBe(resolveCandidates("heavy", cfg)[0]!.model);
+    expect(pendingResumeRaise("gated-child", "root")).toBeNull();
+  }, 60_000);
+
+  it.each([
+    { roleFloor: "gated", needs: "shell,edit", gated: true, strictUnverifiable: false },
+    { roleFloor: "gated", needs: "shell,edit", gated: true, strictUnverifiable: true },
+    { roleFloor: "strict", needs: "edit", gated: false, strictUnverifiable: false },
+    { roleFloor: "strict", needs: "edit", gated: false, strictUnverifiable: true },
+    { roleFloor: "gated", needs: "edit", gated: false, strictUnverifiable: false },
+    { roleFloor: "gated", needs: "edit", gated: false, strictUnverifiable: true },
+    { roleFloor: "gated", needs: "shell,edit", gated: true, strictUnverifiable: false, noFit: true },
+    { roleFloor: "strict", needs: "edit", gated: false, strictUnverifiable: false, noFit: true },
+  ] as const)("R1-541a0cb-2: UNVERIFIABLE raises only gated children (%j)", async (scenario) => {
+    const { roleFloor, needs, gated, strictUnverifiable } = scenario;
+    const noFit = "noFit" in scenario;
+    const { dir, cfg } = home({
+      routing: { delegation: "roles", engine: "enforce", roleFloor },
+      enforcement: { verify: { strictUnverifiable } },
+    }, { MODEL_ROUTER_ENFORCE: "1" });
+    const runner = {
+      run: vi.fn(async () => { throw new Error("grader unavailable"); }),
+      dispose: vi.fn(async () => {}),
+    };
+    const { hooks } = await plugin(dir, "v2", { routerChildRunner: runner });
+    const sessions: Record<string, Record<string, unknown>> = {};
+    const v2 = host(dir, cfg, sessions);
+    await v2.start(hooks);
+    const criterion = noFit ? "x".repeat(CRITERIA_BUDGET_CHARS + 1) : "the change is minimal";
+    const fresh = {
+      sessionID: "root", agent: "build", messageID: "m", id: "unverifiable", tool: "subagent",
+      input: {
+        agent: "implementer", description: "change x",
+        prompt: `[route class=implement risk=medium scope=single needs=${needs} d=grader]\nVERIFY:required\nchange x\n[acceptance]\ncriteria: ${criterion}\n[/acceptance]`,
+      } as Record<string, unknown>,
+    };
+    await v2.toolHooks["execute.before"](fresh);
+    expect(routedRoleOf(fresh.id)!.tier).toBe("medium");
+    expect(routedRoleOf(fresh.id)!.gated).toBe(gated ? true : undefined);
+    sessions["unverifiable-child"] = { id: "unverifiable-child", parentID: "root", agent: "implementer", title: fresh.input.description, location: { directory: dir } };
+    await v2.toolHooks["execute.before"]({ sessionID: "unverifiable-child", agent: "implementer", messageID: "m", id: "unverifiable-read", tool: "read", input: { path: join(dir, "x.ts") } });
+    const finished = parentCall(fresh.id, "unverifiable-child", "implementer", "DONE: updated x", fresh.input);
+    await v2.toolHooks["execute.after"](finished);
+    expect(runner.run).toHaveBeenCalledTimes(noFit ? 0 : 1);
+    const text = resultText(finished);
+    expect(text).toContain(noFit ? "no criterion fits the verification budget" : "grader unavailable");
+    expect(text.includes("NOT ACCEPTED")).toBe(strictUnverifiable);
+    expect(pendingResumeRaise("unverifiable-child", "root")).toBe(gated ? "heavy" : null);
+    if (!gated) {
+      expect(text).not.toContain("resume the same sessionID");
+      expect(text).not.toContain("the router raises it");
+    } else {
+      const resume = {
+        sessionID: "root", agent: "build", messageID: "m", id: "unverifiable-resume", tool: "subagent",
+        input: { agent: "implementer", sessionID: "unverifiable-child", prompt: "retry verification" } as Record<string, unknown>,
+      };
+      await v2.toolHooks["execute.before"](resume);
+      expect(routedRoleOf(resume.id)).toMatchObject({ tier: "heavy", window: { floor: "heavy" }, notes: expect.arrayContaining(["raise:verification-fail:heavy"]) });
+      expect(pendingResumeRaise("unverifiable-child", "root")).toBeNull();
+    }
+  }, 60_000);
+
+  it("R1-541a0cb-2: the gated marker survives a routed-role snapshot; strict snapshots stay byte-identical", () => {
+    const strict = { verifyRoot: "/work", parentSessionID: "root", resumeID: null };
+    expect(routedRoleSnapshotOf(strict)).toEqual(strict);
+    expect(routedRoleSnapshotOf({ ...strict, gated: true })).toEqual({ ...strict, gated: true });
+    expect(routedRoleSnapshotOf({ ...strict, gated: false })).toBeUndefined();
+    expect(routedRoleSnapshotOf({ ...strict, gated: "true" })).toBeUndefined();
+  });
+
   it("QA-P21-2-3: a role dispatch's own CAP:3 caps its child's reads (banners, CAP REACHED, budget note); no CAP, no cap", async () => {
     let snapshot: ((child: string) => ReturnType<typeof captureBudget>) | undefined;
     const { dir, cfg } = home(ROLES, { MODEL_ROUTER_ENFORCE: "0" });
@@ -1755,7 +1892,12 @@ describe("QA round 1 (P2.1)", () => {
     const output = { system: [] as string[] };
     await hooks["experimental.chat.system.transform"]({ sessionID: "root", model: { providerID: "openai", modelID: "gpt-x" } }, output);
     const enfOn = resolveEnforcementMode({ config: cfg, env: process.env }).mode !== "off";
-    expect(output.system[0]).toBe(assembleSystemPrompt(cfg, "openai/gpt-x", enfOn));
+    // The tiers protocol on v2: since phase 2.1 it carries the "Background dispatches" block (v2 only), nothing else.
+    expect(output.system[0]).toBe(assembleSystemPrompt(cfg, "openai/gpt-x", enfOn, "v2"));
+    expect(output.system[0]).toContain("## Background dispatches");
+    expect(output.system[0]).toContain("- After a background dispatch, continue any independent work;");
+    expect(output.system[0]).toContain("- A held result is not usable until its verdict arrives.");
+    expect(output.system[0]!.replace(/\n\n## Background dispatches\n[\s\S]*?(?=\n\n---\n\n|$)/, "")).toBe(assembleSystemPrompt(cfg, "openai/gpt-x", enfOn));
   });
 
   it("QA-P21-2 nit 1: a context overflow named in error.data.message is a stop", () => {
@@ -2001,6 +2143,70 @@ describe("P3.3 global QA round 1 (fix-5)", () => {
 // ---------------------------------------------------------------------------
 
 describe("P3.3 global QA round 2 (fix-8)", () => {
+  it("R3-3. the slot-location plugin consumes the owner's cap and each resumed guard round exactly once", async () => {
+    const { bindPlanChild } = await import("../../src/routing/roles/binding");
+    const { EXECUTOR_READ_CAP_LINE } = await import("../../src/executor/types");
+    const { dir, cfg } = home(ROLES, { MODEL_ROUTER_ENFORCE: "1" });
+    const slotDir = temp("omr-plan-slot-location-");
+    let ownerGuard: import("../../src/executor/types").ExecutorChildGuardPort | undefined;
+    await plugin(dir, "v2", { routerOnExecutorChildGuard: (port: NonNullable<typeof ownerGuard>) => { ownerGuard = port; } });
+    const { hooks } = await plugin(slotDir);
+    const child = "plan-cross-location";
+    const role = resolveRoles(cfg, "v2").get("explorer")!;
+    const budget = role.budget.fast!;
+    const cap = Number(/CAP:(\d+)/.exec(EXECUTOR_READ_CAP_LINE)?.[1]);
+    expect(cap).toBeGreaterThan(0);
+    bindPlanChild({ childSessionID: child, role: role.agent, agent: role.agent, tier: "fast", budget,
+      planId: "plan-locations", taskId: "T1", attempt: 1, workRoot: slotDir, grant: ["read"] });
+    ownerGuard!.applyCap(child, role.agent, `PLAN CONTEXT\n${EXECUTOR_READ_CAP_LINE}\nrest of task`);
+    let n = 0;
+    const read = async (): Promise<string> => {
+      const callID = `cross-${++n}`;
+      const args = { filePath: join(slotDir, `${n}.ts`) };
+      await hooks["tool.execute.before"]({ tool: "read", sessionID: child, agent: role.agent, callID }, { args });
+      const output = { title: "", output: "contents", metadata: {} };
+      await hooks["tool.execute.after"]({ tool: "read", sessionID: child, agent: role.agent, callID, args }, output);
+      return output.output;
+    };
+    expect(await read()).toContain(`[cap: 1/${cap}]`);
+    for (let i = 1; i < budget; i++) {
+      const output = await read();
+      if (i + 1 === cap) expect(output).toContain(`CAP REACHED (${cap}/${cap})`);
+    }
+    await expect(read()).rejects.toThrow(`tool-call budget ${budget} exhausted`);
+    ownerGuard!.beginResumeRound(child, role.agent, "continue and finish");
+    expect(await read()).toContain(`[cap: 1/${cap}]`);
+    expect(await read()).toContain(`[cap: 2/${cap}]`);
+    for (let i = 2; i < budget; i++) await read();
+    await expect(read()).rejects.toThrow(`tool-call budget ${budget} exhausted`);
+  });
+
+  it.each(["medium", "heavy"])("R3-5. a %s plan child uses its resolved tier's budget= and cumulative ceiling", async (tier) => {
+    const { bindPlanChild } = await import("../../src/routing/roles/binding");
+    const { dir, cfg } = home(ROLES, { MODEL_ROUTER_ENFORCE: "1" });
+    let guard: { beginResumeRound(child: string, agent: string, prompt: string): void } | undefined;
+    const { hooks } = await plugin(dir, "v2", { routerOnExecutorChildGuard: (port: NonNullable<typeof guard>) => { guard = port; } });
+    const role = resolveRoles(cfg, "v2").get("implementer")!;
+    const budget = role.budget[tier]! * 2;
+    const child = `plan-tier-${tier}`;
+    bindPlanChild({ childSessionID: child, role: role.agent, agent: role.agent, tier, budget,
+      planId: "plan-tier", taskId: "T1", attempt: 1, workRoot: dir, grant: ["edit"] });
+    for (let round = 0; round < 3; round++) {
+      if (round > 0) guard!.beginResumeRound(child, role.agent, "continue and finish");
+      for (let i = 0; i < budget; i++) {
+        const args = { filePath: join(dir, `tier-${round}-${i}.ts`), oldString: "a", newString: "b" };
+        const callID = `${child}-${round}-${i}`;
+        await hooks["tool.execute.before"]({ tool: "edit", sessionID: child, agent: role.agent, callID }, { args });
+        await hooks["tool.execute.after"]({ tool: "edit", sessionID: child, agent: role.agent, callID, args }, { title: "", output: "edited", metadata: {} });
+      }
+      await expect(hooks["tool.execute.before"]({ tool: "edit", sessionID: child, agent: role.agent, callID: `${child}-${round}-stop` },
+        { args: { filePath: join(dir, "last.ts") } })).rejects.toThrow(`tool-call budget ${budget} exhausted`);
+    }
+    guard!.beginResumeRound(child, role.agent, "continue and finish");
+    await expect(hooks["tool.execute.before"]({ tool: "edit", sessionID: child, agent: role.agent, callID: `${child}-stop` },
+      { args: { filePath: join(dir, "last.ts") } })).rejects.toThrow(`cumulative tool-call budget ${budget * 3} exhausted`);
+  });
+
   it("QA-G-A3-2-2: resumes without budget= keep the fresh dispatch's budget= raise; the cumulative limit follows the largest round", async () => {
     const { dir, cfg } = home(ROLES, { MODEL_ROUTER_ENFORCE: "1" });
     const { hooks } = await plugin(dir);

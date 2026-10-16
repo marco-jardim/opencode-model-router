@@ -48,12 +48,28 @@ afterEach(async () => {
   resetApprovalsState();
 });
 
+/**
+ * G-20: a failing git call rethrows with git's exit status, signal, stderr and stdout, so a CI-only failure (seen once on a
+ * Windows runner as a bare `Command failed: git … commit`) is diagnosable from the log. No retry.
+ */
 function fgit(cwd: string, ...args: string[]): string {
-  return execFileSync("git", ["-c", "user.name=qa", "-c", "user.email=qa@example.invalid", "-c", "commit.gpgsign=false", ...args], {
-    cwd,
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
-  }).trim();
+  try {
+    return execFileSync("git", ["-c", "user.name=qa", "-c", "user.email=qa@example.invalid", "-c", "commit.gpgsign=false", ...args], {
+      cwd,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trim();
+  } catch (error) {
+    const failed = error as { message?: unknown; status?: unknown; signal?: unknown; stderr?: unknown; stdout?: unknown };
+    const text = (value: unknown): string => (typeof value === "string" ? value : Buffer.isBuffer(value) ? value.toString("utf8") : "").trim();
+    throw new Error(
+      `fgit failed in ${cwd}: git ${args.join(" ")}\n` +
+        `status: ${String(failed.status ?? null)}, signal: ${String(failed.signal ?? null)}\n` +
+        `stderr: ${text(failed.stderr) || "(empty)"}\nstdout: ${text(failed.stdout) || "(empty)"}\n` +
+        `cause: ${typeof failed.message === "string" ? failed.message : String(error)}`,
+      { cause: error },
+    );
+  }
 }
 
 function forgeRepo(dir: string): void {

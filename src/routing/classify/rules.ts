@@ -665,3 +665,14 @@ export function analyzeRules(
 export function classifyByRules(text: string, cfg: RulesConfig, ctx?: { cwd?: string }): TaskFacts {
   return analyzeRules(text, cfg, ctx).facts;
 }
+
+/** Observability only: the first high-risk hit under R11's exact section/negation rules, without surrounding task text. */
+export function highRiskTermOf(text: string): string | undefined {
+  const raw = collapseLongRuns(String(text ?? "").slice(0, RULES_MAX_CHARS));
+  const { riskText, prohibitionText } = splitSections(prepareBody(raw));
+  const hit = firstHit(HIGH_RISK_RES, riskText, false) ?? firstHit(HIGH_RISK_RES, prohibitionText, true);
+  if (hit === null) return undefined;
+  const word = hit.text.toLowerCase();
+  // Multiword/command regexes can span arbitrary arguments, and credential names can be private: log only a table id for those.
+  return /^[a-z-]{1,40}$/.test(word) ? word : `term-${hit.index}`;
+}

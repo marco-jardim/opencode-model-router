@@ -8,9 +8,12 @@ import { join } from "node:path";
 import { validateConfig, type RouterConfig } from "../../src/router/config";
 import { buildRoleDispatchHeader, DISPATCH_HEADER_PREFIX, DISPATCH_HEADER_SEPARATOR, stripDispatchHeader } from "../../src/router/dispatch-header";
 import { rememberDispatch, resetDispatchRegistry } from "../../src/router/sessions";
-import { buildRoleLadder } from "../../src/routing/engine/ladders";
+import { buildRoleLadder, roleTierOrder } from "../../src/routing/engine/ladders";
+import { classify } from "../../src/routing/classify";
+import { candidateKey, decideRole } from "../../src/routing/engine/kernel";
+import { effectiveDetection, effectiveFactsOf, grantFor, tierBounds } from "../../src/routing/roles/policy";
 import { acquireOutcomes } from "../../src/routing/outcomes";
-import type { DecisionRow, OutcomesBundle } from "../../src/routing/outcomes/types";
+import { normalizeVariant, type DecisionRow, type OutcomesBundle } from "../../src/routing/outcomes/types";
 import { resetIngestState } from "../../src/routing/outcomes/ingest";
 import { bind, bindingRegistrySize, resetBindingRegistryForTests } from "../../src/routing/roles/binding";
 import {
@@ -263,6 +266,95 @@ describe("role dispatch path", () => {
     expect(row.chosen.origin).toBe("role");
   });
 
+  it.each([
+    { name: "route-line-only high", line: "[route class=implement risk=high scope=single needs=edit]\n", body: "implement a parser guard", rules: "medium", routeLine: "high", effective: "high", tier: "heavy" },
+    { name: "rules-only high", line: "[route class=implement scope=single needs=edit]\n", body: "implement a parser guard for production", rules: "high", routeLine: null, effective: "high", tier: "heavy", term: "production" },
+    { name: "both high", line: "[route class=implement risk=high scope=single needs=edit]\n", body: "implement a parser guard for production", rules: "high", routeLine: "high", effective: "high", tier: "heavy", term: "production" },
+    { name: "neither high (class base)", line: "", body: "implement a parser guard", rules: "medium", routeLine: null, effective: "medium", tier: "medium" },
+    { name: "explicit low cannot lower rules high", line: "[route class=implement risk=low scope=single needs=edit]\n", body: "implement a parser guard for production", rules: "high", routeLine: "low", effective: "high", tier: "heavy", term: "production" },
+  ])("traces $name without changing any routing decision bytes", async (scenario) => {
+    const world = makeWorld({ delegation: "roles", engine: "enforce" });
+    const input = { agent: "implementer", prompt: scenario.line + scenario.body, description: "risk attribution probe" };
+    // The pre-existing decision path, before any log attribution is collected: pin its serialized result against the wire row.
+    const rp = (await world.runtime.prepareRoles!("implementer", world.cfg))!;
+    const result = await classify({ ...input, cwd: world.main }, rp.classifyDeps);
+    const classified = { ...result, facts: effectiveFactsOf(result) };
+    const grant = grantFor(rp.spec, classified.facts, [], world.main, result.trace.routeLine);
+    const none = effectiveDetection({ routerGate: false, claim: null, acceptance: null });
+    const bounds = tierBounds(rp.spec, grant, classified, none, {
+      floorTier: null, runningTier: null, pinTier: null, tiers: roleTierOrder(world.cfg, rp.session),
+    });
+    const ladder = buildRoleLadder({
+      cfg: world.cfg, facts: classified.facts, role: "implementer", window: bounds,
+      pricing: (model) => rp.catalog.pricing(model), logger, session: rp.session,
+    });
+    const before = decideRole({ classified, ladder, detection: none, engine: rp.engine, routing: rp.routing, store: rp.store });
+    const dispatch = before.dispatch!;
+    const chosen = {
+      key: candidateKey(classified.facts.class, dispatch), agent: "implementer", origin: "role",
+      model: dispatch.model, variant: normalizeVariant(dispatch.variant),
+    };
+    const extra = [...before.reasons, ...grant.notes];
+    const reason = `${before.decision.reasonCode}: ${before.decision.reason.replace(/^(?:kept|switched): /, "")}; role @implementer on ${dispatch.tier} in ${bounds.floor}..${bounds.ceiling}${extra.length > 0 ? ` [${extra.join("; ")}]` : ""}`;
+    const baseline = JSON.stringify({
+      tier: dispatch.tier, window: { floor: bounds.floor, ceiling: bounds.ceiling, pinned: bounds.pinned },
+      chosen, best: before.decision.best, switched: before.switched, pinned: before.decision.pinned,
+      costs: before.decision.costs, reason, boundsReasons: bounds.reasons,
+    });
+
+    const c = call(world, input);
+    const outcome = await world.router.route(c);
+    expect(outcome.role).toMatchObject({ tier: scenario.tier, window: { floor: scenario.tier, ceiling: "heavy", pinned: null }, detection: "none" });
+    expect(outcome.model).toBe(tierRef(world.cfg, scenario.tier));
+    world.router.commit(c.callID, applied(input, outcome));
+    const [row] = await world.rows();
+    expect(row!.trace?.riskSources).toEqual({
+      base: "medium", rules: scenario.rules, routeLine: scenario.routeLine,
+      facts: scenario.effective, effective: scenario.effective,
+      ...("term" in scenario ? { term: scenario.term } : {}),
+    });
+    expect(row!.facts.risk).toBe(scenario.effective);
+    expect(JSON.stringify({
+      tier: row!.tier, window: outcome.role!.window,
+      chosen: row!.chosen, best: row!.best, switched: row!.switched, pinned: row!.pinned,
+      costs: row!.costs, reason: row!.reason, boundsReasons: row!.boundsReasons,
+    })).toBe(baseline);
+  });
+
+  it.each([
+    { body: "TASK: implement a parser guard\nCONTEXT: Production settings", term: "production", risk: "high" },
+    { body: "TASK: implement a parser guard\nMUST NOT DO: do not deploy anything", risk: "medium" },
+    { body: "implement a parser guard; git push PRIVATE_ARGUMENT --force", term: "term-16", risk: "high" },
+    { body: `implement a parser guard for deploy${"x".repeat(60)}`, term: "term-42", risk: "high" },
+    { body: "implement a parser guard using PRIVATE_SERVICE_TOKEN", term: "term-47", risk: "high" },
+  ])("risk term metadata respects sections, prohibitions and privacy: $body", async ({ body, term, risk }) => {
+    const world = makeWorld({ delegation: "roles", engine: "shadow" });
+    const c = call(world, { agent: "implementer", prompt: `[route class=implement scope=single needs=edit]\n${body}` });
+    const outcome = await world.router.route(c);
+    world.router.commit(c.callID, applied(c.args, outcome));
+    const [row] = await world.rows();
+    expect(row!.facts.risk).toBe(risk);
+    expect(row!.trace?.riskSources?.term).toBe(term);
+    if (term !== undefined) expect(term.length).toBeLessThanOrEqual(40);
+    expect(JSON.stringify(row!.trace)).not.toContain("PRIVATE");
+    expect(JSON.stringify(row!.trace)).not.toContain("x".repeat(41));
+  });
+
+  it("records inherited risk when a resume's own sources are lower", async () => {
+    const world = makeWorld({ delegation: "roles", engine: "advise" });
+    const [model, variant] = tierRef(world.cfg, "heavy").split("#");
+    rememberDispatch("risk-child", {
+      facts: { class: "implement", risk: "high", scope: "single", needs: ["edit"], confidence: 1, source: "rules" },
+      agent: "implementer", model: model!, variant: variant ?? null, tier: "heavy", parentSessionID: "root", decisionID: "risk-original", step: "dispatch", picked: "implementer",
+    });
+    const c = call(world, { agent: "implementer", sessionID: "risk-child", prompt: "implement the remaining parser guard" });
+    const outcome = await world.router.route(c);
+    world.router.commit(c.callID, applied(c.args, outcome));
+    const [row] = await world.rows();
+    expect(row!.trace?.riskSources).toEqual({ base: "medium", rules: "medium", routeLine: null, facts: "medium", resumedDispatch: "high", effective: "high" });
+    expect(row!.facts.risk).toBe("high");
+  });
+
   // Q9: FLIPPED ON PURPOSE — the dispatch used to run with no work root, a note and write withheld; a declared target that was
   // refused now refuses the dispatch with the note.
   it("root= outside the session's worktrees: the dispatch is refused with the note — and no filesystem call on it", async () => {
@@ -356,6 +448,90 @@ describe("role dispatch path", () => {
     expect((await on.router.route(call(on, { agent: "implementer", prompt: criteria }))).role!.detection).toBe("grader");
     // …and a cwd outside the root the gate verifies in runs nothing either (the gate refuses it: unverifiable).
     expect((await on.router.route(call(on, { agent: "implementer", prompt: criteria, cwd: on.outside }))).role!.detection).toBe("none");
+  });
+
+  it("gated: criteria-only acceptance + d=grader + write and exec + medium risk dispatches medium and records gated:authority", async () => {
+    const world = makeWorld({ delegation: "roles", engine: "enforce", roleFloor: "gated" });
+    const prompt = "[route class=implement risk=medium scope=single needs=shell,edit d=grader]\nchange x\n[acceptance]\ncriteria: the change is minimal\n[/acceptance]";
+    const c = call(world, { agent: "implementer", prompt });
+    const outcome = await world.router.route(c);
+    expect(outcome.role).toMatchObject({ detection: "grader", tier: "medium", window: { floor: "medium" } });
+    expect(outcome.role!.grant.actions.has("edit")).toBe(true);
+    expect(outcome.role!.grant.actions.has("router_run")).toBe(true);
+    expect(outcome.model).toBe(tierRef(world.cfg, "medium"));
+    world.router.commit(c.callID, applied(c.args, outcome));
+    expect((await world.rows())[0]).toMatchObject({ tier: "medium", detection: { effective: "grader" }, boundsReasons: ["gated:authority", "floor:authority"] });
+  });
+
+  it.each([
+    {
+      name: "role ceiling medium",
+      extra: { roleAgents: { implementer: { tierRange: { ceiling: "medium" } } } },
+      reasons: ["floor:authority", "lift:authority"],
+    },
+    {
+      name: "custom rung between medium and heavy",
+      extra: {
+        activePreset: "gated-test",
+        presets: {
+          "gated-test": {
+            fast: { model: "anthropic/fast", costRatio: 1 },
+            medium: { model: "anthropic/medium", costRatio: 2 },
+            middle: { model: "anthropic/middle", costRatio: 3 },
+            heavy: { model: "anthropic/heavy", costRatio: 4 },
+          },
+        },
+      },
+      reasons: ["floor:authority"],
+    },
+  ])("R1-541a0cb-1: gated stays strict with $name (no direct raise to heavy)", async ({ extra, reasons }) => {
+    const prompt = "[route class=implement risk=medium scope=single needs=shell,edit d=grader]\nchange x\n[acceptance]\ncriteria: the change is minimal\n[/acceptance]";
+    const windows = [];
+    for (const roleFloor of ["gated", "strict"] as const) {
+      const world = makeWorld({ delegation: "roles", engine: "enforce", roleFloor }, { extra });
+      const c = call(world, { agent: "implementer", prompt });
+      const outcome = await world.router.route(c);
+      expect(outcome.role).toMatchObject({ tier: "heavy", detection: "grader", window: { floor: "heavy", ceiling: "heavy" } });
+      expect(outcome.role!.gated).toBeUndefined();
+      expect(outcome.model).toBe(tierRef(world.cfg, "heavy"));
+      windows.push(outcome.role!.window);
+      world.router.commit(c.callID, applied(c.args, outcome));
+      expect((await world.rows())[0]!.boundsReasons).toEqual(reasons);
+    }
+    expect(windows[0]).toEqual(windows[1]);
+  });
+
+  it.each([
+    { name: "deferred testsPass", directive: "VERIFY:deferred\n", checks: "check: testsPass\n", detection: "grader" },
+    { name: "high effective risk", risk: "high", detection: "grader" },
+    { name: "no d= claim", claim: "", detection: "none" },
+    { name: "enforcement off", enforcement: { mode: "off" }, detection: "none" },
+    { name: "strict default", mode: undefined, detection: "grader" },
+    { name: "explicit strict", mode: "strict", detection: "grader" },
+    { name: "no acceptance", acceptance: false, detection: "none" },
+    { name: "bypassed", bypassed: true, detection: "none" },
+    { name: "verification never", enforcement: { verify: { require: "never" } }, detection: "none" },
+    { name: "verification outside work root", outside: true, detection: "none" },
+  ])("gated exception is not used with $name: write and exec stays heavy", async (scenario) => {
+    const roleFloor = "mode" in scenario ? scenario.mode : "gated";
+    const world = makeWorld({ delegation: "roles", engine: "enforce", ...(roleFloor === undefined ? {} : { roleFloor }) }, {
+      extra: "enforcement" in scenario ? { enforcement: scenario.enforcement } : {},
+      bypassed: "bypassed" in scenario && scenario.bypassed,
+    });
+    const risk = "risk" in scenario ? scenario.risk : "medium";
+    const claim = "claim" in scenario ? scenario.claim : " d=grader";
+    const directive = "directive" in scenario ? scenario.directive : "";
+    const checks = "checks" in scenario ? scenario.checks : "";
+    const acceptance = "acceptance" in scenario && scenario.acceptance === false ? "" : `\n[acceptance]\n${checks}criteria: the change is minimal\n[/acceptance]`;
+    const prompt = `[route class=implement risk=${risk} scope=single needs=shell,edit${claim}]\n${directive}change x${acceptance}`;
+    const c = call(world, { agent: "implementer", prompt, ...("outside" in scenario ? { cwd: world.outside } : {}) });
+    const outcome = await world.router.route(c);
+    expect(outcome.role).toMatchObject({ tier: "heavy", detection: scenario.detection, window: { floor: "heavy" } });
+    expect(outcome.role!.grant.actions.has("edit")).toBe(true);
+    expect(outcome.role!.grant.actions.has("router_run")).toBe(true);
+    expect(outcome.model).toBe(tierRef(world.cfg, "heavy"));
+    world.router.commit(c.callID, applied(c.args, outcome));
+    expect((await world.rows())[0]!.boundsReasons).toEqual(["floor:authority"]);
   });
 
   it("a delegate's dispatch is not parsed, but runs on the floor rung of the local-only window (QA-P21-1-1)", async () => {

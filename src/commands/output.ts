@@ -239,7 +239,10 @@ export const ROUTER_APPROVAL_HELP_LINES: readonly string[] = Object.freeze([
 ]);
 
 /** Bare `/router`. */
-export function buildRouterHelp(current: string, options: { stats?: boolean; roles?: Iterable<RoleSpec>; approvals?: boolean } = {}): string {
+export function buildRouterHelp(
+  current: string,
+  options: { stats?: boolean; roles?: Iterable<RoleSpec>; approvals?: boolean; plan?: boolean } = {},
+): string {
   const roleLines = options.roles === undefined ? [] : buildRoleLines(options.roles);
   return [
     `# Model Router`,
@@ -254,8 +257,27 @@ export function buildRouterHelp(current: string, options: { stats?: boolean; rol
       : []),
     ...(options.approvals === true ? ROUTER_APPROVAL_HELP_LINES : []),
     "- `/tiers`, `/preset`, `/budget`, `/bypass`, `/annotate-plan`",
+    ...(options.plan === true ? ["", ...PLAN_HELP_LINES] : []),
     ...(roleLines.length > 0 ? ["", ...roleLines] : []),
   ].join("\n");
+}
+
+/** `/plan` usage lines (v2 only): appended to `/router` help when `plan` is set and printed for an unknown `/plan` subcommand. */
+export const PLAN_HELP_LINES: readonly string[] = [
+  "Plan executor (`/plan`):",
+  "- `/plan run <path> [--phases <id,id,...>] [--done-before <id>]` — compile a plan file (path absolute, or relative to the project directory) and show its summary; it does not start until approved",
+  "- `/plan approve <planId>` — approve a compiled plan and start it (not needed with `executor.approve: \"auto\"`)",
+  "- `/plan status [planId]` — show plan progress",
+  "- `/plan inbox [--plan <planId>]` — show the questions waiting for an answer",
+  "- `/plan answer [--plan <planId>] <id> <text>` — answer an inbox question (without `--plan`: this session's running plan)",
+  "- `/plan pause|resume|abort <planId>` — pause, resume or abort a plan",
+  "- `/plan land <planId>` — land a finished plan",
+  "- `/plan adopt <planId>` — adopt a plan whose owning session is gone",
+];
+
+/** `/plan` with no or an unknown subcommand. */
+export function buildPlanHelp(): string {
+  return ["# Plan executor", "", ...PLAN_HELP_LINES].join("\n");
 }
 
 /**

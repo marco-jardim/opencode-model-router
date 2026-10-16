@@ -42,9 +42,10 @@
  *   Windows what an already-exited direct child left running (only the sweep
  *   reaches that).
  */
-import { execFile, spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { execFile, spawn, spawnSync, type ChildProcess, type SpawnOptions } from "node:child_process";
 import { constants as osConstants, setPriority, tmpdir } from "node:os";
 import { join } from "node:path";
+import type { SlotEnv } from "../executor/slots/env";
 import type { ArgvSeam, ExecOptions, ExecSeam } from "./types";
 
 export interface ShellResult {
@@ -75,6 +76,14 @@ export interface RunOptions extends ExecOptions {
    * Default 10 MB.
    */
   maxBuffer?: number;
+}
+
+/** A diagnostic hook must never affect spawning, cancellation or settlement (including injected hooks). */
+function observeProcess(opts: RunOptions, event: "prepare" | "start" | "end", result = "error"): void {
+  try {
+    if (event === "end") opts.service?.end(result);
+    else opts.service?.[event]();
+  } catch { /* Diagnostics only. */ }
 }
 
 export const DEFAULT_TIMEOUT_MS = 120_000;
@@ -122,6 +131,7 @@ const DEFAULT_POWERSHELL = SYSTEM32 ? join(SYSTEM32, "WindowsPowerShell", "v1.0"
 
 /** Run `command` through the platform shell (`cmd.exe` / `/bin/sh`). */
 export function runShell(command: string, opts: RunOptions = {}): Promise<ShellResult> {
+  observeProcess(opts, "prepare");
   // POSIX low priority: `nice -n 10 -- /bin/sh -c <command>` is exactly what
   // `shell: true` would spawn, just prefixed, so the command string keeps its
   // shell semantics and is never re-quoted. niceness is inherited by every
@@ -153,7 +163,11 @@ const BATCH_REFUSED = "exec failed: Error: spawn EINVAL (batch files must run th
  * the argv adapters pass absolute `.js`/`.exe` targets.
  */
 export function runArgv(file: string, args: readonly string[], opts: RunOptions = {}): Promise<ShellResult> {
-  if (isWin && BATCH_FILE.test(file)) return Promise.resolve({ code: 1, stdout: "", stderr: BATCH_REFUSED, timedOut: false });
+  observeProcess(opts, "prepare");
+  if (isWin && BATCH_FILE.test(file)) {
+    observeProcess(opts, "end");
+    return Promise.resolve({ code: 1, stdout: "", stderr: BATCH_REFUSED, timedOut: false });
+  }
   // `--` keeps a target whose name starts with "-" from being read as a nice option.
   if (opts.lowPriority && !isWin) return run("nice", ["-n", "10", "--", file, ...args], false, opts, file);
   return run(file, [...args], false, opts);
@@ -168,7 +182,10 @@ export const argvSeam: ArgvSeam = runArgv;
  *   reports a target it cannot exec as exit 127/126 instead of a spawn error.
  */
 function run(file: string, args: string[], shell: boolean, opts: RunOptions, niceTarget?: string): Promise<ShellResult> {
-  if (opts.signal?.aborted) return Promise.resolve({ code: 1, stdout: "", stderr: "", timedOut: true });
+  if (opts.signal?.aborted) {
+    observeProcess(opts, "end", "interrupted");
+    return Promise.resolve({ code: 1, stdout: "", stderr: "", timedOut: true });
+  }
   const deadline = deadlineOf(opts);
   return new Promise((resolve) => {
     const limit = opts.maxBuffer === undefined || Number.isNaN(opts.maxBuffer) ? DEFAULT_MAX_BUFFER : Math.max(0, opts.maxBuffer);
@@ -194,16 +211,19 @@ function run(file: string, args: string[], shell: boolean, opts: RunOptions, nic
     const spawnedAt = Date.now();
     let child: ChildProcess;
     try {
-      child = spawn(file, args, {
+      const spawnOptions: SpawnOptions = {
         cwd: opts.cwd,
-        env: mergeEnv(opts.env),
+        env: opts.envMode === "replace" ? { ...opts.env } : mergeEnv(opts.env, opts.cwd),
         shell,
         windowsHide: true,
         // Its own process group on POSIX, so the whole tree can be signalled at once.
         detached: !isWin,
         stdio: ["ignore", "pipe", "pipe"],
-      });
+      };
+      observeProcess(opts, "start");
+      child = spawn(file, args, spawnOptions);
     } catch (e) {
+      observeProcess(opts, "end");
       resolve({ code: 1, stdout: "", stderr: `exec failed: ${String(e)}`, timedOut: false });
       return;
     }
@@ -240,6 +260,7 @@ function run(file: string, args: string[], shell: boolean, opts: RunOptions, nic
     const finish = (code: number | null, error?: unknown) => {
       if (settled) return;
       settled = true;
+      observeProcess(opts, "end", opts.signal?.aborted ? "interrupted" : killed ? "timed-out" : error ? "error" : code === 0 ? "pass" : "fail");
       clearTimeout(timer);
       clearTimeout(grace);
       clearTimeout(armTimer);
@@ -387,15 +408,37 @@ export function deadlineOf(opts: RunOptions): number | undefined {
   return Math.min(Math.max(t, 0), MAX_TIMER_MS);
 }
 
+interface SlotEnvHook {
+  slotEnvFor(cwd: string, platform: NodeJS.Platform): SlotEnv | null;
+  applySlotEnv(env: NodeJS.ProcessEnv, s: SlotEnv | null, platform: NodeJS.Platform): NodeJS.ProcessEnv;
+}
+
+/**
+ * The slot-environment functions executor/slots/env.ts publishes when it loads. This file
+ * is also loaded alone by Node's type stripping (no module resolution beyond node:
+ * built-ins), so it reads the hook from globalThis instead of importing the module. Absent
+ * (v1, or no executor loaded), nothing changes.
+ */
+function slotEnvHook(): SlotEnvHook | null {
+  const hook: unknown = Reflect.get(globalThis, Symbol.for("omr.executor.slotEnvHook"));
+  if (typeof hook !== "object" || hook === null) return null;
+  const find: unknown = Reflect.get(hook, "slotEnvFor");
+  const apply: unknown = Reflect.get(hook, "applySlotEnv");
+  return typeof find === "function" && typeof apply === "function" ? (hook as SlotEnvHook) : null;
+}
+
 /**
  * Overrides merged over process.env. Windows environment names are
  * case-insensitive and Node keeps only one of two keys that differ in case
  * (the first in sort order, not the override), so an inherited key that
  * matches an override case-insensitively is dropped first.
  */
-function mergeEnv(overrides: Record<string, string> | undefined): NodeJS.ProcessEnv {
-  if (!overrides) return process.env;
-  const env: NodeJS.ProcessEnv = { ...process.env };
+function mergeEnv(overrides: Record<string, string> | undefined, cwd?: string): NodeJS.ProcessEnv {
+  const hook = cwd === undefined ? null : slotEnvHook();
+  const slot = hook === null || cwd === undefined ? null : hook.slotEnvFor(cwd, process.platform);
+  if (!slot && !overrides) return process.env;
+  const env: NodeJS.ProcessEnv = slot && hook ? hook.applySlotEnv({ ...process.env }, slot, process.platform) : { ...process.env };
+  if (!overrides) return env;
   for (const [key, value] of Object.entries(overrides)) {
     if (isWin) {
       const upper = key.toUpperCase();
