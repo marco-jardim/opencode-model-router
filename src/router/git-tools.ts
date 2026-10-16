@@ -535,6 +535,8 @@ function killDirect(child: ChildProcess, label: BoundedLabel): void {
 }
 
 export interface BoundedOptions {
+  /** Optional v2 process-lifetime diagnostics; never includes executable/environment/directory preparation. */
+  service?: import("../executor/observations").ServiceExecution;
   signal?: AbortSignal; timeoutMs?: number; maxBytes?: number; env?: NodeJS.ProcessEnv;
   /**
    * Keep running past `maxBytes` (the head) and retain only the last `tailBytes` of
@@ -592,18 +594,43 @@ function rollingWindow(max: number) {
   };
 }
 
+function observeBoundedProcess(options: BoundedOptions, event: "prepare" | "start" | "end", result = "error"): void {
+  try {
+    if (event === "end") options.service?.end(result);
+    else options.service?.[event]();
+  } catch { /* Diagnostics must never affect the process. */ }
+}
+
 /**
  * Spawn with byte, time and abort bounds. Settles on `close`, or shortly after
  * `exit` when helpers that inherited the pipes (MSYS sh/sleep re-parented away
  * from taskkill's tree) keep `close` from firing (G7). Never a shell.
  */
 export function spawnBounded(executable: string, args: readonly string[], cwd: string, options: BoundedOptions = {}): Promise<BoundedResult> {
+  observeBoundedProcess(options, "prepare");
   const label = options.label ?? GIT_LABEL;
-  if (options.signal?.aborted) return Promise.reject(new Error(`${label.message} aborted`));
-  if (!isDirectory(cwd)) return Promise.reject(new Error(`${label.message} directory does not exist`));
+  if (options.signal?.aborted) {
+    observeBoundedProcess(options, "end", "interrupted");
+    return Promise.reject(new Error(`${label.message} aborted`));
+  }
+  if (!isDirectory(cwd)) {
+    observeBoundedProcess(options, "end");
+    return Promise.reject(new Error(`${label.message} directory does not exist`));
+  }
   return new Promise((resolveResult, reject) => {
-    const child = spawn(executable, args, { cwd, env: options.env ?? gitEnvironment(), shell: false, windowsHide: true,
-      detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"] });
+    const launch = () => {
+      const env = options.env ?? gitEnvironment();
+      observeBoundedProcess(options, "start");
+      return spawn(executable, args, { cwd, env, shell: false, windowsHide: true,
+        detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"] });
+    };
+    let child: ReturnType<typeof launch>;
+    try { child = launch(); }
+    catch (error) {
+      observeBoundedProcess(options, "end");
+      reject(error);
+      return;
+    }
     const max = options.maxBytes ?? MAX_BYTES;
     const tailMax = options.tailBytes;
     const errorTail = options.mergeStderr && options.stderrTailBytes !== undefined ? rollingWindow(options.stderrTailBytes) : undefined;
@@ -625,9 +652,10 @@ export function spawnBounded(executable: string, args: readonly string[], cwd: s
       timers.add(timer);
       return timer;
     };
-    const settle = (outcome: () => void) => {
+    const settle = (outcome: () => void, serviceResult = "error") => {
       if (settled) return;
       settled = true;
+      observeBoundedProcess(options, "end", serviceResult);
       for (const timer of timers) clearTimeout(timer);
       timers.clear();
       options.signal?.removeEventListener("abort", abort);
@@ -652,7 +680,8 @@ export function spawnBounded(executable: string, args: readonly string[], cwd: s
     };
     const finish = (code: number | null) => {
       if (settled) return;
-      const done = () => settle(() => failure && !options.settleOnFailure ? reject(new Error(failure)) : resolveResult(result(code)));
+      const done = () => settle(() => failure && !options.settleOnFailure ? reject(new Error(failure)) : resolveResult(result(code)),
+        failure !== undefined ? options.signal?.aborted ? "interrupted" : "timed-out" : truncated ? "fail" : code === 0 ? "pass" : "fail");
       if (!killing) { done(); return; }
       void Promise.race([killing, new Promise(wait => setTimeout(wait, KILL_WAIT_MS))]).then(done);
     };

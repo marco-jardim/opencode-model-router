@@ -22,6 +22,9 @@
  *                          moves the child session there with ctx.session.move (QA-0.1-19; lines retained-progress-called / -move / -resolved).
  *   CPX_PROBE_TOOL_URL     retained-launch only, optional: file URL of a module exporting `tool` (from @opencode-ai/plugin),
  *                          used to build the input schema of `cpx_probe_capture` when the bare specifier does not resolve.
+ *                          Also used by plugin-session-api and spawn-hold for their input schemas.
+ *   CPX_PROBE_SPAWN_DIR / CPX_PROBE_NODE / CPX_PROBE_NPM_CLI / CPX_PROBE_HOLD  spawn-hold only: scratch directory, real Node
+ *                          executable (NOT the OpenCode binary), npm-cli.js and the absolute cpx-hold.cjs path.
  *
  * Always observed (recorded): events session.created / session.execution.* / session.step.failed; execute.before and
  * execute.after of subagent, file tools, search tools, router_run and cpx_probe_capture; every session "context" hook call;
@@ -60,17 +63,22 @@
  *   retained-launch        registers tool cpx_probe_capture (no args, returns "captured") that retains its tool context; when the
  *                          turn that called it ends, starts CPX_PROBE_RETAINED_COUNT (default THREE) concurrent native `subagent` children with that retained context
  *                          (the way src/compat/v2-client.ts does), and again after CPX_PROBE_RELAUNCH_MS if set.
+ *   spawn-hold             registers cpx_probe_spawn_hold({ shape: "direct" | "npm", token }); records the call's stored self-view,
+ *                          spawns a silent heartbeat leaf with spawnBounded's options (including pipes, never unref), then waits
+ *                          for abort. Abort kills the tree/group; a server-pid-only kill deliberately cannot run that handler.
  */
-import { appendFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
+import { spawn, spawnSync } from "node:child_process";
+import path from "node:path";
 
 const MODES = new Set([
   "rewrite-completion", "append-tail-system", "append-tail-user", "append-tail-newest", "cache-hint-1h", "cache-hint-1h-message", "cache-hint-1h-all", "append-tail-user+hint-last-real",
   "mutate-subagent-prompt", "filter-grep", "rewrite-compaction", "retained-launch",
-  "rewrite-completion+compaction", "retry-observe", "retry-stop", "plugin-session-api",
+  "rewrite-completion+compaction", "retry-observe", "retry-stop", "plugin-session-api", "spawn-hold",
 ]);
 const OBSERVED_TOOLS = new Set([
-  "subagent", "read", "write", "edit", "multiedit", "patch", "apply_patch", "glob", "grep", "list", "router_run", "cpx_probe_capture", "cpx_probe_session_api",
+  "subagent", "read", "write", "edit", "multiedit", "patch", "apply_patch", "glob", "grep", "list", "router_run", "cpx_probe_capture", "cpx_probe_session_api", "cpx_probe_spawn_hold", "shell",
 ]);
 const PICKED_ARGS = ["path", "filePath", "pattern", "cwd", "directory", "background", "agent", "subagent_type", "description", "script", "sessionID"];
 const PLACEHOLDER = "held \u2014 verdict pending (probe)";
@@ -633,6 +641,81 @@ export default {
           });
         });
         rec("retained-tool-registered", { from: loaded.from });
+      }
+    }
+
+    // ---- spawn-hold (C16: deliberately open tools across a server-pid-only kill) -----------------------------------
+    if (mode === "spawn-hold") {
+      const loaded = await loadTool();
+      if (!loaded.tool) {
+        rec("probe-error", { where: "spawn-hold", error: "cannot build cpx_probe_spawn_hold input schema", failures: loaded.failures });
+      } else {
+        await ctx.tool.transform((editor) => {
+          editor.add({
+            name: "cpx_probe_spawn_hold",
+            description: "Test probe: spawn a heartbeat leaf directly or via npm, then hold this tool open until aborted.",
+            input: loaded.tool.schema.object({ shape: loaded.tool.schema.enum(["direct", "npm"]), token: loaded.tool.schema.string() }),
+            options: { codemode: false },
+            execute: async ({ shape, token }, context) => {
+              if (!/^[A-Za-z0-9_-]+$/.test(token)) throw new Error("invalid spawn-hold token");
+              const sessionID = context.sessionID;
+              const callID = context.id;
+              let selfView;
+              try {
+                const history = await ctx.session.context({ sessionID });
+                // v2 tool entries and assistant tool parts both carry the call id; do not match prompt/input text.
+                const pending = Array.isArray(history) ? [...history] : [];
+                let entry;
+                while (pending.length && typeof callID === "string") {
+                  const value = pending.shift();
+                  if (!value || typeof value !== "object") continue;
+                  if ([value.id, value.callID, value.toolCallId, value.toolCallID].includes(callID) &&
+                    [value.tool, value.name, value.toolName].includes("cpx_probe_spawn_hold")) { entry = value; break; }
+                  for (const key of ["parts", "content"]) if (Array.isArray(value[key])) pending.push(...value[key]);
+                }
+                selfView = { visible: Boolean(entry), status: entry?.state?.status ?? entry?.status ?? null };
+              } catch (error) { selfView = { visible: false, status: null, error: String(error) }; }
+              rec("spawn-hold-self-view", { token, shape, sessionID, callID, selfView });
+              const dir = process.env.CPX_PROBE_SPAWN_DIR;
+              const node = process.env.CPX_PROBE_NODE;
+              const npm = process.env.CPX_PROBE_NPM_CLI;
+              const hold = process.env.CPX_PROBE_HOLD;
+              if (!dir || !node || !npm || !hold || !context.signal) throw new Error("missing spawn-hold env/signal");
+              if (context.signal.aborted) throw new Error("spawn-hold already aborted");
+              let cwd = dir;
+              let argv = [hold, "leaf", token, dir];
+              if (shape === "npm") {
+                cwd = path.join(dir, `npm-${token}`);
+                mkdirSync(cwd, { recursive: true });
+                writeFileSync(path.join(cwd, "package.json"), JSON.stringify({ private: true, scripts: { "cpx-hold": `node "${hold}" leaf ${token} "${dir}"` } }));
+                argv = [npm, `--script-shell=${process.env.ComSpec || process.env.COMSPEC || "/bin/sh"}`, "--update-notifier=false", "--logs-max=0", "--workspaces=false", "run", "cpx-hold"];
+              }
+              const child = spawn(node, argv, { cwd, env: process.env, shell: false, windowsHide: true,
+                detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"] });
+              child.stdout.on("data", () => {});
+              child.stderr.on("data", () => {});
+              await new Promise((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
+              child.on("error", (error) => rec("probe-error", { where: "spawn-hold-child", token, error: String(error) }));
+              rec("spawn-hold-spawned", { token, shape, sessionID, callID, directPid: child.pid, selfView });
+              return await new Promise((_resolve, reject) => {
+                const abort = () => {
+                  let cleanup;
+                  try {
+                    if (process.platform === "win32") {
+                      const result = spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true, encoding: "utf8", timeout: 3000 });
+                      cleanup = { status: result.status, error: result.error?.message };
+                    } else { process.kill(-child.pid, "SIGKILL"); cleanup = { groupKilled: true }; }
+                  } catch (error) { cleanup = { error: String(error) }; }
+                  rec("spawn-hold-aborted", { token, directPid: child.pid, cleanup });
+                  reject(new Error("spawn-hold aborted"));
+                };
+                context.signal.addEventListener("abort", abort, { once: true });
+                if (context.signal.aborted) abort();
+              });
+            },
+          });
+        });
+        rec("spawn-hold-tool-registered", { from: loaded.from });
       }
     }
 

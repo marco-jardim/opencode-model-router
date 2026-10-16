@@ -6,9 +6,11 @@
 
 import { posix, win32 } from "node:path";
 import { CLEANUP_RETRIES, CLEANUP_RETRY_BASE_MS, TRANSIENT_FS_CODES, isStrictlyInside } from "../../verify/reference";
+import type { ObservationValue } from "../../compat/v2-observations";
 import type { GitOps } from "../git";
-import { ExecutorError, GIT_ID_PATTERN, PLAN_ID_PATTERN } from "../types";
-import type { Clock, FileSystem, PlanId, SlotLease, SlotPool, SlotRecord } from "../types";
+import { observeSlotPool } from "../observations";
+import { ExecutorError, GIT_ID_PATTERN, PLAN_ID_PATTERN, isTaskId } from "../types";
+import type { Clock, FileSystem, PlanId, SlotAcquisition, SlotLease, SlotPool, SlotRecord } from "../types";
 import { registerSlot, unregisterSlot } from "./env";
 import type { SlotBin } from "./env";
 import { DEPENDENCY_DIRS, SLOT_SWEEP_MAX_ENTRIES, needsProvision } from "./provision";
@@ -742,6 +744,7 @@ export function createSlotPool(d: SlotPoolDeps): OpenSlotPool {
   const retireCtx: RetireCtx = { ...fileCtx, git: d.git, toplevel: d.toplevel };
 
   const records = new Map<string, SlotRecord>();
+  const releaseListeners = new Set<() => void>();
   const corrupt = new Set<string>();
   const poolLock = new Mutex();
   const slotLocks = new Map<string, Mutex>();
@@ -753,6 +756,17 @@ export function createSlotPool(d: SlotPoolDeps): OpenSlotPool {
   const produced = new Map<string, string[]>();
   /** The executable snapshot of each provisioned slot (path, size, mtime), registered with the slot environment. */
   const binsOf = new Map<string, SlotBin[]>();
+
+  const taskIdOf = (owner: string | null): string | null => {
+    const id = owner?.startsWith(`plan:${d.planId}:`) === true ? owner.slice(`plan:${d.planId}:`.length) : null;
+    return isTaskId(id) ? id : null;
+  };
+  // Lazy, exception-contained copies of existing memory only: no get/list, filesystem or scheduling queries.
+  const observe = (action: string, detail: () => ObservationValue = () => null): void => {
+    observeSlotPool(d.clock, d.planId, action, () => ({ clockMs: d.clock.now(), maxParallel: d.maxParallel, opened, closed,
+      slots: [...records.values()].map(r => ({ slot: r.slot, kind: r.kind, state: r.state, taskId: taskIdOf(r.owner) })),
+      corrupt: [...corrupt], detail: detail() }));
+  };
 
   const slotLock = (slot: string): Mutex => {
     let m = slotLocks.get(slot);
@@ -788,6 +802,7 @@ export function createSlotPool(d: SlotPoolDeps): OpenSlotPool {
     const next: SlotRecord = { ...cloneRecord(rec), updatedAt: d.clock.iso() };
     await writeMarkerFile(fileCtx, next);
     records.set(next.slot, next);
+    observe("slot-state", () => ({ slot: next.slot }));
     return next;
   }
 
@@ -815,6 +830,7 @@ export function createSlotPool(d: SlotPoolDeps): OpenSlotPool {
     } catch (error) {
       logger?.warn(`could not write the broken marker of ${slot}: ${messageOf(error)}`);
       records.set(slot, { ...broken, updatedAt: d.clock.iso() });
+      observe("slot-state", () => ({ slot }));
     }
   }
 
@@ -923,22 +939,36 @@ export function createSlotPool(d: SlotPoolDeps): OpenSlotPool {
     const detection = await detectFor(rec);
     if (!needsProvision(rec, detection)) return { rec, drifted: false };
     const prov = await save({ ...rec, state: "provisioning" });
-    if (detection.managers.length > 0) await install(prov, detection, true);
-    else await clearProvisioned(prov);
-    return { rec: { ...prov, managers: [...detection.managers], manifests: { ...detection.manifests } }, drifted: true };
+    observe("slot-provision-start", () => ({ slot: rec.slot }));
+    try {
+      if (detection.managers.length > 0) await install(prov, detection, true);
+      else await clearProvisioned(prov);
+      observe("slot-provision-end", () => ({ slot: rec.slot, result: "completed" }));
+      return { rec: { ...prov, managers: [...detection.managers], manifests: { ...detection.manifests } }, drifted: true };
+    } catch (error) {
+      observe("slot-provision-end", () => ({ slot: rec.slot, result: "failed" }));
+      throw error;
+    }
   }
 
   async function stageProvision(rec: SlotRecord, fresh: boolean): Promise<SlotRecord> {
     const prov = rec.state === "provisioning" ? rec : await save({ ...rec, state: "provisioning" });
-    const detection = await detectFor(prov);
-    if (detection.managers.length > 0) await install(prov, detection, fresh);
-    else await clearProvisioned(prov);
-    const done = await save({
-      ...prov, managers: [...detection.managers], manifests: { ...detection.manifests },
-      state: prov.owner === null ? "ready" : "leased",
-    });
-    syncEnv(done);
-    return done;
+    observe("slot-provision-start", () => ({ slot: rec.slot }));
+    try {
+      const detection = await detectFor(prov);
+      if (detection.managers.length > 0) await install(prov, detection, fresh);
+      else await clearProvisioned(prov);
+      const done = await save({
+        ...prov, managers: [...detection.managers], manifests: { ...detection.manifests },
+        state: prov.owner === null ? "ready" : "leased",
+      });
+      syncEnv(done);
+      observe("slot-provision-end", () => ({ slot: rec.slot, result: "completed" }));
+      return done;
+    } catch (error) {
+      observe("slot-provision-end", () => ({ slot: rec.slot, result: "failed" }));
+      throw error;
+    }
   }
 
   // ---- stages -----------------------------------------------------------------------------------------------
@@ -957,7 +987,14 @@ export function createSlotPool(d: SlotPoolDeps): OpenSlotPool {
       }
       if (pointersOk) {
         // The checkout of an interrupted `worktree add` may be partial or dirty: bring it to the base commit first.
-        await resetRoutine(rec);
+        observe("slot-reset-start", () => ({ slot: rec.slot }));
+        try {
+          await resetRoutine(rec);
+          observe("slot-reset-end", () => ({ slot: rec.slot, result: "completed" }));
+        } catch (error) {
+          observe("slot-reset-end", () => ({ slot: rec.slot, result: "failed" }));
+          throw error;
+        }
         return;
       }
       if ((await d.fs.readdir(rec.path)).length === 0) {
@@ -965,6 +1002,7 @@ export function createSlotPool(d: SlotPoolDeps): OpenSlotPool {
       } else {
         await retireSlot(retireCtx, rec, Number.POSITIVE_INFINITY, d.slotsDir);
         records.delete(rec.slot);
+        observe("slot-state", () => ({ slot: rec.slot }));
         await clearProvisioned(rec);
         await save({ ...rec, state: "creating" });
       }
@@ -1023,12 +1061,23 @@ export function createSlotPool(d: SlotPoolDeps): OpenSlotPool {
     }
   }
 
-  async function stageReset(rec: SlotRecord): Promise<SlotRecord> {
-    await resetRoutine(rec);
-    const drift = await driftProvision(rec);
-    const done = await save({ ...drift.rec, state: drift.rec.owner === null ? "ready" : "leased" });
-    syncEnv(done);
-    return done;
+  async function stageReset(rec: SlotRecord, verifyAfterProvision = false): Promise<{ rec: SlotRecord; provisioned: boolean }> {
+    observe("slot-reset-start", () => ({ slot: rec.slot }));
+    try {
+      await resetRoutine(rec);
+      const drift = await driftProvision(rec);
+      const provisioned = drift.drifted && drift.rec.managers.length > 0;
+      // Public reset is launch's last preparation, including when integration moved after a proven acquisition.
+      // An installer can change HEAD or tracked files: restore and verify once more, without another install.
+      if (verifyAfterProvision && provisioned) await resetRoutine(drift.rec);
+      const done = await save({ ...drift.rec, state: drift.rec.owner === null ? "ready" : "leased" });
+      syncEnv(done);
+      observe("slot-reset-end", () => ({ slot: rec.slot, result: "completed" }));
+      return { rec: done, provisioned };
+    } catch (error) {
+      observe("slot-reset-end", () => ({ slot: rec.slot, result: "failed" }));
+      throw error;
+    }
   }
 
   /** Runs the stage the marker is in, from its start (also the repair of an interrupted stage, memo 4.1). */
@@ -1040,7 +1089,7 @@ export function createSlotPool(d: SlotPoolDeps): OpenSlotPool {
         await d.git.verifySlotPointers(rec.path);
         return stageProvision(rec, true);
       case "resetting":
-        return stageReset(rec);
+        return (await stageReset(rec)).rec;
     }
   }
 
@@ -1120,15 +1169,25 @@ export function createSlotPool(d: SlotPoolDeps): OpenSlotPool {
   }
 
   /** Under the slot mutex: re-reads the record and does the slow work. */
-  async function work(slot: string, mode: ClaimMode, spec: AcquireSpec): Promise<SlotLease> {
+  async function work(slot: string, mode: ClaimMode, spec: AcquireSpec): Promise<SlotAcquisition> {
+    const acquired = (record: SlotRecord): SlotLease => {
+      const lease = leaseOf(record);
+      observe("slot-acquire-result", () => ({ slot, kind: spec.kind, taskId: taskIdOf(spec.owner), mode,
+        result: mode === "create" || mode === "recreate" ? "created" : "reused" }));
+      return lease;
+    };
     let rec = records.get(slot);
-    if (rec === undefined) throw new ExecutorError("E_SLOT_BROKEN", `slot ${slot} disappeared`, { slot });
+    if (rec === undefined) {
+      observe("slot-acquire-result", () => ({ slot, kind: spec.kind, taskId: taskIdOf(spec.owner), mode, result: "failed" }));
+      throw new ExecutorError("E_SLOT_BROKEN", `slot ${slot} disappeared`, { slot });
+    }
     try {
       let firstRun = mode === "create" || mode === "reset";
       if (mode === "recreate" && (rec.state === "broken" || rec.state === "retired")) {
         unregisterSlot(rec.path);
         await retireSlot(retireCtx, rec, Number.POSITIVE_INFINITY, d.slotsDir);
         records.delete(slot);
+        observe("slot-state", () => ({ slot }));
         await clearProvisioned(rec);
         rec = await save(newRecord(slot, spec.owner, spec.base));
         firstRun = true;
@@ -1139,7 +1198,7 @@ export function createSlotPool(d: SlotPoolDeps): OpenSlotPool {
       }
       if (rec.state === "leased") {
         if (rec.owner !== spec.owner) throw unavailable();
-        return leaseOf(rec);
+        return acquired(rec);
       }
       if (rec.state === "broken" || rec.state === "retired") {
         throw new ExecutorError("E_SLOT_BROKEN", `slot ${slot} is ${rec.state}`, { slot, state: rec.state });
@@ -1148,20 +1207,43 @@ export function createSlotPool(d: SlotPoolDeps): OpenSlotPool {
         // A special slot is leased at its current HEAD; the queue resets it afterwards.
         rec = await save({ ...rec, commit: await d.git.revParse(rec.path, "HEAD") });
       }
-      return leaseOf(await driveStage(staged(rec), firstRun));
+      // Only a full reset in this acquisition proves launch cleanliness. Same-owner/recovery and create/recreate
+      // remain unproven, even if their marker already names the requested base.
+      if (mode === "reset" && rec.state === "resetting" && rec.commit === spec.base) {
+        const reset = await stageReset(staged(rec));
+        const lease = acquired(reset.rec);
+        // Install hooks can dirty tracked files or move HEAD after resetRoutine verified them.
+        // Withhold the proof so launch's forced reset restores the requested base in that case.
+        return reset.provisioned ? lease : { ...lease, verifiedResetBase: spec.base };
+      }
+      return acquired(await driveStage(staged(rec), firstRun));
     } catch (error) {
-      throw await failStage(slot, error);
+      const failed = await failStage(slot, error);
+      observe("slot-acquire-result", () => ({ slot, kind: spec.kind, taskId: taskIdOf(spec.owner), mode,
+        result: errorCode(error) === "E_SLOT_UNAVAILABLE" ? "unavailable" : "failed" }));
+      throw failed;
     }
   }
 
   async function acquireSlot(
-    claim: () => Promise<{ slot: string; mode: ClaimMode }>, spec: AcquireSpec,
-  ): Promise<SlotLease> {
+    claim: (base: string) => Promise<{ slot: string; mode: ClaimMode }>, spec: Omit<AcquireSpec, "base">,
+    baseLookup: Promise<string>,
+  ): Promise<SlotAcquisition> {
     assertLive();
+    observe("slot-acquire-start", () => ({ kind: spec.kind, taskId: taskIdOf(spec.owner) }));
     const scheduled = await poolLock.run(async () => {
-      const { slot, mode } = await claim();
-      // Queued on the slot mutex before the pool mutex is released, so nothing runs on this slot ahead of the claim.
-      return { run: slotLock(slot).run(() => work(slot, mode, spec)) };
+      try {
+        // Queued on the pool mutex before awaiting this caller's lookup, so lookup timing cannot reorder claims.
+        const base = await baseLookup;
+        const { slot, mode } = await claim(base);
+        observe("slot-claim", () => ({ slot, kind: spec.kind, taskId: taskIdOf(spec.owner), mode }));
+        // Queued on the slot mutex before the pool mutex is released, so nothing runs on this slot ahead of the claim.
+        return { run: slotLock(slot).run(() => work(slot, mode, { ...spec, base })) };
+      } catch (error) {
+        observe("slot-acquire-result", () => ({ slot: null, kind: spec.kind, taskId: taskIdOf(spec.owner), mode: null,
+          result: errorCode(error) === "E_SLOT_UNAVAILABLE" ? "unavailable" : "failed" }));
+        throw error;
+      }
     });
     return scheduled.run;
   }
@@ -1184,17 +1266,31 @@ export function createSlotPool(d: SlotPoolDeps): OpenSlotPool {
       try {
         if (rec.state === "creating" || rec.state === "provisioning") rec = await driveStage(staged(rec), false);
         const resetting = await save({ ...rec, state: "resetting", commit: oid });
-        await driveStage(staged(resetting), false);
+        await stageReset(staged(resetting), true);
       } catch (error) {
         throw await failStage(slot, error);
       }
     });
   }
 
-  async function cleanForChecks(slot: string): Promise<void> {
+  async function noteCommit(slot: string, commit: string): Promise<void> {
     assertLive();
     assertSlot(slot);
+    if (typeof commit !== "string" || !GIT_ID_PATTERN.test(commit)) {
+      throw new ExecutorError("E_INVALID_INPUT", "commit must be a full git object id", { commit: String(commit).slice(0, 80) });
+    }
     await slotLock(slot).run(async () => {
+      const rec = records.get(slot);
+      if (rec === undefined) throw new ExecutorError("E_INVALID_INPUT", `unknown slot ${slot}`, { slot });
+      if (rec.state !== "leased") throw new ExecutorError("E_INVALID_INPUT", `slot ${slot} is ${rec.state}, not leased`, { slot, state: rec.state });
+      await save({ ...rec, commit });
+    });
+  }
+
+  async function cleanForChecks(slot: string): Promise<{ drifted: boolean }> {
+    assertLive();
+    assertSlot(slot);
+    return slotLock(slot).run(async () => {
       const rec = records.get(slot);
       if (rec === undefined) throw new ExecutorError("E_INVALID_INPUT", `unknown slot ${slot}`, { slot });
       if (rec.state !== "leased") throw new ExecutorError("E_INVALID_INPUT", `slot ${slot} is ${rec.state}, not leased`, { slot, state: rec.state });
@@ -1214,6 +1310,7 @@ export function createSlotPool(d: SlotPoolDeps): OpenSlotPool {
         await d.git.cleanForChecks(rec.path, keep);
         const drift = await driftProvision(rec);
         if (drift.drifted) syncEnv(await save({ ...drift.rec, state: "leased" }));
+        return { drifted: drift.drifted };
       } catch (error) {
         throw await failStage(slot, error);
       }
@@ -1223,11 +1320,25 @@ export function createSlotPool(d: SlotPoolDeps): OpenSlotPool {
   async function release(slot: string): Promise<void> {
     assertOpen();
     assertSlot(slot);
-    await slotLock(slot).run(async () => {
+    const released = await slotLock(slot).run(async () => {
       const rec = records.get(slot);
-      if (rec === undefined || rec.state !== "leased") return;
-      await save({ ...rec, state: "ready", owner: null });
+      observe("slot-release-start", () => ({ slot }));
+      if (rec === undefined || rec.state !== "leased") {
+        observe("slot-release-complete", () => ({ slot, result: "unchanged" }));
+        return false;
+      }
+      try {
+        await save({ ...rec, state: "ready", owner: null });
+        observe("slot-release-complete", () => ({ slot, result: "released" }));
+        return rec.kind === "task";
+      } catch (error) {
+        observe("slot-release-failed", () => ({ slot }));
+        throw error;
+      }
     });
+    if (released) for (const listener of releaseListeners) {
+      try { listener(); } catch { /* A notification cannot undo a successful durable release. */ }
+    }
   }
 
   // ---- open -------------------------------------------------------------------------------------------------
@@ -1293,6 +1404,7 @@ export function createSlotPool(d: SlotPoolDeps): OpenSlotPool {
     opened = true;
     // A gc-only handle never leases a slot.
     if (!create) closed = true;
+    observe("slot-pool-open");
   }
 
   /**
@@ -1352,9 +1464,11 @@ export function createSlotPool(d: SlotPoolDeps): OpenSlotPool {
           const read = await readMarkerFile(fileCtx, markerPath(d.markersDir, rec.planId, rec.slot));
           if (read.ok) {
             records.set(rec.slot, read.rec);
+            observe("slot-state", () => ({ slot: rec.slot }));
             if (read.rec.state === "retired" || read.rec.state === "broken") unregisterSlot(read.rec.path);
           } else if (read.missing) {
             records.delete(rec.slot);
+            observe("slot-state", () => ({ slot: rec.slot }));
             unregisterSlot(rec.path);
             produced.delete(rec.slot);
             binsOf.delete(rec.slot);
@@ -1374,6 +1488,8 @@ export function createSlotPool(d: SlotPoolDeps): OpenSlotPool {
   function close(): void {
     if (closed) return;
     closed = true;
+    releaseListeners.clear();
+    observe("slot-pool-close");
     abort.abort();
   }
 
@@ -1390,19 +1506,26 @@ export function createSlotPool(d: SlotPoolDeps): OpenSlotPool {
         throw new ExecutorError("E_INVALID_INPUT", "owner must be 1-128 printable characters", { length: typeof owner === "string" ? owner.length : -1 });
       }
       assertLive();
-      const base = await d.git.revParse(d.toplevel, baseCommit);
-      return acquireSlot(() => claimTask(owner, base), { kind: "task", owner, base });
+      const baseLookup = d.git.revParse(d.toplevel, baseCommit);
+      void baseLookup.catch(() => {}); // A lookup can reject while its claim is still queued.
+      return acquireSlot(base => claimTask(owner, base), { kind: "task", owner }, baseLookup);
     },
     async acquireSpecial(planId, kind) {
       if (planId !== d.planId) throw new ExecutorError("E_INVALID_INPUT", "plan id differs from the pool's plan", { planId: String(planId).slice(0, 80) });
       if (kind !== "integration" && kind !== "ci") throw new ExecutorError("E_INVALID_INPUT", "kind must be integration or ci", { kind: String(kind).slice(0, 40) });
       assertLive();
-      const base = await d.git.revParse(d.toplevel, "HEAD");
-      return acquireSlot(() => claimSpecial(kind, base), { kind, owner: kind, base });
+      const baseLookup = d.git.revParse(d.toplevel, "HEAD");
+      void baseLookup.catch(() => {}); // A lookup can reject while its claim is still queued.
+      return acquireSlot(base => claimSpecial(kind, base), { kind, owner: kind }, baseLookup);
     },
     reset,
+    noteCommit,
     cleanForChecks,
     release,
+    onTaskSlotReleased(listener) {
+      releaseListeners.add(listener);
+      return () => { releaseListeners.delete(listener); };
+    },
     async get(slot) {
       const rec = records.get(slot);
       return rec === undefined ? null : cloneRecord(rec);

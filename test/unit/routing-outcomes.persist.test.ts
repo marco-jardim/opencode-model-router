@@ -995,6 +995,31 @@ describe("parseLogLine", () => {
     expect(parsed?.kind === "decision" ? parsed.trace?.needTerms : undefined).toEqual(good);
   });
 
+  it("round-trips additive risk sources, including null proposals and inherited risk, without changing the row version", () => {
+    for (const riskSources of [
+      { base: "medium", rules: "high", routeLine: null, facts: "high", effective: "high", term: "production" },
+      { base: "low", rules: null, routeLine: "low", facts: "low", resumedDispatch: "high", effective: "high", term: "term-16" },
+    ] as const) {
+      const row = decisionRow(6, { trace: { routeLines: { count: 1, conflict: false, edgeOnly: true }, backend: null, riskSources } });
+      expect(roundTrip(row)).toEqual(row);
+    }
+    const old = decisionRow(7, { trace: { routeLines: { count: 0, conflict: false, edgeOnly: true }, backend: null } });
+    expect(roundTrip(old)).toEqual(old);
+  });
+
+  it("drops malformed risk sources alone and filters unsafe optional labels without losing the existing trace", () => {
+    const trace = { routeLines: { count: 1, conflict: false, edgeOnly: true }, backend: null, needTerms: ["edit:write"] };
+    const row = decisionRow(8, { trace });
+    const good = { base: "medium", rules: "medium", routeLine: null, facts: "medium", effective: "medium" };
+    for (const riskSources of [null, [], "high", {}, { ...good, rules: "unsafe" }, { ...good, routeLine: 1 }, { ...good, base: "" }, { ...good, facts: null }, { ...good, effective: "unsafe" }]) {
+      expect(parseLogLine(JSON.stringify({ ...row, trace: { ...trace, riskSources } }))).toEqual(row);
+    }
+    for (const term of ["https://private.example/token", "git push PRIVATE --force", "x".repeat(41), "PRIVATE_SERVICE_TOKEN", ""]) {
+      expect(parseLogLine(JSON.stringify({ ...row, trace: { ...trace, riskSources: { ...good, term, resumedDispatch: "unsafe" } } })))
+        .toEqual({ ...row, trace: { ...trace, riskSources: good } });
+    }
+  });
+
   const base = (): Record<string, unknown> => JSON.parse(JSON.stringify(decisionRow(1))) as Record<string, unknown>;
   const verdictBase = (): Record<string, unknown> => JSON.parse(JSON.stringify(verdictRow(1))) as Record<string, unknown>;
   const mutate = (source: () => Record<string, unknown>, change: (r: Record<string, unknown>) => void): string => {

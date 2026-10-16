@@ -1,0 +1,8 @@
+{
+  "name": "idle-with-ready",
+  "fromAt": "2026-10-12T09:00:00.000Z",
+  "toAt": "2026-10-12T09:00:01.000Z",
+  "ms": 1000,
+  "readyTaskIds": ["a"],
+  "free": 4
+}

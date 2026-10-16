@@ -9,6 +9,7 @@ const state = vi.hoisted(() => ({
   branchRef: "refs/heads/main" as string | null,
   calls: [] as string[][], directories: [] as string[], binaries: [] as string[],
   priorities: [] as [number, number][], priorityThrows: false,
+  hashError: null as Error | null,
 }));
 vi.mock("node:os", async importOriginal => ({
   ...(await importOriginal<typeof import("node:os")>()),
@@ -48,7 +49,10 @@ vi.mock("node:child_process", async () => {
 vi.mock("node:fs/promises", () => ({
   realpath: async (path: string) => path,
   lstat: async () => ({ mode: 33188, size: 4, isFile: () => true, isSymbolicLink: () => false }),
-  readFile: async () => state.content,
+  readFile: async () => {
+    if (state.hashError) throw state.hashError;
+    return state.content;
+  },
   readlink: async () => "target",
 }));
 /** QA-1 F4: the hardening a `hardened` snapshot takes from git-tools.ts (loaded only then), pinned here. */
@@ -77,6 +81,7 @@ beforeEach(() => Object.assign(state, {
   head: "head1", status: "", diff: "", index: "", untracked: "", content: "", stage: "", error: false,
   branchRef: "refs/heads/main",
   calls: [], directories: [], binaries: [], priorities: [], priorityThrows: false,
+  hashError: null,
 }));
 const capture = () => snapshotTree(process.cwd(), new AbortController().signal);
 describe("Git tree fingerprint adapter", () => {
@@ -105,6 +110,90 @@ describe("Git tree fingerprint adapter", () => {
     expect(await capture()).toBeUndefined(); state.stage = "";
     const controller = new AbortController(); controller.abort();
     expect(await snapshotTree(process.cwd(), controller.signal)).toBeUndefined();
+  });
+  it("reports a failing git call's reason while still returning undefined", async () => {
+    state.error = true;
+    const onError = vi.fn();
+    await expect(snapshotTree(process.cwd(), new AbortController().signal, { onError })).resolves.toBeUndefined();
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(onError).toHaveBeenCalledWith("root: git exited with code 1");
+  });
+  it("reports git timeout and spawn errors, with bounded, single-line, scrubbed diagnostics", async () => {
+    const timeout = `git timed out after ${SNAPSHOT_GIT_TIMEOUT_MS} ms`;
+    for (const [error, expected] of [
+      [new Error(timeout), timeout],
+      [Object.assign(new Error("spawn git ENOENT"), { code: "ENOENT" }), "ENOENT: spawn git ENOENT"],
+      ["plain git failure", "plain git failure"],
+    ] as const) {
+      const onError = vi.fn();
+      const git = async () => { throw error; };
+      expect(await snapshotTree(process.cwd(), new AbortController().signal, { git, onError })).toBeUndefined();
+      expect(onError).toHaveBeenCalledWith(`root: ${expected}`);
+    }
+    const onError = vi.fn();
+    const git = async () => { throw new Error(`git failed\nghp_${"s".repeat(30)} ${"y".repeat(300)}`); };
+    expect(await snapshotTree(process.cwd(), new AbortController().signal, { git, onError })).toBeUndefined();
+    const reason = onError.mock.calls[0]![0] as string;
+    expect(reason).toHaveLength(200);
+    expect(reason).not.toMatch(/[\r\n]|ghp_/);
+    expect(reason).toContain("[REDACTED]");
+  });
+  it.each(["root", "head", "status", "diff-worktree", "diff-index", "index", "untracked-list"])(
+    "labels timeout and spawn failures at %s without retrying or returning a snapshot", async stage => {
+      const commands = [
+        "rev-parse --show-toplevel", "rev-parse HEAD --symbolic-full-name HEAD",
+        "status --porcelain=v1 -z --untracked-files=all", "diff HEAD --binary --no-ext-diff --no-textconv",
+        "diff --cached --binary --no-ext-diff --no-textconv", "ls-files --stage",
+        "ls-files --others --exclude-standard --full-name -z",
+      ];
+      const index = ["root", "head", "status", "diff-worktree", "diff-index", "index", "untracked-list"].indexOf(stage);
+      const timeout = `git timed out after ${SNAPSHOT_GIT_TIMEOUT_MS} ms`;
+      for (const [error, expected] of [
+        [new Error(timeout), `${stage}: ${timeout}`],
+        [Object.assign(new Error(`spawn git ENOENT\ntoken=secret-123456 ${"x".repeat(300)}`), { code: "ENOENT" }),
+          `${stage}: ENOENT: spawn git ENOENT token=[REDACTED] ${"x".repeat(300)}`.slice(0, 200)],
+      ] as const) {
+        const onError = vi.fn();
+        const git = vi.fn(async (args: readonly string[], opts: SnapshotGitOptions) => {
+          expect(opts.timeoutMs).toBe(10_000);
+          if (args.slice(1).join(" ") === commands[index]) throw error;
+          return execGit(args, opts);
+        });
+        expect(await snapshotTree(process.cwd(), new AbortController().signal, { git, onError })).toBeUndefined();
+        expect(git).toHaveBeenCalledTimes(index + 1);
+        expect(git.mock.calls.map(([args]) => args.slice(1).join(" "))).toEqual(commands.slice(0, index + 1));
+        expect(onError).toHaveBeenCalledExactlyOnceWith(expected);
+        expect(expected.length).toBeLessThanOrEqual(200);
+        expect(expected).not.toMatch(/[\r\n]|secret-123456/);
+      }
+    },
+  );
+  it.each(["-v", "--ignored"])("keeps optional ignored-digest listing failures (%s) nonfatal", async flag => {
+    const onError = vi.fn();
+    const git = async (args: readonly string[], opts: SnapshotGitOptions) => {
+      if (args.includes(flag)) throw new Error("git timed out after 10000 ms");
+      return execGit(args, opts);
+    };
+    const snapshot = await snapshotTree(process.cwd(), new AbortController().signal, { git, onError, ignoredDigest: true });
+    expect(snapshot).toBeDefined();
+    expect(snapshot?.ignored).toBeUndefined();
+    expect(onError).not.toHaveBeenCalled();
+  });
+  it("labels untracked content-read failures as hash rather than the last git listing", async () => {
+    state.untracked = "untracked.txt\0";
+    state.hashError = new Error("read failed token=secret-123456");
+    const onError = vi.fn();
+    expect(await snapshotTree(process.cwd(), new AbortController().signal, { onError })).toBeUndefined();
+    expect(onError).toHaveBeenCalledExactlyOnceWith("hash: read failed token=[REDACTED]");
+    expect(state.calls).toHaveLength(7);
+  });
+  it("ignores a throwing diagnostic callback and does not report errors on success", async () => {
+    const onError = vi.fn(() => { throw new Error("diagnostic failed"); });
+    expect(await snapshotTree(process.cwd(), new AbortController().signal, { onError })).toBeDefined();
+    expect(onError).not.toHaveBeenCalled();
+    state.error = true;
+    await expect(snapshotTree(process.cwd(), new AbortController().signal, { onError })).resolves.toBeUndefined();
+    expect(onError).toHaveBeenCalledTimes(1);
   });
   it("QA-3.1-8: every git process of a snapshot gets lowPriority through the seam (default off)", async () => {
     const seen: SnapshotGitOptions[] = [];

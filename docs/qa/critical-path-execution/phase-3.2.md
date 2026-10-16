@@ -126,8 +126,18 @@ The phase suite is the backstop for breakage that affected-test scoping misses. 
 - **M8 Clean step before every check run.**
   - `prepare(slot, commit)` = `pool.reset(slot, commit)` (detached checkout, clean tracked files, re-provision if manifests drifted, `types.ts:1388`), then `pool.cleanForChecks(slot)` (`checkout --force`, `clean -ffdx -e keep`, empty status), then assert `revParse(slot, "HEAD") === commit`.
   - Runs before checks, batch-checks, every bisect probe, every rerun, the base check, revert-checks and the suite.
+  - *Amended 2026-10-15 (Phase 6.1, integration lane latency):* for `checks`/`batch-checks` on the slot the queue's
+    `stack()` has just rebased to exactly this candidate, the reset is skipped: `cleanForChecks` then the same
+    `HEAD === commit` assertion, then a write-through marker update to the candidate commit. A HEAD mismatch or explicit
+    provisioning/manifest drift returned by the clean falls back to the full `prepare`; bisect probes, reruns, the base
+    check, revert-checks and the suite always use the full `prepare`.
   - Any failure is `error:"prepare"`, never pass.
+  - The commit-only selection reads (`git show` and the base-to-candidate `git diff`) overlap the full or reused
+    prepare. On a prepare failure all overlapped reads settle before returning; the prepare error is reported first.
 - **M9 Check selection** (`select(tree)`, read at the candidate).
+  - Commit-only file reads overlap M8 preparation, but command resolution waits for successful preparation. Only a
+    git error explicitly reporting an absent path means "file missing"; other read errors fail as `error:"prepare"`,
+    never a `no-checks` pass. A prepare error takes precedence over a concurrent selection-read error.
   1. typecheck, if `package.json` has a string `scripts.typecheck`; resolved as a package script with no args.
   2. tests:
      - Node: `scripts.test` exists and is not npm's placeholder `echo "Error: no test specified" && exit 1`.

@@ -6,15 +6,17 @@
  *  1. captures the request (method, url, headers without credentials, parsed JSON body) in {@link CpxScriptedProvider.requests};
  *  2. waits the configured per-request delay;
  *  3. answers a queued fault (429 rate limit, 529 overloaded, usage limit with a reset time) instead of forwarding, or
- *  4. forwards method/path/body to the inner provider and streams the answer back, optionally
+ *  4. answers a queued v2 scripted reply, or forwards method/path/body to the inner provider and streams the answer back, optionally
  *  5. rewriting the Anthropic `usage` object with `cache_read_input_tokens` / `cache_creation_input_tokens` (non-stream JSON
- *     body and the SSE `message_start` event's `message.usage`; every other byte of the stream is left unchanged).
+ *     body and the SSE `message_start` event's `message.usage`; every other byte of the stream is left unchanged);
+ *  6. records per-call duration through response completion, including the delay, forwarding and connection close on cancellation.
  * With no options and no queued fault the front is a transparent pass-through. `start()` returns the FRONT base URL, same shape as
  * `ScriptedProvider` (`http://127.0.0.1:<port>/v1`), so `RoutingHost` can use either.
  */
 import { createServer, request as httpRequest, type IncomingHttpHeaders, type IncomingMessage, type OutgoingHttpHeaders, type ServerResponse } from "node:http";
 import { listenOnFetchSafePort } from "./fetch-safe-port";
 import { ScriptedProvider, type HostVersion } from "./scripted-provider";
+import { canonicalFindingsJson, isFindingsReport, type FindingsReport } from "../../../src/executor/types";
 
 /** Fault shapes the front can answer instead of forwarding (all are Anthropic error envelopes `{type:"error",error:{type,message}}`). */
 export type FaultKind = "rate-limit" | "overloaded" | "usage-limit" | "invalid-request";
@@ -37,7 +39,11 @@ export interface CpxRequest {
   /** Parsed JSON body; the raw text when it is not JSON; `undefined` when empty. */
   body: unknown;
   /** How the request was answered; `undefined` while it is still in flight. */
-  served?: "forwarded" | FaultKind;
+  served?: "forwarded" | "scripted" | FaultKind;
+  /** Elapsed milliseconds from arrival through response completion (or connection close); absent while in flight. */
+  durationMs?: number;
+  /** Host-facing connection closed BEFORE the response finished (not a normal completed response). Wall clock for restart evidence. */
+  connectionClosed?: { kind: "connection-closed"; at: number };
 }
 /** Options of a queued fault. */
 export interface FaultOptions {
@@ -60,9 +66,48 @@ export interface CpxProviderOptions {
   cacheUsage?: CacheUsage | ((request: CpxRequest) => CacheUsage | undefined);
   /** Waiter used for `delayMs` (default: a real timer). Inject a controlled one to test without wall-clock time. */
   sleep?: (ms: number) => Promise<void>;
+  /** Monotonic millisecond clock for request durations (default: `performance.now`). */
+  now?: () => number;
 }
 interface QueuedFault { kind: FaultKind; remaining: number; options: FaultOptions }
 export interface FaultAnswer { status: number; headers: OutgoingHttpHeaders; body: string }
+/** A scripted v2 assistant turn; tool execution belongs to the host, not this HTTP fixture. */
+export type CpxReply = { text: string } | { tool: string; input: Record<string, unknown> };
+export interface ReplyOptions {
+  /** Number of matching turns to answer (default 1; `Infinity` never exhausts). */
+  times?: number;
+  /** Non-matching requests pass through without consuming the reply. */
+  when?: (request: CpxRequest) => boolean;
+}
+interface QueuedReply { reply: CpxReply; remaining: number; options: ReplyOptions }
+
+/** Same Anthropic JSON/SSE shape as the frozen fixture, with a front-local request ID. */
+function replyAnswer(request: CpxRequest, reply: CpxReply, cache: CacheUsage | undefined): FaultAnswer {
+  const body = request.body !== null && typeof request.body === "object" ? request.body : {};
+  const tool = "tool" in reply;
+  const content = tool
+    ? { type: "tool_use", id: `toolu_cpx_${request.index}`, name: reply.tool, input: reply.input }
+    : { type: "text", text: reply.text };
+  const stop = tool ? "tool_use" : "end_turn";
+  const usage = { input_tokens: 10, output_tokens: 0, ...(cache ? { cache_read_input_tokens: cache.read, cache_creation_input_tokens: cache.creation } : {}) };
+  const message = { id: `msg_cpx_${request.index}`, type: "message", role: "assistant", model: "model" in body ? body.model : undefined, content: [], stop_reason: null, stop_sequence: null, usage };
+  if (!("stream" in body && body.stream === true)) return {
+    status: 200,
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ ...message, content: [content], stop_reason: stop, usage: { ...usage, output_tokens: 5 } }),
+  };
+  const event = (type: string, data: Record<string, unknown>) => `event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`;
+  return {
+    status: 200,
+    headers: { "content-type": "text/event-stream", "cache-control": "no-cache" },
+    body: event("message_start", { message }) + event("ping", {})
+      + event("content_block_start", { index: 0, content_block: tool ? { ...content, input: {} } : { type: "text", text: "" } })
+      + event("content_block_delta", { index: 0, delta: tool ? { type: "input_json_delta", partial_json: JSON.stringify(reply.input) } : { type: "text_delta", text: reply.text } })
+      + event("content_block_stop", { index: 0 })
+      + event("message_delta", { delta: { stop_reason: stop, stop_sequence: null }, usage: { output_tokens: 5 } })
+      + event("message_stop", {}),
+  };
+}
 
 const CREDENTIAL_HEADERS = new Set(["authorization", "x-api-key", "proxy-authorization"]);
 const HOP_HEADERS = new Set(["host", "connection", "content-length", "transfer-encoding", "keep-alive"]);
@@ -145,6 +190,7 @@ export class CpxFront {
   /** Front-side failures (the inner provider unreachable, a bad `delayMs`...), as text. Inner fixture errors stay with the fixture. */
   readonly frontErrors: string[] = [];
   private faults: QueuedFault[] = [];
+  private scriptedReplies: QueuedReply[] = [];
   private innerPort = 0;
   private readonly server = createServer((req, res) => { void this.handle(req, res); });
 
@@ -177,6 +223,38 @@ export class CpxFront {
   /** Number of faults still to be served (finite entries only; an `Infinity` entry counts as 1). */
   get pendingFaults(): number { return this.faults.reduce((n, f) => n + (Number.isFinite(f.remaining) ? f.remaining : 1), 0); }
 
+  /** Queues an assistant turn for v2 executor smoke scenarios. Faults take precedence without consuming replies. */
+  replyNext(reply: CpxReply, options: ReplyOptions = {}): this {
+    const times = options.times ?? 1;
+    if (times !== Infinity && (!Number.isInteger(times) || times < 1)) throw new Error("Reply times must be a positive integer or Infinity");
+    this.scriptedReplies.push({ reply, remaining: times, options });
+    return this;
+  }
+  /** Requests a real v2 host `write` call (`path`, not v1's `filePath`). Host guards apply; the provider never writes behind its back. */
+  writeNext(path: string, content: string, options: ReplyOptions = {}): this {
+    if (!path.trim()) throw new Error("Write path must not be empty");
+    return this.replyNext({ tool: "write", input: { path, content } }, options);
+  }
+  /** An escalation is a successful assistant reply, not a retryable provider error. */
+  escalateNext(reason: string, options: ReplyOptions = {}): this {
+    if (!reason.trim()) throw new Error("Escalation reason must not be empty");
+    return this.replyNext({ text: `ESCALATE: ${reason}` }, options);
+  }
+  /** Emits the executor's FINDINGS_FORMAT JSON as the assistant's final text, including an empty passing report. */
+  findingsNext(report: FindingsReport, options: ReplyOptions = {}): this {
+    if (!isFindingsReport(report)) throw new Error("Findings must match FINDINGS_FORMAT");
+    return this.replyNext({ text: canonicalFindingsJson(report) }, options);
+  }
+  clearReplies(): void { this.scriptedReplies = []; }
+  get pendingReplies(): number { return this.scriptedReplies.reduce((n, r) => n + (Number.isFinite(r.remaining) ? r.remaining : 1), 0); }
+
+  private takeReply(request: CpxRequest): CpxReply | undefined {
+    const queued = this.scriptedReplies.find(r => r.remaining > 0 && (r.options.when?.(request) ?? true));
+    if (queued) queued.remaining -= 1;
+    this.scriptedReplies = this.scriptedReplies.filter(r => r.remaining > 0);
+    return queued?.reply;
+  }
+
   private takeFault(request: CpxRequest): QueuedFault | undefined {
     const fault = this.faults.find(f => f.remaining > 0 && (f.options.when?.(request) ?? true));
     if (fault) fault.remaining -= 1;
@@ -185,6 +263,8 @@ export class CpxFront {
   }
 
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const now = this.options.now ?? (() => performance.now());
+    const started = now();
     try {
       const chunks: Buffer[] = [];
       for await (const chunk of req) chunks.push(Buffer.from(chunk));
@@ -195,6 +275,12 @@ export class CpxFront {
       const headers = Object.fromEntries(Object.entries(req.headers).filter(([name]) => !CREDENTIAL_HEADERS.has(name)));
       const request: CpxRequest = { index: this.requests.length, method: req.method ?? "GET", url: req.url ?? "/", headers, body };
       this.requests.push(request);
+      const completed = () => { request.durationMs ??= Math.max(0, now() - started); };
+      res.once("finish", completed);
+      res.once("close", () => {
+        if (!res.writableFinished) request.connectionClosed = { kind: "connection-closed", at: Date.now() };
+        completed();
+      });
       const wait = typeof this.options.delayMs === "function" ? this.options.delayMs(request) : this.options.delayMs ?? 0;
       if (wait > 0) await (this.options.sleep ?? (ms => new Promise<void>(resolve => setTimeout(resolve, ms))))(wait);
       if (res.destroyed) return; // stop() closed the connection during the delay
@@ -206,8 +292,16 @@ export class CpxFront {
         res.end(answer.body);
         return;
       }
-      request.served = "forwarded";
       const cache = typeof this.options.cacheUsage === "function" ? this.options.cacheUsage(request) : this.options.cacheUsage;
+      const reply = this.takeReply(request);
+      if (reply) {
+        const answer = replyAnswer(request, reply, cache);
+        request.served = "scripted";
+        res.writeHead(answer.status, answer.headers);
+        res.end(answer.body);
+        return;
+      }
+      request.served = "forwarded";
       await this.forward(req, res, raw, cache);
     } catch (error) {
       this.frontErrors.push(String(error));
@@ -255,7 +349,8 @@ export class CpxFront {
 }
 
 /** `ScriptedProvider` + a {@link CpxFront}: `start()` returns the FRONT base URL, `stop()` closes the front, then the fixture.
- * Queue faults and read captures through {@link CpxScriptedProvider.front} (`provider.front.failNext(...)`, `provider.front.requests`). */
+ * Queue faults/scripted v2 turns and read captures through {@link CpxScriptedProvider.front}
+ * (`provider.front.writeNext(...)`, `provider.front.escalateNext(...)`, `provider.front.findingsNext(...)`, `provider.front.requests`). */
 export class CpxScriptedProvider extends ScriptedProvider {
   /** The front proxy; its `options` (delay, cache usage) may be changed between requests. */
   readonly front: CpxFront;

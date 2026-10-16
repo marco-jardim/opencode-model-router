@@ -736,12 +736,40 @@ describe("the task lane on real git", SLOW, () => {
 
   it("a same-line edit conflicts: the paths are reported, the rebase is aborted, the branch is unchanged", async () => {
     const s = await laneSetup("conflict", { integrationEdit: { "src/value.txt": "theirs\n" }, taskEdit: { "src/value.txt": "mine\n" } });
+    const before = s.env.gitCalls.length;
     const rebased = await s.env.ops.rebaseOnto(s.integration.path, s.tip, s.c0);
     expect(rebased).toEqual({ ok: false, conflicts: ["src/value.txt"] });
     expect(git(s.repo, "rev-parse", s.branch)).toBe(s.tip);
     expect(await s.env.ops.revParse(s.integration.path, "HEAD")).toBe(s.taskHead);
     expect(git(s.integration.path, "status", "--porcelain")).toBe("");
-    expect(existsSync(join(await s.env.ops.verifySlotPointers(s.integration.path).then((p) => p.gitdir), "rebase-merge"))).toBe(false);
+    const { gitdir } = await s.env.ops.verifySlotPointers(s.integration.path);
+    for (const state of ["rebase-merge", "rebase-apply"]) expect(existsSync(join(gitdir, state))).toBe(false);
+    // The queue's defensive second abort is a no-op after successful conflict cleanup.
+    await s.env.ops.rebaseAbort(s.integration.path);
+    const rebases = s.env.gitCalls.slice(before).filter(c => c.args.includes("rebase")).map(c => c.args.slice(c.args.indexOf("rebase")));
+    expect(rebases).toEqual([["rebase", "--onto", s.tip, s.c0], ["rebase", "--abort"]]);
+    expectLinearReflog(s.repo, s.branch);
+  });
+
+  it("an invalid upstream refuses before starting: the initiating git error survives, no abort or reset runs", async () => {
+    const s = await laneSetup("not-started", { integrationEdit: { "src/other.txt": "theirs\n" }, taskEdit: { "src/mine.txt": "mine\n" } });
+    const upstream = "0".repeat(40); // Well-formed, but cannot name a commit.
+    const before = s.env.gitCalls.length;
+    await expect(s.env.ops.rebaseOnto(s.integration.path, s.tip, upstream)).rejects.toMatchObject({
+      code: "E_GIT", message: "git rebase failed (exit 128)",
+      detail: { op: "rebase", code: 128, stderr: expect.stringContaining(`invalid upstream '${upstream}'`) },
+    });
+    const calls = s.env.gitCalls.slice(before);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.args.slice(-4)).toEqual(["rebase", "--onto", s.tip, upstream]);
+    const { gitdir } = await s.env.ops.verifySlotPointers(s.integration.path);
+    for (const state of ["rebase-merge", "rebase-apply"]) expect(existsSync(join(gitdir, state))).toBe(false);
+    expect(await s.env.ops.revParse(s.integration.path, "HEAD")).toBe(s.taskHead);
+    expect(read(join(s.integration.path, "src", "mine.txt"))).toBe("mine\n");
+    expect(git(s.integration.path, "status", "--porcelain")).toBe("");
+    expect(git(s.repo, "rev-parse", s.branch)).toBe(s.tip);
+    expect(git(s.repo, "rev-parse", "main")).toBe(s.c0);
+    expect(git(s.repo, "status", "--porcelain")).toBe("");
     expectLinearReflog(s.repo, s.branch);
   });
 

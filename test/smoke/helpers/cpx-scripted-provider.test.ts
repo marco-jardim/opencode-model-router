@@ -1,14 +1,22 @@
 import { afterEach, expect, it, vi } from "vitest";
 import { createServer } from "node:http";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { CpxFront, CpxScriptedProvider, faultAnswer, withCacheUsageJson, withCacheUsageSse, type CpxProviderOptions, type UsageLimitVariant } from "./cpx-scripted-provider";
-import { EVIDENCE_DIR, RoutingHost, evidenceDir } from "./routing-host";
+import { EVIDENCE_DIR, ROOT, RoutingHost, evidenceDir, obj } from "./routing-host";
 import { ScriptedProvider } from "./scripted-provider";
 import { isFetchSafePort } from "./fetch-safe-port";
+import { parseFindings } from "../../../src/executor/qa-loop";
+import type { FindingsReport } from "../../../src/executor/types";
 
 const providers: { stop(): Promise<void> }[] = [];
-afterEach(async () => { await Promise.all(providers.splice(0).map(p => p.stop())); });
-async function start(options: CpxProviderOptions = {}) {
-  const provider = new CpxScriptedProvider("v1", options);
+const scratch: string[] = [];
+afterEach(async () => {
+  await Promise.all(providers.splice(0).map(p => p.stop()));
+  await Promise.all(scratch.splice(0).map(path => rm(path, { recursive: true, force: true })));
+});
+async function start(options: CpxProviderOptions = {}, host: "v1" | "v2" = "v1") {
+  const provider = new CpxScriptedProvider(host, options);
   providers.push(provider);
   const base = await provider.start();
   expect(isFetchSafePort(Number(new URL(base).port))).toBe(true);
@@ -29,6 +37,136 @@ async function until(label: string, done: () => boolean) {
   if (!done()) throw new Error(`Timed out waiting for ${label}`);
 }
 const events = (sse: string) => sse.split("\n\n").filter(Boolean);
+
+it.each([false, true])("answers ESCALATE as a successful v2 assistant turn (stream=%s)", async stream => {
+  const { provider, front, url } = await start({ cacheUsage: { read: 2, creation: 3 } }, "v2");
+  front.escalateNext("authority: edit is required");
+  const response = await post(url, { ...ask, stream });
+  expect(response.status).toBe(200);
+  const text = await response.text();
+  if (stream) {
+    const data = events(text).map(event => obj(JSON.parse(event.split("\n")[1]!.slice("data: ".length))));
+    expect(data.find(event => event.type === "content_block_delta")!.delta).toEqual({ type: "text_delta", text: "ESCALATE: authority: edit is required" });
+    expect(obj(data.find(event => event.type === "message_delta")!.delta).stop_reason).toBe("end_turn");
+    expect(obj(data[0]!.message).usage).toMatchObject({ cache_read_input_tokens: 2, cache_creation_input_tokens: 3 });
+  } else {
+    expect(JSON.parse(text)).toMatchObject({ content: [{ type: "text", text: "ESCALATE: authority: edit is required" }], stop_reason: "end_turn", usage: { cache_read_input_tokens: 2, cache_creation_input_tokens: 3 } });
+  }
+  expect(provider.captures).toHaveLength(0);
+  expect(front.requests[0]!.served).toBe("scripted");
+  expect(front.pendingReplies).toBe(0);
+  expect(front.frontErrors).toEqual([]);
+});
+
+it.each([false, true])("scripts a real write-tool payload followed by a completion turn (stream=%s)", async stream => {
+  const directory = await mkdtemp(join(ROOT, "tmp-cpx-provider-"));
+  scratch.push(directory);
+  const filePath = join(directory, "proof.txt");
+  const content = "CPX_WRITE_DONE\nUnicode: λ\n";
+  const { provider, front, url } = await start({}, "v2");
+  front.writeNext(filePath, content).replyNext({ text: "DONE: proof.txt written" });
+  const response = await post(url, { ...ask, stream, tools: [{ name: "write" }] });
+  expect(response.status).toBe(200);
+  const wire = await response.text();
+  let tool: Record<string, unknown>;
+  if (stream) {
+    const data = events(wire).map(event => obj(JSON.parse(event.split("\n")[1]!.slice("data: ".length))));
+    const block = obj(data.find(event => event.type === "content_block_start")!.content_block);
+    expect(block).toMatchObject({ type: "tool_use", name: "write", input: {} });
+    const delta = obj(data.find(event => event.type === "content_block_delta")!.delta);
+    expect(delta.type).toBe("input_json_delta");
+    tool = { ...block, input: JSON.parse(String(delta.partial_json)) };
+    expect(obj(data.find(event => event.type === "message_delta")!.delta).stop_reason).toBe("tool_use");
+    expect(data.at(-1)!.type).toBe("message_stop");
+  } else {
+    const message = JSON.parse(wire) as { content: Record<string, unknown>[]; stop_reason: string };
+    expect(message.stop_reason).toBe("tool_use");
+    tool = message.content[0]!;
+  }
+  expect(tool).toMatchObject({ type: "tool_use", name: "write", input: { path: filePath, content } });
+  // Emulate only the host's write tool: the provider must not create files itself or bypass guards.
+  await expect(readFile(filePath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  const input = obj(tool.input);
+  await writeFile(String(input.path), String(input.content), "utf8");
+  expect(await readFile(filePath, "utf8")).toBe(content);
+  const followUp = await post(url, { ...ask, messages: [
+    ...ask.messages,
+    { role: "assistant", content: [tool] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: tool.id, content: "File written" }] },
+  ] });
+  expect(await followUp.json()).toMatchObject({ content: [{ type: "text", text: "DONE: proof.txt written" }], stop_reason: "end_turn" });
+  expect(front.pendingReplies).toBe(0);
+  expect(provider.captures).toHaveLength(0);
+  expect(front.frontErrors).toEqual([]);
+});
+
+it.each([false, true])("emits structured QA findings and an empty passing report accepted by the executor (stream=%s)", async stream => {
+  const { front, url } = await start({}, "v2");
+  const report: FindingsReport = { findings: [
+    { id: "QA-1", severity: "blocking", files: ["src/proof.ts"], problem: "Missing proof", fix: "Write the proof" },
+    { id: "QA-2", severity: "minor", files: [], problem: "Clarify wording", fix: "" },
+  ] };
+  front.findingsNext(report).findingsNext({ findings: [] });
+  for (const expected of [report, { findings: [] }]) {
+    const response = await post(url, { ...ask, stream });
+    expect(response.status).toBe(200);
+    const wire = await response.text();
+    let text: string;
+    if (stream) {
+      const data = events(wire).map(event => obj(JSON.parse(event.split("\n")[1]!.slice("data: ".length))));
+      const delta = obj(data.find(event => event.type === "content_block_delta")!.delta);
+      expect(delta.type).toBe("text_delta");
+      text = String(delta.text);
+      expect(obj(data.find(event => event.type === "message_delta")!.delta).stop_reason).toBe("end_turn");
+    } else {
+      const message = JSON.parse(wire) as { content: { type: string; text: string }[]; stop_reason: string };
+      expect(message.content[0]!.type).toBe("text");
+      expect(message.stop_reason).toBe("end_turn");
+      text = message.content[0]!.text;
+    }
+    expect(parseFindings(text)).toEqual({ ok: true, report: expected });
+    expect(JSON.parse(text)).toEqual(expected);
+  }
+  expect(front.pendingReplies).toBe(0);
+});
+
+it("rejects invalid scripted reply counts, empty write paths/escalations and malformed findings before queueing", () => {
+  const front = new CpxFront();
+  for (const times of [0, -1, 1.5, NaN, -Infinity]) {
+    expect(() => front.replyNext({ text: "ok" }, { times })).toThrow("Reply times");
+  }
+  expect(() => front.writeNext("  ", "text")).toThrow("Write path");
+  expect(() => front.escalateNext("\n ")).toThrow("reason");
+  const invalid: FindingsReport = { findings: [{ id: "invalid id", severity: "major", files: ["proof.ts"], problem: "Missing proof", fix: "" }] };
+  expect(() => front.findingsNext(invalid)).toThrow("FINDINGS_FORMAT");
+  const extra = { findings: [], extra: true };
+  expect(() => front.findingsNext(extra)).toThrow("FINDINGS_FORMAT");
+  expect(front.pendingReplies).toBe(0);
+});
+
+it("matches scripted turns by predicate/count, preserves them across faults, and falls back to the fixture", async () => {
+  const { provider, front, url } = await start({}, "v2");
+  const options = { times: 2, when: (r: { headers: Record<string, unknown> }) => r.headers["x-proof-session"] === "ses_scripted" };
+  front.escalateNext("authority", options);
+  expect((await post(url)).status).toBe(200);
+  expect(front.pendingReplies).toBe(2);
+  front.failNext("rate-limit");
+  expect((await post(url, ask, { "x-proof-session": "ses_scripted" })).status).toBe(429);
+  expect(front.pendingReplies).toBe(2);
+  for (let i = 0; i < 2; i++) {
+    expect(await (await post(url, ask, { "x-proof-session": "ses_scripted" })).json()).toMatchObject({ content: [{ text: "ESCALATE: authority" }] });
+  }
+  expect(front.pendingReplies).toBe(0);
+  expect(await (await post(url)).json()).toMatchObject({ content: [{ text: "ok" }] });
+  expect(provider.captures).toHaveLength(2);
+  expect(front.requests.map(r => r.served)).toEqual(["forwarded", "rate-limit", "scripted", "scripted", "forwarded"]);
+  front.replyNext({ text: "repeat" }, { times: Infinity });
+  for (let i = 0; i < 2; i++) expect(await (await post(url)).json()).toMatchObject({ content: [{ text: "repeat" }] });
+  expect(front.pendingReplies).toBe(1);
+  front.clearReplies();
+  expect(front.pendingReplies).toBe(0);
+  expect(await (await post(url)).json()).toMatchObject({ content: [{ text: "ok" }] });
+});
 
 it("is a transparent pass-through with no options (JSON and SSE bytes equal the fixture's)", async () => {
   const plain = await startPlain();
@@ -215,10 +353,12 @@ it("derives the delay from the request, and does not wait for a zero delay", asy
 });
 
 it("really delays with the default timer (generous lower bound)", async () => {
-  const { url } = await start({ delayMs: 200 });
+  const { front, url } = await start({ delayMs: 200 });
   const began = Date.now();
   expect((await post(url)).status).toBe(200);
   expect(Date.now() - began).toBeGreaterThanOrEqual(150);
+  await until("the measured duration", () => front.requests[0]!.durationMs !== undefined);
+  expect(front.requests[0]!.durationMs).toBeGreaterThanOrEqual(150);
 });
 
 it("applies a delay before a fault too", async () => {
@@ -227,6 +367,78 @@ it("applies a delay before a fault too", async () => {
   front.failNext("overloaded");
   expect((await post(url)).status).toBe(529);
   expect(asked).toEqual([9]);
+});
+
+it("records each forwarded and faulted call's duration, including its scripted delay", async () => {
+  let now = 100;
+  const { front, url } = await start({
+    now: () => now,
+    delayMs: r => r.index === 0 ? 25 : 70,
+    sleep: async ms => { now += ms; },
+  });
+  expect((await post(url)).status).toBe(200);
+  front.failNext("overloaded");
+  expect((await post(url)).status).toBe(529);
+  await until("completed request durations", () => front.requests.every(r => r.durationMs !== undefined));
+  expect(front.requests.map(r => r.durationMs)).toEqual([25, 70]);
+  expect(front.requests.every(r => r.connectionClosed === undefined)).toBe(true); // Normal response completion is not cancellation evidence.
+});
+
+it("leaves the duration absent while a call is in flight", async () => {
+  let now = 0;
+  let release: (() => void) | undefined;
+  const { front, url } = await start({ now: () => now, delayMs: 20, sleep: () => new Promise<void>(resolve => { release = resolve; }) });
+  const pending = post(url);
+  await until("the delay to begin", () => release !== undefined);
+  expect(front.requests[0]!.durationMs).toBeUndefined();
+  now = 20;
+  release!();
+  await (await pending).text();
+  await until("the duration to be recorded", () => front.requests[0]!.durationMs !== undefined);
+  expect(front.requests[0]!.durationMs).toBe(20);
+});
+
+it("measures overlapping calls independently instead of recording a provider-wide duration", async () => {
+  let now = 0;
+  const release: (() => void)[] = [];
+  const { front, url } = await start({ now: () => now, delayMs: 1, sleep: () => new Promise<void>(resolve => release.push(resolve)) });
+  front.failWhen(r => r.index === 1, "overloaded");
+  const first = post(url);
+  await until("the first request's delay", () => release.length === 1);
+  now = 5;
+  const second = post(url);
+  await until("both requests' delays", () => release.length === 2);
+  now = 10;
+  release[0]!();
+  await (await first).text();
+  await until("the first call's duration", () => front.requests[0]!.durationMs !== undefined);
+  expect(front.requests[1]!.durationMs).toBeUndefined();
+  now = 40;
+  release[1]!();
+  expect((await second).status).toBe(529);
+  await until("the second call's duration", () => front.requests[1]!.durationMs !== undefined);
+  expect(front.requests.map(r => r.durationMs)).toEqual([10, 35]);
+});
+
+it("records a cancelled call's duration when its connection closes during the delay", async () => {
+  let now = 0;
+  let release: (() => void) | undefined;
+  const { provider, front, url } = await start({ now: () => now, delayMs: 30, sleep: () => new Promise<void>(resolve => { release = resolve; }) });
+  const controller = new AbortController();
+  const pending = fetch(url, { method: "POST", body: JSON.stringify(ask), signal: controller.signal });
+  const rejected = expect(pending).rejects.toThrow();
+  await until("the cancelled call's delay", () => release !== undefined);
+  now = 12;
+  controller.abort();
+  await rejected;
+  await until("the closed connection's duration", () => front.requests[0]!.durationMs !== undefined);
+  expect(front.requests[0]!.durationMs).toBe(12);
+  expect(front.requests[0]!.connectionClosed).toEqual({ kind: "connection-closed", at: expect.any(Number) });
+  release!();
+  await tick();
+  expect(provider.captures).toHaveLength(0);
+  expect(front.requests[0]!.served).toBeUndefined();
+  expect(front.frontErrors).toEqual([]);
 });
 
 it("captures method, url, parsed body and headers without credentials", async () => {
@@ -316,6 +528,8 @@ it("reports a front error as an Anthropic api_error when the fixture is unreacha
   expect(response.status).toBe(502);
   expect(await response.json()).toEqual({ type: "error", error: { type: "api_error", message: "cpx front error" } });
   expect(front.frontErrors).toHaveLength(1);
+  await until("the failed call's duration", () => front.requests[0]!.durationMs !== undefined);
+  expect(front.requests[0]!.durationMs).toBeGreaterThanOrEqual(0);
 });
 
 it("OMR_SMOKE_EVIDENCE_DIR is read at call time; unset keeps the tracked directory", () => {

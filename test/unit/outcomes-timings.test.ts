@@ -20,6 +20,7 @@ import {
 import type { DispatchStartInput, TimingLogger, TimingRecorder } from "../../src/routing/outcomes/timings";
 import type { DispatchTimingRow, OrchestratorTurnRow, SideLogs } from "../../src/routing/outcomes/types";
 import { removeDirWhenReleased } from "../helpers/remove-dir";
+import { createV2Observations, timingWriteObserver, type ObservationRecord } from "../../src/compat/v2-observations";
 
 const NOW = Date.UTC(2026, 9, 11, 12, 0, 0);
 
@@ -84,6 +85,60 @@ let clockNow: number;
 let logger: CapturingLogger;
 
 const now = (): number => clockNow;
+
+describe("v2 timing-write observations", () => {
+  it("counts actual writes (including failure), not duplicate end events; broken sink cannot lose a timing row", async () => {
+    for (const broken of [false, true]) {
+      const rows: ObservationRecord[] = [];
+      const append = vi.fn(async () => ({ ok: false as const, error: "write failed" }));
+      const observations = createV2Observations({ write: (line) => { if (broken) throw new Error("sink"); rows.push(JSON.parse(line)); } });
+      const r = createTimingRecorder({ dir: "observations", now: () => NOW, logger: capturingLogger(), sideLogs: fakeSideLogs({ appendTimings: append }),
+        onTimingWrite: timingWriteObserver(observations) });
+      r.recordDispatchStart(startInput());
+      await r.onExecutionOutcome("child-1", "end", "succeeded", NOW + 10);
+      await r.onExecutionOutcome("child-1", "end", "succeeded", NOW + 10);
+      expect(append).toHaveBeenCalledTimes(1);
+      observations.flush();
+      if (broken) expect(rows).toEqual([]);
+      else expect(rows).toMatchObject([{ family: "completion-effect", effect: "timing-row-write", callID: "call-1", parentSessionID: "root-1", childSessionID: "child-1" }]);
+      await r.dispose();
+    }
+  });
+
+  it("shared recorders emit once, handing observation ownership to another live holder", async () => {
+    const rows: ObservationRecord[] = [];
+    const observations = createV2Observations({ write: (line) => { rows.push(JSON.parse(line)); } });
+    const a = acquireTimingRecorder({ dir: "observed-shared", now: () => NOW, sideLogs: fakeSideLogs(), onTimingWrite: timingWriteObserver(observations) });
+    const b = acquireTimingRecorder({ dir: "observed-shared", now: () => NOW, onTimingWrite: timingWriteObserver(observations) });
+    a.recordDispatchStart(startInput());
+    await a.onExecutionOutcome("child-1", "e1", "succeeded", NOW + 1);
+    await b.onExecutionOutcome("child-1", "e1", "succeeded", NOW + 1);
+    await a.release();
+    b.recordDispatchStart(startInput({ callID: "call-2" }));
+    await b.onExecutionOutcome("child-1", "e2", "succeeded", NOW + 2);
+    observations.flush();
+    expect(rows.map((r) => r.family === "completion-effect" ? r.callID : "")).toEqual(["call-1", "call-2"]);
+    await b.release();
+  });
+
+  it("a mutating or throwing timing-write callback cannot change the row or prevent its append", async () => {
+    const appended: DispatchTimingRow[] = [];
+    const callback = vi.fn((identity: { readonly callID: string }) => {
+      expect(Object.isFrozen(identity)).toBe(true);
+      expect(Reflect.set(identity, "callID", "changed")).toBe(false);
+      throw new Error("observer failed");
+    });
+    const r = createTimingRecorder({ dir: "observed-callback", now: () => NOW, onTimingWrite: callback,
+      sideLogs: fakeSideLogs({ appendTimings: async (rows) => { appended.push(...rows); return { ok: true }; } }) });
+    r.recordDispatchStart(startInput());
+    await r.onExecutionOutcome("child-1", "end", "succeeded", NOW + 10);
+    expect(callback).toHaveBeenCalledTimes(1);
+    expect(callback.mock.calls[0][0]).toEqual({ parentSessionID: "root-1", callID: "call-1", childSessionID: "child-1", outcome: "succeeded" });
+    expect(appended).toHaveLength(1);
+    expect(appended[0].callID).toBe("call-1");
+    await r.dispose();
+  });
+});
 
 function recorder(overrides: { sideLogs?: SideLogs; logger?: TimingLogger; dir?: string } = {}): TimingRecorder {
   return createTimingRecorder({ dir: overrides.dir ?? dir, now, logger: overrides.logger ?? logger, ...(overrides.sideLogs ? { sideLogs: overrides.sideLogs } : {}) });
@@ -1247,7 +1302,7 @@ describe("timing recorder: shared per directory (QA-1.1-3)", () => {
 describe("timing recorder: shared across module copies (DF-1.1-2)", () => {
   type TimingsModule = typeof import("../../src/routing/outcomes/timings");
   const step = { input: 10, cacheRead: 20, cacheWrite: 30 };
-  const REGISTRY_KEY = Symbol.for("opencode-model-router.timings.registry.v2"); // the current TIMING_REGISTRY_VERSION (asserted below)
+  const REGISTRY_KEY = Symbol.for("opencode-model-router.timings.registry.v3"); // the current TIMING_REGISTRY_VERSION (asserted below)
   const holders: Array<{ release(): Promise<void> }> = [];
 
   // The host loads the plugin once per booted location: each load is a distinct module instance in one process.
@@ -1328,7 +1383,7 @@ describe("timing recorder: shared across module copies (DF-1.1-2)", () => {
 
     it("exports the version the entries are stamped with", async () => {
       const copy = await loadCopy();
-      expect(copy.TIMING_REGISTRY_VERSION).toBe(2);
+      expect(copy.TIMING_REGISTRY_VERSION).toBe(3); // v3 adds diagnostic holder ownership; timing semantics are unchanged
       expect(Symbol.keyFor(REGISTRY_KEY)).toBe(`opencode-model-router.timings.registry.v${copy.TIMING_REGISTRY_VERSION}`);
     });
 

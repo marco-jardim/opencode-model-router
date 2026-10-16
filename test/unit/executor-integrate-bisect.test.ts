@@ -699,10 +699,24 @@ describe("createIntegrateGit", () => {
   });
 
   it("showFile returns the content, or null when the path is not in the commit", async () => {
-    const { igit, calls } = gitEnv([runResult(0, "content"), runResult(128)]);
+    const { igit, calls } = gitEnv([runResult(0, "content"), runResult(128, "", "fatal: path 'missing' does not exist in 'c1'\n")]);
     expect(await igit.showFile("/wt", "c1", "package.json")).toBe("content");
     expect(rest(calls[0]?.args ?? [], "show")).toEqual(["show", "c1:package.json"]);
     expect(await igit.showFile("/wt", "c1", "missing")).toBeNull();
+  });
+
+  it("showFile recognizes a path present only on disk, not in the requested tree", async () => {
+    const { igit } = gitEnv([runResult(128, "", "fatal: path 'package.json' exists on disk, but not in 'c1'\n")]);
+    expect(await igit.showFile("/wt", "c1", "package.json")).toBeNull();
+  });
+
+  it.each([
+    runResult(128, "", "fatal: unable to read tree c1"), runResult(128, "", "fatal: generic git failure"),
+    runResult(128), runResult(null), runResult(1, "", "fatal: path 'package.json' does not exist in 'c1'"),
+    runResult(128, "", "fatal: path 'other' does not exist in 'c1'"),
+  ])("showFile fails closed on a non-absence git error: %j", async reply => {
+    const { igit } = gitEnv([reply]);
+    await expect(igit.showFile("/wt", "c1", "package.json")).rejects.toMatchObject({ code: "E_GIT", detail: { op: "show" } });
   });
 
   it("subject drops the trailing newline only", async () => {
@@ -777,7 +791,7 @@ interface ChecksOpts {
   acquire?: (o: SlotOptions, n: number) => SlotResult | Promise<SlotResult>;
   /** null: leave the dependency unset, so the default (wiring.preemptBackgroundVerification) runs. */
   preemptForeground?: (() => Promise<void>) | null;
-  resolve?: (ref: RunCommandRef) => { ok: true; command: ResolvedCommand } | { ok: false; reason: string };
+  resolve?: (ref: RunCommandRef, cwd: string) => { ok: true; command: ResolvedCommand } | { ok: false; reason: string };
   config?: Partial<LedgerV1["config"]>;
   allowCommand?: (command: string) => boolean;
   slotMax?: number;
@@ -797,7 +811,9 @@ function checksEnv(o: ChecksOpts = {}) {
   const background = o.background ?? new BackgroundRuns();
   const pool = stub<SlotPool>({
     reset: async (s, commit) => { resets.push(`reset:${s}@${commit}`); current = commit; if (o.resetError !== undefined) throw o.resetError; },
-    cleanForChecks: async s => { resets.push(`clean:${s}`); },
+    cleanForChecks: async s => { resets.push(`clean:${s}`); return { drifted: false }; },
+    noteCommit: async () => undefined,
+    get: async () => stub<SlotRecord>({ state: "leased", managers: [], manifests: {}, updatedAt: "unchanged" }),
     // The plan's slots: the ci slot that observed a suite failure, and this check's slot.
     list: async () => [stub<SlotRecord>({ path: nodePath.resolve("/ci") }), stub<SlotRecord>({ path: nodePath.resolve("/slot") })],
   });
@@ -809,9 +825,9 @@ function checksEnv(o: ChecksOpts = {}) {
     diffNameStatus: async () => { if (o.diffError !== undefined) throw o.diffError; return o.diff ?? []; },
   });
   const resolver: RunResolver = {
-    resolve: async ref => (o.resolve ?? ((r: RunCommandRef) => ({
+    resolve: async (ref, cwd) => (o.resolve ?? ((r: RunCommandRef) => ({
       ok: true as const, command: { label: r.script, file: "npm", args: ["run", r.script, ...r.args], source: "package-script" as const, ref: r },
-    })))(ref),
+    })))(ref, cwd),
   };
   const checks = createIntegrationChecks({
     ledger: () => stub<LedgerV1>({
@@ -834,7 +850,7 @@ function checksEnv(o: ChecksOpts = {}) {
     ...(o.allowCommand === undefined ? {} : { allowCommand: o.allowCommand }),
     fileExists: async p => (o.exists ?? (() => true))(p),
   });
-  return { checks, spawned, released, acquired, preempts, resets, background, at: () => current };
+  return { checks, pool, git, igit, spawned, released, acquired, preempts, resets, background, at: () => current };
 }
 
 function checkReq(o: Partial<CheckRequest> = {}): CheckRequest {
@@ -849,7 +865,7 @@ const slot: SlotLease = { slot: "s1", path: "/slot", planId: "plan", owner: "int
 const cmd: ResolvedCommand = { label: "npm test", file: "npm", args: ["test"], source: "package-script", ref: { script: "test", args: [] } };
 
 function runRes(verdict: CommandRunResult["verdict"], o: Partial<CommandRunResult> = {}): CommandRunResult {
-  return { verdict, ids: [], files: [], idsUnparsed: false, output: "", durationMs: 1, error: null, ...o };
+  return { verdict, ids: [], files: [], idsUnparsed: false, scope: "rerun", output: "", durationMs: 1, error: null, ...o };
 }
 function failRes(ids: string[], o: Partial<CommandRunResult> = {}): CommandRunResult {
   return runRes("fail", { ids, files: ["f.test.ts"], output: "out", ...o });
@@ -891,7 +907,12 @@ function suiteEnv(over: {
   const requests: CommandRunRequest[] = [];
   const background = new BackgroundRuns();
   const checks = stub<IntegrationChecks>({
-    runCommands: async req => { requests.push(req); return (over.runCommands ?? (() => runRes("pass")))(req, requests.length); },
+    runCommands: async req => {
+      requests.push(req);
+      const result = (over.runCommands ?? (() => runRes("pass")))(req, requests.length);
+      // These doubles support scoping unless a test explicitly returns a full fallback.
+      return req.mode === "full" ? { ...result, scope: "full" } : result;
+    },
     ...over.checks,
   });
   const runner = createPhaseSuiteRunner({
@@ -906,6 +927,72 @@ function suiteReq(o: Partial<SuiteRunRequest> = {}): SuiteRunRequest {
 }
 
 const lintCfg: Partial<LedgerV1["config"]> = { integrationChecks: [{ script: "lint", args: [] }] };
+
+describe("phase suite execution cwd", () => {
+  it.each(["auto", "configured"] as const)("runs the %s suite, base and probes at their commits in CI, then checks the revert slot", async setting => {
+    const integration = nodePath.resolve("/integration");
+    const ci = { ...slot, slot: "ci", path: nodePath.resolve("/ci") };
+    let integrationHead = "c9"; // Integration has moved on beyond the suite commit under test.
+    const executed: Array<{ label: string; cwd: string; commit: string }> = [];
+    const resolve: NonNullable<ChecksOpts["resolve"]> = (ref, cwd) => ({
+      ok: true, command: { ...cmd, label: ref.script, ref, resolution: { cwd, env: {} } },
+    });
+    runnerHooks.planScopedRun = async () => unverifiable;
+    const env = checksEnv({
+      files: { "package.json": PKG_BOTH }, config: lintCfg, resolve,
+      spawn: (command, opts) => {
+        // Match the production spawner too: a command cwd overrides the options cwd a second time.
+        const cwd = command.cwd ?? opts.cwd;
+        const commit = cwd === integration ? integrationHead : env.at();
+        executed.push({ label: command.label, cwd, commit });
+        return commit === "c0" || commit === "c1" || commit === "rh" ? noneOut() : noneOut(1, { stdout: "unparsed failure" });
+      },
+    });
+    const { runner } = suiteEnv({
+      checks: env.checks, resolver: { resolve: async (ref, cwd) => resolve(ref, cwd) },
+      igit: { revList: async (_cwd, _from, to) => to === "c2" ? ["c2"] : ["c1", "c2", "c3"], subject: async () => "change [plan:T2]" },
+      git: { revert: async () => { integrationHead = "rh"; return { ok: true, head: "rh" }; }, revParse: async () => integrationHead },
+    });
+    const ledger = stub<LedgerV1>({
+      integration: stub<LedgerV1["integration"]>({ worktree: integration }),
+      config: stub<LedgerV1["config"]>({ phaseSuite: setting === "auto" ? "auto" : [{ script: "suite", args: [] }] }),
+    });
+    const resolved = await runner.resolve(ledger, "p1", "c3");
+    if (resolved.kind !== "runs") throw new Error("expected suite commands");
+    const verdict = await runner.run(suiteReq({ slot: ci, commands: resolved.commands }), journalOf().j);
+    expect(executed.slice(0, 4).map(({ cwd, commit }) => ({ cwd, commit }))).toEqual(
+      ["c3", "c3", "c3", "c0"].map(commit => ({ cwd: ci.path, commit })),
+    );
+    expect(executed.every(run => run.cwd === ci.path)).toBe(true);
+    expect(new Set(executed.slice(4).map(run => run.commit))).toEqual(new Set(["c1", "c2"]));
+    expect(integrationHead).toBe("c9");
+    expect(verdict).toEqual({ kind: "culprit", range: { taskId: "T2", from: "c1", to: "c2" }, ids: [], files: [] });
+    expect(env.resets.filter(r => r.startsWith("reset:"))).toEqual(executed.map(run => `reset:ci@${run.commit}`));
+
+    // Reuse the resolved suite command for the full-command revert regression; CI is still at a bisect commit.
+    executed.length = 0;
+    expect(await runner.revert({
+      planId: "plan", phaseId: "p1", culprit: { taskId: "T2", from: "c1", to: "c2" }, suiteCommit: "c3", head: "c9",
+      regression: { ids: [], files: [], commands: resolved.commands }, slot: { ...slot, slot: "integration", path: integration },
+    }, journalOf().j)).toEqual({ kind: "ok", revertHead: "rh", reverted: ["c2"] });
+    expect(executed).toEqual(["typecheck", "test", "lint", setting === "auto" ? "test" : "suite"].map(label => ({ label, cwd: integration, commit: "rh" })));
+    expect(env.resets.slice(-4)).toEqual(["reset:integration@c9", "clean:integration", "reset:integration@rh", "clean:integration"]);
+  });
+
+  it("preserves an intentional command cwd instead of changing shared exec semantics", async () => {
+    const override = { ...cmd, cwd: "/slot/pkg" };
+    const { runner } = suiteEnv({ resolver: { resolve: async () => ({ ok: true, command: override }) } });
+    const resolved = await runner.resolve(stub<LedgerV1>({
+      integration: stub<LedgerV1["integration"]>({ worktree: "/integration" }),
+      config: stub<LedgerV1["config"]>({ phaseSuite: [{ script: "test", args: [] }] }),
+    }), "p1", "c3");
+    if (resolved.kind !== "runs") throw new Error("expected suite commands");
+    const { checks, spawned } = checksEnv();
+    expect(await checks.runCommands({ slot, commit: "c3", commands: resolved.commands, mode: "full", priority: "background", signal: new AbortController().signal, prepare: true }))
+      .toMatchObject({ verdict: "pass" });
+    expect(spawned[0]).toMatchObject({ cwd: override.cwd, c: override });
+  });
+});
 
 describe("integration checks: prepare and select", () => {
   it("prepare resets, cleans and verifies the head of the slot", async () => {
@@ -971,6 +1058,170 @@ describe("integration checks: prepare and select", () => {
 });
 
 describe("integration checks: run", () => {
+  it("reuses the candidate checkout with one clean and no reset when HEAD still matches", async () => {
+    const { checks, pool, git, resets } = checksEnv();
+    const head = vi.spyOn(git, "revParse");
+    const note = vi.spyOn(pool, "noteCommit").mockImplementation(async () => {
+      expect(resets).toEqual(["clean:s1"]);
+      expect(head).toHaveBeenCalledExactlyOnceWith("/slot", "HEAD");
+    });
+    expect(await checks.run(checkReq({ reuseCheckout: true }))).toMatchObject({ verdict: "pass" });
+    expect(resets).toEqual(["clean:s1"]);
+    expect(head).toHaveBeenCalledExactlyOnceWith("/slot", "HEAD");
+    expect(note).toHaveBeenCalledExactlyOnceWith("s1", "cand");
+  });
+
+  it("falls back to full prepare when the reused checkout HEAD does not match", async () => {
+    const { checks, git, resets } = checksEnv();
+    vi.spyOn(git, "revParse").mockResolvedValueOnce("other").mockResolvedValue("cand");
+    expect(await checks.run(checkReq({ reuseCheckout: true }))).toMatchObject({ verdict: "pass" });
+    expect(resets).toEqual(["clean:s1", "reset:s1@cand", "clean:s1"]);
+  });
+
+  it.each([
+    { drift: "managers", change: { managers: ["pnpm"] } },
+    { drift: "manifests", change: { manifests: { "package.json": "new-digest" } } },
+    { drift: "provisioning", change: { updatedAt: "changed" } },
+  ])("falls back to full prepare when $drift changes during the reuse clean", async ({ change }) => {
+    const { checks, pool, resets } = checksEnv();
+    const before = { ...(await pool.get("s1"))!, managers: ["npm"], manifests: { "package.json": "old-digest" } };
+    vi.spyOn(pool, "get").mockResolvedValueOnce(before).mockResolvedValueOnce({ ...before, ...change });
+    const clean = pool.cleanForChecks.bind(pool);
+    vi.spyOn(pool, "cleanForChecks").mockImplementation(async s => { await clean(s); return { drifted: true }; });
+    expect(await checks.run(checkReq({ reuseCheckout: true }))).toMatchObject({ verdict: "pass" });
+    expect(resets).toEqual(["clean:s1", "reset:s1@cand", "clean:s1"]);
+  });
+
+  it("uses the explicit drift result even when marker timestamps and metadata do not change", async () => {
+    const { checks, pool, resets } = checksEnv();
+    const clean = pool.cleanForChecks.bind(pool);
+    vi.spyOn(pool, "cleanForChecks").mockImplementation(async s => { await clean(s); return { drifted: true }; });
+    expect(await checks.run(checkReq({ reuseCheckout: true }))).toMatchObject({ verdict: "pass" });
+    expect(resets).toEqual(["clean:s1", "reset:s1@cand", "clean:s1"]);
+  });
+
+  it("does not infer drift from unrelated marker metadata changes", async () => {
+    const { checks, pool, resets } = checksEnv();
+    const rec = (await pool.get("s1"))!;
+    vi.spyOn(pool, "get").mockResolvedValueOnce(rec).mockResolvedValue({ ...rec, updatedAt: "new timestamp" });
+    expect(await checks.run(checkReq({ reuseCheckout: true }))).toMatchObject({ verdict: "pass" });
+    expect(resets).toEqual(["clean:s1"]);
+  });
+
+  it("reports a marker save failure as prepare, never as a pass", async () => {
+    const { checks, pool, acquired } = checksEnv();
+    vi.spyOn(pool, "noteCommit").mockRejectedValue(new Error("marker save failed"));
+    expect(await checks.run(checkReq({ reuseCheckout: true }))).toMatchObject({
+      verdict: "error", reason: "prepare", message: "could not prepare slot s1: marker save failed",
+    });
+    expect(acquired).toEqual([]);
+  });
+
+  it("retains the prepare error when full prepare cannot repair a reused checkout HEAD", async () => {
+    const { checks, resets } = checksEnv({ head: "other" });
+    expect(await checks.run(checkReq({ reuseCheckout: true }))).toMatchObject({
+      verdict: "error", reason: "prepare", message: "slot s1 is at other, not cand", components: [],
+    });
+    expect(resets).toEqual(["clean:s1", "reset:s1@cand", "clean:s1"]);
+  });
+
+  it("wraps a reused checkout clean failure with the same prepare error semantics", async () => {
+    const { checks, pool, resets } = checksEnv();
+    vi.spyOn(pool, "cleanForChecks").mockRejectedValue("clean failed");
+    expect(await checks.run(checkReq({ reuseCheckout: true }))).toMatchObject({
+      verdict: "error", reason: "prepare", message: "could not prepare slot s1: clean failed", components: [],
+    });
+    expect(resets).toEqual([]);
+  });
+
+  it.each([false, true])("overlaps commit selection reads with the clean (reuseCheckout=%s), but resolves commands afterwards", async reuseCheckout => {
+    let release!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const cleaning = new Promise<void>(resolve => { entered = resolve; });
+    let cleanDone = false;
+    const resolve = vi.fn((ref: RunCommandRef) => {
+      expect(cleanDone).toBe(true);
+      return { ok: true as const, command: { ...cmd, label: ref.script, ref } };
+    });
+    const { checks, pool, igit } = checksEnv({ files: { "package.json": JSON.stringify({ scripts: { typecheck: "tsc" } }) }, resolve });
+    const show = vi.spyOn(igit, "showFile");
+    const diff = vi.spyOn(igit, "diffNameStatus");
+    vi.spyOn(pool, "cleanForChecks").mockImplementation(async () => { entered(); await gate; cleanDone = true; return { drifted: false }; });
+    const running = checks.run(checkReq({ reuseCheckout }));
+    try {
+      await cleaning;
+      expect(show.mock.calls.map(([, commit, path]) => [commit, path])).toEqual(
+        ["package.json", "pytest.ini", "conftest.py", "pyproject.toml", "setup.cfg", "tox.ini"].map(path => ["cand", path]),
+      );
+      expect(diff).toHaveBeenCalledExactlyOnceWith("/slot", "base", "cand");
+      expect(resolve).not.toHaveBeenCalled();
+    } finally { release(); }
+    expect(await running).toMatchObject({ verdict: "pass" });
+    expect(resolve).toHaveBeenCalledExactlyOnceWith({ script: "typecheck", args: [] }, "/slot");
+  });
+
+  it.each([false, true])("reports prepare failure before failed overlapped reads without unhandled rejection (reuseCheckout=%s)", async reuseCheckout => {
+    let release!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const preparing = new Promise<void>(resolve => { entered = resolve; });
+    const unhandled: unknown[] = [];
+    const onUnhandled = (e: unknown): void => { unhandled.push(e); };
+    const { checks, pool, igit } = checksEnv({ diffError: new Error("diff failed") });
+    vi.spyOn(igit, "showFile").mockRejectedValue(new Error("show failed"));
+    const failPrepare = async (): Promise<never> => { entered(); await gate; throw new Error("prepare failed"); };
+    if (reuseCheckout) vi.spyOn(pool, "cleanForChecks").mockImplementation(failPrepare);
+    else vi.spyOn(pool, "reset").mockImplementation(failPrepare);
+    process.on("unhandledRejection", onUnhandled);
+    const running = checks.run(checkReq({ reuseCheckout }));
+    try {
+      await preparing;
+      await new Promise<void>(resolve => setImmediate(resolve)); // reads reject while prepare is still pending
+      release();
+      expect(await running).toMatchObject({ verdict: "error", reason: "prepare", message: "could not prepare slot s1: prepare failed" });
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(unhandled).toEqual([]);
+    } finally {
+      release();
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+
+  it.each([false, true])("settles every overlapped read before returning a prepare failure (reuseCheckout=%s)", async reuseCheckout => {
+    let releaseShow!: () => void, releaseDiff!: () => void;
+    const showGate = new Promise<void>(resolve => { releaseShow = resolve; });
+    const diffGate = new Promise<void>(resolve => { releaseDiff = resolve; });
+    const { checks, pool, igit } = checksEnv();
+    vi.spyOn(igit, "showFile").mockImplementation(async (_cwd, _commit, path) => {
+      if (path === "package.json") throw new Error("early show failure");
+      await showGate;
+      return null;
+    });
+    vi.spyOn(igit, "diffNameStatus").mockImplementation(async () => { await diffGate; throw new Error("late diff failure"); });
+    if (reuseCheckout) vi.spyOn(pool, "cleanForChecks").mockRejectedValue(new Error("prepare failed"));
+    else vi.spyOn(pool, "reset").mockRejectedValue(new Error("prepare failed"));
+    let resolved = false;
+    const running = checks.run(checkReq({ reuseCheckout })).then(r => { resolved = true; return r; });
+    try {
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(resolved).toBe(false);
+      releaseShow();
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(resolved).toBe(false);
+    } finally { releaseShow(); releaseDiff(); }
+    expect(await running).toMatchObject({ verdict: "error", reason: "prepare", message: "could not prepare slot s1: prepare failed" });
+  });
+
+  it.each(["fatal: unable to read tree cand", "fatal: generic git failure"])("a failed git show cannot become a no-checks pass: %s", async stderr => {
+    const { checks, igit, acquired, spawned } = checksEnv();
+    const realGit = createIntegrateGit(stub<GitRunner>({ run: async () => runResult(128, "", stderr) }), { assertWriteCwd: async () => undefined });
+    vi.spyOn(igit, "showFile").mockImplementation(realGit.showFile);
+    expect(await checks.run(checkReq())).toMatchObject({ verdict: "error", reason: "prepare", message: "git show failed (exit 128)", components: [] });
+    expect(acquired).toEqual([]);
+    expect(spawned).toEqual([]);
+  });
+
   it("reports a prepare error with no component", async () => {
     const { checks, acquired } = checksEnv({ resetError: new Error("boom") });
     const r = await checks.run(checkReq());
@@ -1604,7 +1855,7 @@ describe("integration checks: runCommands", () => {
   it("the full mode runs every command and passes", async () => {
     const { checks, spawned } = checksEnv();
     const r = await checks.runCommands(cmdReq({ commands: [lintCmd, testCmd, pyCmd] }));
-    expect(r).toMatchObject({ verdict: "pass", ids: [], files: [], idsUnparsed: false, error: null });
+    expect(r).toMatchObject({ verdict: "pass", ids: [], files: [], idsUnparsed: false, scope: "full", error: null });
     expect(spawned.map(s => s.c.label)).toEqual(["lint", "npm test", "python -m pytest"]);
   });
 
@@ -1625,7 +1876,7 @@ describe("integration checks: runCommands", () => {
     runnerHooks.readResult = async () => report({ failingIds: ["b > y", "a > x"], failingFiles: ["/slot/b", "/slot/a"] });
     const { checks, spawned } = checksEnv({ spawn: () => noneOut(1, { stdout: "boom" }) });
     const r = await checks.runCommands(cmdReq({ mode: { rerun: ["a.test.ts > x", "b.py::T::t", "a.test.ts"] } }));
-    expect(r).toMatchObject({ verdict: "fail", ids: ["a > x", "b > y"], files: ["/slot/a", "/slot/b"], idsUnparsed: false, output: "boom" });
+    expect(r).toMatchObject({ verdict: "fail", ids: ["a > x", "b > y"], files: ["/slot/a", "/slot/b"], idsUnparsed: false, scope: "rerun", output: "boom" });
     expect(planned).toEqual([{ command: "rerun", files: [nodePath.resolve("/slot", "a.test.ts"), nodePath.resolve("/slot", "b.py")] }]);
     expect(spawned[0]).toMatchObject({ cwd: "/slot/rr", c: { args: ["rr"], env: { R: "1" }, label: "npm test" } });
   });
@@ -1637,9 +1888,21 @@ describe("integration checks: runCommands", () => {
     runnerHooks.readResult = async () => report();
     const { checks, spawned } = checksEnv();
     const r = await checks.runCommands(cmdReq({ commands: [pyCmd, lintCmd], mode: { rerun: ["t.py::T::t"] } }));
-    expect(r).toMatchObject({ verdict: "pass", ids: [], files: [], idsUnparsed: false });
+    expect(r).toMatchObject({ verdict: "pass", ids: [], files: [], idsUnparsed: false, scope: "full" });
     expect(detectedFor).toEqual(["python -m pytest"]);
     expect(spawned.map(s => s.c.label)).toEqual(["python -m pytest", "lint"]);
+  });
+
+  it.each([false, true])("a passing full command makes mixed failure evidence unscoped (full first=%s)", async fullFirst => {
+    runnerHooks.detectRunner = async () => detected;
+    runnerHooks.planRerun = async () => scoped({ mode: "rerun", args: ["rr"] });
+    runnerHooks.readResult = async () => report({ failingIds: ["r.test.ts > R"], failingFiles: ["/slot/r.test.ts"] });
+    const { checks, spawned } = checksEnv({ spawn: c => noneOut(c.args.includes("rr") ? 1 : 0) });
+    const commands = fullFirst ? [lintCmd, testCmd] : [testCmd, lintCmd];
+    expect(await checks.runCommands(cmdReq({ commands, mode: { rerun: ["r.test.ts"] } }))).toMatchObject({
+      verdict: "fail", ids: ["r.test.ts > R"], idsUnparsed: false, scope: "full",
+    });
+    expect(spawned.map(s => s.c.args)).toEqual(fullFirst ? [["run", "lint"], ["rr"]] : [["rr"], ["run", "lint"]]);
   });
 
   it("an unparsed or timed out scoped failure marks the ids unparsed; a rerun with nothing affected is skipped", async () => {
@@ -1664,13 +1927,13 @@ describe("integration checks: runCommands", () => {
     for (const res of [report({ complete: false }), report({ collectionError: true })]) {
       runnerHooks.readResult = async () => res;
       const pass = checksEnv({ spawn: () => noneOut(0) });
-      expect(await pass.checks.runCommands(cmdReq({ mode: { rerun: ["a.test.ts > x"] } }))).toMatchObject({ verdict: "pass", idsUnparsed: false });
+      expect(await pass.checks.runCommands(cmdReq({ mode: { rerun: ["a.test.ts > x"] } }))).toMatchObject({ verdict: "pass", idsUnparsed: false, scope: "full" });
       expect(pass.spawned.map(s => s.c.args)).toEqual([["rr"], ["test"]]);
     }
     runnerHooks.readResult = async () => report({ complete: false });
     const fail = checksEnv({ spawn: (_c, _o, k) => (k === 1 ? noneOut(0) : noneOut(1, { stdout: " FAIL  a.test.ts > x\n Tests  1 failed (1)\n" })) });
     expect(await fail.checks.runCommands(cmdReq({ mode: { rerun: ["a.test.ts > x"] } }))).toMatchObject({
-      verdict: "fail", ids: ["a.test.ts > x"], files: [nodePath.resolve("/slot", "a.test.ts")], idsUnparsed: false,
+      verdict: "fail", ids: ["a.test.ts > x"], files: [nodePath.resolve("/slot", "a.test.ts")], idsUnparsed: false, scope: "full",
     });
     // A failing rerun whose report names no id falls back too.
     runnerHooks.readResult = async () => report();
@@ -1699,7 +1962,7 @@ describe("integration checks: runCommands", () => {
     runnerHooks.detectRunner = async () => unverifiable;
     const { checks, spawned } = checksEnv({ spawn: () => noneOut(3, { stdout: "plain" }) });
     const r = await checks.runCommands(cmdReq({ mode: { rerun: ["t"] } }));
-    expect(r).toMatchObject({ verdict: "fail", idsUnparsed: true, output: "plain" });
+    expect(r).toMatchObject({ verdict: "fail", idsUnparsed: true, scope: "full", output: "plain" });
     expect(spawned.map(s => s.c)).toEqual([testCmd]);
   });
 
@@ -1936,6 +2199,22 @@ describe("phase suite runner: run", () => {
     expect(log.counters).toEqual([{ key: "integration.bisect.probes", value: probed.length, labels: { kind: "suite" } }]);
     expect(log.ends.some(e => e.result === "ok" && e.ids?.length === 0)).toBe(true);
     expect(log.starts.at(-1)?.detail).toMatchObject({ probe: "memo", tasks: ["T1", "T2", "T3"] });
+  });
+
+  it.each(["pass", "fail"] as const)("stops a file-scoped bisect when a historical probe falls back to full (%s)", async verdict => {
+    const P = "p.test.ts > P", R = "r.test.ts > R";
+    const { runner, requests } = suiteEnv({
+      runCommands: q => q.commit === "c2" ? suiteFail([P, R]) : q.commit === "c0" ? suiteFail([P])
+        : verdict === "fail" ? suiteFail([P], { scope: "full" }) : runRes("pass", { scope: "full" }),
+      igit: { revList: async () => ["c1", "c2"] },
+    });
+    const { j, log } = journalOf();
+    expect(await runner.run(suiteReq({ commit: "c2", ranges: rangesOf(2) }), j)).toEqual({ kind: "unattributed", ids: [R], reason: "base-overlap" });
+    expect(requests.map(q => q.commit)).toEqual(["c2", "c2", "c2", "c0", "c1"]);
+    expect(requests.at(-1)?.mode).toEqual({ rerun: [fileOfSuiteId(slot.path, R)] });
+    expect(log.ends.at(-1)).toMatchObject({ result: "refused", detail: { reason: "full-command-fallback" } });
+    expect(log.counters).toEqual([{ key: "integration.bisect.probes", value: 1, labels: { kind: "suite" } }]);
+    expect(log.starts.at(-1)?.detail).toMatchObject({ probe: "memo" });
   });
 
   it("bisects an unattributable failure by the verdict alone", async () => {

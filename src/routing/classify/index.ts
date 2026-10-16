@@ -20,7 +20,7 @@ import {
 } from "./backends/shared";
 import { createTypeSafeBackend } from "./backends/typesafe";
 import { applyRouteLine, parseRouteLine, type RouteLinePositions } from "./route-line";
-import { analyzeRules, needMatchesOf, type NeedMatch } from "./rules";
+import { analyzeRules, highRiskTermOf, needMatchesOf, type NeedMatch } from "./rules";
 
 export type { NeedMatch } from "./rules";
 import { hasCredentialSignal } from "./scrub";
@@ -286,6 +286,12 @@ function ruleTextOf(input: ClassifyInput, parsed: RouteLineParse): string {
 export function classifyNeedMatches(input: ClassifyInput, deps: Pick<ClassifyDeps, "routeLinePositions">): NeedMatch[] {
   const parsed = parseRouteLine(typeof input.prompt === "string" ? input.prompt : "", { positions: deps.routeLinePositions ?? "first" });
   return needMatchesOf(ruleTextOf(input, parsed), { ...(input.cwd === undefined ? {} : { cwd: input.cwd }) });
+}
+
+/** Role decision-log metadata only; reads the same bounded, route-line-stripped text as the rules, never a backend. */
+export function classifyRiskTerm(input: ClassifyInput, deps: Pick<ClassifyDeps, "routeLinePositions">): string | undefined {
+  const parsed = parseRouteLine(typeof input.prompt === "string" ? input.prompt : "", { positions: deps.routeLinePositions ?? "first" });
+  return highRiskTermOf(ruleTextOf(input, parsed));
 }
 
 /** Steps 1–3: route line, rules, route line applied. */

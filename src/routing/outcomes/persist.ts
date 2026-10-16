@@ -59,6 +59,7 @@ import {
   MAX_QUEUED_ROWS,
   MAX_CORRUPT_COPIES,
   NEED_TERM_RE,
+  RISK_TERM_RE,
   OUTCOMES_CORRUPT_PREFIX,
   OUTCOMES_CORRUPT_RE,
   OUTCOMES_FILE,
@@ -295,6 +296,23 @@ function readChoice(x: unknown): RouteChoice | null {
   return { key, agent, origin, model, variant };
 }
 
+function isRisk(x: unknown): x is NonNullable<DecisionTrace["riskSources"]>["effective"] {
+  return x === "low" || x === "medium" || x === "high";
+}
+
+/** Additive audit metadata: an invalid proposal drops only this field, never the existing trace or decision. */
+function readRiskSources(x: unknown): DecisionTrace["riskSources"] {
+  if (!isRec(x)) return undefined;
+  const { base, rules, routeLine, facts, effective } = x;
+  if (!isRisk(base) || !isRisk(facts) || !isRisk(effective)
+    || (rules !== null && !isRisk(rules)) || (routeLine !== null && !isRisk(routeLine))) return undefined;
+  return {
+    base, rules, routeLine, facts, effective,
+    ...(isRisk(x.resumedDispatch) ? { resumedDispatch: x.resumedDispatch } : {}),
+    ...(typeof x.term === "string" && RISK_TERM_RE.test(x.term) ? { term: x.term } : {}),
+  };
+}
+
 /** A trace is optional and cosmetic: a malformed one is dropped, never a reason to lose the row. */
 function readTrace(x: unknown): DecisionTrace | undefined {
   if (!isRec(x) || !isRec(x.routeLines)) return undefined;
@@ -314,6 +332,7 @@ function readTrace(x: unknown): DecisionTrace | undefined {
     };
   }
   const argmin = readChoice(x.argmin);
+  const riskSources = readRiskSources(x.riskSources);
   return {
     routeLines: { count, conflict, edgeOnly },
     backend,
@@ -321,6 +340,7 @@ function readTrace(x: unknown): DecisionTrace | undefined {
     ...(argmin === null ? {} : { argmin }),
     // QA-G-B-2-2 (D14): only well-shaped need terms; one that could carry prompt text (an older row's URL or path) is dropped.
     ...(isStringArray(x.needTerms) ? { needTerms: x.needTerms.filter((term) => NEED_TERM_RE.test(term)) } : {}),
+    ...(riskSources === undefined ? {} : { riskSources }),
   };
 }
 function readLadderStep(x: unknown): (typeof LADDER_STEP_KINDS)[number] | null {

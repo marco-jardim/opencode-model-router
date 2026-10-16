@@ -48,7 +48,7 @@ import {
 import { buildRoleLadder, roleTierOrder, routerTierIds } from "../engine/ladders";
 import { decideRole } from "../engine/kernel";
 import type { Candidate, ChosenDispatch, Decision, HostAgentInfo, Ladder, RoleLadder } from "../engine/types";
-import { CLASS_IMPLIED_NEEDS, FACT_SOURCES, NEEDS, RISKS, SCOPES, TASK_CLASSES, classify, classifyNeedMatches } from "../classify";
+import { CLASS_BASE_RISK, CLASS_IMPLIED_NEEDS, FACT_SOURCES, NEEDS, RISKS, SCOPES, TASK_CLASSES, classify, classifyNeedMatches, classifyRiskTerm } from "../classify";
 import type { ClassifyResult, Detection, Need, RouteLine, TaskFacts } from "../classify/types";
 import { resolveRolesRouting, resolveVerifyBudget, type RouterConfig } from "../../router/config";
 import { resolveEnforcementMode } from "../../router/enforcement";
@@ -305,6 +305,8 @@ export interface RoleRouted {
   /** Grant and catalog notes (decision-row / diagnostic text; they are not shown in the dispatch header or the parent result). */
   readonly notes: readonly string[];
   readonly detection: EffectiveDetection;
+  /** The bounds reason includes `gated:authority`: gating lowered the final floor compared with strict. Absent otherwise. */
+  readonly gated?: true;
   /** The dispatch's total call budget (`roleGuardProfile(spec, tier, routeLine.budget).budget`). */
   readonly budget: number;
   /** The route line's `budget=`, or null (pass it to `roleGuardProfile`, handoff 27). */
@@ -1373,7 +1375,7 @@ function factsOf(facts: TaskFacts): DecisionRow["facts"] {
   return { class: facts.class, risk: facts.risk, scope: facts.scope, needs: [...facts.needs], confidence: facts.confidence, source: facts.source };
 }
 
-function traceOf(result: ClassifyResult, argmin: RouteChoice | null): DecisionTrace {
+function traceOf(result: ClassifyResult, argmin: RouteChoice | null, riskSources?: DecisionTrace["riskSources"]): DecisionTrace {
   const { routeLines, backend, backendSkipped } = result.trace;
   return {
     routeLines: { count: routeLines.count, conflict: routeLines.conflict, edgeOnly: routeLines.edgeOnly },
@@ -1389,6 +1391,7 @@ function traceOf(result: ClassifyResult, argmin: RouteChoice | null): DecisionTr
         },
     ...(backendSkipped === undefined ? {} : { backendSkipped }),
     ...(argmin === null ? {} : { argmin }),
+    ...(riskSources === undefined ? {} : { riskSources }),
   };
 }
 
@@ -2132,14 +2135,15 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     const env = deps.env === undefined ? {} : { env: deps.env };
     const verifyRoot = verifyRootOf(grant, sessionDirectory, workRootDeps.realpath);
     const inReadSet = readSetFor(rp.cfg, call.sessionID);
+    // QA-P21-1-2, QA-P21-2 nit 3. QA-G-B-2-1: a carried acceptance is never deferred (its gate runs at the return); its change-set
+    // checks (testsPass, lintClean) can cover the child's earlier attempts only once the attempt that introduced the block was
+    // gated with a known change set (its baseline) — until then the gate cannot back `deterministic`.
+    const deferred = carried === null
+      ? roleGateDeferred(rp.cfg, verifyPrompt, description, { verifyEnabled: deps.routerVerifyEnabled?.() !== false })
+      : (carried.baseline === undefined || carried.baseline.changed === "unavailable") && carriedChecksChangeSet(carried.block);
     const routerGate = roleRouterGate({
       cfg: rp.cfg, bypassed, acceptance, ...env,
-      // QA-P21-1-2, QA-P21-2 nit 3. QA-G-B-2-1: a carried acceptance is never deferred (its gate runs at the return); its change-set
-      // checks (testsPass, lintClean) can cover the child's earlier attempts only once the attempt that introduced the block was
-      // gated with a known change set (its baseline) — until then the gate cannot back `deterministic`.
-      deferred: carried === null
-        ? roleGateDeferred(rp.cfg, verifyPrompt, description, { verifyEnabled: deps.routerVerifyEnabled?.() !== false })
-        : (carried.baseline === undefined || carried.baseline.changed === "unavailable") && carriedChecksChangeSet(carried.block),
+      deferred,
       outsideWorkRoot: roleGateOutsideWorkRoot(grant.workRoot, verifyPrompt, description, args.cwd, inReadSet), // DF2-F1, QA-P33F1-1-1, nit 3
     });
     // QA-G-B-7: the gate verifies nothing at all (enforcement off, /bypass, `require: never`, a cwd outside the root it verifies in)
@@ -2148,6 +2152,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
       cfg: rp.cfg, bypassed, ...env, outsideWorkRoot: roleGateOutsideWorkRoot(verifyRoot, verifyPrompt, description, args.cwd, inReadSet),
     });
     const detection = effectiveDetection({ routerGate, claim, acceptance, verifies });
+    const gateAtReturn = verifies && !deferred && acceptance !== "none";
 
     // 6. bounds on the one role tier order (handoff 9); a resume passes the child's running tier. QA-P21-2-2: the raise recorded
     // after a verification FAIL of this child (for this parent) is a raise-only floor, like `floorTier`; consumed on success.
@@ -2156,6 +2161,11 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     const raised = resumeID === null ? null : pendingResumeRaise(resumeID, call.sessionID);
     const floorTier = higherTier(tiers, rp.cfg.enforcement?.escalate?.floorTier ?? null, raised);
     const bounds = tierBounds(rp.spec, grant, classified, detection, {
+      // The gated cell promises a one-step raise to heavy; a narrowed ceiling or an intermediate rung cannot back it.
+      floorPolicy: {
+        mode: resolveRolesRouting(rp.cfg, "v2").roleFloor,
+        gateAtReturn: gateAtReturn && nextRoleTier(tiers, rp.spec.tierRange.ceiling, "medium") === "heavy",
+      },
       floorTier,
       runningTier: running?.tier ?? null,
       pinTier: routeLine?.tier ?? null,
@@ -2233,6 +2243,8 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
       // QA-P21-1-11: a fresh dispatch has no binding yet (its child binds later; `noteBinding` writes the observed kind then).
       // A resume records the child's current binding.
       const binding = resumed ? currentBinding(resumeID, { maxOf: (name) => roleMaxActions(rp.roles.get(name)) })?.kind : undefined;
+      const riskTerm = classifyRiskTerm({ description, prompt, cwd: classifyCwd }, rp.classifyDeps);
+      const inheritedRisk = RISKS.find((risk) => risk === original?.facts.risk);
       row = {
         v: LOG_ROW_VERSION,
         ts: new Date(safeNow(now)).toISOString(),
@@ -2252,7 +2264,15 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
         reason: `${head}; role @${agent} on ${tier} in ${bounds.floor}..${bounds.ceiling}${extra.length > 0 ? ` [${extra.join("; ")}]` : ""}`,
         step: "dispatch",
         resume: resumed,
-        trace: { ...traceOf(result, argmin), needTerms }, // QA-G-B-3 (3)
+        trace: { ...traceOf(result, argmin, {
+          base: CLASS_BASE_RISK[result.trace.rules.class],
+          rules: result.trace.rules.risk,
+          routeLine: routeLine?.risk ?? null,
+          facts: result.facts.risk,
+          ...(inheritedRisk === undefined ? {} : { resumedDispatch: inheritedRisk }),
+          effective: taskFacts.risk,
+          ...(riskTerm === undefined ? {} : { term: riskTerm }),
+        }), needTerms }, // QA-G-B-3 (3)
         detection: {
           effective: detection,
           ...(result.detection !== undefined && result.detection !== null && result.detection !== detection ? { claimed: result.detection } : {}),
@@ -2282,6 +2302,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
       requestedRoot: root.requested,
       notes,
       detection,
+      ...(bounds.reasons.includes("gated:authority") ? { gated: true as const } : {}),
       budget,
       routeBudget,
       nonce,

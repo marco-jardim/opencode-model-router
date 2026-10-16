@@ -19,6 +19,7 @@
     "smoke:cpx:provision": "cross-env RUN_OC_SMOKE_CPX=1 vitest run --config vitest.smoke.config.ts test/smoke/cpx-provision",
     "smoke:cpx:e2e": "cross-env RUN_OC_SMOKE_CPX=1 vitest run --config vitest.smoke.config.ts test/smoke/cpx-e2e",
     "routing:stats": "node scripts/routing-stats.ts",
+    "soak:analyze": "node scripts/soak-analyze.mjs",
     "typecheck": "tsc --noEmit"
   },
   "license": "GPL-3.0-only",

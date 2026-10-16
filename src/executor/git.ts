@@ -81,20 +81,27 @@ export function createGitRunner(o: { mode: "hardened" | "user"; toplevel: string
   let executable: string | undefined;
   return {
     async run(args: readonly string[], p: ProcOpts): Promise<ProcessResult> {
-      if (p.stdin !== undefined) throw new Error("the git runner does not support stdin");
-      executable ??= gitExecutable(workRootGuards(o.toplevel));
-      const env = o.mode === "hardened" ? hardenedEnvironment(p.env) : userEnvironment(p.env);
-      const started = Date.now();
-      const bounds = { env, timeoutMs: p.timeoutMs, maxBytes: p.maxOutputBytes ?? GIT_MAX_OUTPUT_BYTES, settleOnFailure: true };
-      const result = await spawnBounded(executable, args, p.cwd, p.signal === undefined ? bounds : { ...bounds, signal: p.signal });
-      if (result.failure !== undefined) {
-        throw new GitRunnerError(result.failure.endsWith("timed out") ? "ETIMEDOUT" : "ABORT_ERR", result.failure);
+      try { p.service?.prepare(); } catch { /* Diagnostics only. */ }
+      try {
+        if (p.stdin !== undefined) throw new Error("the git runner does not support stdin");
+        executable ??= gitExecutable(workRootGuards(o.toplevel));
+        const env = o.mode === "hardened" ? hardenedEnvironment(p.env) : userEnvironment(p.env);
+        const started = Date.now();
+        const bounds = { env, timeoutMs: p.timeoutMs, maxBytes: p.maxOutputBytes ?? GIT_MAX_OUTPUT_BYTES, settleOnFailure: true,
+          ...(p.service === undefined ? {} : { service: p.service }) };
+        const result = await spawnBounded(executable, args, p.cwd, p.signal === undefined ? bounds : { ...bounds, signal: p.signal });
+        if (result.failure !== undefined) {
+          throw new GitRunnerError(result.failure.endsWith("timed out") ? "ETIMEDOUT" : "ABORT_ERR", result.failure);
+        }
+        if (result.truncated) throw new GitRunnerError("EOUTPUT", `git output exceeds ${bounds.maxBytes} bytes`);
+        return {
+          code: result.code, signal: null, stdout: result.output.toString("utf8"), stderr: result.stderr.toString("utf8"),
+          truncated: false, durationMs: Date.now() - started,
+        };
+      } finally {
+        // Preparation can throw before spawnBounded owns the hook. Its completed child is already closed here.
+        try { p.service?.end("error"); } catch { /* Diagnostics only. */ }
       }
-      if (result.truncated) throw new GitRunnerError("EOUTPUT", `git output exceeds ${bounds.maxBytes} bytes`);
-      return {
-        code: result.code, signal: null, stdout: result.output.toString("utf8"), stderr: result.stderr.toString("utf8"),
-        truncated: false, durationMs: Date.now() - started,
-      };
     },
   };
 }
@@ -159,7 +166,7 @@ function foldCase(p: string): string {
 
 function tailBytes(text: string, max: number): string {
   const bytes = Buffer.from(text, "utf8");
-  return bytes.length <= max ? text : bytes.subarray(bytes.length - max).toString("utf8");
+  return bytes.length <= max ? text : bytes.subarray(bytes.length - max).toString("utf8").replace(/^\uFFFD+/, "");
 }
 
 function splitNul(text: string): string[] {
@@ -381,11 +388,11 @@ export interface GitOps {
   /** `cwd` is the toplevel or a slot. */
   revParse(cwd: string, rev: string): Promise<string>;
   diffNames(cwd: string, from: string, to: string): Promise<string[]>;
-  rebaseOnto(slot: string, onto: string, upstream: string): Promise<{ ok: true; head: string } | Conflict>;
+  rebaseOnto(slot: string, onto: string, upstream: string, observation?: ServiceObservation): Promise<{ ok: true; head: string } | Conflict>;
   rebaseAbort(slot: string): Promise<void>;
   cherryPick(slot: string, commits: readonly string[]): Promise<{ ok: true; head: string } | Conflict>;
   revert(slot: string, commit: string, message: string): Promise<{ ok: true; head: string } | Conflict>;
-  mergeFfOnly(cwd: string, commit: string): Promise<{ ok: boolean; head: string }>;
+  mergeFfOnly(cwd: string, commit: string, observation?: ServiceObservation): Promise<{ ok: boolean; head: string }>;
   isAncestor(a: string, b: string): Promise<boolean>;
   tag(name: string, commit: string): Promise<void>;
   deleteRefs(prefix: string): Promise<string[]>;
@@ -393,11 +400,15 @@ export interface GitOps {
    * Compare-and-swap move of `refs/heads/<name>` (`update-ref --no-deref`); `expectedOld` is required, `null` meaning the
    * branch must not exist. Refuses a symbolic ref and a branch checked out in any worktree.
    */
-  branchForce(name: string, commit: string, expectedOld: string | null): Promise<void>;
+  branchForce(name: string, commit: string, expectedOld: string | null, observation?: ServiceObservation): Promise<void>;
 }
 
 interface OpsContext { args: string[]; identity: CommitIdentity }
-interface Call { op: string; args: readonly string[]; timeoutMs?: number; identity?: boolean }
+type ServiceObservation = import("./observations").ServiceObservation;
+interface GitService {
+  observation: ServiceObservation; stage: string; preparation: ReturnType<ServiceObservation["start"]>;
+}
+interface Call { op: string; args: readonly string[]; timeoutMs?: number; identity?: boolean; service?: GitService }
 
 const LOCK_REASON_PATTERN = /^[\x20\x21\x23-\x5b\x5d-\x7e]{1,200}$/;
 
@@ -454,14 +465,25 @@ export function createGitOps(d: GitOpsDeps): GitOps {
 
   // ---- running ----
 
-  async function exec(op: string, cwd: string, args: readonly string[], limit: number): Promise<ProcessResult> {
+  function gitService(observation: ServiceObservation | undefined, stage: string): GitService | undefined {
+    return observation === undefined ? undefined : { observation, stage, preparation: observation.start("service-prep", "git-preparation") };
+  }
+
+  async function exec(op: string, cwd: string, args: readonly string[], limit: number, diagnostic?: GitService): Promise<ProcessResult> {
     let result: ProcessResult;
+    diagnostic?.preparation?.end("completed");
+    const service = diagnostic?.observation.execution(diagnostic.stage);
     try {
-      result = await d.git.run(args, { cwd, timeoutMs: limit, maxOutputBytes: GIT_MAX_OUTPUT_BYTES });
+      result = await d.git.run(args, { cwd, timeoutMs: limit, maxOutputBytes: GIT_MAX_OUTPUT_BYTES,
+        ...(service === undefined ? {} : { service }) });
+      service?.end(result.code === 0 && !result.truncated ? "pass" : "fail");
     } catch (error) {
       if (error instanceof ExecutorError) throw error;
       throw new ExecutorError("E_GIT", `git ${op} could not run: ${stripUrlUserinfo(errorText(error)).slice(0, 300)}`,
         { op, code: errorCode(error) ?? null, stderr: "" });
+    } finally {
+      service?.end("error");
+      if (diagnostic !== undefined) diagnostic.preparation = diagnostic.observation.start("service-prep", "git-result");
     }
     if (result.truncated) throw new ExecutorError("E_GIT", `git ${op} output was truncated`, { op, code: result.code, stderr: "" });
     return result;
@@ -482,7 +504,7 @@ export function createGitOps(d: GitOpsDeps): GitOps {
   async function inRepo(c: Call): Promise<ProcessResult> {
     const x = await context();
     await assertHooksEmpty();
-    return exec(c.op, toplevel, [...x.args, ...identityArgs(x, c.identity), ...c.args], c.timeoutMs ?? timeoutMs);
+    return exec(c.op, toplevel, [...x.args, ...identityArgs(x, c.identity), ...c.args], c.timeoutMs ?? timeoutMs, c.service);
   }
 
   /** cwd = slot, after the pointer check, with explicit --git-dir/--work-tree. */
@@ -491,7 +513,7 @@ export function createGitOps(d: GitOpsDeps): GitOps {
     const x = await context();
     await assertHooksEmpty();
     const scope = [`--git-dir=${gitdir}`, `--work-tree=${slot}`];
-    return exec(c.op, slot, [...x.args, ...identityArgs(x, c.identity), ...scope, ...c.args], c.timeoutMs ?? timeoutMs);
+    return exec(c.op, slot, [...x.args, ...identityArgs(x, c.identity), ...scope, ...c.args], c.timeoutMs ?? timeoutMs, c.service);
   }
 
   /** The toplevel itself, otherwise a slot. */
@@ -823,7 +845,7 @@ export function createGitOps(d: GitOpsDeps): GitOps {
     return splitNul(r.stdout);
   }
 
-  /** After a failed rebase/cherry-pick/revert: read the conflicted paths, abort, and report them. */
+  /** After a failed cherry-pick/revert: read the conflicted paths, abort, and report them. */
   async function conflictOutcome(op: string, slot: string, failed: ProcessResult, abort: readonly string[], resetFallback: boolean): Promise<Conflict> {
     const listed = await ok(inSlot(slot, { op: `${op} conflicts`, args: ["diff", "--name-only", "--diff-filter=U", "-z"] }), `${op} conflicts`);
     const conflicts = [...new Set(splitNul(listed.stdout))];
@@ -836,17 +858,40 @@ export function createGitOps(d: GitOpsDeps): GitOps {
     return { ok: false, conflicts };
   }
 
-  async function rebaseOnto(slot: string, onto: string, upstream: string): Promise<{ ok: true; head: string } | Conflict> {
-    requireCommit(onto, "onto");
-    requireCommit(upstream, "upstream");
-    const r = await inSlot(slot, { op: "rebase", identity: true, args: ["rebase", "--onto", onto, upstream] });
-    if (r.code === 0) return { ok: true, head: await revParse(slot, "HEAD") };
-    return conflictOutcome("rebase", slot, r, ["rebase", "--abort"], false);
+  async function rebaseOnto(slot: string, onto: string, upstream: string, observation?: ServiceObservation): Promise<{ ok: true; head: string } | Conflict> {
+    const diagnostic = gitService(observation, "rebase");
+    try {
+      requireCommit(onto, "onto");
+      requireCommit(upstream, "upstream");
+      const r = await inSlot(slot, { op: "rebase", identity: true, args: ["rebase", "--onto", onto, upstream], service: diagnostic });
+      if (r.code === 0) return { ok: true, head: await revParse(slot, "HEAD") };
+      const failed = gitFailure("rebase", r);
+      let conflicts: string[] = [];
+      try {
+        // Git can refuse before starting a rebase. An abort then only masks the initiating failure.
+        if (await rebaseInProgress(slot)) {
+          const listed = await ok(inSlot(slot, { op: "rebase conflicts", args: ["diff", "--name-only", "--diff-filter=U", "-z"] }), "rebase conflicts");
+          conflicts = [...new Set(splitNul(listed.stdout))];
+          await rebaseAbort(slot);
+        }
+      } catch (cleanup) {
+        throw new ExecutorError(cleanup instanceof ExecutorError ? cleanup.code : "E_GIT",
+          `${failed.message}; rebase cleanup failed: ${tailBytes(stripUrlUserinfo(errorText(cleanup)), GIT_STDERR_TAIL_BYTES)}`,
+          { original: failed.detail, cleanup: cleanup instanceof ExecutorError ? cleanup.detail : null });
+      }
+      if (conflicts.length === 0) throw failed;
+      return { ok: false, conflicts };
+    } catch (error) { diagnostic?.preparation?.end("error"); throw error; }
+    finally { diagnostic?.preparation?.end("completed"); }
+  }
+
+  async function rebaseInProgress(slot: string): Promise<boolean> {
+    const { gitdir } = await verifySlotPointers(slot);
+    return await exists(join(gitdir, "rebase-merge")) || await exists(join(gitdir, "rebase-apply"));
   }
 
   async function rebaseAbort(slot: string): Promise<void> {
-    const { gitdir } = await verifySlotPointers(slot);
-    if (!(await exists(join(gitdir, "rebase-merge"))) && !(await exists(join(gitdir, "rebase-apply")))) return;
+    if (!(await rebaseInProgress(slot))) return;
     await ok(inSlot(slot, { op: "rebase --abort", args: ["rebase", "--abort"] }), "rebase --abort");
   }
 
@@ -876,12 +921,16 @@ export function createGitOps(d: GitOpsDeps): GitOps {
     throw gitFailure("merge-base", r);
   }
 
-  async function mergeFfOnly(cwd: string, commitId: string): Promise<{ ok: boolean; head: string }> {
-    requireCommit(commitId, "commit");
-    const before = await revParse(cwd, "HEAD");
-    if (!(await isAncestor(before, commitId))) return { ok: false, head: before };
-    await ok(inDir(cwd, { op: "merge", identity: true, args: ["merge", "--ff-only", "--no-edit", commitId] }), "merge");
-    return { ok: true, head: await revParse(cwd, "HEAD") };
+  async function mergeFfOnly(cwd: string, commitId: string, observation?: ServiceObservation): Promise<{ ok: boolean; head: string }> {
+    const diagnostic = gitService(observation, "merge");
+    try {
+      requireCommit(commitId, "commit");
+      const before = await revParse(cwd, "HEAD");
+      if (!(await isAncestor(before, commitId))) return { ok: false, head: before };
+      await ok(inDir(cwd, { op: "merge", identity: true, args: ["merge", "--ff-only", "--no-edit", commitId], service: diagnostic }), "merge");
+      return { ok: true, head: await revParse(cwd, "HEAD") };
+    } catch (error) { diagnostic?.preparation?.end("error"); throw error; }
+    finally { diagnostic?.preparation?.end("completed"); }
   }
 
   // ---- refs ----
@@ -922,19 +971,23 @@ export function createGitOps(d: GitOpsDeps): GitOps {
     return deleted;
   }
 
-  async function branchForce(name: string, commitId: string, expectedOld: string | null): Promise<void> {
-    requireCommit(commitId, "commit");
-    await planRef(name, "branch name");
-    if (expectedOld !== null && (typeof expectedOld !== "string" || expectedOld === "")) throw invalid("expectedOld is required: a full object id, or null for a branch that must not exist");
-    const old = expectedOld === null ? "0".repeat(commitId.length) : requireCommit(expectedOld, "expectedOld");
-    const ref = `refs/heads/${name}`;
-    if ((await worktreeList()).some(w => w.branch === ref)) {
-      throw new ExecutorError("E_GIT", "branch is checked out in a worktree", { op: "update-ref", code: null, stderr: name.slice(0, 200) });
-    }
-    const symbolic = await inRepo({ op: "symbolic-ref", args: ["symbolic-ref", "-q", ref] });
-    if (symbolic.code === 0) throw new ExecutorError("E_GIT", "branch is a symbolic ref", { op: "symbolic-ref", code: 0, stderr: name.slice(0, 200) });
-    if (symbolic.code !== 1) throw gitFailure("symbolic-ref", symbolic);
-    await ok(inRepo({ op: "update-ref", identity: true, args: ["update-ref", "--no-deref", ref, commitId, old] }), "update-ref");
+  async function branchForce(name: string, commitId: string, expectedOld: string | null, observation?: ServiceObservation): Promise<void> {
+    const diagnostic = gitService(observation, "cas");
+    try {
+      requireCommit(commitId, "commit");
+      await planRef(name, "branch name");
+      if (expectedOld !== null && (typeof expectedOld !== "string" || expectedOld === "")) throw invalid("expectedOld is required: a full object id, or null for a branch that must not exist");
+      const old = expectedOld === null ? "0".repeat(commitId.length) : requireCommit(expectedOld, "expectedOld");
+      const ref = `refs/heads/${name}`;
+      if ((await worktreeList()).some(w => w.branch === ref)) {
+        throw new ExecutorError("E_GIT", "branch is checked out in a worktree", { op: "update-ref", code: null, stderr: name.slice(0, 200) });
+      }
+      const symbolic = await inRepo({ op: "symbolic-ref", args: ["symbolic-ref", "-q", ref] });
+      if (symbolic.code === 0) throw new ExecutorError("E_GIT", "branch is a symbolic ref", { op: "symbolic-ref", code: 0, stderr: name.slice(0, 200) });
+      if (symbolic.code !== 1) throw gitFailure("symbolic-ref", symbolic);
+      await ok(inRepo({ op: "update-ref", identity: true, args: ["update-ref", "--no-deref", ref, commitId, old], service: diagnostic }), "update-ref");
+    } catch (error) { diagnostic?.preparation?.end("error"); throw error; }
+    finally { diagnostic?.preparation?.end("completed"); }
   }
 
   return {

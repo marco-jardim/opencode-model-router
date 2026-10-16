@@ -289,9 +289,13 @@ export function sameToplevel(a: string, b: string): boolean;
 - `recoverPlan(p)` on every activation of an existing ledger (start, adopt, promotion of a passive plan); `p.recovering`
   makes `schedule` a no-op until it finishes: (1) slot markers + `leases.rebuild` (one item per failure); (2) `feeds =
   reconcile(ledger, tracked nonces)`; (3) interrupt orphans (best effort); (4) `resumeIntegration(p)` (§9); (5) apply
-  feeds in task-id order per the matrix, each requeue-lost after its slot reset, start R1a watches; (6) retry decisions
+  feeds and register task pipelines in task-id order per the matrix, each requeue-lost after its slot reset, start R1a watches; (6) retry decisions
   for failed/conflict/reverted; (7) gate recovery; (8) breaker evaluation per phase with a failure in its window; (9)
   `enqueue(verified)`; (10) `policy.unblock()`; (11) clear `p.recovering`, `schedule`.
+  Re-verification and recovered finished-child completion pipelines run as tracked, per-task serialized work only after
+  this barrier, admitted by the bound orchestrator's live launcher context gate. Independent pipelines need not finish
+  in task-id order. Pending verification alone can request the stale-context wake; no grader rerun is spent waiting
+  for the first root router call. Disposal discards pending work; adoption cuts old-attachment work and re-registers it.
 - Liveness watch: `p.probation: Map<sessionID, {taskId, n, deadlineAt, lastSig, interruptFails}>`; `onHostEvent` marks a
   session alive; the poll timer runs R1a; `dispose` clears timers.
 - D11: `commitTaskInSlot` (`runtime.ts:305-311`) adds the trailer to every commit; on a clean tree read `git log -1
@@ -374,6 +378,9 @@ approve path to 5.1.
 ### 12. Risks and order
 
 - Probation waits up to 60 s per in-flight child after a restart until v2 has a real `activity` (5.1 handoff).
+  *Resolved 2026-10-15 (Phase 6.1):* the host still has no plugin-readable activity signal (`activity` stays `unknown`),
+  but a `running` child is now requeued at once only when its recorded launcher process is provably dead on this host
+  and no tool call was in flight (ADR 0007 D16, host contract `C16/D16`); every other case keeps the probation.
 - A hung previous holder's long-silent live child may be interrupted: wasted, never counted or duplicated; an interrupt
   that cannot reach another server process keeps the task waiting with an item.
 - A late child after a `dispatched` requeue could briefly share the slot until the L12 interrupt (C12 makes it unlikely).
@@ -475,4 +482,3 @@ and `-b.test.ts` (A-4.2-3).
 
 Done at `fbb18a3`: three heavy QA rounds plus a bounded round-3 re-check, every blocking/critical/major finding fixed,
 minors dispositioned. Merged into `cpx/main`.
-

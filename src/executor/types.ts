@@ -1379,17 +1379,31 @@ export interface SlotLease {
   commit: string;
 }
 
+/** A lease returned by one acquisition, with optional proof of that acquisition's completed reset. */
+export interface SlotAcquisition extends SlotLease {
+  /** Full reset at this base: pointer/link checks, checkout/clean, HEAD/status verification and provisioning drift.
+   *  Absent for same-owner/recovery, create/recreate or otherwise unproven acquisitions. This is not a persistent
+   *  cleanliness guarantee: consume it immediately after acquire, and reset if the required base has changed. */
+  readonly verifiedResetBase?: string;
+}
+
 /** Pool of provisioned git worktrees (2.4). */
 export interface SlotPool {
-  /** Never waits: a reset, provisioned slot leased to `owner`, or E_SLOT_UNAVAILABLE. Concurrent calls are serialized; never double-leases.
+  /** Never waits: a reset, provisioned slot leased to `owner`, or E_SLOT_UNAVAILABLE. Concurrent calls are claimed in call order; never double-leases.
    *  A task that already holds a slot gets the same slot back. err E_SLOT_UNAVAILABLE, E_PROVISION, E_SLOT_BROKEN */
-  acquire(planId: PlanId, owner: string, baseCommit: string): Promise<SlotLease>;
-  acquireSpecial(planId: PlanId, kind: "integration" | "ci"): Promise<SlotLease>;
+  acquire(planId: PlanId, owner: string, baseCommit: string): Promise<SlotAcquisition>;
+  acquireSpecial(planId: PlanId, kind: "integration" | "ci"): Promise<SlotAcquisition>;
   /** Checkout detached + clean tracked; re-provision on manifest drift. */
   reset(slot: string, commit: string): Promise<void>;
-  cleanForChecks(slot: string): Promise<void>;
+  /** Persist a leased checkout's commit after the caller has cleaned and verified its HEAD. Does not reset it. */
+  noteCommit(slot: string, commit: string): Promise<void>;
+  /** Clean the checkout and report whether provisioning drift was detected. */
+  cleanForChecks(slot: string): Promise<{ drifted: boolean }>;
   /** Idempotent. */
   release(slot: string): Promise<void>;
+  /** Subscribe without opening the pool. Called only after a task slot's leased -> ready marker is durable.
+   *  Failed/unchanged releases and special slots do not notify. Returns an unsubscribe function. */
+  onTaskSlotReleased?(listener: () => void): () => void;
   get(slot: string): Promise<SlotRecord | null>;
   list(planId?: PlanId): Promise<SlotRecord[]>;
   /** Removes only marked slots of completed/aborted plans, or unknown plans after 7 d; never follows links; reports unmarked dirs */
@@ -1592,8 +1606,9 @@ export function isContextSupersededError(e: unknown): e is ContextSupersededErro
  * Launch gate (A1-6). `disposed` has no wake; every other non-ok reason has one. Keys:
  * `context-stale` -> `stale-context:<bootID>:<epoch>`; `no-context` (a capture existed in this process and is gone) ->
  * `no-context:<bootID>:<orchestratorSessionID>:<lastEpoch>`; `awaiting-first-router-call` (guard 6) ->
- * `await-router-call:<bootID>:<orchestratorSessionID>`. The runtime wakes iff not ok, `wake !== null` and the ready set
- * computed as if the gate were ok is non-empty.
+ * `await-router-call:<bootID>:<orchestratorSessionID>`. The runtime wakes iff not ok, `wake !== null` and there is work
+ * waiting for a root context: the ready set computed as if the gate were ok is non-empty, or recovered work (a
+ * re-verification or a recovered child's end) has not yet been admitted (also on a paused plan).
  */
 export type LaunchGate =
   | { ok: true; context: RetainedContextInfo; ageMs: number }
@@ -1845,6 +1860,8 @@ export interface ProcessResult {
   durationMs: number;
 }
 export interface ProcOpts {
+  /** Optional v2 diagnostics, forwarded to the lowest process boundary. */
+  service?: import("./observations").ServiceExecution;
   cwd: string;
   timeoutMs: number;
   env?: Readonly<Record<string, string>>;
@@ -1852,7 +1869,7 @@ export interface ProcOpts {
   maxOutputBytes?: number;
   signal?: AbortSignal;
 }
-/** No shell; a non-zero exit is a result; throws only spawn/ETIMEDOUT/EOUTPUT. */
+/** No shell; a non-zero exit is a result; throws only spawn/ETIMEDOUT/EOUTPUT. Preparation adapters preserve `service`. */
 export interface GitRunner {
   run(args: readonly string[], o: ProcOpts): Promise<ProcessResult>;
 }
@@ -1884,6 +1901,8 @@ export interface FileSystem {
 
 export interface HostSessionContext {
   messages: Array<{ role: "user" | "assistant" | "idle"; text: string | null; outcome: string | null }>;
+  /** Stored history has an open tool call; absent means unknown and is treated as in flight. */
+  toolInFlight?: boolean;
 }
 /**
  * QA-3.1-8: the v2 adapter owns the step key `<sessionID>:<k>` and sets the optional `stepKey` on every step/retry event it

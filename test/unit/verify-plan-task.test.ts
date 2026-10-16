@@ -15,6 +15,7 @@ import { gateResult, type Artefact, type Delegation, type GateDeps, type GateRes
 import { waitTreeFreeExcept, type PreparedVerification } from "../../src/verify/wiring";
 import { execFileSync } from "node:child_process";
 import { RouterTimeoutError } from "../../src/verify/timeout";
+import type { SnapshotOptions } from "../../src/verify/tree";
 import { PLAN_TASK_PERIMETER_ID, planPerimeter } from "../../src/verify/perimeter";
 import * as configModule from "../../src/router/config";
 import { leaseHolderID, type Attempt, type SlotLease, type TaskNode } from "../../src/executor/types";
@@ -225,6 +226,8 @@ describe("plan-task verifier (D8)", () => {
     expect(PLAN_TASK_RERUN_BACKOFF_MS).toEqual([30_000, 60_000]);
     // One settled verdict: one breaker sample for the runtime.
     expect(h.verdicts).toEqual(["unverifiable"]);
+    expect(h.logs).toEqual([1, 2].map(n =>
+      `plan-task verification retry ${n} for t1#1: grader dispatch failed: grader prompt timed out after 300000ms`));
   });
 
   it("V3: a transient unverifiable that clears on a re-run takes the re-run's verdict", async () => {
@@ -233,6 +236,33 @@ describe("plan-task verifier (D8)", () => {
     const result = await runAttempt(h, task({ text: "x\n[acceptance]\ncriteria: works\n[/acceptance]" }));
     expect(result.verdict).toBe("pass");
     expect(h.sleeps).toEqual([30_000]);
+    expect(h.logs).toEqual(["plan-task verification retry 1 for t1#1: grader dispatch failed: 503"]);
+  });
+
+  it("bounds and scrubs each transient backoff reason without altering the verdict, reruns or delays", async () => {
+    const reason = `grader dispatch failed: token=secret-123456\n${"x".repeat(300)}`;
+    const transient = unverifiable(reason);
+    acceptMock.mockResolvedValue(transient);
+    const h = harness();
+    const result = await runAttempt(h, task({ text: "x\n[acceptance]\ncriteria: works\n[/acceptance]" }));
+    expect(result).toEqual(slotVerdictOf(transient));
+    expect(acceptMock).toHaveBeenCalledTimes(3);
+    expect(h.sleeps).toEqual([30_000, 60_000]);
+    expect(h.verdicts).toEqual(["unverifiable"]);
+    expect(h.logs).toEqual([1, 2].map(n => `plan-task verification retry ${n} for t1#1: ${
+      `grader dispatch failed: token=[REDACTED] ${"x".repeat(300)}`.slice(0, 200)}`));
+    expect(h.logs.join("\n")).not.toContain("secret-123456");
+    expect(transient.verdict.reasons).toEqual([reason]);
+  });
+
+  it("keeps transient retry behaviour when the warning logger throws", async () => {
+    const transient = unverifiable("grader dispatch failed: native subagent tool is unavailable");
+    acceptMock.mockResolvedValue(transient);
+    const h = harness();
+    h.deps.log = () => { throw new Error("logger failed"); };
+    expect(await runAttempt(h)).toEqual(slotVerdictOf(transient));
+    expect(acceptMock).toHaveBeenCalledTimes(3);
+    expect(h.sleeps).toEqual([30_000, 60_000]);
   });
 
   it("V4: a cut gate aborts the deadline and its grader sessions, then is unverifiable", async () => {
@@ -738,10 +768,56 @@ describe("verifier arms", () => {
 
   it("a slot that cannot be snapshotted runs nothing", async () => {
     snapshotMock.mockImplementation(async () => undefined);
-    expect((await runAttempt(harness())).findings).toMatch(/could not be snapshotted/);
-    snapshotMock.mockImplementation(async () => { throw new Error("git busy"); });
-    expect((await runAttempt(harness())).findings).toMatch(/could not be snapshotted/);
+    const unavailable = await runAttempt(harness());
+    expect(unavailable.verdict).toBe("unverifiable");
+    expect(unavailable.findings).toMatch(/could not be snapshotted after cleanForChecks; nothing ran/);
+    snapshotMock.mockImplementation(async () => { throw new Error("git busy token=secret-123456"); });
+    const rejected = await runAttempt(harness());
+    expect(rejected.verdict).toBe("unverifiable");
+    expect(rejected.findings).toMatch(/could not be snapshotted after cleanForChecks \(git busy token=\[REDACTED\]\); nothing ran/);
+    expect(rejected.findings).not.toContain("secret-123456");
     expect(acceptMock).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true].flatMap(strict =>
+    ["root", "head", "status", "diff-worktree", "diff-index", "index", "untracked-list"].flatMap(stage =>
+      ["git timed out after 10000 ms", "ENOENT: spawn git ENOENT"].map(failure => ({ strict, stage, failure })))))(
+    "includes the bounded scrubbed $stage snapshot reason ($failure) and never passes (strict=$strict)", async ({ strict, stage, failure }) => {
+      snapshotMock.mockImplementation(async (_cwd: string, _signal: AbortSignal, options: SnapshotOptions) => {
+        options.onError?.(`${stage}: ${failure}; token=secret-123456 ${"x".repeat(300)}`);
+        return undefined;
+      });
+      const h = harness({ strict });
+      const result = await runAttempt(h);
+      expect(result.verdict).toBe("unverifiable");
+      expect(result.findings).toContain(`after cleanForChecks (${stage}: ${failure}; token=[REDACTED]`);
+      expect(result.findings).not.toContain("secret-123456");
+      expect(result.findings.match(/after cleanForChecks \((.*)\); nothing ran$/)?.[1]).toHaveLength(200);
+      expect(snapshotMock).toHaveBeenCalledTimes(1);
+      expect(acceptMock).not.toHaveBeenCalled();
+      expect(h.sleeps).toEqual([]);
+    },
+  );
+
+  it("reports the slot snapshot timeout without retrying or running checks", async () => {
+    vi.useFakeTimers();
+    try {
+      let started!: () => void;
+      const running = new Promise<void>((resolve) => { started = resolve; });
+      snapshotMock.mockImplementation(() => { started(); return new Promise<undefined>(() => {}); });
+      const h = harness();
+      const pending = runAttempt(h);
+      await running;
+      await vi.advanceTimersByTimeAsync(30_000);
+      const result = await pending;
+      expect(result.verdict).toBe("unverifiable");
+      expect(result.findings).toMatch(/after cleanForChecks \(slot snapshot timed out after 30000ms\); nothing ran/);
+      expect(snapshotMock).toHaveBeenCalledTimes(1);
+      expect(acceptMock).not.toHaveBeenCalled();
+      expect(h.sleeps).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("a snapshot without a root: the observed root, else the slot path", async () => {
@@ -923,6 +999,101 @@ describe("verifier arms", () => {
     expect(result.verdict).toBe("pass");
     expect(result.cut).toBeUndefined();
     expect(result.findings).not.toMatch(/shutting down/);
+  });
+
+  it("an attachment cut aborts its active grader without disposing the verifier or publishing a verdict; adoption can verify anew", async () => {
+    const h = harness();
+    const t = task({ text: "x\n[acceptance]\ncriteria: works\n[/acceptance]" });
+    const v = createPlanTaskVerifier(h.deps);
+    const attachment = new AbortController();
+    const before = { orchestratorSessionID: "orch-old", signal: attachment.signal };
+    let started!: () => void;
+    const running = new Promise<void>((resolve) => { started = resolve; });
+    acceptMock.mockImplementationOnce(async () => {
+      (h.gateDepsCalls[0]![1] as Set<string>).add("grader-old");
+      started();
+      return new Promise<GateResult>(() => {});
+    }).mockImplementation(async () => pass("checker"));
+    await v.begin?.(t, slot(), attempt(), before);
+    h.git.head = CANDIDATE;
+    h.git.branch = t.branch ?? "";
+    await v.observe?.(t, slot(), attempt(), "DONE: implemented", before);
+    const pending = v.verify(t, slot(), attempt(), before);
+    await running;
+    attachment.abort();
+    expect(await pending).toMatchObject({ verdict: "unverifiable", cut: true });
+    expect(v.disposing).toBe(false);
+    expect(h.aborted).toEqual(["grader-old"]);
+    expect((h.gateDepsCalls[0]![3] as { signal: AbortSignal }).signal.aborted).toBe(true);
+    expect(h.verdicts).toEqual([]);
+    expect(h.sleeps).toEqual([]);
+    // The old pipeline has finished cleanup. Re-observe this original attempt under the newly bound orchestrator.
+    h.git.head = BASE;
+    const after = { orchestratorSessionID: "orch-new", signal: new AbortController().signal };
+    await v.begin?.(t, slot(), attempt(), after);
+    await v.observe?.(t, slot(), attempt(), "DONE: implemented", after);
+    h.git.head = CANDIDATE;
+    expect(await v.verify(t, slot(), attempt(), after)).toMatchObject({ verdict: "pass" });
+    expect(h.gateDepsCalls.map((args) => args[0])).toEqual(["orch-old", "orch-new"]);
+    expect(h.verdicts).toEqual(["pass"]);
+  });
+
+  it("an attachment cut interrupts transient backoff without consuming another rerun or publishing", async () => {
+    const h = harness();
+    const attachment = new AbortController();
+    const ctx = { orchestratorSessionID: "orch-old", signal: attachment.signal };
+    const t = task({ text: "x\n[acceptance]\ncriteria: works\n[/acceptance]" });
+    let slept!: () => void;
+    const sleeping = new Promise<void>((resolve) => { slept = resolve; });
+    h.deps.sleep = (ms) => { h.sleeps.push(ms); slept(); return new Promise<void>(() => {}); };
+    const v = createPlanTaskVerifier(h.deps); // The verifier captures its injected sleep at construction.
+    acceptMock.mockImplementation(async () => unverifiable("grader dispatch failed: 503"));
+    await v.begin?.(t, slot(), attempt(), ctx);
+    await v.observe?.(t, slot(), attempt(), undefined, ctx);
+    h.git.head = CANDIDATE;
+    h.git.branch = t.branch ?? "";
+    const pending = v.verify(t, slot(), attempt(), ctx);
+    await sleeping;
+    attachment.abort();
+    expect(await pending).toMatchObject({ cut: true });
+    expect(h.sleeps).toEqual([30_000]); // Real post-admission failure keeps the unchanged bounded transient policy.
+    expect(acceptMock).toHaveBeenCalledTimes(1);
+    expect(h.verdicts).toEqual([]);
+    expect(v.disposing).toBe(false);
+  });
+
+  it("M1: an attachment cut during observe caches no failed observation; the next attachment grades the real one without begin", async () => {
+    acceptMock.mockImplementation(async () => pass("checker"));
+    const h = harness();
+    const t = task({ text: "x\n[acceptance]\ncriteria: works\n[/acceptance]" });
+    const v = createPlanTaskVerifier(h.deps);
+    let observing!: () => void;
+    const started = new Promise<void>((resolve) => { observing = resolve; });
+    let release!: (p: PreparedVerification) => void;
+    h.deps.prepareVerification = (async (...args: unknown[]) => {
+      h.prepareCalls.push(args);
+      observing();
+      return new Promise<PreparedVerification>((resolve) => { release = resolve; });
+    }) as unknown as PlanTaskVerifierDeps["prepareVerification"];
+    const attachment = new AbortController();
+    const before = { orchestratorSessionID: "orch-old", signal: attachment.signal };
+    await v.begin?.(t, slot(), attempt(), before);
+    h.git.head = CANDIDATE;
+    h.git.branch = t.branch ?? "";
+    const observed = v.observe?.(t, slot(), attempt(), "DONE: implemented", before);
+    await started;
+    attachment.abort(); // closePlan/adopt cuts the old attachment while its observation runs
+    await observed; // only the old attachment's wait was cut
+    release(prepared());
+    // The record outlives the attachment: the next attachment re-verifies the same attempt WITHOUT a new begin.
+    const after = { orchestratorSessionID: "orch-new", signal: new AbortController().signal };
+    const result = await v.verify(t, slot(), attempt(), after);
+    expect(result).toMatchObject({ verdict: "pass" });
+    expect(result.findings).not.toMatch(/change observation failed|shutting down/);
+    expect(h.prepareCalls).toHaveLength(1);
+    expect(h.gateDepsCalls.map((args) => args[0])).toEqual(["orch-new"]);
+    expect(h.verdicts).toEqual(["pass"]);
+    expect(v.disposing).toBe(false);
   });
 
   it("QA-5.1-4: dispose cancels a backoff sleep; the transient result is never re-run nor ingested", async () => {

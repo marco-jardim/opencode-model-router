@@ -38,6 +38,41 @@ letting a half-finished task touch your checkout. This page describes what it do
 - **One active plan per process.** A process runs one plan at a time. A plan is owned by the session that runs it; a
   plan owned by another session is refused, and `adopt` takes over a running or paused plan whose session is gone (a plan awaiting approval is never adopted: the user approves it in its own session, or it is compiled again).
 
+## Safety model
+
+**Slots isolate work; leases enforce ownership.** Each task gets a validated git worktree and its own `node_modules`
+or `.venv`, never a dependency-directory junction into the owner's checkout. Slots reset to the integration head
+between tasks; dependency-manifest drift triggers re-provisioning. Check preparation cleans other generated files
+before verification/integration checks. Slot markers and the durable ledger live outside the worktrees.
+
+Declared write footprints guide scheduling, but are not permission grants. Enforced leases protect actual writes,
+including undeclared overlaps: in one checkout a foreign holder blocks writes and child reads, searches omit leased
+files, and `router_run` annotates contamination (or refuses under `routing.leases.run: "refuse"`). Plugin verification
+waits for conflicting leases until release or its deadline. Plan-task holders also conflict on the same repo-relative
+path across linked worktrees of the repository; ordinary children in different checkouts do not. Root sessions take
+no leases and are not refused reads, searches or runs, but cannot write a file a child holds in that checkout.
+Plan-task leases normally survive child completion through integration; parking and retry cleanup release resources.
+See [File leases](ROLES.md#file-leases) for the exact refusals and limits.
+
+The integration queue preserves these invariants, including during batching, culprit reverts and recovery:
+
+| Invariant | Guarantee |
+|---|---|
+| **I1** | The integration branch advances only by `merge --ff-only`, to a commit whose integration checks passed in a slot, reverts included. |
+| **I2** | Published integration history changes only by new commits, never by rewriting published commits. |
+| **I3** | One integration at a time per repository, protected by in-process and cross-process locking. |
+| **I4** | Every integration step is journaled before and after its git writes; recovery reconciles those steps idempotently. |
+| **I5** | The owner's checkout is touched only by landing, fast-forward only, and only when clean. |
+
+The scheduler prioritizes the longest estimated remaining path (bottom level), then plan order. Physical slots are
+claimed in that launch-priority order: the base lookup is awaited inside the queued claim, so a faster lookup cannot
+let a lower-priority task take the slot first. Preparation can overlap after claims; priority is not a promise that
+children finish in order. Provider capacity, leases, gates and available slots can still limit parallelism.
+
+These are router guarantees, not an OS sandbox or a proof that tests are complete. Tools outside the lease hooks
+(`shell`, `execute`) are not lease-covered; trusted package/check scripts run code. Do not edit slots, executor state
+or the running plan by hand. A dirty or diverged owner branch is not force-reset to make landing succeed.
+
 ## Assembly and lifecycle
 
 The tool and command are registered on **OpenCode v2 only**. The executor is assembled at plugin start only when:
@@ -169,6 +204,19 @@ answer text of `/plan answer` is taken as typed, apostrophes included.
 | `export` | `planId` | Returns the plan's ledger as text. |
 | `purge` | `planId` | Removes a completed or aborted plan: slots, `omr/<planId>/` refs and ledger. |
 
+## Task routing and write footprints
+
+Tasks without a `[route ...]` line are annotated automatically. Before role selection, an ordinary task's
+nonempty write footprint (from `Writes:` or inferred from phase ownership) takes precedence over an inferred
+read-only class. The compiler uses an edit-capable class and includes `edit` in its needs, preserving its tier,
+pin, risk and existing needs. A `Reads:` label cannot turn a declared writer into an explorer. Explorer and other
+read-only role permissions are not widened.
+
+An explicitly authored read-only route on a writer is not silently replaced: compilation refuses it with
+`route-write-conflict`, the task id and source line. Choose an edit-capable class and `needs=edit`, or correct the
+write declaration. Manual, preflight and QA tasks, and tasks with `Writes: none`, are excluded from this automatic
+writer reconciliation.
+
 ## Verification of plan tasks
 
 Plan tasks use the same dispatch verification engine as `router_verify`: the definition of done (DoD), scope and check
@@ -180,6 +228,14 @@ The **base is the slot reset commit** captured before launch; the **candidate is
 commits the child's changes. Before the gate, HEAD must be on the task branch and the base must be an ancestor of the
 candidate. Checks see a fresh snapshot after `cleanForChecks`. The changed-file set is the union of observed files and
 the committed diff from base to candidate (including renames), not just the files the child reports.
+
+**Declared writers must produce a diff.** With a nonempty `footprint.writes`, no changes to commit means
+`commit-failed` with detail `no changes`, whether `VERIFY` is `required`, `deferred` or `none`. The failure counts
+toward `routing.executor.maxAttempts` and the circuit breaker; the normal retry path retries while attempts remain,
+then parks exhausted work. A `DONE` claim or an already-implemented/idempotent explanation is not an exception.
+This is the [owner's 2026-10-14 amendment to M39](qa/critical-path-execution/phase-3.1.md#owner-amendment-to-m39-2026-10-14).
+With an empty write footprint, no-change success remains allowed: resources are released and phase gates are
+reconciled, including dependent phases, so eligible QA can launch without another orchestrator turn.
 
 **Plan-task verification is never deferred**, even with `VERIFY:deferred`: the required gate runs synchronously in
 the slot before integration, with no pending handle or deferred footer. A mixed acceptance block is graded in two
@@ -354,6 +410,9 @@ context ends with an explicit terminal `idle` entry **with an outcome**; `idle` 
 is adopted and rebound to its role, grant and slot work root. A missing or mismatching child is lost; orphans still
 running for this plan are interrupted. A dispatched attempt with no child is requeued immediately.
 
+A `running` child whose launching process is provably dead on the same host, and whose stored history shows no tool
+call in flight, is requeued at once; a child stopped inside a tool, whose processes (for example a `router_run` test) can
+outlive the host, gets the **60 s** liveness probation like any other unknown child.
 Unknown liveness enters a **60 s** probation window, polled every **10 s**. A host event or changed context proves
 life; an explicit terminal entry is processed as a result. A silent child past the deadline is interrupted before its
 slot is reset and its attempt requeued as lost. If interruption fails **5 tries**, one blocking failure item is raised
@@ -362,8 +421,115 @@ and the task keeps waiting; the executor does not reset a slot a child might sti
 Completed or verifying tasks are reverified; verified tasks are re-enqueued; an integrating task resumes the serial
 integration queue. The router's attempt trailer prevents recovery from making a duplicate commit. Gates, capacity
 state, leases, blocked dependencies and missed breaker failures are rebuilt from durable state before the first tick.
+Recovered verification/completion pipelines run outside that barrier and wait for any current router-tool context of the
+owning root, requesting the launch gate's wake (awaiting the first router call, or no context) even with no ready producer.
 The verification fallback after a restart remains [fail closed](#verification-of-plan-tasks), so a lost observation
 can cost a counted attempt rather than grant an unchecked pass.
 
 `/plan adopt <planId>` explicitly transfers a running or paused plan when its owning session is gone. It never adopts
 a plan awaiting approval. Recovery and adoption do not turn a compile/run request into approval.
+
+## Windows notes
+
+- **Same drive, short root.** Keep slots on the repository's drive, outside every non-slot worktree; the default
+  `<repo drive>:\.omr-slots\<planId>` is intentionally short. Configure a different root only in the global override.
+  Moving slots to another drive is refused, not a way around checkout isolation.
+- **pnpm store.** Each slot has its own `node_modules`; pnpm's content-addressed store may be shared. For efficient
+  hard links keep that store on the slots' drive. Check `pnpm store path` in the intended environment and configure
+  pnpm there if needed; the executor does not relocate its store. Auto provisioning uses a frozen lockfile and
+  `--prefer-offline`, not a promise of offline installation: warm the store or provide registry access beforehand.
+- **Python and uv.** Use a real Python installation (`py -3` by default on Windows, or global `routing.executor.python`),
+  not the Microsoft Store stub. Installs target each slot's `.venv`. For uv on Windows, if `uv cache dir` reports a
+  different drive and the step environment has no `UV_CACHE_DIR`, provisioning sets `UV_CACHE_DIR` to
+  `<slots drive>:\.omr-cache\uv`; an existing value is preserved. Make that drive writable and leave room for caches.
+- **Long paths and open handles.** Executor git commands set `core.longpaths=true`, but task-path expansion checks
+  the slot's own `core.longpaths`: a rewritten path over 260 characters is refused when it is off. Prefer short
+  repository/slot paths and enable long-path support in the tools you use; git's flag does not fix every package tool.
+  For `EBUSY`/access-denied cleanup failures, close terminals, watchers and processes holding slot files (and check
+  antivirus interference). Never delete a slot that a live or probationary child may still write.
+
+## Troubleshooting
+
+Start with `/plan status <planId>` and `/plan inbox --plan <planId>`, then `router_plan action=export planId=<planId>`
+for durable evidence. Do not repair the journal or markers by hand.
+
+| Symptom | Next step |
+|---|---|
+| Executor unavailable | Use the exact reason in [Assembly and lifecycle](#assembly-and-lifecycle); roles mode must be selected at start. |
+| `awaiting-approval` or `awaiting-residue` | Review and approve that plan, or have the orchestrator merge the architect's residue JSON. Neither status is a running plan. |
+| Ready work does not launch | Inspect paused phases, dependencies, lease holders, provider capacity and inbox items. `router_plan action=ready planId=<planId>` is a readiness view, not proof that a physical slot is available. |
+| Stale launch-context notice | Make a root `router_plan action=status` call in the owning session to supply a fresh tool context. Repeated status polling or sleeps are not scheduling. |
+| `E_PROVISION` | Read the manager/slot and error tail. Commit the correct root manifest and lockfile, install the manager outside the work root on absolute PATH entries, or set a trusted global provision/interpreter override. Do not share another checkout's dependencies. |
+| Lease refusal / contaminated run | Wait for the named holder or answer the parked task's inbox item once the conflict is resolved; repeating the same tool call does not release a lease. |
+| Failed or unverifiable task | Inspect the verification/commit failure and attempt count; fix the cause before exhausting retries or answering a breaker. Missing git identity and a declared writer with no diff are failures, not successful no-ops. |
+| Quiet `running` child after restart | D16 uses launcher liveness plus stored tool history: a provably dead same-host launcher with no tool in flight requeues immediately. An open tool call keeps the 60 s probation because its process tree may survive; do not reset its slot yourself. |
+| Recovery or re-verification cannot progress | Supply a fresh context with a root `router_plan action=status` call in the owning session; recovered verification waits without spending grader retries. If the owning session is gone, the owner runs `router_plan action=adopt` from their session so the plan gets a live root. If it still cannot progress, preserve the export and host error evidence; never force a task to passed. |
+| Landing or GC refused | Clean/resolve the owner's checkout without discarding work; landing is fast-forward only. GC requires a finished, non-live plan; paused plans deliberately retain slots. |
+
+## Metrics and observations
+
+`/plan status` shows launch/wake counts and accumulated `idle-with-ready` milliseconds for the attached runtime; it is
+not a historical performance report. Export the ledger for durable `metric` events: `launch`, `wake`, `capacity`,
+`context-age`, `counter` and `idle-with-ready`. Capacity reductions/pauses explain throttling; a context-age notice
+explains why a fresh root tool call is needed. Dispatch durations (`timings.jsonl`) and orchestrator cache tokens
+(`turns.jsonl`) live in the outcome store; `npm run routing:stats` in a clone summarizes them. Scope by run/session and
+time, since the default store may also contain other sessions. No timing row is proof of a verification pass.
+
+**Opt-in v2 observations** add diagnostic JSONL, not a routing setting. Before starting OpenCode v2, set
+`MODEL_ROUTER_V2_OBSERVATIONS` to an **existing, writable directory**. The adapter writes `<pid>-<file-id>.jsonl` per
+setup; it does not create the directory, and absent/unopenable paths leave observations off. v1 never activates it.
+Collect every file after graceful adapter disposal; keep streams separate. A usable stream has contiguous `seq`
+from 1, a final `kind: "end"` seal and `dropped=failed=0`. A crash without a seal, gaps, overflow or writer faults are
+**unknown evidence, not a pass**. Streams are capped at 50,000 events / 16 MiB; large metric-only ledger snapshots can
+exhaust that cap. Native arguments use stream-local HMAC fingerprints, not raw prompt/path/credential values.
+Scheduler, completion-effect and service rows allow offline correlation; effect rows record invocations, not proof
+that the invoked operation succeeded.
+
+### Reading G8
+
+The throughput smoke reconstructs and records these values; they are **not fields on the status board**:
+
+- `bound = 1.3 × max(CP_eff, W_auth/p, ΣI_service)`, with authored work `W_auth`, configured parallelism `p` and
+  `CP_eff` from the **pre-run dependency graph**, including phase gates and attributable intrinsic verification,
+  integration and phase-suite service. Raw CP/ΣI remain diagnostics. Queueing, resource waits, launch/preparation,
+  cold initialization, idle and driver holds never enlarge a denominator term. Shared-batch service is assigned in
+  full to each member (an antichain) but counted once in serial integration's service union.
+- **`g8Ratio = makespan/bound`**, and **`g8BoundMet = makespan <= bound`**: the bound is met iff **`g8Ratio <= 1.0`**.
+  A ratio above 1 means the measured bound was missed, not that another 1.3 multiplier is allowed. Under owner amendment
+  **A-6.1-2**, this bound is measured and disclosed, **not a Phase 6.1 acceptance gate**. `service-unattributed` grading
+  is recognized evidence at zero intrinsic credit, so the computed bound is conservative; missing/malformed service
+  evidence still fails closed.
+- **Idle ceiling: 10,000 ms per predicate-A episode**, still asserted independently of the makespan metric. Predicate A
+  means a running plan, an idle orchestrator and at least one durably ready automatic task with satisfied
+  dependencies/phase admission and observed provider capacity, with no successful launch inside the episode. It does
+  not require an already prepared physical slot; slot waits do not shorten the episode. Ledger idle
+  fragments and the status total alone cannot prove completeness: use independent scheduler/slot observations and
+  correlate `idle-close` creation with the ledger. Missing facts remain unknown, not assumed eligible or idle-free.
+
+The [Phase 6.1 report](qa/critical-path-execution/phase-6.1.md) records evidence and limitations. Under **A-6.1-3**, the
+remaining `unmeasured` subcases need a real-use soak, not new synthetic smoke cases: at least **5 working days** with
+observations enabled on real plans, analysed offline by `scripts/soak-analyze.mjs`. Each observable criterion
+(G1, G2, G6, G8, G9) needs at least **3 observed occurrences and zero violations**. Unobserved criteria (expected G3,
+G11) are disclosed gaps in the Phase 6.2 PR alongside G13 and G8's bound; G5 stays with 2.3 and G12's full matrix with
+6.2. The soak is also executor dogfood evidence toward G13, which remains unmet until the owner decides. The owner
+may change the soak criteria; absence of evidence is never a pass.
+
+## Owner checklist for the next real plan
+
+- [ ] Start in the intended git repository on OpenCode v2 with roles selected at start, enforced leases and an available
+  verifier; review global command/provision overrides. Keep `approve: "ask"` unless unattended approval is intentional.
+- [ ] Commit root manifests/lockfiles, check tools and cache access, choose a short same-drive slots root, and establish
+  clean baseline checks. Do not depend on untracked inputs or another checkout's `node_modules`/`.venv`.
+- [ ] Give tasks stable ids, explicit dependencies, accurate `Writes:` and acceptance blocks; distinguish manual,
+  preflight and QA work. Use edit-capable routes for writers and keep independent writes disjoint where possible.
+- [ ] Enable observations in an existing directory before startup, record the host/build/config and plan scope, and
+  preserve all streams for the real-use soak. Arrange graceful collection; truncated evidence cannot establish a pass.
+- [ ] Run `/plan run <path>`; review counts, residue, dependencies, manual tasks and estimates before approving that
+  specific plan. Let the executor own the plan file, task slots and ledger while it runs.
+- [ ] Watch status/inbox at decision points, supply actual human answers, report manual work via `action=done`, and
+  refresh context on a stale-context wake. Do not poll/sleep, invent approval or bypass a failed verification.
+- [ ] After completion, export the ledger and collect observations/metrics, inspect the integration result and request
+  landing only into a clean checkout. Resolve dirty/diverged branches without force-resetting them; collect slots only
+  once children and integration work have settled.
+- [ ] Record outcomes, idle episodes, G8 bound/ratio and evidence gaps separately from pass claims. For the soak, retain
+  the working-day window and occurrence/violation counts; carry unmet G13 and unobserved criteria to owner review.

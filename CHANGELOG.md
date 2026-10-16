@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **OpenCode v2: role-dispatch decision rows record where their risk came from.** `trace.riskSources` lists the class
+  base risk, the rules estimate, the route line's `risk=` claim, the merged facts, any inherited resume risk and the
+  effective risk, plus an optional bounded vocabulary label (a single word or a table id, never prompt text). Routing
+  is unchanged; older rows stay readable.
+- **OpenCode v2: opt-in `routing.roleFloor: "gated"`** (global only, default `"strict"`). A role dispatch that may edit
+  and run commands, whose detection is `grader`, whose risk is not `high`, whose return gate runs and whose role can
+  be raised from `medium` straight to `heavy`, gets a `medium` authority floor instead of `heavy` (bounds reason
+  `gated:authority`, recorded only when gating lowers the final floor). A verification FAIL, and for gated children also
+  an UNVERIFIABLE return, raises the resumed child to `heavy`. Every other floor cell is unchanged; inert on OpenCode v1.
+- **OpenCode v2: intrinsic service observations for the amended G8 oracle (A-6.1-1).** With the opt-in observations
+  below, verification checks/grading, integration rebase/checks/fast-forward and phase-suite commands emit paired
+  service spans that bracket only their execution; preparation, slot and lease waits, and retry backoff are recorded as
+  separate spans so they cannot inflate a bound term. Off by default and inert on OpenCode v1.
+- **OpenCode v2: opt-in diagnostic observations.** Set `MODEL_ROUTER_V2_OBSERVATIONS=<directory>` to an existing
+  directory before setup to write bounded, sequence-numbered JSONL streams, sealed on adapter disposal. They
+  record dispatch native-argument fingerprints, completion effects, scheduler and physical-slot transitions,
+  without prompt or file content. Off by default and inert on OpenCode v1.
+- **CPX e2e smoke diagnostics:** bounded wrapper/child-command timings and host/setup/launch checkpoints are
+  retained with failure evidence before scratch cleanup. These are diagnostic observations only; executor
+  behavior, offline checks and G1–G12 bounds are unchanged.
+- **CPX soak: `npm run soak:analyze` offline soak analyzer (amendment A-6.1-3).** It reads retained soak evidence and
+  reports observations, violations and per-criterion and per-subcase status. Subcases the current logs cannot show
+  are reported as `not-observable` declared gaps, never as passes (A-6.1-6); an overall passing verdict requires at least
+  five working days and every required criterion to be `ok`. Absence of evidence is never a pass.
 - **OpenCode v2: `/router stats` shows a "Dispatch durations" table and an "Orchestrator cache-read share" line** when
   timing logs exist. The logs are written once the router wires the timing recorder.
 - **OpenCode v2: background dispatch.** A subagent dispatch whose predicted duration is long runs in the background
@@ -71,6 +95,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **OpenCode v2: shorter serial integration entries.** Integration checks on the slot the queue has just rebased to the
+  candidate no longer reset it a second time (clean and HEAD check only, falling back to the full prepare on a HEAD
+  mismatch or provisioning drift), and the check-selection reads overlap the clean. Bisect probes, reruns, reverts and
+  phase suites keep the full prepare.
+- **CPX e2e smoke: the G8 makespan bound is recorded, not asserted (owner amendment A-6.1-2).** The throughput run
+  still reconstructs and records makespan, CP_eff, W_auth/p, ΣI_service, the bound, the ratio and whether it was met;
+  service-evidence integrity and the 10,000 ms idle-with-ready ceiling stay asserted. Delegated grading observed as
+  `service-unattributed` is recognized verification evidence credited at zero intrinsic cost, so the computed bound is
+  conservative.
+- **CPX e2e smoke: amended G8 intrinsic-service oracle (A-6.1-1).** The bound uses the pre-run DAG, authored work,
+  attributable verification/integration/phase-suite service and configured parallelism, with fail-closed evidence
+  checks and raw CP/integration diagnostics retained. Throughput uses the default integration batching; resilience
+  keeps singleton batches.
+- **OpenCode v2: declared plan writers must produce a diff in every verification mode.** The owner's 2026-10-14
+  amendment to M39 makes a nonempty write footprint with no changes a counted `commit-failed` (`no changes`) for
+  `VERIFY:required`, `deferred` and `none`: bounded retries, then park, never silent `done`. No idempotent exception
+  is allowed. Empty-write no-change success and its phase-gate reconciliation are preserved.
 - **OpenCode v2: per-turn router state moves out of the system prompt.** The pending-verification list, late
   verification notices and the route hint are delivered in a per-turn `<router-state>` message appended after the
   conversation, so the system prompt stays byte-stable across turns. Late notices are repeated every turn until
@@ -78,6 +119,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **OpenCode v2: executor recovery no longer deadlocks when a task was verifying at restart.** Recovered
+  re-verification (and a finished child's completion) no longer blocks the recovery barrier: it waits for the owning
+  root's next router call, then runs. An adopt cuts the old attachment's graders, and a cut observation is no longer graded as a counted
+  `unverifiable` by the next attachment.
+- **OpenCode v2: plan slots are claimed in launch-priority order.** A slot acquisition took its place in the pool's
+  queue only after its own `git rev-parse` returned, so the highest-priority task could claim the last slot and wait
+  behind every other slot's provisioning. Claims now queue in call order and await their base lookup inside the claim.
+- **OpenCode v2: after a host restart, the executor requeues a plan child at once when its launching process is
+  provably gone.** It records each child's launcher (pid, hostname, per-process token); recovery treats a child as lost
+  without the 60 s liveness probation only when that process is dead on this host and the child was not running a tool
+  when the host stopped (host contract C16). A child stopped inside a tool, whose processes (for example a `router_run`
+  test run) can outlive the host, keeps the probation, as does every other case.
+- **OpenCode v2: diagnostic observations record a scheduler graph row for every committed ledger batch**, including
+  metric-only batches, so a runtime row never reports a ledger sequence that no graph row preceded.
+- **OpenCode v2: a plan-task verification that cannot snapshot its slot says why.** The unverifiable result now
+  includes a bounded, scrubbed reason (for example a git timeout or a missing file) naming the git stage that failed;
+  it still fails closed. A grader that cannot start, and each transient verification rerun, log their reason.
+- **OpenCode v2: integration check selection never treats a failed `git show` as a missing file.** Only git's explicit
+  "path does not exist" error means absent; any other read failure fails the check as `prepare`, never a `no-checks`
+  pass. A failed prepare now waits for its overlapped reads before the slot is retried.
+- **OpenCode v2: QA fix tasks get a launchable route line for any repository path.** A repository or phase root that
+  cannot be written safely into a route line (brackets, quotes, separators) is omitted, since the slot root is always
+  appended at launch; fix tasks stored by the earlier build with an unbracketed line launch as well.
+- **OpenCode v2: the executor's default QA fix task route line is now a well-formed `[route ...]` line**, so a fix task created at runtime without a phase `FIX` template launches instead of failing route rendering.
+- **OpenCode v2: service observations exclude process preparation, mark native grading without provider-attempt events as insufficient evidence, and attribute plan-task checks and grading to the checked candidate.**
+- **OpenCode v2: the executor admits tasks to physical slots in critical-path priority order.** A lower-priority
+  task no longer takes the only free slot ahead of a higher-priority ready task, and a durable slot release reschedules
+  slot-blocked tasks at once instead of waiting for their retry backoff.
+- **OpenCode v2: reused executor slots no longer launch dirty or at the wrong base after dependency provisioning.** An
+  acquisition whose reset ran an installer afterwards gives no reset proof, so the launch resets the slot again.
+- **OpenCode v2: executor children adopted after a launch-confirmation timeout get their timing row**, exactly once,
+  without reviving the launch's settled completion effects.
+- **OpenCode v2: executor launches reuse acquisition's verified reset at the current integration head, avoiding a duplicate reset while retaining full preparation for moved heads and unproven leases.**
+- **OpenCode v2: the executor's idle-with-ready metric reports a duration exactly equal to its endpoints.**
+- **CPX e2e G8 idle checks reconstruct maximal episodes from committed v2 observations.** Failed slot/launch
+  reservations no longer hide stalls by fragmenting ledger metrics. The unchanged 10,000 ms ceiling applies to
+  whole episodes; every ledger fragment must be covered, and missing seals, sequence gaps or dropped events fail
+  closed. The asserted G8 idle predicate, confirmed by the owner on 2026-10-14, is **A: durable ready work with
+  provider capacity**, so time spent waiting for a physical slot counts as idle. The physical-slot-blocked/launchable
+  split (predicate B) is diagnostic only and cannot shorten an asserted episode; the 10,000 ms bound has not been
+  relaxed. Per-host streams are retained before scratch cleanup, including incomplete failure/restart diagnostics.
+- **CPX e2e smoke throughput checks follow the strict G8 contract:** provider delays and the independent CP/W
+  oracle use authored fixture milliseconds, makespan has no additive slack, and idle with ready work is capped at
+  10,000 ms. By owner amendment (2026-10-14) the fixed 90 s per-host watchdog, which cannot hold a complete run
+  (measured serial integration alone is ~75–85 s), is replaced by one derived from the contract: a 60 s setup
+  watchdog, then 1.3 × max(CP, W/p, entries × 5 s) plus a 60 s audit margin, capped at 300 s per host. The
+  per-entry allowance only sizes the watchdog; the G8 assertion keeps the measured serial integration.
+- **OpenCode v2: malformed shared lease registry entries no longer disable enforcement.** Entries are validated
+  individually; an invalid entry is refused without replacing it or disturbing valid registries. If the registry cannot
+  start with leases enforced, lease-checked file, search, git and run tools are refused instead of bypassing enforcement.
+- **OpenCode v2: plan checks re-resolve inherited router commands for the prepared execution slot.** Phase suites,
+  base checks, bisect probes and revert regressions refresh the command executable, environment and authorization
+  against the checkout under test rather than reusing the integration worktree's resolution. Explicit working-directory
+  and environment overrides are preserved. Configured commands and commands with explicit `cwd` or `env` overrides
+  execute unchanged in full instead of being replaced by scoped runs; ordinary equivalent package-script test scoping
+  is retained.
+- **OpenCode v2: plan phase bisects distinguish actual file-scoped checks from full-command fallbacks.** A full or
+  mixed run cannot establish isolated-file evidence. With a failing base and no valid isolation, a regression remains
+  unattributed instead of blaming the wrong task; a file-scoped bisect also stops unattributed if a historical probe
+  falls back to full commands. Genuine file-scoped bisects are preserved.
+- **OpenCode v2: explicit plan-writer routes are checked against the selected role's edit grant.** Compilation uses
+  the resolved role policy, including configured permission narrowing, rather than class/tier heuristics. A writer
+  routed to a general role without an `edit` grant is rejected with a task and line diagnostic; valid edit-capable routes
+  remain accepted.
+- **OpenCode v2: failed rebase cleanup preserves the initiating Git error.** Cleanup checks the slot's rebase state
+  before aborting and retains the original failure alongside any cleanup error. Integration refusals persist bounded
+  diagnostic details in the journal with URL credentials redacted from keys and string values before clipping, with
+  bounded traversal and output handling.
+- **OpenCode v2: inferred plan writers no longer launch as read-only explorers.** Before role selection, explicit
+  or ownership-inferred write footprints reconcile automatically inferred read-only classes and add the `edit` need,
+  keeping the tier, pin, risk and existing needs. Incompatible authored read-only routes fail compilation with a task
+  and line diagnostic instead of being silently overridden. Manual/preflight/QA tasks and `Writes: none` are excluded;
+  explorer permissions are unchanged.
+- **OpenCode v2: plan phase suites and base checks run in the CI slot at the commit under test, not the integration worktree's current head.**
+- **OpenCode v2: plan phases no longer stall after a no-change completion.** Tasks that finish without a commit and
+  manual/preflight tasks reported done reconcile their phase gates and dependent phases, so QA launches without another
+  orchestrator turn.
 - **OpenCode v2: work leases no longer collide across linked worktrees.** Two child sessions that edit the same
   repo-relative path in two worktrees of one repository (`git worktree add`) are both allowed: an ordinary write lease
   is keyed by its checkout, not by the repository, and a write whose target the router cannot read is refused only while
@@ -87,6 +205,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   any file (a device path, an 8.3 short name, a drive-relative path) still fails closed against every holder anywhere.
   A refusal names the file under edit and asks for the requester's own path in `NEED MORE: lease` (repo-relative for a
   plan task). Reads were already keyed by the file on disk. OpenCode v1 is unchanged.
+- **OpenCode v2: plugin module copies share one process-wide lease registry.** Snapshot restoration is attempted only
+  once when the registry is created, even if the snapshot is missing or invalid, so a later location cannot overwrite
+  live leases by restoring again.
 - **OpenCode v2: a resumed background dispatch delivers its own answer.** It no longer takes an earlier turn's
   completion as its own result, even when the earlier turn was still being processed when the parent saw it, nor the
   child's earlier answer. Completions are told apart by the message that carries them rather than by their text, so two

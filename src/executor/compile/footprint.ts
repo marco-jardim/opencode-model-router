@@ -43,7 +43,7 @@ export interface FootprintInput {
   kind: TaskKind;
   body: string;
   manual: boolean;
-  route: { fields: { needs?: readonly string[]; class?: string } | null } | null;
+  route: { fields: { needs?: readonly string[]; class?: string } | null; inferred?: boolean } | null;
   writesLine: { line: number; text: string; none: boolean } | null;
   readsLine: { line: number; text: string; none: boolean } | null;
 }
@@ -787,8 +787,9 @@ export function extractFootprint(
   const needs = t.route?.fields?.needs;
   // D9: an editing task with no write evidence of its own writes what its phase owns. The ownership table declares the
   // phase's write set ("Owns (writes)"), so this is a bounded over-approximation (low confidence) instead of ⊤.
+  // An automatically inferred read-only class must not suppress the phase's declared ownership (G6).
   const editsByDefault = !t.manual && !NEVER_EDITING_KINDS.has(t.kind)
-    && (needs !== undefined ? needs.includes("edit") : cls === undefined || !NON_EDITING_CLASSES.has(cls));
+    && (t.route?.inferred === true || (needs !== undefined ? needs.includes("edit") : cls === undefined || !NON_EDITING_CLASSES.has(cls)));
   // QA-2.3-5: skipped when a write candidate was ignored (the task keeps ⊤), and the result is `inferred`, not
   // `ownership`, so the residue may still add to it.
   if (wantOwnership && editsByDefault && writes.length === 0 && !unbounded && !explicit && !writeIgnored) {

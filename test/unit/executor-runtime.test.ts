@@ -11,9 +11,11 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { checkV2ObservationStream, createV2Observations, type ObservationRecord, type V2Observations } from "../../src/compat/v2-observations";
 import { createCapacityController } from "../../src/executor/capacity.js";
-import { taskBranchName } from "../../src/executor/git.js";
-import { createLedgerStore } from "../../src/executor/ledger.js";
+import { phaseIntegrated } from "../../src/executor/integrate/queue.js";
+import { taskBranchName, type GitOps, type StatusEntry } from "../../src/executor/git.js";
+import { createLedgerStore, createNodeFileSystem } from "../../src/executor/ledger.js";
 import {
   commitTaskInSlot,
   createExecutorRuntime,
@@ -25,7 +27,8 @@ import {
   type RuntimeDeps,
 } from "../../src/executor/runtime.js";
 import { createScheduler } from "../../src/executor/schedule.js";
-import { defaultSlotsDir } from "../../src/executor/slots/pool.js";
+import { createSlotPool, defaultSlotsDir } from "../../src/executor/slots/pool.js";
+import { detectManagers, type Provisioner } from "../../src/executor/slots/provision.js";
 import {
   ExecutorError,
   QA_UNPARSABLE_CONTEXT_PREFIX,
@@ -293,13 +296,17 @@ class SlotPoolDouble implements SlotPool {
     this.resets.push({ slot, commit });
     this.log.push(`slots.reset:${slot}`);
   }
-  async cleanForChecks(slot: string): Promise<void> {
+  async noteCommit(): Promise<void> {}
+  async cleanForChecks(slot: string): Promise<{ drifted: boolean }> {
     this.log.push(`slots.cleanForChecks:${slot}`);
+    return { drifted: false };
   }
   async release(slot: string): Promise<void> {
     this.released.push(slot);
     this.log.push(`slots.release:${slot}`);
     for (const [owner, l] of this.byOwner) if (l.slot === slot) this.byOwner.delete(owner);
+    const rec = this.records.get(slot);
+    if (rec?.state === "leased") this.records.set(slot, { ...rec, state: "ready", owner: null });
   }
   async get(slot: string): Promise<SlotRecord | null> {
     return this.records.get(slot) ?? null;
@@ -842,7 +849,7 @@ afterEach(async () => {
   }
 }, 60_000);
 
-async function mk(draft: LedgerV1): Promise<Harness> {
+async function mk(draft: LedgerV1, observations?: V2Observations): Promise<Harness> {
   const root = await mkdtemp(join(tmpdir(), "omr-rt-unit-"));
   const clock = new TestClock();
   const proc = new FakeProc(100, "host-a");
@@ -854,6 +861,7 @@ async function mk(draft: LedgerV1): Promise<Harness> {
     return l === undefined ? "none" : `${l.status}:${Object.values(l.tasks).map((t) => `${t.id}=${t.state}`).join(",")}`;
   };
   const store = createLedgerStore({
+    observations,
     home: join(root, "omr-executor"),
     clock,
     proc,
@@ -874,6 +882,7 @@ async function mk(draft: LedgerV1): Promise<Harness> {
   const unpins: string[] = [];
   const compiler = new CompilerDouble(draft);
   const deps: RuntimeDeps = {
+    observations,
     store,
     compiler,
     slots,
@@ -1042,6 +1051,60 @@ const ERR_RATE_LIMIT = { type: "provider.rate-limit", status: 429, message: "slo
 // ---------------------------------------------------------------------------------------------------------------
 
 describe("lifecycle to integrated and done", () => {
+  it.each(["required", "deferred", "none"] as const)("opens the phase gate and launches QA when the last read-only task finishes with no changes (%s), without an orchestrator turn", async (verify) => {
+    const rows: ObservationRecord[] = [];
+    const draft = planOf([
+      task("T1"),
+      task("T2", { verify, footprint: { writes: [], reads: [], confidence: "explicit", sources: [] } }),
+      task("QA", { kind: "qa", verify: "none", footprint: { writes: [], reads: [], confidence: "explicit", sources: [] } }),
+      task("QA2", { phase: "p2", kind: "qa", verify: "none", footprint: { writes: [], reads: [], confidence: "explicit", sources: [] } }),
+    ], { edges: [edge("T1", "T2")] });
+    draft.phases.push({ ...need(draft.phases[0], "phase"), id: "p2", dependsOn: ["p1"] });
+    need(draft.waves[0], "wave").phases.push("p2");
+    const h = await mk(draft, createV2Observations({ write: (line) => { rows.push(JSON.parse(line)); } }));
+    await h.begin();
+    const phaseId = need(h.task("T2").phase, "task phase");
+    // Play Q's no-suite gate reconciliation on the real ledger; all other queue-double semantics stay unchanged.
+    const checked = vi.spyOn(h.parts().queue, "checkPhase").mockImplementation(async (id) => {
+      const ph = h.ledger().phases.find((p) => p.id === id);
+      if (ph?.gate !== "pending" || !phaseIntegrated(h.ledger(), id)) return;
+      if (h.state("T2") === "done") {
+        expect(h.task("T2").slot).toBeNull();
+        expect(h.slots.byOwner.has(`plan:${PLAN_ID}:T2`)).toBe(false);
+        expect(h.registry.heldBy(`${PLAN_ID}:T2`)).toEqual([]);
+      }
+      await h.parts().writer.append(() => [{
+        type: "gate-changed", phaseId: id, from: "pending", to: "awaiting-qa", trigger: "phase-integrated", qaRound: ph.qaRound,
+      }]);
+      h.parts().listener.onGate(id, "awaiting-qa");
+    });
+    await toVerified(h, "T1");
+    await qIntegrate(h, "T1");
+    h.parts().leases.releaseTask("T1");
+    await h.slots.release("slot-1");
+    await h.parts().queue.checkPhase(phaseId);
+    expect(h.ledger().phases.find((p) => p.id === phaseId)?.gate).toBe("pending");
+    expect(h.launcher.runOf("QA", 1)).toBeUndefined();
+    h.git.dirty = () => false;
+    const last = await h.running("T2", 1, "ses-last");
+    last.complete("DONE: nothing to change");
+    await until(() => h.state("T2") === "done", "last task done");
+    const qa = await h.runOf("QA", 1);
+    expect((await h.events()).some((e) => e.type === "gate-changed" && e.phaseId === phaseId && e.to === "awaiting-qa")).toBe(true);
+    expect(h.ledger().phases.find((p) => p.id === phaseId)?.gate).toBe("qa-running");
+    expect(qa.req.attempt).toBe(1);
+    await h.runOf("QA2", 1);
+    expect((await h.events()).some((e) => e.type === "gate-changed" && e.phaseId === "p2" && e.to === "awaiting-qa")).toBe(true);
+    expect(checked.mock.calls.map(([id]) => id)).toEqual(["p1", "p1", "p2"]);
+    expect(h.hosts.delivered).toEqual([]);
+    expect(rows.filter((r) => r.family === "scheduler" && r.action === "ledger")).toEqual(expect.arrayContaining([
+      expect.objectContaining({ state: expect.objectContaining({ edges: expect.arrayContaining([{ from: "T1", to: "T2" }]),
+        phases: expect.arrayContaining([expect.objectContaining({ id: phaseId, gate: "awaiting-qa" })]),
+        tasks: expect.arrayContaining([expect.objectContaining({ id: "T2", state: "done" })]),
+      }) }),
+    ]));
+  });
+
   it("launches with a durable nonce, a slot and a lease, then commits, verifies and enqueues (to verified)", async () => {
     const h = await mk(planOf([task("T1", { route: { line: "[route needs=shell,edit]", role: "implementer", tier: "fast", pin: false } })]));
     await h.begin();
@@ -1106,8 +1169,8 @@ describe("lifecycle to integrated and done", () => {
     expect(h.registry.heldBy("plan-one:T1")).toEqual([]);
   });
 
-  it("a task with nothing to commit and no declared writes goes straight to done and frees its resources", async () => {
-    const h = await mk(planOf([task("T1", { footprint: { writes: [], reads: [], confidence: "explicit", sources: ["path"] } })]));
+  it.each(["required", "deferred", "none"] as const)("a task with nothing to commit and no declared writes goes straight to done and frees its resources (%s)", async (verify) => {
+    const h = await mk(planOf([task("T1", { verify, footprint: { writes: [], reads: [], confidence: "explicit", sources: ["path"] } })]));
     h.git.dirty = () => false;
     await h.begin();
     const run = await h.running("T1", 1, "ses-c1");
@@ -1125,6 +1188,33 @@ describe("lifecycle to integrated and done", () => {
     expect((await h.events()).some((e) => e.type === "task-transition" && e.to === "done" && e.trigger === "no-changes")).toBe(true);
   });
 
+  it.each(["manual", "preflight"] as const)("reporting a %s task done checks its phase and transitive QA-only dependent phases", async (kind) => {
+    const draft = planOf([
+      task("M1", { kind, verify: "none", footprint: { writes: [], reads: [], confidence: "explicit", sources: [] } }),
+      task("Q2", { phase: "p2", kind: "qa", verify: "none", footprint: { writes: [], reads: [], confidence: "explicit", sources: [] } }),
+      task("Q3", { phase: "p3", kind: "qa", verify: "none", footprint: { writes: [], reads: [], confidence: "explicit", sources: [] } }),
+    ]);
+    const phase = need(draft.phases[0], "phase");
+    draft.phases.push({ ...phase, id: "p2", dependsOn: [phase.id] }, { ...phase, id: "p3", dependsOn: ["p2"] });
+    need(draft.waves[0], "wave").phases.push("p2", "p3");
+    const h = await mk(draft);
+    await h.begin();
+    await until(() => h.state("M1") === "ready", "manual/preflight ready");
+    const checked = vi.spyOn(h.parts().queue, "checkPhase").mockImplementation(async (id) => {
+      const ph = need(h.ledger().phases.find((p) => p.id === id), "phase");
+      if (ph.gate !== "pending" || !phaseIntegrated(h.ledger(), id)) return;
+      await h.parts().writer.append(() => [{
+        type: "gate-changed", phaseId: id, from: "pending", to: "awaiting-qa", trigger: "phase-integrated", qaRound: ph.qaRound,
+      }]);
+      h.parts().listener.onGate(id, "awaiting-qa");
+    });
+    await h.runtime.done(PLAN_ID, "M1", ORCH);
+    expect(checked.mock.calls.map(([id]) => id)).toEqual(["p1", "p2", "p3"]);
+    await h.runOf("Q2", 1);
+    await h.runOf("Q3", 1);
+    expect((await h.events()).flatMap((e) => e.type === "gate-changed" && e.to === "awaiting-qa" ? [e.phaseId] : [])).toEqual(["p1", "p2", "p3"]);
+  });
+
   it("a slot release that throws is logged as a warning and the task still ends done", async () => {
     const h = await mk(planOf([task("T1", { footprint: { writes: [], reads: [], confidence: "explicit", sources: ["path"] } })]));
     h.git.dirty = () => false;
@@ -1140,13 +1230,13 @@ describe("lifecycle to integrated and done", () => {
     expect(h.registry.heldBy("plan-one:T1")).toEqual([]);
   });
 
-  it("M39: a required, writing task that produced no changes fails 'no changes' (counted) and is retried", async () => {
-    const h = await mk(planOf([task("T1")]));
+  it.each(["required", "deferred", "none"] as const)("M39 amended: a writing task with no diff fails, counts, retries and parks at the attempt bound (%s)", async (verify) => {
+    const h = await mk(planOf([task("T1", { verify })], { config: { maxAttempts: 2 } }));
     h.git.dirty = () => false;
     await h.begin();
     const run = await h.running("T1", 1, "ses-c1");
     run.complete("Done, I think.");
-    await h.runOf("T1", 2);
+    const second = await h.running("T1", 2, "ses-c2");
 
     const a1 = need(h.task("T1").attempts[0], "attempt 1");
     expect(a1.outcome).toBe("succeeded");
@@ -1154,18 +1244,23 @@ describe("lifecycle to integrated and done", () => {
     expect(h.verifier.calls).toEqual([]);
     expect(h.parts().policy.counted.map((c) => c.n)).toEqual([1]);
     expect((await h.events()).some((e) => e.type === "task-transition" && e.trigger === "commit-failed")).toBe(true);
-    expect(h.state("T1")).toBe("dispatched");
-  });
+    expect(second.req.prompt).toContain("no changes");
 
-  it("M39 variant: with verify 'deferred' the same no-change task is done, not failed", async () => {
-    const h = await mk(planOf([task("T1", { verify: "deferred" })]));
-    h.git.dirty = () => false;
-    await h.begin();
-    const run = await h.running("T1", 1, "ses-c1");
-    run.complete("Done.");
-    await until(() => h.state("T1") === "done", "T1 done");
-    expect(h.task("T1").attempts).toHaveLength(1);
-    expect(h.parts().policy.counted).toEqual([]);
+    second.complete("DONE: already implemented; nothing to change.");
+    await until(() => h.state("T1") === "parked", "T1 parked");
+    await until(() => h.ledger().inbox.length === 1, "park inbox item");
+    await h.settled();
+    expect(h.parts().policy.counted.map((c) => c.n)).toEqual([1, 2]);
+    expect(h.parts().policy.parks).toEqual([{ taskId: "T1", cause: "exhausted", text: "no changes" }]);
+    expect(h.launcher.runs).toHaveLength(2);
+    expect(h.task("T1").attempts.map((a) => a.context)).toEqual(["no changes", "no changes"]);
+    expect(h.task("T1").slot).toBeNull();
+    expect(h.registry.heldBy("plan-one:T1")).toEqual([]);
+    expect(h.parts().queue.enqueued).toEqual([]);
+    expect(h.verifier.calls).toEqual([]);
+    const events = await h.events();
+    expect(events.filter((e) => e.type === "task-transition" && e.from === "completed" && e.to === "failed" && e.trigger === "commit-failed")).toHaveLength(2);
+    expect(events.some((e) => e.type === "task-transition" && e.to === "done")).toBe(false);
   });
 
   it("a qa task whose report parses goes to QaLoop, ends done and frees its slot", async () => {
@@ -2131,15 +2226,672 @@ describe("late child adoption and the launch race (M27)", () => {
   });
 });
 
+/** Real pool/marker transitions; only git and provisioning are doubles. No diagnostic pool queries in the runtime. */
+async function physicalPool(h: Harness, maxParallel: number) {
+  const fs = createNodeFileSystem(), heads = new Map<string, string>();
+  // Windows temp roots can contain an 8.3 alias; the real pool deliberately rejects non-canonical roots.
+  const root = await fs.realpath(h.root);
+  const unused = async (): Promise<never> => { throw new Error("unexpected pool git operation"); };
+  const git: GitOps = {
+    planId: PLAN_ID, version: unused, checkRefFormat: unused, worktreeList: unused, worktreeRemove: unused,
+    addAll: unused, commit: unused, rebaseOnto: unused, rebaseAbort: unused, cherryPick: unused, revert: unused,
+    mergeFfOnly: unused, isAncestor: unused, tag: unused, deleteRefs: unused, branchForce: unused,
+    async worktreeAdd(path, commit) { await fs.mkdir(path); heads.set(path, commit); },
+    async verifySlotPointers() { return { gitdir: "unused", common: "unused" }; },
+    async checkoutDetach(path, commit) { heads.set(path, commit); },
+    async revParse(path, rev) { return rev === "HEAD" ? heads.get(path) ?? SHA : rev; },
+    async cleanTracked() {}, async cleanForChecks() {}, async cleanPreview() { return []; },
+    async trackedLinks() { return []; }, async lsFiles() { return []; }, async statusPorcelain() { return []; },
+    async diffNames() { return []; },
+  };
+  const provisioner: Provisioner = {
+    detect: async () => ({ managers: [], manifests: {}, yarnBerry: false, editable: false, python: null }),
+    provision: async () => {},
+  };
+  const pool = createSlotPool({ planId: PLAN_ID, repoKey: "repo-key", toplevel: REPO,
+    slotsDir: join(root, "physical-slots"), markersDir: join(root, "markers"), executorHome: root,
+    maxParallel, fs, git, clock: h.clock, provisioner });
+  await pool.open();
+  h.deps.slots = pool;
+  return { pool, fs, git, heads, provisioner };
+}
+
+describe("launch slot preparation", () => {
+  it.each([false, true])("resets a reused ready slot exactly once before launch (observations=%s)", async (observed) => {
+    const rows: ObservationRecord[] = [];
+    const sink = observed ? createV2Observations({ write: line => { rows.push(JSON.parse(line)); } }) : undefined;
+    const h = await mk(planOf([task("T1")], { config: { maxParallel: 1 } }), sink);
+    const { pool, git } = await physicalPool(h, 1);
+    try {
+      const ready = await pool.acquire(PLAN_ID, `plan:${PLAN_ID}:previous`, SHA2);
+      await pool.release(ready.slot);
+      expect(await pool.get(ready.slot)).toMatchObject({ state: "ready", commit: SHA2 });
+      const checkout = vi.spyOn(git, "checkoutDetach"), clean = vi.spyOn(git, "cleanTracked");
+      const pointers = vi.spyOn(git, "verifySlotPointers"), status = vi.spyOn(git, "statusPorcelain");
+      await h.begin();
+      const run = await h.runOf("T1", 1);
+
+      expect(run.req.workRoot).toBe(ready.path);
+      expect(checkout).toHaveBeenCalledTimes(1);
+      expect(checkout).toHaveBeenCalledWith(ready.path, SHA);
+      expect(clean).toHaveBeenCalledTimes(1);
+      expect(pointers).toHaveBeenCalledTimes(1);
+      expect(status).toHaveBeenCalledTimes(1);
+      expect(await pool.get(ready.slot)).toMatchObject({ state: "leased", owner: `plan:${PLAN_ID}:T1`, commit: SHA });
+      sink?.flush();
+      if (observed) {
+        expect(rows.filter(r => r.family === "scheduler" && r.action === "slot-reset-start")).toHaveLength(1);
+        expect(rows.filter(r => r.family === "scheduler" && r.action === "slot-reset-end")).toHaveLength(1);
+        expect(rows.filter(r => r.family === "scheduler" && r.action === "slot-acquire-result")).toContainEqual(expect.objectContaining({
+          state: expect.objectContaining({ detail: expect.objectContaining({ taskId: "T1", mode: "reset", result: "reused" }) }),
+        }));
+      } else expect(rows).toEqual([]);
+    } finally {
+      await h.close(); sink?.close(); pool.close();
+    }
+  });
+
+  it.each([
+    ["tracked file", false], ["HEAD", false], ["tracked file", true], ["HEAD", true],
+  ] as const)("launches a clean requested base when drift provisioning changes %s after reset (integration advanced=%s)", async (mutation, advanceHead) => {
+    const h = await mk(planOf([task("T1")], { config: { maxParallel: 1 } }));
+    const { pool, fs, git, heads, provisioner } = await physicalPool(h, 1);
+    const movedHead = "e".repeat(40);
+    const initialBase = advanceHead ? SHA : SHA2;
+    const launchBase = advanceHead ? SHA2 : SHA;
+    const filesAt = (commit: string): Record<string, string> => ({
+      "requirements.txt": `example==${commit === SHA2 ? "1" : "2"}.0.0\n`,
+      "tracked.txt": `checked in at ${commit}\n`,
+    });
+    // Model forced checkout and status from the actual on-disk tracked files, not an always-clean stub.
+    const checkoutTree = async (path: string, commit: string): Promise<void> => {
+      heads.set(path, commit);
+      for (const [name, text] of Object.entries(filesAt(commit))) await fs.writeText(join(path, name), text);
+    };
+    const add = git.worktreeAdd.bind(git);
+    git.worktreeAdd = async (path, commit, reason) => { await add(path, commit, reason); await checkoutTree(path, commit); };
+    git.checkoutDetach = checkoutTree;
+    git.lsFiles = async () => Object.keys(filesAt(SHA));
+    git.statusPorcelain = async (path) => {
+      const status: StatusEntry[] = [];
+      for (const [name, text] of Object.entries(filesAt(await git.revParse(path, "HEAD")))) {
+        if (await fs.readText(join(path, name)) !== text) status.push({ xy: " M", path: name, orig: null });
+      }
+      return status;
+    };
+    provisioner.detect = (path, tracked) => detectManagers(path, tracked, fs, { provision: "auto", python: "auto" });
+    const afterProvision: Array<{ head: string; status: StatusEntry[] }> = [];
+    const provision = vi.fn(async (path: string) => {
+      if (await git.revParse(path, "HEAD") !== launchBase) return; // The old manifest's initial install is clean.
+      if (mutation === "tracked file") await fs.writeText(join(path, "tracked.txt"), "rewritten by postinstall\n");
+      else await checkoutTree(path, movedHead); // A provisioning override can itself run git.
+      afterProvision.push({ head: await git.revParse(path, "HEAD"), status: await git.statusPorcelain(path) });
+    });
+    provisioner.provision = provision;
+    const verifierBases: Array<{ commit: string; head: string; status: StatusEntry[] }> = [];
+    h.deps.verifier = {
+      verify: h.verifier.verify.bind(h.verifier),
+      async begin(_task, slot) {
+        verifierBases.push({ commit: slot.commit, head: await git.revParse(slot.path, "HEAD"), status: await git.statusPorcelain(slot.path) });
+      },
+    };
+    try {
+      const ready = await pool.acquire(PLAN_ID, `plan:${PLAN_ID}:previous`, initialBase);
+      await pool.release(ready.slot);
+      const checkout = vi.spyOn(git, "checkoutDetach");
+      const proofs: Array<string | undefined> = [];
+      if (advanceHead) {
+        const acquire = pool.acquire.bind(pool);
+        vi.spyOn(pool, "acquire").mockImplementation(async (...args) => {
+          const lease = await acquire(...args);
+          proofs.push(lease.verifiedResetBase);
+          // A was fully reset with proof; B's changed manifest is first installed by launch's fallback reset.
+          await h.parts().writer.append([{ type: "integration-head", head: SHA2 }]);
+          return lease;
+        });
+      }
+      await h.begin();
+      const run = await h.runOf("T1", 1);
+
+      if (advanceHead) expect(proofs).toEqual([SHA]);
+      expect(provision).toHaveBeenCalledTimes(2); // The new base's real manifest digest must trigger drift provisioning.
+      expect(afterProvision).toEqual([{
+        head: mutation === "HEAD" ? movedHead : launchBase,
+        status: mutation === "tracked file" ? [{ xy: " M", path: "tracked.txt", orig: null }] : [],
+      }]);
+      expect(run.req.workRoot).toBe(ready.path);
+      expect(verifierBases).toEqual([{ commit: launchBase, head: launchBase, status: [] }]);
+      expect(await git.statusPorcelain(run.req.workRoot)).toEqual([]);
+      expect(await git.revParse(run.req.workRoot, "HEAD")).toBe(launchBase);
+      expect(await fs.readText(join(run.req.workRoot, "tracked.txt"))).toBe(filesAt(launchBase)["tracked.txt"]);
+      expect(run.req.prompt).toContain(`Base commit: ${launchBase}`);
+      expect(checkout.mock.calls).toEqual(advanceHead
+        ? [[ready.path, SHA], [ready.path, SHA2], [ready.path, SHA2]]
+        : [[ready.path, SHA], [ready.path, SHA]]);
+    } finally {
+      await h.close(); pool.close();
+    }
+  });
+
+  it("resets again to the current integration head when it moved during acquisition", async () => {
+    const h = await mk(planOf([task("T1")], { config: { maxParallel: 1 } }));
+    const { pool, git } = await physicalPool(h, 1);
+    try {
+      const ready = await pool.acquire(PLAN_ID, `plan:${PLAN_ID}:previous`, SHA);
+      await pool.release(ready.slot);
+      const checkout = vi.spyOn(git, "checkoutDetach");
+      const acquire = pool.acquire.bind(pool);
+      vi.spyOn(pool, "acquire").mockImplementation(async (...args) => {
+        const lease = await acquire(...args);
+        await h.parts().writer.append([{ type: "integration-head", head: SHA2 }]);
+        return lease;
+      });
+      await h.begin();
+      await h.runOf("T1", 1);
+
+      expect(checkout.mock.calls).toEqual([[ready.path, SHA], [ready.path, SHA2]]);
+      expect(await pool.get(ready.slot)).toMatchObject({ state: "leased", commit: SHA2 });
+    } finally {
+      await h.close(); pool.close();
+    }
+  });
+
+  it("still resets a same-owner lease even when an earlier acquisition reset it to the same base", async () => {
+    const h = await mk(planOf([task("T1")], { config: { maxParallel: 1 } }));
+    const { pool, git } = await physicalPool(h, 1);
+    try {
+      const ready = await pool.acquire(PLAN_ID, `plan:${PLAN_ID}:previous`, SHA2);
+      await pool.release(ready.slot);
+      const held = await pool.acquire(PLAN_ID, `plan:${PLAN_ID}:T1`, SHA);
+      const checkout = vi.spyOn(git, "checkoutDetach"), reset = vi.spyOn(pool, "reset");
+      await h.begin();
+      const run = await h.runOf("T1", 1);
+
+      expect(run.req.workRoot).toBe(held.path);
+      expect(reset.mock.calls).toEqual([[held.slot, SHA]]);
+      expect(checkout.mock.calls).toEqual([[held.path, SHA]]);
+    } finally {
+      await h.close(); pool.close();
+    }
+  });
+});
+
+describe("physical slot admission", () => {
+  it("preserves ready priority through reverse base lookups, FIFO provisioning and the first launch", async () => {
+    const rows: ObservationRecord[] = [];
+    const sink = createV2Observations({ write: line => { rows.push(JSON.parse(line)); } });
+    // Distinct estimates, with the highest-priority task last in plan order.
+    const h = await mk(planOf([1, 2, 3, 4].map(n => task(`T${n}`, {
+      estimate: { p50: n * 100, p90: n * 200, source: "default" },
+    })), { config: { maxParallel: 4 } }), sink);
+    const { pool, git, provisioner } = await physicalPool(h, 4);
+    const readyOrder = ["T4", "T3", "T2", "T1"];
+    const lookups = readyOrder.map(() => deferred<void>());
+    const releases = readyOrder.map(() => deferred<void>());
+    const handoffs = readyOrder.map(() => deferred<void>());
+    const resolvedLookups: string[] = [], queued: string[] = [], provisioning: string[] = [];
+    const revParse = git.revParse.bind(git);
+    let lookupCalls = 0;
+    git.revParse = async (path, rev) => {
+      if (path === REPO && rev === SHA && lookupCalls < lookups.length) {
+        const n = lookupCalls++;
+        await lookups[n]!.promise;
+        resolvedLookups.push(readyOrder[n]!);
+      }
+      return revParse(path, rev);
+    };
+    // Hand fake git work to provisioning in worktreeAdd call order; unrelated marker fsync timing is not this race.
+    const worktreeAdd = git.worktreeAdd.bind(git);
+    let creationTail = Promise.resolve(), creationCalls = 0;
+    git.worktreeAdd = (...args) => {
+      const n = creationCalls++;
+      const run = creationTail.then(() => worktreeAdd(...args));
+      creationTail = run.then(() => handoffs[n]!.promise);
+      return run;
+    };
+    // Model the machine-wide installer mutex: FIFO entry, one explicitly released install at a time.
+    let provisionTail = Promise.resolve();
+    provisioner.detect = async () => ({ managers: ["pip"], manifests: {}, yarnBerry: false, editable: false, python: null });
+    provisioner.provision = path => {
+      handoffs[queued.length]!.resolve();
+      queued.push(path);
+      const run = provisionTail.then(async () => {
+        const n = provisioning.length;
+        provisioning.push(path);
+        await releases[n]!.promise;
+      });
+      provisionTail = run;
+      return run;
+    };
+    try {
+      const acquire = vi.spyOn(pool, "acquire");
+      await h.begin();
+      await until(() => lookupCalls === 4, "all priority-ordered acquisitions started their base lookups");
+      sink.flush();
+      expect(rows.filter(r => r.family === "scheduler" && r.action === "launch-gate")).toContainEqual(expect.objectContaining({
+        state: expect.objectContaining({ detail: { ok: true, ready: readyOrder } }),
+      }));
+      expect(acquire.mock.calls.map(([, owner]) => owner)).toEqual(readyOrder.map(id => `plan:${PLAN_ID}:${id}`));
+      // On the old code these completions queue T1's claim first: T4 gets slot-4 and the last installer turn.
+      for (const lookup of [...lookups].reverse()) {
+        lookup.resolve();
+        await new Promise<void>(resolve => { setImmediate(resolve); });
+      }
+      expect(resolvedLookups).toEqual([...readyOrder].reverse()); // The top task's lookup really finished last.
+      await until(() => queued.length === 4 && provisioning.length === 1, "four claims queued behind the FIFO installer");
+      const topSlot = need(await pool.get("slot-1"), "highest-priority slot");
+      expect(topSlot).toMatchObject({ owner: `plan:${PLAN_ID}:T4`, state: "provisioning" });
+      expect((await pool.list()).map(r => r.owner)).toEqual(readyOrder.map(id => `plan:${PLAN_ID}:${id}`));
+      expect(queued[0]).toBe(topSlot.path);
+      expect(provisioning).toEqual([topSlot.path]);
+      expect(h.launcher.runs).toEqual([]);
+      releases[0]!.resolve();
+      await until(() => h.launcher.runs.length === 1, "first launch after releasing only one provision");
+      expect(h.launcher.runs.map(run => run.req.taskId)).toEqual(["T4"]);
+      expect(h.launcher.runs[0]!.req.workRoot).toBe(topSlot.path);
+    } finally {
+      lookups.forEach(lookup => { lookup.resolve(); });
+      releases.forEach(release => { release.resolve(); });
+      handoffs.forEach(handoff => { handoff.resolve(); });
+      await h.close(); sink.close(); pool.close();
+    }
+  });
+
+  it("does not consume a release wake while the abandoning launch step is still in flight", async () => {
+    const rows: ObservationRecord[] = [];
+    const sink = createV2Observations({ write: line => { rows.push(JSON.parse(line)); } });
+    const h = await mk(planOf([
+      task("T1", { estimate: { p50: 100, p90: 200, source: "default" } }),
+      task("T2", { estimate: { p50: 1, p90: 2, source: "default" } }),
+    ], { config: { maxParallel: 2 } }), sink);
+    const { pool } = await physicalPool(h, 2);
+    const finishRelease = deferred<void>();
+    const events = (action: string) => {
+      sink.flush();
+      return rows.filter(r => r.family === "scheduler" && r.action === action);
+    };
+    try {
+      await pool.acquire(PLAN_ID, `plan:${PLAN_ID}:integrating`, SHA);
+      const free = await pool.acquire(PLAN_ID, `plan:${PLAN_ID}:previous`, SHA);
+      await pool.release(free.slot);
+      const acquire = vi.spyOn(pool, "acquire");
+      const acquireWrite = h.registry.acquireWrite.bind(h.registry);
+      vi.spyOn(h.registry, "acquireWrite").mockImplementation((holder, writes) => {
+        if (holder.taskRef === `${PLAN_ID}:T1`) throw new Error("lease acquisition failed");
+        return acquireWrite(holder, writes);
+      });
+      const release = pool.release.bind(pool);
+      let notified = false;
+      vi.spyOn(pool, "release").mockImplementationOnce(async slot => {
+        await release(slot); // The ready marker is durable and the runtime's release listener already ran.
+        notified = true;
+        await finishRelease.promise; // Keep abandon()/startStep's inFlight guard alive after notification.
+      });
+      const before = h.clock.now();
+      await h.begin();
+      await until(() => notified, "abandoned slot durably released");
+      const released = need(events("slot-release-complete")[0], "durable release observation");
+      expect(released).toMatchObject({ state: { detail: { slot: free.slot, result: "released" } } });
+      // Drain the release-driven tick while T1 still holds its step guard. It must see T2 as ready.
+      await expect.poll(() => events("launch-gate").filter(r => r.seq > released.seq), { timeout: 750, interval: 10 })
+        .toContainEqual(expect.objectContaining({ state: expect.objectContaining({
+          inFlight: expect.arrayContaining(["T1"]), detail: { ok: true, ready: ["T2"] },
+        }) }));
+      await new Promise<void>(resolve => { setImmediate(resolve); });
+      finishRelease.resolve();
+      await until(() => events("launch-step-end").some(r => JSON.stringify(r).includes('"taskId":"T1"')), "abandoning step finished");
+      // No router turn, lease callback or fake timer tick after the release-driven pass.
+      await expect.poll(() => h.launcher.runOf("T2", 1), { timeout: 750, interval: 10 }).toBeDefined();
+      expect(h.clock.now()).toBe(before);
+      expect(h.task("T1")).toMatchObject({ state: "ready", attempts: [] });
+      expect(acquire.mock.calls.map(([, owner]) => owner)).toEqual([`plan:${PLAN_ID}:T1`, `plan:${PLAN_ID}:T2`]);
+    } finally {
+      finishRelease.resolve();
+      await h.close(); sink.close(); pool.close();
+    }
+  });
+
+  it("does not let a failed launch wake itself continuously by returning its fresh slot", async () => {
+    const h = await mk(planOf([task("T1")], { config: { maxParallel: 1 } }));
+    const { pool } = await physicalPool(h, 1);
+    try {
+      const acquire = vi.spyOn(pool, "acquire");
+      vi.spyOn(h.registry, "acquireWrite").mockImplementation(() => { throw new Error("lease acquisition failed"); });
+      const before = h.clock.now();
+      await h.begin();
+      await h.settled();
+      expect(acquire).toHaveBeenCalledTimes(1);
+      expect(h.launcher.runs).toEqual([]);
+      expect(h.task("T1")).toMatchObject({ state: "ready", attempts: [] });
+      expect(h.clock.now()).toBe(before);
+      expect(await pool.get("slot-1")).toMatchObject({ state: "ready", owner: null });
+    } finally {
+      await h.close(); pool.close();
+    }
+  });
+
+  it("admits only the highest-priority ready task when one physical slot is free, even across ticks", async () => {
+    // Put the lower priority first in plan order; the real scheduler must still prefer T2.
+    const h = await mk(planOf([task("T1"), task("T2", { estimate: { p50: 100, p90: 200, source: "default" } })],
+      { config: { maxParallel: 2 } }));
+    const { pool, git } = await physicalPool(h, 2);
+    const lookup = deferred<void>();
+    try {
+      await pool.acquire(PLAN_ID, `plan:${PLAN_ID}:integrating`, SHA);
+      const free = await pool.acquire(PLAN_ID, `plan:${PLAN_ID}:previous`, SHA);
+      await pool.release(free.slot);
+      const acquire = vi.spyOn(pool, "acquire");
+      const revParse = git.revParse.bind(git);
+      let entered = false;
+      git.revParse = async (path, rev) => {
+        if (!entered && path === REPO && rev === SHA) {
+          entered = true;
+          await lookup.promise; // Hold the highest-priority acquisition in its base lookup.
+        }
+        return revParse(path, rev);
+      };
+      await h.begin();
+      await until(() => entered, "highest-priority acquisition waiting on git");
+      h.runtime.onRouterToolCall(ORCH);
+      await pause(30);
+      expect(acquire.mock.calls.map(([, owner]) => owner)).toEqual([`plan:${PLAN_ID}:T2`]);
+      lookup.resolve();
+      const run = await h.runOf("T2", 1);
+      expect(run.req.workRoot).toBe(free.path);
+      expect(h.launcher.runs.map(r => r.req.taskId)).toEqual(["T2"]);
+      expect(h.task("T1")).toMatchObject({ state: "ready", attempts: [] });
+    } finally {
+      lookup.resolve();
+      await h.close(); pool.close();
+    }
+  });
+
+  it("does not lose a release that races the physical-slot snapshot before a waiter is recorded", async () => {
+    const h = await mk(planOf([task("T1")], { config: { maxParallel: 1 } }));
+    const { pool } = await physicalPool(h, 1);
+    try {
+      const held = await pool.acquire(PLAN_ID, `plan:${PLAN_ID}:integrating`, SHA);
+      const list = pool.list.bind(pool);
+      vi.spyOn(pool, "list").mockImplementationOnce(async (...args) => {
+        const snapshot = await list(...args);
+        await pool.release(held.slot);
+        return snapshot; // The snapshot still says every slot is busy, but the release has already happened.
+      });
+      const before = h.clock.now();
+      await h.begin();
+      await expect.poll(() => h.launcher.runOf("T1", 1), { timeout: 750, interval: 10 }).toBeDefined();
+      expect(h.clock.now() - before).toBe(0);
+    } finally {
+      await h.close(); pool.close();
+    }
+  });
+
+  it("launches a slot-blocked ready task on physical release without advancing the backoff clock", async () => {
+    const h = await mk(planOf([task("T1")], { config: { maxParallel: 1 } }));
+    const { pool } = await physicalPool(h, 1);
+    try {
+      const held = await pool.acquire(PLAN_ID, `plan:${PLAN_ID}:integrating`, SHA);
+      const timers = vi.spyOn(h.clock, "setTimer");
+      const clearTimer = vi.spyOn(h.clock, "clearTimer");
+      await h.begin();
+      await h.settled();
+      expect(h.launcher.runs).toEqual([]);
+      expect(h.task("T1")).toMatchObject({ state: "ready", attempts: [] });
+      const backoff = timers.mock.results[timers.mock.calls.findIndex(([ms]) => ms === 1000)];
+      expect(backoff?.type).toBe("return");
+      const before = h.clock.now();
+      // No integration callback, lease notification, router turn or timer tick: only the successful physical release.
+      await pool.release(held.slot);
+      await expect.poll(() => h.launcher.runOf("T1", 1), { timeout: 750, interval: 10 }).toBeDefined();
+      expect(h.clock.now() - before).toBe(0);
+      expect(clearTimer).toHaveBeenCalledWith(backoff?.value);
+      expect(h.launcher.runs).toHaveLength(1);
+    } finally {
+      await h.close(); pool.close();
+    }
+  });
+});
+
+describe("physical slot observations", () => {
+  it("G8: provider-free is not slot-launchable while verifying/integrating tasks retain every slot", async () => {
+    const lines: string[] = [], rows: ObservationRecord[] = [];
+    const sink = createV2Observations({ write: line => { lines.push(line); rows.push(JSON.parse(line)); } });
+    const h = await mk(planOf([task("T1"), task("T2"), task("T3")], { config: { maxParallel: 2 } }), sink);
+    const { pool, fs } = await physicalPool(h, 2);
+    const verifying = deferred<void>(), releasing = deferred<void>();
+    const verify = h.verifier.verify.bind(h.verifier);
+    h.verifier.verify = async (t, slot, attempt) => {
+      if (t.id === "T1") await verifying.promise;
+      return verify(t, slot, attempt);
+    };
+    const events = (action: string) => {
+      sink.flush(); // Test barrier only: production captures synchronously and drains writes later.
+      return rows.filter(r => r.family === "scheduler" && r.action === action);
+    };
+    try {
+      await h.begin();
+      const first = await h.running("T1", 1, "child-1"), second = await h.running("T2", 1, "child-2");
+      first.complete("Done."); second.complete("Done.");
+      await until(() => h.state("T1") === "verifying", "T1 verifying with its slot retained");
+      await untilEnqueued(h, "T2");
+      // Q opens its history entry in the same batch as verified -> integrating (A1-3a).
+      await h.parts().writer.append(l => [
+        { type: "integration-step", edge: "start", step: "rebase", result: null, detail: null, failingIds: [], closes: false,
+          entry: { id: `i-${l.seq + 1}`, kind: "task", phaseId: "p1", taskIds: ["T2"], slot: "slot-2",
+            baseHead: l.integration.head, candidate: null } },
+        tr("T2", "verified", "integrating", "dequeued"),
+      ]);
+      const entry = need(h.parts().writer.openIntegration().find(open => open.entry.taskIds.includes("T2")), "T2 integration entry").entry;
+      h.runtime.onRouterToolCall(ORCH);
+      await until(async () => (await h.counters()).some(c => c.key === "launch-skipped" && c.labels.reason === "slot-unavailable"), "slot-unavailable skip");
+      expect(h.state("T3")).toBe("ready");
+      expect(h.launcher.runs).toHaveLength(2);
+      expect(events("capacity-release").filter(r => r.family === "scheduler" && JSON.stringify(r.state).includes('"result":"success"'))).toHaveLength(2);
+      // Admission now reports the physical-slot wait without starting a doomed acquisition or reserving provider capacity.
+      expect(events("slot-admission")).toContainEqual(expect.objectContaining({ state: expect.objectContaining({
+        detail: { taskId: "T3", result: "unavailable", free: 0 },
+      }) }));
+      expect(events("slot-acquire-start").some(r => r.family === "scheduler" && JSON.stringify(r.state).includes('"taskId":"T3"'))).toBe(false);
+      expect(events("capacity-reserve").some(r => r.family === "scheduler" && JSON.stringify(r.state).includes('"taskId":"T3"'))).toBe(false);
+      expect(events("ledger")).toContainEqual(expect.objectContaining({ state: expect.objectContaining({ tasks: expect.arrayContaining([
+        expect.objectContaining({ id: "T1", state: "verifying", slot: "slot-1" }),
+        expect.objectContaining({ id: "T2", state: "integrating", slot: "slot-2" }),
+        expect.objectContaining({ id: "T3", state: "ready", slot: null }),
+      ]) }) }));
+
+      // Q clears task.slot and the write lease before awaiting the actual marker release.
+      await h.parts().writer.append([
+        { type: "integration-step", edge: "end", entry, step: "rebase", result: "ok", detail: null, failingIds: [], closes: false },
+        { type: "integration-step", edge: "start", entry: { ...entry, candidate: SHA2 }, step: "fast-forward",
+          result: null, detail: null, failingIds: [], closes: false },
+        { type: "integration-step", edge: "end", entry: { ...entry, candidate: SHA2 }, step: "fast-forward",
+          result: "ok", detail: null, failingIds: [], closes: true },
+        { type: "task-integrated", taskId: "T2", from: SHA, to: SHA2 },
+        tr("T2", "integrating", "integrated", "fast-forwarded"),
+        { type: "integration-head", head: SHA2 }, { type: "task-slot", taskId: "T2", slot: null, branch: h.task("T2").branch },
+      ]);
+      expect(h.parts().writer.openIntegration()).toEqual([]);
+      h.parts().leases.releaseTask("T2");
+      const fsync = fs.fsyncDir.bind(fs);
+      fs.fsyncDir = async path => { await releasing.promise; await fsync(path); };
+      const release = pool.release("slot-2");
+      await until(() => events("slot-release-start").length === 1, "physical release started");
+      expect(events("slot-release-complete")).toEqual([]);
+      await expect(pool.acquire(PLAN_ID, `plan:${PLAN_ID}:T3`, SHA2)).rejects.toMatchObject({ code: "E_SLOT_UNAVAILABLE" });
+      releasing.resolve(); await release;
+      expect(events("slot-release-complete")).toContainEqual(expect.objectContaining({ state: expect.objectContaining({
+        detail: expect.objectContaining({ slot: "slot-2", result: "released" }),
+        slots: expect.arrayContaining([expect.objectContaining({ slot: "slot-2", state: "ready", taskId: null })]),
+      }) }));
+      await h.runOf("T3", 1);
+      expect(events("slot-acquire-result")).toContainEqual(expect.objectContaining({ state: expect.objectContaining({
+        detail: expect.objectContaining({ taskId: "T3", slot: "slot-2", result: "reused" }),
+      }) }));
+      const releaseSeq = events("slot-release-complete")[0]!.seq;
+      expect(events("lease-release").some(r => r.seq < releaseSeq)).toBe(true);
+      expect(events("launch").at(-1)!.seq).toBeGreaterThan(releaseSeq);
+    } finally {
+      verifying.resolve(); releasing.resolve();
+      await h.close(); sink.close(); pool.close();
+    }
+    expect(checkV2ObservationStream(lines).length).toBeGreaterThan(0);
+    expect(lines.join("")).not.toContain("physical-slots");
+  });
+
+  it("reports a failed physical release without announcing availability (even after the write lease is gone)", async () => {
+    const rows: ObservationRecord[] = [];
+    const sink = createV2Observations({ write: line => { rows.push(JSON.parse(line)); } });
+    const h = await mk(planOf([task("T1", { footprint: { writes: [], reads: [], confidence: "explicit", sources: [] } })],
+      { config: { maxParallel: 1 } }), sink);
+    const { pool, fs } = await physicalPool(h, 1);
+    h.git.dirty = () => false;
+    await h.begin();
+    const run = await h.running("T1", 1, "child-1");
+    fs.fsyncDir = async () => { throw new Error("private marker path: cannot flush"); };
+    run.complete("Done."); await h.settled();
+    sink.flush();
+    expect(h.registry.releases).toContain(`${PLAN_ID}:T1`);
+    expect(h.logs.some(line => line.includes("slot release failed"))).toBe(true);
+    expect(rows.filter(r => r.family === "scheduler" && r.action === "slot-release-failed")).toContainEqual(expect.objectContaining({
+      state: expect.objectContaining({ maxParallel: 1, detail: expect.objectContaining({ slot: "slot-1" }),
+        slots: expect.arrayContaining([expect.objectContaining({ slot: "slot-1", state: "leased" })]) }),
+    }));
+    expect(rows.some(r => r.family === "scheduler" && r.action === "slot-release-complete")).toBe(false);
+    await expect(pool.acquire(PLAN_ID, `plan:${PLAN_ID}:T2`, SHA)).rejects.toMatchObject({ code: "E_SLOT_UNAVAILABLE" });
+    sink.flush();
+    expect(JSON.stringify(rows)).not.toContain("private marker path");
+  });
+
+  it("keeps physical pool operations and ledger bytes identical off/on/with a throwing observer", async () => {
+    const results: string[] = [];
+    for (const mode of ["off", "on", "broken"] as const) {
+      const rows: ObservationRecord[] = [];
+      const sink = mode === "off" ? undefined : createV2Observations({ write: line => { rows.push(JSON.parse(line)); } });
+      if (mode === "broken" && sink !== undefined) sink.record = () => { throw new Error("broken observer"); };
+      const h = await mk(planOf([task("T1", { footprint: { writes: [], reads: [], confidence: "explicit", sources: [] } })],
+        { config: { maxParallel: 1 } }), sink);
+      const { pool, fs } = await physicalPool(h, 1);
+      const get = vi.spyOn(pool, "get"), list = vi.spyOn(pool, "list"), writes = vi.spyOn(fs, "writeText");
+      h.git.dirty = () => false;
+      await h.begin();
+      const run = await h.running("T1", 1, "child-1");
+      run.complete("Done."); await h.settled();
+      // Observation hooks must not ask the pool extra questions, perform extra I/O, consume clock randomness,
+      // mutate the journal, or change the launch. Compare before the test itself asks for the final record.
+      const calls = { get: [...get.mock.calls], list: [...list.mock.calls], writes: writes.mock.calls.length };
+      const record = await pool.get("slot-1");
+      expect(record).toMatchObject({ state: "ready", owner: null });
+      const req = h.launcher.runs[0]!.req;
+      results.push(JSON.stringify({ task: h.task("T1"), events: await h.events(), calls,
+        record: { ...record, path: "<slot>" }, request: { ...req, workRoot: "<slot>", prompt: req.prompt.replaceAll(req.workRoot, "<slot>") } }));
+      sink?.flush();
+      if (mode === "on") {
+        for (const action of ["slot-acquire-start", "slot-claim", "slot-acquire-result", "slot-state",
+          "slot-provision-start", "slot-provision-end", "slot-reset-start", "slot-reset-end", "slot-release-start", "slot-release-complete"]) {
+          expect(rows.some(r => r.family === "scheduler" && r.action === action), action).toBe(true);
+        }
+        expect(rows.filter(r => r.family === "scheduler" && r.action === "slot-acquire-result")).toContainEqual(expect.objectContaining({
+          state: expect.objectContaining({ detail: { slot: "slot-1", kind: "task", taskId: "T1", mode: "create", result: "created" } }),
+        }));
+      } else expect(rows).toEqual([]);
+      await h.close(); sink?.close(); pool.close();
+    }
+    expect(new Set(results).size).toBe(1);
+  });
+});
+
 describe("metrics", () => {
+  it("observes a context-age commit before a closed-gate tick reports its watermark", async () => {
+    const rows: ObservationRecord[] = [];
+    const observations = createV2Observations({ write: line => { rows.push(JSON.parse(line)); } });
+    const h = await mk(planOf([task("T1")]), observations);
+    try {
+      h.launcher.gateValue = DISPOSED_GATE; // Closed without a wake that could mask the metric-only commit.
+      await h.begin();
+      await h.settled();
+      const before = h.ledger().seq;
+      const metric: MetricPayload = {
+        name: "context-age", taskId: "T1", attempt: 1, bootID: GATE_CONTEXT.bootID, epoch: 1,
+        callID: "call-1", capturedAt: T0, ageMs: 0, result: "confirmed",
+      };
+      h.runtime.recordMetric(PLAN_ID, metric);
+      await h.settled();
+      const metricSeq = before + 1;
+      expect(h.ledger().seq).toBe(metricSeq);
+
+      h.runtime.onRouterToolCall(ORCH);
+      await h.settled();
+      // No non-metric batch may supply the missing graph between recordMetric and this tick.
+      expect((await h.events()).filter(e => e.seq > before)).toEqual([
+        expect.objectContaining({ type: "metric", seq: metricSeq, metric }),
+      ]);
+      expect(h.launcher.runs).toEqual([]);
+      observations.flush();
+      expect(rows.filter(r => r.family === "scheduler" && r.action === "ledger"
+        && (r.state as Record<string, unknown>).ledgerSeq === metricSeq)).toHaveLength(1);
+      expect(rows.filter(r => r.family === "scheduler" && r.action === "schedule"
+        && (r.state as Record<string, unknown>).ledgerSeq === metricSeq)).toHaveLength(1);
+    } finally {
+      await h.close();
+      observations.close();
+    }
+
+    const latestGraph = new Map<string, unknown>();
+    let runtimeRows = 0;
+    for (const row of rows) {
+      if (row.family !== "scheduler" || row.planId !== PLAN_ID) continue;
+      const state = row.state as Record<string, unknown>;
+      if (row.action === "attach" || row.action === "ledger") latestGraph.set(row.stream, state.ledgerSeq);
+      else if (state.ledgerSeq !== undefined) {
+        expect(latestGraph.has(row.stream), `${row.action} at ${row.seq} has a preceding graph`).toBe(true);
+        expect(state.ledgerSeq, `${row.action} at ${row.seq}`).toBe(latestGraph.get(row.stream));
+        runtimeRows++;
+      }
+    }
+    expect(runtimeRows).toBeGreaterThan(0);
+  });
+
+  it("observations do not change native launches or ledger bytes, including a throwing sink", async () => {
+    const results: string[] = [];
+    for (const mode of ["off", "on", "broken"] as const) {
+      const rows: ObservationRecord[] = [];
+      const observations = mode === "off" ? undefined : createV2Observations({ write: (line) => {
+        if (mode === "broken") throw new Error("sink failed");
+        rows.push(JSON.parse(line));
+      } });
+      const h = await mk(planOf([task("T1")]), observations);
+      await h.begin();
+      await toVerified(h, "T1");
+      await h.settled();
+      results.push(JSON.stringify({ requests: h.launcher.runs.map((r) => r.req), task: h.task("T1"), log: h.log }));
+      observations?.flush();
+      if (mode === "on") {
+        const actions = rows.flatMap((r) => r.family === "scheduler" ? [r.action] : []);
+        for (const action of ["attach", "ledger", "lease-eligibility", "lease-acquire", "route", "capacity-free", "capacity-reserve", "capacity-release", "launch-prepare", "launch"]) {
+          expect(actions).toContain(action);
+        }
+        expect(rows.map((r) => r.seq)).toEqual(rows.map((_, i) => i + 1));
+        expect(JSON.stringify(rows)).not.toContain(SLOT_ROOT);
+        expect(JSON.stringify(rows)).not.toContain("Done. Implemented it.");
+      } else expect(rows).toEqual([]);
+      await h.close();
+    }
+    expect(new Set(results).size).toBe(1);
+  });
+
   it("emits every metric variant: launch, wake (sent and debounced), idle-with-ready, capacity, counter, context-age", async () => {
-    const h = await mk(planOf([task("T1")]));
+    const rows: ObservationRecord[] = [];
+    const observations = createV2Observations({ write: (line) => { rows.push(JSON.parse(line)); } });
+    const h = await mk(planOf([task("T1")]), observations);
     h.launcher.gateValue = staleGate("stale-context:boot:1");
     await h.begin();
     await until(() => h.hosts.delivered.length === 1, "first wake");
 
     // The orchestrator goes idle while T1 is ready but the gate is closed: the idle-with-ready window opens at T0.
     h.runtime.onHostEvent({ type: "execution.completed", sessionID: ORCH, at: h.clock.iso() });
+    // Synchronous raw host transition, before any tick/updateIdle can run or journal a metric.
+    observations.flush();
+    expect(rows.filter((r) => r.family === "scheduler" && r.action === "orchestrator").at(-1)).toMatchObject({ state: { orchIdle: true, clockMs: Date.parse(T0) } });
     await h.settled();
 
     // A new state key inside the debounce is not sent; the runtime re-arms a tick for the end of the window.
@@ -2155,6 +2907,10 @@ describe("metrics", () => {
     h.launcher.gateValue = OK_GATE;
     h.runtime.onRouterToolCall(ORCH);
     await h.runOf("T1", 1);
+
+    observations.flush();
+    expect(rows.find((r) => r.family === "scheduler" && r.action === "launch-gate")).toMatchObject({ state: { detail: { ok: false, ready: ["T1"] } } });
+    expect(rows.find((r) => r.family === "scheduler" && r.action === "launch-prepare")).toMatchObject({ state: { clockMs: Date.parse(T0) + 5000 } });
 
     h.runtime.onHostEvent({ type: "step.started", sessionID: "ses-x", providerID: PROVIDER, modelID: "model-1", at: h.clock.iso() });
     h.runtime.onHostEvent({ type: "retry", sessionID: "ses-x", stepKey: "k1", source: "scheduled", error: ERR_RATE_LIMIT, at: h.clock.iso() });
@@ -2197,6 +2953,114 @@ describe("metrics", () => {
     expect(ms.find((m) => m.name === "counter")).toMatchObject({ key: "custom", labels: { k: "v" } });
     expect(ms.find((m) => m.name === "context-age")).toMatchObject({ taskId: "T1", ageMs: 5000, result: "confirmed" });
     expect(await h.runtime.status(PLAN_ID, ORCH)).toContain("Metrics: launches 1, wakes 2, idle-with-ready 5000 ms");
+  });
+
+  it.each(["off", "on", "broken"] as const)("observes idle closure at its continuation, not the host event or delayed metric append (%s)", async mode => {
+    const rows: ObservationRecord[] = [];
+    const sink = mode === "off" ? undefined : createV2Observations({ write: line => { rows.push(JSON.parse(line)); } });
+    if (mode === "broken" && sink !== undefined) sink.record = () => { throw new Error("observer failed"); };
+    const h = await mk(planOf([task("T1")], { config: { maxParallel: 1 } }), sink);
+    const finishAppend = deferred<void>();
+    const idleCloses = () => {
+      sink?.flush();
+      return rows.filter(r => r.family === "scheduler" && r.action === "idle-close");
+    };
+    try {
+      h.launcher.gateValue = DISPOSED_GATE;
+      await h.begin();
+      await h.settled();
+      h.runtime.onHostEvent({ type: "execution.completed", sessionID: ORCH, at: h.clock.iso() });
+      await h.settled();
+      const append = h.parts().writer.append.bind(h.parts().writer);
+      let blocked = false, idleAppendEntered = false;
+      vi.spyOn(h.parts().writer, "append").mockImplementation(async batch => {
+        if (typeof batch !== "function") {
+          if (batch.some(e => e.type === "metric" && e.metric.name === "idle-with-ready")) idleAppendEntered = true;
+          if (batch.some(e => e.type === "metric" && e.metric.name === "counter" && e.metric.key === "idle-close-barrier")) {
+            blocked = true;
+            await finishAppend.promise;
+          }
+        }
+        return append(batch);
+      });
+      // Hold the metric chain BEFORE closing: an observation in metric()'s append continuation would be too late.
+      h.runtime.recordMetric(PLAN_ID, { name: "counter", key: "idle-close-barrier", value: 1, labels: {} });
+      await until(() => blocked, "metric append barrier");
+      const gate = vi.spyOn(h.launcher, "gate");
+      h.clock.advance(125);
+      h.runtime.onHostEvent({ type: "step.started", sessionID: ORCH, providerID: PROVIDER, modelID: "model-1", at: h.clock.iso() });
+      expect(idleCloses()).toEqual([]); // The host input is synchronous; the closing tick has not resumed yet.
+      h.clock.advance(200);
+      await until(() => gate.mock.calls.length > 0, "closing tick resumed");
+      const metric = {
+        name: "idle-with-ready", fromAt: T0, toAt: h.clock.iso(), ms: 325, readyTaskIds: ["T1"], free: 1,
+      };
+      expect(idleAppendEntered).toBe(false);
+      if (mode === "on") {
+        expect(idleCloses()).toHaveLength(1);
+        expect(idleCloses()[0]).toMatchObject({
+          family: "scheduler", action: "idle-close", planId: PLAN_ID, parentSessionID: ORCH,
+          state: { clockMs: Date.parse(T0) + 325, ledgerSeq: h.ledger().seq,
+            detail: { fromMs: Date.parse(T0), toMs: Date.parse(T0) + 325, ms: 325, metric } },
+        });
+      } else expect(idleCloses()).toEqual([]);
+      h.clock.advance(400);
+      finishAppend.resolve();
+      await h.settled();
+      expect((await h.events()).filter(e => e.type === "metric" && e.metric.name === "idle-with-ready"))
+        .toEqual([expect.objectContaining({ at: h.clock.iso(), metric })]);
+      expect(h.launcher.runs).toEqual([]);
+      expect(idleCloses()).toHaveLength(mode === "on" ? 1 : 0);
+    } finally {
+      finishAppend.resolve();
+      await h.close(); sink?.close();
+    }
+  });
+
+  it("keeps idle-with-ready duration and its closing observation equal to the endpoints with an advancing clock", async () => {
+    const rows: ObservationRecord[] = [];
+    const observations = createV2Observations({ write: line => { rows.push(JSON.parse(line)); } });
+    const h = await mk(planOf([task("T1")]), observations);
+    h.launcher.gateValue = staleGate("stale-context:boot:1");
+    await h.begin();
+    await until(() => h.hosts.delivered.length === 1, "first wake");
+
+    // A millisecond can tick between two reads. Model that without moving the test timers: every now() lands one more
+    // ms later, while a bare iso() keeps the timer time. Separate reads for an endpoint's ms and ISO time then
+    // disagree by a different amount at each endpoint, as the run-13 smoke observed (1,060 vs 1,061 ms).
+    const readNow = h.clock.now.bind(h.clock);
+    let reads = 0;
+    vi.spyOn(h.clock, "now").mockImplementation(() => readNow() + ++reads);
+    vi.spyOn(h.clock, "iso").mockImplementation((ms) => new Date(ms ?? readNow()).toISOString());
+
+    // Same window as the metrics test: idle orchestrator with a stale context, a debounced second wake, then a launch.
+    h.runtime.onHostEvent({ type: "execution.completed", sessionID: ORCH, at: h.clock.iso() });
+    await h.settled();
+    h.launcher.gateValue = staleGate("stale-context:boot:2");
+    h.runtime.onRouterToolCall(ORCH);
+    await h.settled();
+    h.clock.advance(1000);
+    await until(() => h.hosts.delivered.length === 2, "second wake after the debounce");
+    await h.settled();
+    h.clock.advance(4000);
+    h.launcher.gateValue = OK_GATE;
+    h.runtime.onRouterToolCall(ORCH);
+    await h.runOf("T1", 1);
+    h.launcher.gateValue = DISPOSED_GATE;
+    h.launcher.releaseAll();
+    await h.settled();
+
+    const idle = need((await h.metrics()).find((m) => m.name === "idle-with-ready"), "idle-with-ready metric");
+    expect(idle.readyTaskIds).toEqual(["T1"]);
+    expect(idle.ms).toBeGreaterThan(0);
+    expect(Date.parse(idle.toAt) - Date.parse(idle.fromAt)).toBe(idle.ms);
+    observations.flush();
+    const closes = rows.filter(r => r.family === "scheduler" && r.action === "idle-close");
+    expect(closes).toHaveLength(1);
+    expect(closes[0]).toMatchObject({ state: { clockMs: Date.parse(idle.toAt), detail: {
+      fromMs: Date.parse(idle.fromAt), toMs: Date.parse(idle.toAt), ms: idle.ms, metric: idle,
+    } } });
+    observations.close();
   });
 
   it("recordMetric for a plan that is not attached journals nothing", async () => {
@@ -2925,11 +3789,15 @@ describe("usage-limit pauses and paused phases", () => {
   const QUOTA = { type: "provider.quota", status: 402, message: "usage limit reached" };
 
   it("a quota failure pauses the provider, raises one usage-limit item and re-arms the tick; a repeat raises nothing", async () => {
-    const h = await mk(planOf([task("T1")]));
+    const rows: ObservationRecord[] = [];
+    const observations = createV2Observations({ write: (line) => { rows.push(JSON.parse(line)); } });
+    const h = await mk(planOf([task("T1")]), observations);
     await h.begin();
     await h.running("T1", 1, "ses-c1");
     h.runtime.onHostEvent({ type: "step.started", sessionID: "ses-c1", providerID: PROVIDER, modelID: "model-1", at: h.clock.iso() });
     h.runtime.onHostEvent({ type: "step.failed", sessionID: "ses-c1", error: QUOTA, at: h.clock.iso() });
+    observations.flush();
+    expect(rows.find((r) => r.family === "scheduler" && r.action === "provider")).toMatchObject({ state: { change: "pause", provider: expect.stringMatching(/^provider:[a-f0-9]{64}$/) } });
     await until(() => h.parts().policy.raised.length === 1, "usage-limit item");
 
     expect(h.parts().policy.raised[0]).toMatchObject({ kind: "usage-limit" });
@@ -2939,6 +3807,16 @@ describe("usage-limit pauses and paused phases", () => {
     h.runtime.onHostEvent({ type: "step.failed", sessionID: "ses-c1", error: QUOTA, at: h.clock.iso() });
     await pause(30);
     expect(h.parts().policy.raised).toHaveLength(1);
+    // Advancing time alone must NOT query the controller on behalf of diagnostics. Resume is lazy.
+    h.clock.advance(h.ledger().config.capacityPauseMs + 1);
+    observations.flush();
+    expect(rows.filter((r) => r.family === "scheduler" && r.action === "provider" && JSON.stringify(r.state).includes('"resume"'))).toHaveLength(0);
+    // The running child's retry hook queries capacity even with no ready task. A non-capacity
+    // error does not start another quota pause, so this query observes only the expired pause's resume.
+    expect(h.runtime.onRetryHook({ sessionID: "ses-c1", stepKey: "after-pause",
+      error: { type: "provider.timeout", status: null, message: "transient timeout" } })).toEqual({ stop: false });
+    observations.flush();
+    expect(rows.filter((r) => r.family === "scheduler" && r.action === "provider" && JSON.stringify(r.state).includes('"resume"'))).toHaveLength(1);
   });
 
   it("while the provider is paused the retry hook stops a plan child's retries, and not another session's", async () => {
