@@ -668,10 +668,10 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1)", () => {
   it("S6 order against the router's own after-hook, and a background-flagged dispatch with verification on and off", async () => {
     const NOTE = "S6B_APPENDED_NOTE";
     const OK = "[router \u2713 verified: deterministic]";
-    // Phase 2.1 honours explicit background:true unless routing.background.mode is "off"; these spikes pin the legacy path.
-    // The 2.1 background path is covered by cpx-background; both runs below keep background mode off while varying verification enforcement.
-    const run = async (mode: "enforced" | "off") => {
-      const host = await startSpikeHost(`s6b-${mode}`, { [NO_MODEL]: agentWithoutModel() }, { routing: { engine: "shadow", background: { mode: "off" } }, probe: { afterAppend: { tool: "subagent", text: NOTE } }, overrides: { enforcement: { mode } } });
+    // Phase 2.1 honours explicit background:true unless routing.background.mode is "off": the first two runs pin the legacy
+    // path with background mode off; the third checks explicit background:true with auto and verification enforced.
+    const run = async (mode: "enforced" | "off", backgroundMode: "off" | "auto" = "off") => {
+      const host = await startSpikeHost(`s6b-${mode}${backgroundMode === "auto" ? "-auto" : ""}`, { [NO_MODEL]: agentWithoutModel() }, { routing: { engine: "shadow", background: { mode: backgroundMode } }, probe: { afterAppend: { tool: "subagent", text: NOTE } }, overrides: { enforcement: { mode } } });
       try {
         const present = path.join(host.project, "s6b-present.txt");
         await writeFile(present, "x\n");
@@ -702,7 +702,8 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1)", () => {
     };
     const enforced = await run("enforced");
     const off = await run("off");
-    await save("S6-order-background", { enforced, off });
+    const auto = await run("enforced", "auto");
+    await save("S6-order-background", { enforced, off, auto });
 
     // Order: within the parent's tool_result the router's own execute.after text (the verification line, appended by the router plugin
     // loaded FIRST) comes before the probe's note (the probe plugin is loaded second): plugin load order, observed on the host's output.
@@ -735,6 +736,18 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1)", () => {
     expect(off.delivery.isToolResult).toBe(false);
     expect(off.delivery.hasNote).toBe(false);
     expect(off.delivery.snippet).toContain('state=\\"completed\\" description=\\"S6B bg\\"'); // a host-made completion notification to the parent
+    // Enforced fileExists acceptance is required, not deferred: decideBackground holds the explicit auto dispatch for verification.
+    expect(auto.bgInputBackground).toBe(true);
+    expect(auto.bgAckStatus).toBe("running");
+    expect(auto.bgBlockedMs).toBeLessThan(3_000);
+    // Order on the held acknowledgement: the host's running ack, then the router's held line (router after-hook, loaded
+    // first), then the probe's note.
+    expect(auto.bgParts).toHaveLength(3);
+    expect(auto.bgParts[0]).toMatch(/^The subagent is working in the background \(sessionID: ses_[A-Za-z0-9]+/);
+    expect(auto.bgParts[1]).toMatch(/^\[router\] Running in the background \(ses_[A-Za-z0-9]+\)\. Its result is held until verification finishes\.$/);
+    expect(auto.bgParts.at(-1)).toBe(NOTE);
+    expect(auto.bgAfterRecords).toBe(1);
+    expect(auto.hostErrors).toEqual([]);
   }, 600_000);
 
   // CPX 2.1 (memo §6 footnote 1, row 12): routing.background.mode "auto" with a thin outcome store selects nothing, so a dispatch that sets no

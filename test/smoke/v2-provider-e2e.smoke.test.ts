@@ -98,6 +98,12 @@ function sendCompletion(response: import("node:http").ServerResponse, body: Chat
   response.end("data: [DONE]\n\n");
 }
 
+function contentText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.flatMap(part => typeof part === "object" && part !== null && "text" in part && typeof part.text === "string" ? [part.text] : []).join("\n");
+}
+
 async function startProvider(allowGraderTemperature: boolean) {
   const requests: CapturedRequest[] = [];
   const server = createServer(async (request, response) => {
@@ -116,7 +122,7 @@ async function startProvider(allowGraderTemperature: boolean) {
     const text = textOf(body.messages);
     // Keep system content decoded so exact Windows paths are not JSON-escaped.
     const system = body.messages?.filter(message => message?.role === "system")
-      .map(message => message.content).join("\n") ?? "";
+      .map(message => contentText(message.content)).join("\n") ?? "";
     const toolNames = body.tools?.map(tool => tool.function?.name).filter((name): name is string => typeof name === "string") ?? [];
     requests.push({ ...body, url: request.url, text, system, toolNames });
 
