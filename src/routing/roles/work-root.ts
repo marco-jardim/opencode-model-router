@@ -41,7 +41,12 @@ export function canonicalAuthorityPath(
   }
   if (!api.isAbsolute(text) && !api.isAbsolute(base)) return undefined;
   const sep = platform === "win32" ? "\\" : "/";
-  let head = api.isAbsolute(text) ? text : `${base.replace(/[\\/]+$/, "")}${sep}${text}`;
+  let head = text;
+  if (!api.isAbsolute(text)) {
+    let end = base.length;
+    while (end > 0 && (base[end - 1] === "\\" || base[end - 1] === "/")) end--;
+    head = `${base.slice(0, end)}${sep}${text}`;
+  }
   const tail: string[] = [];
   const missing = (error: unknown): boolean => {
     const code = (error as { code?: unknown } | null)?.code;

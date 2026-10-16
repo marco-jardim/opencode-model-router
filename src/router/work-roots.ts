@@ -19,7 +19,11 @@ const nativeRealpath: Realpath = (path) => realpathSync.native(path);
 
 function normalize(path: string, platform: NodeJS.Platform): string {
   const forward = path.replace(/\\/g, "/");
-  const trimmed = /^[A-Za-z]:\/$|^\/$/.test(forward) ? forward : forward.replace(/\/+$/, "");
+  let end = forward.length;
+  if (!/^[A-Za-z]:\/$|^\/$/.test(forward)) {
+    while (end > 0 && forward[end - 1] === "/") end--;
+  }
+  const trimmed = forward.slice(0, end);
   return platform === "win32" ? trimmed.toLowerCase() : trimmed;
 }
 
