@@ -249,6 +249,32 @@ pending 6.2.QA
   no other Windows-path `toContain` checks against serialised bodies in this file. No new helper or unit test;
   no smokes or checks run by this implementer. Validation remains with the orchestrator.
 
+- **G-12 (major, regression of `7180ac8` / QA-DF1-19) — fixed: role registration lists the project's worktrees
+  again whatever `routing.workRoots` contains.** Final-gate evidence (`gate62\roles.log`, `8c8c6e0`): roles smoke
+  I3+I4, I5+I9, ladder and "work roots and host handoffs" failed with `Permission denied: external_directory`; the
+  registered rules held only the smoke's later-worktree glob `<tmp>\wt-late-*`. Isolated bisection of I3+I4 on
+  2.0.26 (scratch worktree at each commit, `node_modules` junction): pass at `6ec3faa` (master), `b716ee9`,
+  `226d967`, `b871c00`, `12774fc`, `51d3c51`; fail at `7180ac8`, `fa59281`, `9fa7607`, `92f09d1`, `4623f8d`,
+  `b7642c7`, `83f90e7`, `992816b`. Cause: `registerRoleAgents` skipped `git worktree list` when the start directory
+  lay outside every `workRoots` entry, so a glob meant for later worktrees dropped the existing ones (it also broke
+  the documented `D:/git/my-repo-wt-*` example). Fix: the listing gate is `hasLocalActions` only, as on master;
+  `locationOutsideWorkRoots` still gates the start-up reference GC (DF-1-1) and the executor-home lookup
+  (QA-5.1-5). Accepted trade-off: a read-only `git worktree list` runs at start in every location again, as on
+  master. QA-DF1-19 unit cases flipped to pin the listing; new test "G-12 a workRoots glob for later-created
+  worktrees does not drop the project's existing worktrees" in `test/unit/role-agents-work-roots.test.ts`.
+  `docs/ROLES.md`, `docs/CONFIG_REFERENCE.md` and `CHANGELOG.md` no longer claim the skip.
+- **G-13 (minor, stale smoke) — fixed: role-spikes S2 and S6 pin the legacy background path explicitly.** They
+  asserted that a model-flagged `background: true` reaches the host as `false`; Phase 2.1 honours an explicit
+  `background: true` unless `routing.background.mode` is `off` (`decideBackground`, reason `explicit`). S2/S6 pass
+  at `6eaf7f0` and fail from `bc0df8a` (2.1 merge) on. Their hosts now run with `routing.background.mode: "off"`;
+  no assertion changed. The 2.1 path stays covered by `cpx-background`.
+- **G-14 (minor, pre-existing, host drift) — deferred with reason.** role-spikes S11 "(1) default agent:
+  external_directory is ASKED for the sibling worktree" receives `completed` on host 2.0.26. It fails identically at
+  `origin/master` `6ec3faa` (`omr-evidence\gate62-master-roles.log`), so it is neither caused nor fixable by this
+  plan's changes; it pins a host default, not router behaviour. Reason for deferral: out of the plan's scope (A-6.2-2);
+  to be refreshed against the host in a separate change. The routing-engine smoke `5-advisor` failure is the known
+  pre-existing PF-4 (fails at `7181165` too).
+
 ## Deferred findings
 
 pending 6.2.QA
