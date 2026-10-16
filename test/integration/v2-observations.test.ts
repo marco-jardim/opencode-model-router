@@ -72,7 +72,11 @@ describe("v2 completion-effect observation boundaries", () => {
     expect(finishes).toEqual(recovery === "finish" ? [expect.objectContaining({
       source: "restored-hold", parentSessionID: "orch", callID: "restored-call", childSessionID: "restored-child",
     })] : []);
-  });
+    // G-17: the "finish" case runs the restored hold's real verification, and its git probes of the project spawn
+    // processes. The other two cases do not. On a loaded windows-latest runner "finish" took 5810 ms against the 5 s
+    // default ("stored-verdict" 1778 ms, "missing-text" 139 ms; PR #116, win22). The limit is the one the other
+    // verification cases of this describe already use. No assertion changes.
+  }, 30_000);
 
   it("metadata-only child identity in the foreground annotation matches its timing row", async () => {
     const rows: ObservationRecord[] = [];

@@ -5,9 +5,15 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { treeMove, type TreeMove } from "../../src/verify/branch";
 import { readHead, readHeadState, readReflogWindow, type HeadState, type ReflogEntry } from "../../src/verify/head";
+
+// G-17: every test here spawns real git, synchronously, three to ten processes per test. The test "an empty subject is
+// kept as an empty string" spawns seven, plus the reader's own. On a loaded 2-4 core windows-latest runner one spawn took
+// about 1.5 s, so that test took 10.5 s against the 5 s default (PR #116, win22). It passes in about 1 s elsewhere
+// (win24: 1095 ms). The limit is the one the other real-git files use (reference.test.ts: 60 s). No assertion changes.
+vi.setConfig({ testTimeout: 60_000 });
 
 const base = mkdtempSync(join(tmpdir(), "head-test-"));
 afterAll(() => rmSync(base, { recursive: true, force: true }));

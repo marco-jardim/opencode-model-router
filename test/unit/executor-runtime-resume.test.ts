@@ -559,7 +559,8 @@ describe("QA-PDF21 snapshot safety", () => {
     await h.end(first, "ses-1", "ESCALATE: stuck");
     await untilState(h, "parked");
     expect(await sh(h.r.top, "show", `refs/heads/${wipRef}:b.txt`)).toBe("behind a lock\n");
-    expect(h.pool.release).toHaveBeenCalled();
+    // G-17: the release follows the save after the parked state (A3), so wait for it as -4 below does.
+    await until(() => { expect(h.pool.release).toHaveBeenCalled(); });
   }, TEST_MS);
 
   it("-4. the pool's acquire resets a ready slot, and the released attempt's work still comes back", async () => {
@@ -570,7 +571,10 @@ describe("QA-PDF21 snapshot safety", () => {
     await writeFile(join(h.r.slot, "b.txt"), "kept\n");
     await h.end(first, "ses-1", "ESCALATE: stuck");
     await untilState(h, "parked");
-    expect(h.pool.release).toHaveBeenCalledTimes(1);
+    // G-17: the release follows the parked state by design: the ledger batch that writes TS(null) lands first, then
+    // `releaseResources` saves the slot's work with git and only then gives the slot back (A3, QA-PDF21-4). On a slow
+    // runner that git save outlasts the fixed pause after "parked", so wait for the release itself (still exactly one).
+    await until(() => { expect(h.pool.release).toHaveBeenCalledTimes(1); });
     await h.answer("go on");
     await h.launched(2);
     expect(h.acquireResets).toHaveLength(2);

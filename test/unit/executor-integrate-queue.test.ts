@@ -902,6 +902,24 @@ describe("createRepoLockFactory (M5, I3)", () => {
     throw new Error("the lock file never parsed");
   }
 
+  /**
+   * G-17: fires the held heartbeat timer and returns the heartbeat the beat left, read only after that beat attempt has
+   * finished. The factory signals that by re-arming its timer (`heldCount()` back to 1, queue.ts `beatOnce`). Reading the
+   * lock file while the beat renames its side file over it makes the rename fail on Windows (EPERM: the target is open).
+   * The product treats that as transient and retries at the next beat, and this fake clock never reaches that beat on
+   * its own. That is why polling the file before the attempt finished timed out on CI. A beat that an outside reader
+   * (such as an antivirus scan) still made fail is fired again at the same fake instant. The expected heartbeat stays the
+   * same, and a beat that never lands still fails at the deadline.
+   */
+  async function beatSettled(clock: FakeClock, file: string, want: number, deadline: number): Promise<number> {
+    for (;;) {
+      clock.fire();
+      while (clock.heldCount() === 0 && Date.now() < deadline) await realPause(5);
+      const got = await heartbeatOf(file);
+      if (got === want || clock.heldCount() === 0 || Date.now() >= deadline) return got;
+    }
+  }
+
   it("the heartbeat timer refreshes heartbeatAt and re-arms itself; release disarms it", async () => {
     const env = await lockEnv();
     const clock = new FakeClock();
@@ -911,12 +929,9 @@ describe("createRepoLockFactory (M5, I3)", () => {
     const first = await heartbeatOf(file);
     expect(clock.heldCount()).toBe(1);
     clock.advance(5_000);
-    clock.fire();
     const deadline = Date.now() + 20_000;
-    while (await heartbeatOf(file) === first && Date.now() < deadline) await realPause(5);
-    expect(await heartbeatOf(file)).toBe(first + 5_000);
+    expect(await beatSettled(clock, file, first + 5_000, deadline)).toBe(first + 5_000);
     expect(JSON.parse(await readFile(file, "utf8"))).toMatchObject({ pid: 10, entryId: "i-3" });
-    while (clock.heldCount() === 0 && Date.now() < deadline) await realPause(5);
     expect(clock.heldCount()).toBe(1);
     expect(lock.lost.aborted).toBe(false);
     await lock.release();
@@ -1010,7 +1025,10 @@ describe("createRepoLockFactory (M5, I3)", () => {
       return pid !== 99;
     } });
     const errP = f.acquire("repo-T", holder(), new AbortController().signal).then(() => null, (e: unknown) => e as { code?: string });
-    await realPause(30);
+    // G-17: fire the poll only once the first poll armed it. A fixed 30 ms pause lost that race on slow CI runners: fire()
+    // ran before the poll sleep was held, and the acquire then waited on a fake timer nobody fired (the 60 s timeout).
+    const armed = Date.now() + 20_000;
+    while (clock.heldCount() === 0 && Date.now() < armed) await realPause(5);
     clock.fire();
     const err = await errP;
     expect(err?.code).toBeDefined();

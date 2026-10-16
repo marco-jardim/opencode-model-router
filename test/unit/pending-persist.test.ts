@@ -402,7 +402,11 @@ describe("pending.jsonl journal (memo 11.1, 11.2)", () => {
     expect((await first.load()).map((r) => r.callID).sort()).toEqual([...expected].sort());
     // Exactly one writer mark for this process, whatever the number of journals.
     expect(readdirSync(join(dir, PENDING_WRITERS_DIRNAME)).filter((name) => name.startsWith(`${process.pid}.`))).toHaveLength(1);
-  });
+    // G-17: this test is bound by disk I/O, not by CPU. The one shared queue runs 13 fsync'd appends (5 before, 3 during,
+    // 5 after) one after another, plus the start-up compaction's rewrite. On the shared disk of a windows-latest runner,
+    // with the parallel pool writing too, it took 6431 ms against the 5 s default (PR #116, win24). It takes 452 ms on
+    // win22. The order and content assertions are unchanged.
+  }, 30_000);
 
   it("QA-2.1-16: recreate rewrites a vanished journal from the caller's records; later loads and appends succeed again", async () => {
     const stateDir = join(dir, "state");
