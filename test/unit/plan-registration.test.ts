@@ -44,6 +44,9 @@ describe("plan registration (Phase 5.1.2)", () => {
     mkdirSync(temp, { recursive: true });
     for (const key of ["TMP", "TEMP", "TMPDIR"] as const) process.env[key] = temp;
     process.env.MODEL_ROUTER_ENFORCE = "1";
+    // G-16: the registration under test is the Windows one (the executor is Windows-only); drive the platform seam there on
+    // every host. The fresh module instance after resetModules is the one src/index.ts imports.
+    vi.spyOn(await import("../../src/executor/platform"), "executorPlatformSupported").mockReturnValue(true);
     // G-5: caller/access/conflict tests exercise the registered surface, now roles-at-start only.
     await configure({ routing: { delegation: "roles" } });
   });

@@ -21,7 +21,12 @@ const MIN = { lines: 90, branches: 90 };
 
 function run(
   files: Record<string, FileStat>,
-  opts: { exact?: string[]; prefixes?: Parameters<typeof evaluateGates>[0]["prefixes"]; warnOnly?: string[] },
+  opts: {
+    exact?: string[];
+    prefixes?: Parameters<typeof evaluateGates>[0]["prefixes"];
+    warnOnly?: string[];
+    warnOnlyPrefixes?: string[];
+  },
 ) {
   return evaluateGates({
     exact: opts.exact ?? [],
@@ -29,6 +34,7 @@ function run(
     prefixes: opts.prefixes ?? [],
     files: new Map(Object.entries(files)),
     warnOnly: new Set(opts.warnOnly ?? []),
+    warnOnlyPrefixes: new Set(opts.warnOnlyPrefixes ?? []),
   });
 }
 
@@ -122,6 +128,56 @@ describe("prefix entries", () => {
     expect(out.results).toEqual([]);
   });
 
+  it("warns without failing for misses under a warn-only prefix", () => {
+    const out = run(
+      { "src/executor/a.ts": stat(50, 60, 70) },
+      { prefixes, warnOnlyPrefixes: ["src/executor/"] },
+    );
+    expect(out.failed).toBe(false);
+    expect(out.results[0]).toMatchObject({
+      source: "prefix",
+      prefix: "src/executor/",
+      status: "fail",
+      soft: true,
+      misses: ["lines", "branches", "functions"],
+    });
+    expect(out.warnings).toEqual([
+      "src/executor/a.ts below the prefix gate src/executor/ (lines 50%, branches 60%, functions 70%); warn-only, not blocking",
+    ]);
+  });
+
+  it("keeps non-soft prefixes blocking when another prefix is warn-only", () => {
+    const out = run(
+      { "src/executor/a.ts": stat(50, 50), "src/verify/a.ts": stat(50, 50) },
+      {
+        prefixes: [...prefixes, { prefix: "src/verify/", lines: 90, branches: 90 }],
+        warnOnlyPrefixes: ["src/executor/"],
+      },
+    );
+    expect(out.failed).toBe(true);
+    expect(out.warnings).toHaveLength(1);
+    expect(out.results.find((r) => r.prefix === "src/verify/")).toMatchObject({ status: "fail", soft: false });
+  });
+
+  it("only warns when a warn-only prefix matches no file", () => {
+    const out = run({}, { prefixes, warnOnlyPrefixes: ["src/executor/"] });
+    expect(out.failed).toBe(false);
+    expect(out.emptyPrefixes).toEqual(["src/executor/"]);
+    expect(out.results).toEqual([]);
+    expect(out.warnings).toEqual([
+      "src/executor/ prefix gate matched no file of the merged report (warn-only, not blocking)",
+    ]);
+  });
+
+  it("does not soften an exact entry with a warn-only prefix", () => {
+    const out = run(
+      { "src/executor/a.ts": stat(10, 10) },
+      { exact: ["src/executor/a.ts"], prefixes, warnOnlyPrefixes: ["src/executor/"] },
+    );
+    expect(out.failed).toBe(true);
+    expect(out.results.find((r) => r.source === "exact")).toMatchObject({ status: "fail", soft: false });
+  });
+
   it("gates functions for entries that declare it", () => {
     const out = run({ "src/executor/a.ts": stat(100, 100, 80) }, { prefixes });
     expect(out.failed).toBe(true);
@@ -191,7 +247,7 @@ function fixtureCoverage(fnHits: number, fnLine = 1): string {
   });
 }
 
-function runMerge(name: string, inputs: string[]) {
+function runMerge(name: string, inputs: string[], options: string[] = []) {
   const dir = join(WORK, name);
   mkdirSync(dir, { recursive: true });
   const files = inputs.map((text, i) => {
@@ -202,7 +258,7 @@ function runMerge(name: string, inputs: string[]) {
   const soft = MERGED_PER_FILE_GATED.flatMap((rel) => ["--warn-only", rel]); // the fixture covers none of the exact files
   const r = spawnSync(
     process.execPath,
-    ["--experimental-strip-types", "scripts/coverage-merge.mjs", ...soft, join(dir, "out"), ...files],
+    ["--experimental-strip-types", "scripts/coverage-merge.mjs", ...soft, ...options, join(dir, "out"), ...files],
     { cwd: ROOT, encoding: "utf8" },
   );
   return { status: r.status, out: `${r.stdout}\n${r.stderr}` };
@@ -220,6 +276,32 @@ describe.skipIf(!canStrip)("scripts/coverage-merge.mjs on fixture summaries", ()
     const r = runMerge("fn-fail", [fixtureCoverage(0)]);
     expect(r.out).toMatch(/src\/executor\/fixture\.ts.*FAIL/);
     expect(r.status).toBe(1);
+  });
+
+  it("warns without failing on a soft prefix miss", () => {
+    const r = runMerge("fn-soft", [fixtureCoverage(0)], ["--warn-only-prefix", "src/executor/"]);
+    expect(r.out).toMatch(/src\/executor\/fixture\.ts.*WARN \(warn-only\)/);
+    expect(r.out).toContain("::warning::src/executor/fixture.ts below the prefix gate");
+    expect(r.status).toBe(0);
+  });
+
+  it("warns without failing on an empty soft prefix", () => {
+    const r = runMerge("empty-soft", ["{}"], ["--warn-only-prefix", "src/executor/"]);
+    expect(r.out).toMatch(/src\/executor\/.*WARN \(warn-only\): prefix gate matched no file/);
+    expect(r.out).toContain("::warning::src/executor/ prefix gate matched no file");
+    expect(r.out).not.toContain("FAIL");
+    expect(r.status).toBe(0);
+  });
+
+  it.each(["src/not-gated/", "src/executor", undefined])("rejects an undeclared or missing warn-only prefix (%s)", (prefix) => {
+    const r = spawnSync(
+      process.execPath,
+      ["--experimental-strip-types", "scripts/coverage-merge.mjs", "--warn-only-prefix", ...(prefix ? [prefix] : [])],
+      { cwd: ROOT, encoding: "utf8" },
+    );
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain("--warn-only-prefix needs one of: src/executor/");
+    expect(r.stderr).toContain("usage: node scripts/coverage-merge.mjs");
   });
 
   it("reports function-map drift when two inputs map the same source to different function locations", () => {

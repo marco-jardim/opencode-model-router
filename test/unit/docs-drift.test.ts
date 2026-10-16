@@ -38,6 +38,7 @@ import { RENDERED_REASONS_MAX } from "../../src/verify/dispatch";
 import { GRADER_REASONS_MAX } from "../../src/verify/checker";
 import { oneLineReason } from "../../src/routing/roles/authority";
 import { PLAN_HELP_LINES } from "../../src/commands/output";
+import { EXECUTOR_PLATFORM_NOTICE } from "../../src/executor/platform";
 import { ROUTER_PLAN_ACTIONS } from "../../src/executor/tool";
 import { EXECUTOR_HOME_DIRNAME } from "../../src/executor/paths";
 import { defaultSlotsDir } from "../../src/executor/slots/pool";
@@ -498,7 +499,8 @@ function executorSafetyPauseDocProblems(doc: string, pauses: ReturnType<typeof e
 }
 
 describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
-  const doc = read("docs/EXECUTOR.md");
+  // `sectionOf` joins its lines with "\n": normalize so a CRLF checkout (core.autocrlf) matches sections verbatim.
+  const doc = read("docs/EXECUTOR.md").replace(/\r\n/g, "\n");
   const runtimeSource = read("src/executor/runtime.ts");
   const queueSource = read("src/executor/integrate/queue.ts");
   const qaLoopSource = read("src/executor/qa-loop.ts");
@@ -655,6 +657,8 @@ describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
       const section = sectionOf(doc, heading);
       for (const reason of [...safetyPauses.plan, ...safetyPauses.phase]) {
         const mutated = doc.replace(section, section.replaceAll(`\`${reason}\``, "`removed-pause`"));
+        // The mutation must land: a section that is not found verbatim in `doc` would leave it unchanged.
+        expect(mutated, `${heading}: ${reason} (mutation applied)`).not.toBe(doc);
         expect(executorSafetyPauseDocProblems(mutated, safetyPauses), `${heading}: ${reason}`).toEqual([`${heading}: ${reason}`]);
       }
     }
@@ -700,6 +704,52 @@ describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
     const section = sectionOf(v2, "## Plan executor").replace(/\s+/g, " ");
     expect(section).toContain("The `router_plan` tool and the `/plan` command are registered on OpenCode v2 in roles mode selected at start only, like `router_run`; executor instructions require an assembled runtime. OpenCode v1's tool, command and help maps are unchanged.");
     expect(section).not.toMatch(/not active yet|a later phase registers/);
+  });
+
+  it("states the executor is Windows only in this release, with the one notice, in every guide (G-16)", () => {
+    expect(EXECUTOR_PLATFORM_NOTICE).toBe("plan executor requires Windows; router_plan and /plan are not registered");
+    const quoted = `\`${EXECUTOR_PLATFORM_NOTICE}\``;
+    const flat = (text: string): string => text.replace(/\r?\n>\s?/g, " ").replace(/\s+/g, " ");
+    const executor = flat(doc);
+    expect(executor).toContain("**Windows only in this release.** Execution slots need a drive-letter path");
+    expect(executor).toContain("`router_plan` and `/plan` are not registered, `/router` does not list `/plan`");
+    expect(executor).toContain("so on platforms other than Windows the executor is inert on OpenCode v2");
+    expect(executor).not.toMatch(/on Linux and macOS the executor is inert/);
+    expect(executor).toContain("role agents get no slots rule and no executor-home lookup runs, and no executor discovery runs at start");
+    // QA-62C-1, QA-62C-14: the executor home is still denied off Windows, found on disk without git, even before it exists.
+    expect(executor).toContain("whether or not it exists yet, is still denied to role agents whenever the git common directory resolves: the router finds `<git common dir>/omr-executor` on disk, without running git");
+    expect(executor).not.toMatch(/An executor home that already exists/);
+    // QA-62C-12: the notice condition is the one src/index.ts checks.
+    expect(executor).toContain(`When roles mode at start with enforced leases and verification not \`never\` would assemble it, the router logs one notice per process: ${quoted}`);
+    const roles = flat(read("docs/ROLES.md"));
+    expect(roles).toContain("The plan executor is Windows only in this release: on other platforms it is inert");
+    expect(roles).not.toMatch(/on Linux and macOS `router_plan`/);
+    // QA-62C-1, QA-62C-13, QA-62C-14: off Windows the executor home is still denied, found on disk without git, even before it exists.
+    expect(roles).toContain("so role agents get no slots-root allowance and no executor-home lookup runs. The executor home in the git common directory");
+    expect(roles).toContain("is still denied, whether or not it exists yet: starting at the listed worktree, else the directory OpenCode was started in, the router walks up to the nearest repository and reads its `.git` (and its `commondir`; each at most 4 KiB, regular files only, a linked `.git` refused) to find `<git common dir>/omr-executor` on disk, without running git. When no repository is found, nothing is denied.");
+    expect(roles).not.toMatch(/An executor home that already exists there/);
+    // QA-62C-12: the scope and the notice condition src/index.ts checks.
+    expect(roles).toContain(`on platforms other than Windows \`router_plan\` and \`/plan\` are not registered, and when roles mode at start with enforced leases and verification not \`never\` would assemble it the router logs one notice per process, ${quoted}`);
+    const executorRows = read("docs/CONFIG_REFERENCE.md").split(/\r?\n/).filter((line) => line.startsWith("| `routing.executor."));
+    expect(executorRows.length).toBeGreaterThan(0);
+    for (const row of executorRows) expect(row, row.slice(0, 60)).toContain("Windows only");
+    const changelog = read("CHANGELOG.md").replace(/\r\n/g, "\n");
+    const unreleased = changelog.slice(changelog.indexOf("## [Unreleased]"), changelog.indexOf("\n## [", changelog.indexOf("## [Unreleased]") + 1));
+    expect(flat(unreleased)).toContain("**OpenCode v2: the plan executor is Windows only in this release.**");
+    expect(flat(unreleased)).toContain(`logs one notice per process, ${quoted}`);
+    expect(flat(unreleased)).toContain("On platforms other than Windows it is inert:");
+    expect(flat(unreleased)).not.toMatch(/On Linux and macOS it is inert/);
+    expect(flat(unreleased)).toContain("`<git common dir>/omr-executor`, found on disk without running git, is still denied to them whenever the common directory resolves, even before it exists");
+    expect(flat(unreleased)).not.toMatch(/an existing `<git common dir>\/omr-executor`/);
+    expect(flat(unreleased)).toContain("invalid `routing.executor.*` values are not reported");
+    expect(flat(unreleased)).toContain("when roles mode at start with enforced leases and verification not `never` would assemble it the router logs one notice per process");
+    // The code the docs describe: the one seam gates v2 discovery and the plugin's registration and notice.
+    expect(read("src/v2.ts")).toContain("!executorPlatformSupported() ? EXECUTOR_PLATFORM_REASON");
+    expect(read("src/index.ts")).toContain("warnExecutorPlatformOnce(logger)");
+    // QA-62C-12: the condition the guides state is the one the plugin checks before the notice.
+    expect(read("src/index.ts").replace(/\s+/g, " ")).toContain(
+      "rolesAtStart && resolveRouting(cfg, \"v2\").leases.mode === \"enforce\" && cfg.enforcement?.verify?.require !== \"never\") warnExecutorPlatformOnce(logger)",
+    );
   });
 
   it("states the root-only authority rule and own-plan read exception (QA-5.1-2)", () => {

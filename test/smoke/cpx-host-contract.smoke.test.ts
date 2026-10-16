@@ -967,7 +967,7 @@ d("C10 provider errors: 429, 529 and usage limit", () => {
           const classification = failedError ? str(failedError.type) ?? "step.failed without type" : retryError ? str(retryError.type) ?? "retry without type" : "none";
           const resetIsoSent = new Date(resetAtMs).toISOString();
           const surfaced = failedError ?? retryError;
-          const resetPaths = surfaced ? stringPaths(surfaced, new RegExp(resetIsoSent.replace(/[.]/g, "\\."))) : [];
+          const resetPaths = surfaced ? stringPaths(surfaced, new RegExp(resetIsoSent.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))) : [];
           const responseFields = surfaced ? findKeys(surfaced, /^(headers|response|responseHeaders|retryAfter|resetAt|resetsAt)$/i).map(k => ({ path: k.path, value: clip(k.value, 300) })) : [];
           // ADR 0007 D13: what must not reach the error are the provider's response HEADERS (`retry-after` / reset headers). A field named `headers` / `responseHeaders` at any depth
           // (which includes `response.headers`) is such a field; a `response` object that carries only a `body` is not. The body is recorded (`responseBodySurfaced`), not judged.

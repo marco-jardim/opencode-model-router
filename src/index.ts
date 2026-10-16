@@ -184,6 +184,7 @@ import { createDepthTracker, DEPTH_LOOKUP_RETRY_MS } from "./router/depth";
 import { createDepthGuard } from "./router/depth-guard";
 import { applyEffortOverride, createEffortOverrideStore } from "./escalate/effort-override";
 import { createExecutorAccess, lateRuntime, type ExecutorAccess, type CreateExecutorOptions } from "./executor/create";
+import { executorPlatformSupported, warnExecutorPlatformOnce } from "./executor/platform";
 import { createRouterPlanTool } from "./executor/tool";
 import { createPlanCommand, parsePlanCommand } from "./executor/command";
 
@@ -618,7 +619,9 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     routerExecutor?: ExecutorAccess;
     routerOnPlanAnnotate?: (port: NonNullable<CreateExecutorOptions["annotate"]>) => void;
   } : undefined;
-  const absentExecutor = isV2Host ? createExecutorAccess() : undefined;
+  // G-16: the plan executor is Windows-only; elsewhere no executor access exists, so router_plan and /plan are not built.
+  const executorPlatform = isV2Host && executorPlatformSupported();
+  const absentExecutor = executorPlatform ? createExecutorAccess() : undefined;
   const executorAccess: ExecutorAccess | undefined = absentExecutor === undefined ? undefined : {
     runtime: () => (executorInput?.routerExecutor ?? absentExecutor).runtime(),
     unavailable: () => (executorInput?.routerExecutor ?? absentExecutor).unavailable(),
@@ -1684,6 +1687,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   // v1 the set is exactly the previous one (router_run and router_request_authority are not registered; router_git_* keep their
   // directory resolution). Switching to roles mode registers them on the next start.
   const rolesAtStart = rolesNow().size > 0;
+  // G-16: on v2 off Windows, one notice per process, only for a config that asks for the executor (roles mode at start with
+  // enforced leases and verification not disabled: the prerequisites v2.ts's executor discovery checks).
+  if (isV2Host && !executorPlatform && rolesAtStart && resolveRouting(cfg, "v2").leases.mode === "enforce"
+    && cfg.enforcement?.verify?.require !== "never") warnExecutorPlatformOnce(logger);
   const dynamicRolesAtStart = [...rolesNow().values()].some((spec) => spec.authority.mode === "dynamic");
   /**
    * Cross-repo 3b.4 (SD-3b-1): `router_git_*` declare `root` only on v2, in roles mode, with `routing.repoParents` non-empty at start
@@ -3758,7 +3765,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
         } else {
           // #84 P2.2: `/router` lists the roles in roles mode on v2 (`rolesNow()` is empty in tiers mode and on v1).
           // Match registration at start and v2.ts's executor discovery prerequisites; never advertise an unregistered command.
-          const planAvailable = rolesAtStart && !userPlanCommandDefined && resolveRolesRouting(cfg, "v2").delegation === "roles"
+          const planAvailable = rolesAtStart && planCommand !== undefined && !userPlanCommandDefined && resolveRolesRouting(cfg, "v2").delegation === "roles"
             && resolveRouting(cfg, "v2").leases.mode === "enforce" && cfg.enforcement?.verify?.require !== "never"
             && !locationOutsideWorkRoots(ctx.directory, cfg.routing?.workRoots);
           text = buildRouterOutput(cfg, args, projectDir, rolesNow().size > 0 ? rolesNow().values() : undefined, approvalsAvailable, planAvailable);

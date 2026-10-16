@@ -16,10 +16,13 @@
  * all (fail closed); tier agents are never touched.
  */
 import { lstatSync, realpathSync, statSync } from "node:fs";
-import { join, posix, win32 } from "node:path";
-import { resolveExecutorHome } from "../executor/paths";
+import { join, posix, resolve as resolvePath, win32 } from "node:path";
+import { EXECUTOR_HOME_DIRNAME, resolveExecutorHome } from "../executor/paths";
 import { resolveActiveTiers, resolveRolesRouting, resolveRouting, slotsDirProblem, type RouterConfig, type TierConfig } from "./config";
-import { GIT_TOOL_NAMES, gitEnvironment, gitExecutable, hardeningArgs, inheritedSafeDirectoryArgs, spawnBounded, workRootGuards } from "./git-tools";
+import {
+  GIT_TOOL_NAMES, gitEnvironment, gitExecutable, gitPointers, hardeningArgs, inheritedSafeDirectoryArgs, nearestRepository, spawnBounded,
+  workRootGuards,
+} from "./git-tools";
 import { positiveBudget, REFUSAL_CAP, ROUTE_BUDGET_RAISE_MAX, TIER_GUARD_BUDGET } from "./guard-profile";
 import { PLUGIN_AGENT, pluginAgentMarker, pluginAgentPolicy, type PluginAgentMarker } from "./plugin-agents";
 import { CONTEXT7_DOC_TOOLS, permissionMatches, type PermissionMap } from "./read-only";
@@ -238,6 +241,25 @@ export function approvedRootPattern(path: string, realpath: Realpath = nativeRea
   if (!same) return { problem: `resolves to ${canonical}, not the approved path` };
   const after = workRootProblem(canonical);
   return after === undefined ? { pattern: join(canonical, "*") } : { problem: `canonical form ${canonical} ${after}` };
+}
+
+/**
+ * QA-62C-1, QA-62C-13: the git common directory of the repository holding `directory`, read from disk without running
+ * git (used off Windows, where the executor never runs but a Windows host sharing the repository may). The nearest
+ * checkout ({@link nearestRepository}) is read by the hardened {@link gitPointers}: `.git` and `commondir` at most 4 KiB,
+ * regular files only, opened non-blocking, a linked `.git` and a network or device pointer refused. `common` is the
+ * git directory's `commondir` target when present, else the git directory (`<checkout>/.git` or what `gitdir:` names).
+ * `{}` when no repository is found or its `.git` names no git directory; `problem` when the pointers are refused or unreadable.
+ */
+function gitCommonDirOnDisk(directory: string): { common?: string; problem?: string } {
+  const checkout = nearestRepository(resolvePath(directory));
+  if (checkout === undefined) return {};
+  try {
+    const pointers = gitPointers(checkout);
+    return pointers === undefined ? {} : { common: pointers.common };
+  } catch (error) {
+    return { problem: errorText(error) };
+  }
 }
 
 /** Executor directories may not exist yet; only ENOENT permits using a canonical parent and the literal basename. */
@@ -483,6 +505,14 @@ export interface RoleRegistrationOptions {
   realpath?: Realpath;
   /** Replaces the executor-home lookup; its result is still canonicalized before granting slots access. */
   executorHome?: (directory: string) => Promise<string>;
+  /**
+   * G-16: false when the plan executor cannot run on this platform (the caller asks `executorPlatformSupported`): the
+   * executor is treated as disabled, so no executor-home lookup runs and no slots root is granted. The executor home in
+   * the git common directory (found on disk by {@link gitCommonDirOnDisk}, no git) is still denied whenever that directory
+   * resolves, even before the home exists (QA-62C-1, QA-62C-14: a Windows host may run the executor on a repository
+   * shared with WSL). Absent: true.
+   */
+  executorPlatform?: boolean;
   /** Clock in epoch ms for the approval expiry; default `Date.now`. */
   now?: () => number;
 }
@@ -548,7 +578,8 @@ export async function registerRoleAgents(
     // slotsDir is trusted here: the project-controlled value was stripped before the config merge (D18).
     const executorRouting = resolveRouting(cfg, "v2");
     const slotsDir = executorRouting.executor.slotsDir;
-    const executorEnabled = executorRouting.leases.mode === "enforce" && cfg.enforcement?.verify?.require !== "never";
+    const executorEnabled = opts.executorPlatform !== false
+      && executorRouting.leases.mode === "enforce" && cfg.enforcement?.verify?.require !== "never";
     const executorProblems: Array<readonly [key: string, message: string]> = [];
     // QA-62F-1, QA-62F-9: outside every work root, listed worktrees or configured roots can still cover the executor
     // home in the git common directory, even when listing failed. Resolve the home (one read-only, guarded rev-parse)
@@ -606,6 +637,24 @@ export async function registerRoleAgents(
           executorProblems.push(["roles:executor-slots", `${PREFIX}executor slots root ${root ?? "(default)"} ${slots.problem ?? "is not usable"}; not granted`]);
         } else if (!externalDirectory.includes(slots.pattern)) {
           externalDirectory.push(slots.pattern);
+        }
+      }
+    } else if (opts.executorPlatform === false && table.roles.size > 0
+      && (!outside || worktrees.length > 0 || worktreeListingProblem !== undefined)) {
+      // QA-62C-1: the executor does not run on this platform, but a Windows host sharing the repository (WSL) may run it.
+      // Deny the executor home in the common directory, found on disk without running git, whether or not it exists yet
+      // (QA-62C-14: a deny on a missing path is harmless, and the Windows host may create it later); never grant the slots
+      // root here. A home that does not exist yet gets its canonical parent and the literal name, like the win32 branch.
+      const found = gitCommonDirOnDisk(worktrees[0] ?? opts.directory);
+      if (found.problem !== undefined) {
+        executorProblems.push(["roles:executor-home", `${PREFIX}the git common directory could not be read (${found.problem}); the executor home is not denied`]);
+      } else if (found.common !== undefined) {
+        const home = join(found.common, EXECUTOR_HOME_DIRNAME);
+        const canonical = executorDirectoryRoot(home, opts.realpath ?? nativeRealpath, false);
+        if (canonical.root !== undefined) {
+          externalDirectoryDenied = [join(canonical.root, "*")];
+        } else {
+          executorProblems.push(["roles:executor-home", `${PREFIX}the executor home ${home} ${canonical.problem ?? "has no canonical long form"}; the executor home is not denied`]);
         }
       }
     }

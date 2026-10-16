@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -355,6 +355,7 @@ describe("planProvision", () => {
   let root = "";
   let bin = "";
   let emptyBin = "";
+  let shOnly = "";
   const exe = (name: string): string => (WIN ? `${name}.exe` : name);
 
   beforeAll(() => {
@@ -366,6 +367,10 @@ describe("planProvision", () => {
     for (const name of ["pnpm", "uv", "poetry", "py", "python3", "pytool"]) writeFileSync(join(bin, exe(name)), "");
     mkdirSync(join(root, "Microsoft", "WindowsApps"), { recursive: true });
     writeFileSync(join(root, "Microsoft", "WindowsApps", exe("python")), "");
+    // A POSIX PATH entry that holds only the shell the step environment needs, never the host's python3 or pip.
+    shOnly = join(root, "sh-only");
+    mkdirSync(shOnly);
+    if (!WIN) symlinkSync("/bin/sh", join(shOnly, "sh"));
   });
   afterAll(() => { rmSync(root, { recursive: true, force: true }); });
 
@@ -375,6 +380,12 @@ describe("planProvision", () => {
     env.PATH = [dir, ...(WIN ? [] : ["/usr/bin", "/bin"])].join(delimiter);
     Object.assign(env, extra);
     return { env, platform: process.platform, nodeExecPath: process.execPath, guards: [] };
+  }
+
+  /** Hermetic PATH: `dir` plus, on POSIX, a directory with only `sh` (the real /usr/bin may hold python3 and pip). */
+  function bareHostWith(dir: string): ProvisionHost {
+    const host = hostWith(dir);
+    return { ...host, env: { ...host.env, PATH: [dir, ...(WIN ? [] : [shOnly])].join(delimiter) } };
   }
 
   const det = (managers: Detection["managers"], more: Partial<Detection> = {}): Detection => ({
@@ -491,7 +502,7 @@ describe("planProvision", () => {
 
   // A posix host needs /bin/sh for the step environment (planning fails earlier on Windows), so these two run on posix only.
   it.skipIf(WIN)("names the remedy when python3 is missing on a non-Windows host", () => {
-    const posix: ProvisionHost = { ...hostWith(emptyBin), platform: "linux" };
+    const posix: ProvisionHost = { ...bareHostWith(emptyBin), platform: "linux" };
     try {
       planProvision(SLOT, det(["pip"]), posix, AUTO);
       expect.unreachable("planProvision should refuse a host without python3");
@@ -515,9 +526,9 @@ describe("planProvision", () => {
     ["poetry", /poetry was not found on PATH.*install poetry/],
     ["pip", WIN ? /py\.exe on PATH.*set executor\.python/ : /python3 was not found.*set executor\.python/],
   ] as Array<[Detection["managers"][number], RegExp]>)("a missing %s binary is E_PROVISION naming the remedy", (manager, pattern) => {
-    expect(() => planProvision(SLOT, det([manager]), hostWith(emptyBin), AUTO)).toThrow(pattern);
+    expect(() => planProvision(SLOT, det([manager]), bareHostWith(emptyBin), AUTO)).toThrow(pattern);
     try {
-      planProvision(SLOT, det([manager]), hostWith(emptyBin), AUTO);
+      planProvision(SLOT, det([manager]), bareHostWith(emptyBin), AUTO);
     } catch (error) {
       expect(error).toMatchObject({ code: "E_PROVISION" });
     }

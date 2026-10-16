@@ -6,7 +6,7 @@
  * slots-root grant is skipped there (QA-5.1-5). The listing's git executable uses the listed directory's work-root guards (QA-62F-4).
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, win32 } from "node:path";
 import { invalidateConfigCache, loadConfig, localOverridePath, overridePath, resolveRouting, type RouterConfig } from "../../src/router/config";
@@ -70,6 +70,117 @@ describe("QA-DF1-19/G-12 role agent registration and routing.workRoots", () => {
     expect(result.externalDirectory).not.toContain(join(slots, "*"));
     expect(result.externalDirectoryDenied).toEqual([]);
     expect(opts.warn).not.toHaveBeenCalled();
+  });
+
+  it.each(["enforce", "off"] as const)(
+    "QA-62C-1 off Windows (leases %s) an existing <common>/omr-executor is denied without git and without a slots grant",
+    async (mode) => {
+      const base = temp(), main = join(base, "main"), slots = temp("omr-roles-wr-slots-");
+      const home = join(main, ".git", "omr-executor");
+      mkdirSync(home, { recursive: true });
+      const cfg = rolesConfig(undefined);
+      cfg.routing = { ...cfg.routing, leases: { mode }, executor: { slotsDir: slots } };
+      cfg.enforcement = { ...cfg.enforcement, verify: { require: "always" } };
+      const executorHome = vi.fn(async () => home);
+      const opts = { ...options(main, vi.fn(async () => [main])), executorHome, executorPlatform: false };
+      const spawn = vi.spyOn(gitTools, "spawnBounded").mockRejectedValue(new Error("unexpected executor git"));
+      const agents: Record<string, Record<string, unknown>> = {};
+      const result = await registerRoleAgents(agents, cfg, opts);
+      expect(result.failed).toBe(false);
+      expect(spawn).not.toHaveBeenCalled();
+      expect(executorHome).not.toHaveBeenCalled();
+      expect(result.externalDirectoryDenied).toEqual([join(home, "*")]);
+      expect(result.externalDirectory).toEqual([join(main, "*")]);
+      expect(result.externalDirectory.some((pattern) => pattern.toLowerCase().includes(".omr-slots"))).toBe(false);
+      const policy = permissionRules(agents.implementer!.permission as PermissionMap);
+      expect(evaluatePermission(policy, "external_directory", join(main, "src", "x.ts"))).toBe("allow");
+      expect(evaluatePermission(policy, "external_directory", join(home, "ledger.json"))).toBe("deny");
+      expect(evaluatePermission(policy, "external_directory", join(slots, "plan", "slot-1", "x"))).toBe("deny");
+      expect(opts.warn).not.toHaveBeenCalled();
+    },
+  );
+
+  it("QA-62C-1 off Windows a linked worktree's .git file and commondir lead to the shared executor home", async () => {
+    const base = temp(), main = join(base, "main"), wt = join(base, "wt");
+    const home = join(main, ".git", "omr-executor");
+    const privateGitDir = join(main, ".git", "worktrees", "wt");
+    mkdirSync(home, { recursive: true });
+    mkdirSync(privateGitDir, { recursive: true });
+    mkdirSync(wt, { recursive: true });
+    writeFileSync(join(wt, ".git"), "gitdir: ../main/.git/worktrees/wt\n");
+    writeFileSync(join(privateGitDir, "commondir"), "../..\n");
+    const cfg = rolesConfig(undefined);
+    cfg.routing = { ...cfg.routing, leases: { mode: "enforce" } };
+    cfg.enforcement = { ...cfg.enforcement, verify: { require: "always" } };
+    const executorHome = vi.fn(async () => home);
+    const opts = { ...options(wt, vi.fn(async () => [wt])), executorHome, executorPlatform: false };
+    const spawn = vi.spyOn(gitTools, "spawnBounded").mockRejectedValue(new Error("unexpected executor git"));
+    const result = await registerRoleAgents({}, cfg, opts);
+    expect(result.failed).toBe(false);
+    expect(spawn).not.toHaveBeenCalled();
+    expect(executorHome).not.toHaveBeenCalled();
+    expect(result.externalDirectoryDenied).toEqual([join(home, "*")]);
+    expect(opts.warn).not.toHaveBeenCalled();
+  });
+
+  it("QA-62C-14 off Windows the home is denied once the common dir resolves, before omr-executor exists, and no git runs", async () => {
+    const base = temp(), main = join(base, "main"), slots = temp("omr-roles-wr-slots-");
+    mkdirSync(join(main, ".git"), { recursive: true });
+    const home = join(main, ".git", "omr-executor");
+    const cfg = rolesConfig(undefined);
+    cfg.routing = { ...cfg.routing, leases: { mode: "enforce" }, executor: { slotsDir: slots } };
+    cfg.enforcement = { ...cfg.enforcement, verify: { require: "always" } };
+    const executorHome = vi.fn(async () => home);
+    const opts = { ...options(main, vi.fn(async () => [main])), executorHome, executorPlatform: false };
+    const spawn = vi.spyOn(gitTools, "spawnBounded").mockRejectedValue(new Error("unexpected executor git"));
+    const agents: Record<string, Record<string, unknown>> = {};
+    const result = await registerRoleAgents(agents, cfg, opts);
+    expect(result.failed).toBe(false);
+    expect(spawn).not.toHaveBeenCalled();
+    expect(executorHome).not.toHaveBeenCalled();
+    // The home does not exist: its canonical parent and the literal name, the same text as the canonical allow's prefix.
+    expect(result.externalDirectoryDenied).toEqual([join(main, ".git", "omr-executor", "*")]);
+    expect(result.externalDirectory).toEqual([join(main, "*")]);
+    const policy = permissionRules(agents.implementer!.permission as PermissionMap);
+    expect(evaluatePermission(policy, "external_directory", join(main, "src", "x.ts"))).toBe("allow");
+    expect(evaluatePermission(policy, "external_directory", join(home, "ledger.json"))).toBe("deny");
+    expect(opts.warn).not.toHaveBeenCalled();
+  });
+
+  it("QA-62C-14 off Windows without a repository nothing is denied and no git runs", async () => {
+    const base = temp(), main = join(base, "main"), slots = temp("omr-roles-wr-slots-");
+    mkdirSync(main, { recursive: true });
+    const cfg = rolesConfig(undefined);
+    cfg.routing = { ...cfg.routing, leases: { mode: "enforce" }, executor: { slotsDir: slots } };
+    cfg.enforcement = { ...cfg.enforcement, verify: { require: "always" } };
+    const executorHome = vi.fn(async () => join(main, ".git", "omr-executor"));
+    const opts = { ...options(main, vi.fn(async () => [main])), executorHome, executorPlatform: false };
+    const spawn = vi.spyOn(gitTools, "spawnBounded").mockRejectedValue(new Error("unexpected executor git"));
+    const result = await registerRoleAgents({}, cfg, opts);
+    expect(result.failed).toBe(false);
+    expect(spawn).not.toHaveBeenCalled();
+    expect(executorHome).not.toHaveBeenCalled();
+    expect(result.externalDirectoryDenied).toEqual([]);
+    expect(result.externalDirectory).toEqual([join(main, "*")]);
+    expect(opts.warn).not.toHaveBeenCalled();
+  });
+
+  it.skipIf(process.platform === "win32")("QA-62C-13 off Windows a linked .git is refused: nothing is denied, one warning, no git", async () => {
+    const base = temp(), main = join(base, "main"), elsewhere = join(base, "elsewhere");
+    mkdirSync(join(elsewhere, ".git", "omr-executor"), { recursive: true });
+    mkdirSync(main, { recursive: true });
+    symlinkSync(join(elsewhere, ".git"), join(main, ".git"));
+    const cfg = rolesConfig(undefined);
+    cfg.routing = { ...cfg.routing, leases: { mode: "enforce" } };
+    cfg.enforcement = { ...cfg.enforcement, verify: { require: "always" } };
+    const opts = { ...options(main, vi.fn(async () => [main])), executorPlatform: false };
+    const spawn = vi.spyOn(gitTools, "spawnBounded").mockRejectedValue(new Error("unexpected executor git"));
+    const result = await registerRoleAgents({}, cfg, opts);
+    expect(result.failed).toBe(false);
+    expect(spawn).not.toHaveBeenCalled();
+    expect(result.externalDirectoryDenied).toEqual([]);
+    expect(opts.warn).toHaveBeenCalledTimes(1);
+    expect(opts.warn).toHaveBeenCalledWith("roles:executor-home", expect.stringContaining("its .git is a link"));
   });
 
   it.skipIf(process.platform === "win32")("silently skips the default slots root on POSIX", async () => {

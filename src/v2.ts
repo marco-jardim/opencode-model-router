@@ -8,6 +8,7 @@ import type { BudgetSnapshot } from "./guard/enforce";
 import type { PlanTaskVerifier } from "./executor/runtime";
 import type { ExecutorChildGuardPort } from "./executor/types";
 import { createExecutor, createExecutorAccess, prepareExecutor, type CreateExecutorOptions, type PreparedExecutor } from "./executor/create";
+import { EXECUTOR_PLATFORM_REASON, executorPlatformSupported } from "./executor/platform";
 import { loadConfig, resolveRolesRouting, resolveRouting } from "./router/config";
 import { locationOutsideWorkRoots } from "./router/work-roots";
 import { openV2Observations } from "./compat/v2-observations";
@@ -23,7 +24,9 @@ export default {
       const directory = ctx.location.directory;
       const access = createExecutorAccess();
       const cfg = loadConfig(directory), routing = resolveRouting(cfg, "v2"), rolesRouting = resolveRolesRouting(cfg, "v2");
-      const discoveryDisabled = rolesRouting.delegation !== "roles" ? "routing.delegation must be roles at start"
+      // G-16: off Windows the executor is not assembled; start-up discovery runs no git and touches no executor home.
+      const discoveryDisabled = !executorPlatformSupported() ? EXECUTOR_PLATFORM_REASON
+        : rolesRouting.delegation !== "roles" ? "routing.delegation must be roles at start"
         : routing.leases.mode !== "enforce" ? "routing.leases.mode must be enforce"
         : cfg.enforcement?.verify?.require === "never" ? "enforcement.verify.require is never"
         : locationOutsideWorkRoots(directory, rolesRouting.workRoots) ? "the location is outside routing.workRoots"

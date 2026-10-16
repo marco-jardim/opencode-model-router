@@ -245,7 +245,10 @@ describe("toolTargets: search tools", () => {
       expect(toolTargets("glob", { pattern: "../x/file.ts" }, CWD).roots).toEqual([CWD, p("../x")]);
       expect(toolTargets("glob", { pattern: "../(a)/x" }, CWD).roots).toEqual([CWD, p("..")]);
       expect(toolTargets("glob", { pattern: "../!n/x" }, CWD).roots).toEqual([CWD, p("..")]);
-      expect(toolTargets("glob", { pattern: "..\\win\\*.ts" }, CWD).roots).toEqual(win ? [CWD, p("../win")] : [CWD]);
+      // A backslash counts as a separator on every platform (fail-safe over-approximation): on POSIX it may be a glob escape,
+      // and `..\/sibling` (an escaped `/`) must not hide a `..` that leaves the root.
+      expect(toolTargets("glob", { pattern: "..\\win\\*.ts" }, CWD).roots).toEqual([CWD, p("../win")]);
+      expect(toolTargets("glob", { pattern: "..\\/sibling/*.ts" }, CWD).roots).toEqual([CWD, p("../sibling")]);
       expect(toolTargets("glob", { pattern: "../sibling/*.ts", path: "sub" }, CWD).roots).toEqual([p("sub"), p("sibling")]);
     });
 

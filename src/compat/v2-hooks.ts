@@ -90,6 +90,7 @@ import type { PlanRoleBindings } from "../executor/launch";
 import { LAUNCH_HEADER_PATTERN, parseLaunchHeader, type LaunchHeaderFields } from "../executor/types";
 import { withoutHostPreamble } from "../executor/host-preamble";
 import { processToken } from "../executor/process-identity";
+import { executorPlatformSupported } from "../executor/platform";
 export { processToken } from "../executor/process-identity";
 import { grantFor } from "../routing/roles/policy";
 import { NEEDS, UNKNOWN_FACTS, type Need } from "../routing/classify/types";
@@ -2794,6 +2795,7 @@ export async function registerV2Hooks(
         }
         const registration = await registerRoleAgents(next.agent, routerConfig, {
           context7: Boolean(context7), directory: ctx.location.directory, seed: baseSeed, warn: warnRoleOnce, approvedRoots,
+          ...(executorPlatformSupported() ? {} : { executorPlatform: false }), // G-16: the plan executor is Windows-only
           ...(options.listRegistrationWorktrees ? { listWorktrees: options.listRegistrationWorktrees } : {}),
         });
         // #84 P2.3 (T2.3.3, §2.5): the ladder tool is a plugin tool, advertised to a deny-by-default agent only with an explicit

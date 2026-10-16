@@ -68,6 +68,8 @@ export interface GateInput {
   files: ReadonlyMap<string, FileStat>;
   /** Exact entries whose miss only warns. */
   warnOnly?: ReadonlySet<string>;
+  /** Prefix entries whose misses (including an empty prefix) only warn. */
+  warnOnlyPrefixes?: ReadonlySet<string>;
 }
 
 const METRICS: readonly GateMetric[] = ["lines", "branches", "functions"];
@@ -82,6 +84,7 @@ function misses(stat: FileStat, required: GateMin): GateMetric[] {
 /** Decide every gate against the merged report. Never reads files or exits. */
 export function evaluateGates(input: GateInput): GateOutcome {
   const warnOnly = input.warnOnly ?? new Set<string>();
+  const warnOnlyPrefixes = input.warnOnlyPrefixes ?? new Set<string>();
   const results: GateResult[] = [];
   const warnings: string[] = [];
   const emptyPrefixes: string[] = [];
@@ -121,24 +124,32 @@ export function evaluateGates(input: GateInput): GateOutcome {
     if (!entry.prefix.endsWith("/")) {
       throw new Error(`prefix gate "${entry.prefix}" must end with "/"`);
     }
+    const soft = warnOnlyPrefixes.has(entry.prefix);
     const required: GateMin = { lines: entry.lines, branches: entry.branches, functions: entry.functions };
     const matched = [...input.files.entries()]
       .filter(([rel]) => rel.startsWith(entry.prefix))
       .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
     if (matched.length === 0) {
       emptyPrefixes.push(entry.prefix);
-      failed = true;
+      if (soft) warnings.push(`${entry.prefix} prefix gate matched no file of the merged report (warn-only, not blocking)`);
+      else failed = true;
       continue;
     }
     for (const [rel, stat] of matched) {
       const missed = misses(stat, required);
-      if (missed.length > 0) failed = true;
+      if (missed.length > 0) {
+        if (soft) {
+          warnings.push(
+            `${rel} below the prefix gate ${entry.prefix} (${missed.map((m) => `${m} ${stat[m].pct}%`).join(", ")}); warn-only, not blocking`,
+          );
+        } else failed = true;
+      }
       results.push({
         rel,
         source: "prefix",
         prefix: entry.prefix,
         status: missed.length > 0 ? "fail" : "ok",
-        soft: false,
+        soft,
         required,
         stat,
         misses: missed,

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { mkdirSync, unlinkSync, writeFileSync } from "node:fs";
-import { mkdir, mkdtemp, readdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rmdir, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -16,7 +16,7 @@ import { removeDirWhenReleased } from "../helpers/remove-dir.js";
 // would starve the timer too, so the idle-lane guard below bounds ledger reads directly).
 vi.setConfig({ testTimeout: 60_000, hookTimeout: 60_000 });
 import { ExecutorError } from "../../src/executor/types";
-import { createRepoLockFactory } from "../../src/executor/integrate/queue";
+import { createRepoLockFactory, LOCK_HEARTBEAT_MS, LOCK_HEARTBEAT_RETRY_MS, LOCK_HEARTBEAT_WARN_FAILURES } from "../../src/executor/integrate/queue";
 import { createPhaseSuiteRunner, fileOfSuiteId } from "../../src/executor/integrate/phase-suite";
 import {
   AX_MAX_CHARS,
@@ -628,6 +628,18 @@ describe("createRepoLockFactory (M5, I3)", () => {
     return { lock: await p, fired };
   }
 
+  /**
+   * G-20: waits until a waiting acquire armed its poll sleep (the only held timer before the lock is taken; a held lock's
+   * heartbeat, normal or the QA-62C-7 1 s retry, only exists after acquire resolved). The poll is armed once the poll's
+   * create, read and judgement finished, so it is the deterministic "this poll is done" signal. A fixed real pause lost
+   * that race on slow CI runners: fire() ran before the sleep was held and the acquire waited on a timer nobody fired.
+   */
+  async function pollArmed(clock: FakeClock): Promise<void> {
+    const deadline = Date.now() + 20_000;
+    while (clock.heldCount() === 0 && Date.now() < deadline) await realPause(5);
+    expect(clock.heldCount()).toBe(1);
+  }
+
   it("takes over a lock file of a dead pid on the same host (counter reason dead-pid) after a second poll", async () => {
     const env = await lockEnv();
     const file = env.file("repo-C");
@@ -664,12 +676,13 @@ describe("createRepoLockFactory (M5, I3)", () => {
     let settled = false;
     const waiting = f.acquire("repo-live", holder(), ctl.signal);
     void waiting.then(() => { settled = true; }, () => { settled = true; });
+    // QA-62C-17: each fire waits until the previous poll judged the holder and armed its sleep (G-20, see pollArmed).
     for (let i = 0; i < 4; i++) {
-      await realPause(20);
+      await pollArmed(clock);
       clock.advance(1_000);
       clock.fire();
     }
-    await realPause(20);
+    await pollArmed(clock); // the poll after the fourth fire judged the live holder again and sleeps
     expect(settled).toBe(false);
     ctl.abort();
     await expect(waiting).rejects.toMatchObject({ code: "E_DISPOSED" });
@@ -695,11 +708,11 @@ describe("createRepoLockFactory (M5, I3)", () => {
     let settled = false;
     const waiting = f.acquire("repo-beat", holder(), ctl.signal);
     void waiting.then(() => { settled = true; }, () => { settled = true; });
-    await realPause(30);
+    await pollArmed(clock); // G-20: the first poll judged the old bytes
     // The holder beats (new bytes): the first poll's verdict does not carry over, the next poll starts again.
     await writeFile(file, JSON.stringify({ pid: 99, hostname: "elsewhere", planId: "o", entryId: null, heartbeatAt: 2 }), "utf8");
     clock.fire();
-    await realPause(30);
+    await pollArmed(clock); // G-20: the second poll judged the new bytes and sleeps again
     expect(settled).toBe(false);
     expect(JSON.parse(await readFile(file, "utf8"))).toMatchObject({ heartbeatAt: 2 });
     ctl.abort();
@@ -722,11 +735,13 @@ describe("createRepoLockFactory (M5, I3)", () => {
     let settled = false;
     const waiting = f.acquire("repo-race", holder(), ctl.signal);
     void waiting.then(() => { settled = true; }, () => { settled = true; });
+    // G-20: each fire waits until the previous poll armed its sleep; the last wait means the poll after the second
+    // judgement (compare-and-delete linked the winner back, then the live winner was judged) is done.
     for (let i = 0; i < 3; i++) {
-      await realPause(30);
+      await pollArmed(clock);
       clock.fire();
     }
-    await realPause(30);
+    await pollArmed(clock);
     expect(asked).toBeGreaterThanOrEqual(2);
     expect(settled).toBe(false);
     expect(await readFile(file, "utf8")).toBe(winner);
@@ -765,14 +780,17 @@ describe("createRepoLockFactory (M5, I3)", () => {
     const waiting = f.acquire("repo-F", holder(), ctl.signal);
     let settled = false;
     void waiting.then(() => { settled = true; }, () => { settled = true; });
-    await realPause(30);
+    await pollArmed(clock); // G-20: the first poll judged the live holder and waits
     expect(settled).toBe(false);
     ctl.abort();
     await expect(waiting).rejects.toMatchObject({ code: "E_DISPOSED" });
+    // The abort cleared the first acquire's poll timer (queue.ts `sleep`), so nothing is held now.
+    expect(clock.heldCount()).toBe(0);
     // the in-process mutex was released: a second attempt reaches the file again instead of queueing behind the first
     const ctl2 = new AbortController();
     const second = f.acquire("repo-F", holder(), ctl2.signal);
-    await realPause(30);
+    // QA-62C-17: only an acquire that holds the mutex reads the file, judges the live holder and arms its poll sleep.
+    await pollArmed(clock);
     ctl2.abort();
     await expect(second).rejects.toMatchObject({ code: "E_DISPOSED" });
   });
@@ -783,7 +801,7 @@ describe("createRepoLockFactory (M5, I3)", () => {
     const file = await foreignLock(env, "repo-G", JSON.stringify({ pid: 99, hostname: "elsewhere", planId: "other", entryId: null, heartbeatAt: clock.now() }));
     const f = createRepoLockFactory({ stateRoot: env.root, clock, pid: 10, hostname: "h", isPidAlive: () => true });
     const waiting = f.acquire("repo-G", holder("i-7"), new AbortController().signal);
-    await realPause(30);
+    await pollArmed(clock); // G-20: firing before the poll sleep is held would leave the waiter on a timer nobody fires
     await unlink(file);
     clock.fire();
     const lock = await waiting;
@@ -800,7 +818,7 @@ describe("createRepoLockFactory (M5, I3)", () => {
     let settled = false;
     const waiting = f.acquire("repo-H", holder(), new AbortController().signal);
     void waiting.then(() => { settled = true; }, () => { settled = true; });
-    await realPause(30);
+    await pollArmed(clock); // G-20: the first poll judged the bytes and sleeps; only then is firing its sleep meaningful
     expect(settled).toBe(false); // the first poll only notes it
     expect(await readFile(file, "utf8")).toBe("{{ not json");
     clock.fire();
@@ -818,10 +836,10 @@ describe("createRepoLockFactory (M5, I3)", () => {
     let settled = false;
     const waiting = f.acquire("repo-H2", holder(), ctl.signal);
     void waiting.then(() => { settled = true; }, () => { settled = true; });
-    await realPause(30);
+    await pollArmed(clock); // G-20: the first poll saw the empty (unparsable) file
     await writeFile(file, JSON.stringify({ pid: 99, hostname: "h", planId: "o", entryId: null, heartbeatAt: clock.now() }), "utf8");
     clock.fire();
-    await realPause(30);
+    await pollArmed(clock); // G-20: the second poll judged the completed write and sleeps again
     expect(settled).toBe(false);
     ctl.abort();
     await expect(waiting).rejects.toMatchObject({ code: "E_DISPOSED" });
@@ -902,6 +920,30 @@ describe("createRepoLockFactory (M5, I3)", () => {
     throw new Error("the lock file never parsed");
   }
 
+  /**
+   * G-17: fires the held heartbeat timer and returns the heartbeat the beat left, read only after that beat attempt has
+   * finished. The factory signals that by re-arming its timer (`heldCount()` back to 1, queue.ts `beatOnce`). Reading the
+   * lock file while the beat renames its side file over it makes the rename fail on Windows (EPERM: the target is open).
+   * The product treats that as transient and retries at the next beat, and this fake clock never reaches that beat on
+   * its own. That is why polling the file before the attempt finished timed out on CI. A beat that an outside reader
+   * (such as an antivirus scan) still made fail is fired again at the same fake instant. The expected heartbeat stays the
+   * same, and a beat that never lands still fails at the deadline. QA-62C-7: a failed beat re-arms at the short retry delay
+   * (LOCK_HEARTBEAT_RETRY_MS, 1 s), which this fake clock holds like the normal period, so a re-fire runs that retry.
+   * QA-62C-8: at most BEAT_REFIRES re-fires; more means the beat keeps failing, which is reported, not hidden.
+   */
+  const BEAT_REFIRES = 3;
+  async function beatSettled(clock: FakeClock, file: string, want: number, deadline: number): Promise<number> {
+    for (let refires = 0; ; refires++) {
+      clock.fire();
+      while (clock.heldCount() === 0 && Date.now() < deadline) await realPause(5);
+      const got = await heartbeatOf(file);
+      if (got === want || clock.heldCount() === 0 || Date.now() >= deadline) return got;
+      if (refires >= BEAT_REFIRES) {
+        throw new Error(`beatSettled: the heartbeat is still ${got}, not ${want}, after ${refires} re-fires (more than ${BEAT_REFIRES} is a beat that keeps failing)`);
+      }
+    }
+  }
+
   it("the heartbeat timer refreshes heartbeatAt and re-arms itself; release disarms it", async () => {
     const env = await lockEnv();
     const clock = new FakeClock();
@@ -911,14 +953,84 @@ describe("createRepoLockFactory (M5, I3)", () => {
     const first = await heartbeatOf(file);
     expect(clock.heldCount()).toBe(1);
     clock.advance(5_000);
-    clock.fire();
     const deadline = Date.now() + 20_000;
-    while (await heartbeatOf(file) === first && Date.now() < deadline) await realPause(5);
-    expect(await heartbeatOf(file)).toBe(first + 5_000);
+    expect(await beatSettled(clock, file, first + 5_000, deadline)).toBe(first + 5_000);
     expect(JSON.parse(await readFile(file, "utf8"))).toMatchObject({ pid: 10, entryId: "i-3" });
-    while (clock.heldCount() === 0 && Date.now() < deadline) await realPause(5);
     expect(clock.heldCount()).toBe(1);
     expect(lock.lost.aborted).toBe(false);
+    await lock.release();
+    expect(clock.heldCount()).toBe(0);
+  });
+
+  /** QA-62C-7: fires the held heartbeat once and waits until that beat attempt re-armed its timer (it finished). */
+  async function beatAttempt(clock: FakeClock, deadline: number): Promise<void> {
+    clock.fire();
+    while (clock.heldCount() === 0 && Date.now() < deadline) await realPause(5);
+    expect(clock.heldCount()).toBe(1);
+  }
+
+  /**
+   * QA-62C-7: a directory where the lock file was makes the beat's read fail (EISDIR): a transient failure, not a loss
+   * (only a missing or foreign lock file is one). Returns how to put the lock file back as it was.
+   */
+  async function breakLockFile(file: string): Promise<() => Promise<void>> {
+    const raw = await readFile(file, "utf8");
+    await unlink(file);
+    await mkdir(file);
+    return async () => {
+      await rmdir(file);
+      await writeFile(file, raw, "utf8");
+    };
+  }
+
+  it("QA-62C-7: a failed heartbeat re-arms at the short retry delay; a successful one restores the normal period", async () => {
+    const env = await lockEnv();
+    const clock = new FakeClock();
+    const f = createRepoLockFactory({ stateRoot: env.root, clock, pid: 10, hostname: "h", isPidAlive: () => true });
+    const lock = await f.acquire("repo-HB1", holder(), new AbortController().signal);
+    const file = env.file("repo-HB1");
+    const first = await heartbeatOf(file);
+    const timers = vi.spyOn(clock, "setTimer");
+    const deadline = Date.now() + 20_000;
+    const restore = await breakLockFile(file);
+    await beatAttempt(clock, deadline);
+    expect(timers.mock.calls.map(([ms]) => ms)).toEqual([Math.min(LOCK_HEARTBEAT_MS, LOCK_HEARTBEAT_RETRY_MS)]);
+    expect(LOCK_HEARTBEAT_RETRY_MS).toBeLessThan(LOCK_HEARTBEAT_MS);
+    expect(lock.lost.aborted).toBe(false);
+    await restore();
+    clock.advance(1_000);
+    expect(await beatSettled(clock, file, first + 1_000, deadline)).toBe(first + 1_000);
+    expect(timers.mock.calls.at(-1)?.[0]).toBe(LOCK_HEARTBEAT_MS);
+    expect(clock.heldCount()).toBe(1);
+    expect(lock.lost.aborted).toBe(false);
+    await lock.release();
+    expect(clock.heldCount()).toBe(0);
+  });
+
+  it("QA-62C-7: three heartbeat failures in a row are warned once, through the factory's logger", async () => {
+    const env = await lockEnv();
+    const clock = new FakeClock();
+    const warn = vi.fn();
+    const f = createRepoLockFactory({ stateRoot: env.root, clock, pid: 10, hostname: "h", isPidAlive: () => true, logger: { warn } });
+    const lock = await f.acquire("repo-HB2", holder(), new AbortController().signal);
+    const file = env.file("repo-HB2");
+    const timers = vi.spyOn(clock, "setTimer");
+    const deadline = Date.now() + 20_000;
+    const restore = await breakLockFile(file);
+    expect(LOCK_HEARTBEAT_WARN_FAILURES).toBe(3);
+    for (let failure = 1; failure < LOCK_HEARTBEAT_WARN_FAILURES; failure++) {
+      await beatAttempt(clock, deadline);
+      expect(warn).not.toHaveBeenCalled();
+    }
+    await beatAttempt(clock, deadline); // the third failure in a row
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]?.[0]).toContain(`repo lock heartbeat failed ${LOCK_HEARTBEAT_WARN_FAILURES} times in a row`);
+    await beatAttempt(clock, deadline); // a fourth failure: no second warning
+    expect(warn).toHaveBeenCalledTimes(1);
+    // Every failed beat re-armed at the short retry delay.
+    expect(timers.mock.calls.map(([ms]) => ms)).toEqual(Array.from({ length: 4 }, () => LOCK_HEARTBEAT_RETRY_MS));
+    expect(lock.lost.aborted).toBe(false);
+    await restore();
     await lock.release();
     expect(clock.heldCount()).toBe(0);
   });
@@ -1010,7 +1122,10 @@ describe("createRepoLockFactory (M5, I3)", () => {
       return pid !== 99;
     } });
     const errP = f.acquire("repo-T", holder(), new AbortController().signal).then(() => null, (e: unknown) => e as { code?: string });
-    await realPause(30);
+    // G-17: fire the poll only once the first poll armed it. A fixed 30 ms pause lost that race on slow CI runners: fire()
+    // ran before the poll sleep was held, and the acquire then waited on a fake timer nobody fired (the 60 s timeout).
+    const armed = Date.now() + 20_000;
+    while (clock.heldCount() === 0 && Date.now() < armed) await realPause(5);
     clock.fire();
     const err = await errP;
     expect(err?.code).toBeDefined();

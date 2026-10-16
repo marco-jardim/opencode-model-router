@@ -64,6 +64,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `UNVERIFIABLE`, and a restored held result settles in place. A journal that vanishes under a running process is
   rewritten from memory. OpenCode v1 ignores every `routing.background.*` and `routing.leases.*` key and logs one
   notice per process that names them.
+- **OpenCode v2: the plan executor is Windows only in this release.** Its execution slots need a drive-letter path
+  (`routing.executor.slotsDir`, default `<drive>:\.omr-slots\<planId>`). On platforms other than Windows it is inert:
+  `router_plan` and `/plan` are not registered, `/router` does not list `/plan`, role agents get no slots rule and no
+  executor-home lookup runs (`<git common dir>/omr-executor`, found on disk without running git, is still denied to
+  them whenever the common directory resolves, even before it exists), invalid `routing.executor.*` values are not reported, no executor discovery runs at start, and when
+  roles mode at start with enforced leases and verification not `never` would assemble it the router logs one notice
+  per process, `plan executor requires Windows; router_plan and /plan are not registered`.
 - **OpenCode v2: plan executor registration.** `router_plan` and `/plan` are registered only in roles mode selected at
   start, and `router_plan` resolves the executor at call time; `/router` lists `/plan` only when it is registered, not
   user-defined, and the executor prerequisites hold (roles delegation, enforced leases, verification not `never`, a
@@ -125,6 +132,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **CI: pull requests are Linux-only; one Windows Node 22 typecheck + full-suite coverage job runs on master pushes
+  and manual runs.** Linux e2e and Bun smoke stay blocking. Without Windows coverage, only `src/verify/exec.ts`
+  and the `src/executor/` prefix are warn-only; with it, all coverage gates block (G-21).
 - **OpenCode v2: register `router_plan` and `/plan` only in roles mode selected at start, like `router_run`.** Tiers
   mode no longer carries the unusable plan-tool schema; switching to roles needs a restart. `/router` help never
   advertises an unregistered or user-defined `/plan`. OpenCode v1's tool, command and help maps are unchanged.

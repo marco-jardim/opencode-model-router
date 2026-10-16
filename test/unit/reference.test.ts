@@ -198,6 +198,14 @@ async function mat(ref: DispatchReference, over: Partial<ReferenceDeps> = {}): P
   return result.reference;
 }
 
+/**
+ * G-17: these hooks spawn real git: seven processes before each test (init, four config, add, commit) and one after it,
+ * plus a retried tree removal. Each git call took 1-2 s on a loaded 2-4 core windows-latest runner, so the 10 s default
+ * hook limit ran out there (PR #116, win24: "#88: without a live-vs-reference eol difference ...", 10156 ms). The limit
+ * matches the describe blocks' 60 s test limit. No assertion or deadline in a test changes.
+ */
+const GIT_HOOK_TIMEOUT_MS = 60_000;
+
 beforeEach(async () => {
   warnings = [];
   base = await fsp.mkdtemp(join(await fsp.realpath(tmpdir()), "omr refs ü テスト "));
@@ -221,7 +229,7 @@ beforeEach(async () => {
     await fsp.mkdir(nm);
     await fsp.writeFile(join(nm, "sentinel.txt"), "keep me");
   }
-});
+}, GIT_HOOK_TIMEOUT_MS);
 
 afterEach(async () => {
   try {
@@ -230,7 +238,7 @@ afterEach(async () => {
   } finally {
     await fsp.rm(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   }
-});
+}, GIT_HOOK_TIMEOUT_MS);
 
 describe("captureReference", { timeout: 60_000 }, () => {
   it("clean tree -> commit is HEAD", async () => {
@@ -1585,7 +1593,13 @@ describe("materialize / dispose", { timeout: 60_000 }, () => {
     expect(await worktreeCount(repo)).toBe(1);
     expect(await refDirsIn(tmp)).toEqual([]);
     expect(warnings).toEqual([]);
-  });
+    // G-17: this test spawns real git and tree-kills it mid-checkout. Its own bounds add up past the describe's 60 s: the
+    // lock wait above (15 s), the kill and the escaped MSYS `sleep 3`, then materialize's abort cleanup, whose git calls
+    // (`worktree list`, `unlock`, `remove --force`) are each bounded by CLEANUP_GIT_TIMEOUT_MS (15 s), plus about 3.1 s of
+    // CLEANUP_RETRIES backoff (src/verify/reference.ts). On a loaded windows-latest runner (PR #116, win22) it ran out at
+    // 60 s, and the afterEach then saw the still-registered omr-ref entry (`expected 2 to be 1`). It passed in 4.2 s on
+    // win24. The limit covers that sum; the assertions and the 15 s lock wait are unchanged.
+  }, 120_000);
 });
 
 describe("gcStaleReferences", { timeout: 60_000 }, () => {

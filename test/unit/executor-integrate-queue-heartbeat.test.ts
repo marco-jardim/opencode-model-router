@@ -43,6 +43,30 @@ async function heartbeatOf(file: string): Promise<number> {
   throw new Error("the lock file never parsed");
 }
 
+/**
+ * G-17: fires the held heartbeat timer and returns the heartbeat the beat left, read only after that beat attempt has
+ * finished. The factory signals that by re-arming its timer (`heldCount()` back to 1, queue.ts `beatOnce`). Reading the
+ * lock file while the beat renames its side file over it makes the rename fail on Windows (EPERM: the target is open).
+ * The product treats that as transient and retries at the next beat, and this fake clock never reaches that beat on its
+ * own. That is why polling the file before the attempt finished timed out on CI. A beat that an outside reader (such as
+ * an antivirus scan) still made fail is fired again at the same fake instant. The expected heartbeat stays the same,
+ * and a beat that never lands still fails at the deadline. QA-62C-7: a failed beat re-arms at the short retry delay
+ * (LOCK_HEARTBEAT_RETRY_MS, 1 s), which this fake clock holds like the normal period, so a re-fire runs that retry.
+ * QA-62C-8: at most BEAT_REFIRES re-fires; more means the beat keeps failing, which is reported, not hidden.
+ */
+const BEAT_REFIRES = 3;
+async function beatSettled(clock: FakeClock, file: string, want: number, deadline: number): Promise<number> {
+  for (let refires = 0; ; refires++) {
+    clock.fire();
+    while (clock.heldCount() === 0 && Date.now() < deadline) await realPause(5);
+    const got = await heartbeatOf(file);
+    if (got === want || clock.heldCount() === 0 || Date.now() >= deadline) return got;
+    if (refires >= BEAT_REFIRES) {
+      throw new Error(`beatSettled: the heartbeat is still ${got}, not ${want}, after ${refires} re-fires (more than ${BEAT_REFIRES} is a beat that keeps failing)`);
+    }
+  }
+}
+
 describe("createRepoLockFactory (M5, I3)", () => {
   it("a re-armed heartbeat keeps beating on every period", async () => {
     const env = await lockEnv();
@@ -54,10 +78,7 @@ describe("createRepoLockFactory (M5, I3)", () => {
     const deadline = Date.now() + 20_000;
     for (const k of [1, 2]) {
       clock.advance(1_000);
-      clock.fire();
-      while (await heartbeatOf(file) !== t0 + 1_000 * k && Date.now() < deadline) await realPause(5);
-      expect(await heartbeatOf(file)).toBe(t0 + 1_000 * k);
-      while (clock.heldCount() === 0 && Date.now() < deadline) await realPause(5);
+      expect(await beatSettled(clock, file, t0 + 1_000 * k, deadline)).toBe(t0 + 1_000 * k);
       expect(clock.heldCount()).toBe(1);
     }
     expect(lock.lost.aborted).toBe(false);

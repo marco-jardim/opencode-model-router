@@ -6,6 +6,16 @@
 > OpenCode v1 is unchanged: no executor tool, command or instructions are registered there, and the
 > `routing.executor.*` keys are ignored with one notice per process (see
 > [OpenCode v1 fallback](ROLES.md#opencode-v1-fallback) for how v2-only features behave there).
+>
+> **Windows only in this release.** Execution slots need a drive-letter path (`routing.executor.slotsDir`, default
+> `<drive>:\.omr-slots\<planId>`), so on platforms other than Windows the executor is inert on OpenCode v2:
+> `router_plan` and `/plan` are not registered, `/router` does not list `/plan`, role agents get no slots rule and no
+> executor-home lookup runs, and no executor discovery runs at start. The executor home (a Windows host runs the
+> executor on a repository shared with, for example, WSL), whether or not it exists yet, is still denied to role agents
+> whenever the git common directory resolves: the router finds `<git common dir>/omr-executor` on disk, without running
+> git. When roles mode at start with enforced leases and
+> verification not `never` would assemble it, the router logs one notice per process:
+> `plan executor requires Windows; router_plan and /plan are not registered`.
 
 The plan executor runs a written plan (a Markdown file of phases and tasks) with several subagents at once, without
 letting a half-finished task touch your checkout. This page describes what it does, the `/plan` command, the
@@ -510,6 +520,11 @@ can cost a counted attempt rather than grant an unchecked pass.
 a plan awaiting approval. Recovery and adoption do not turn a compile/run request into approval.
 
 ## Windows notes
+
+CI exercises the Windows executor in `test + coverage (node 22, windows-latest)`: typecheck and the full
+default suite with coverage on master pushes and manual runs, without Windows e2e. Pull requests are
+Linux-only; without the Windows coverage input, the `src/executor/` prefix and `src/verify/exec.ts` are
+warn-only in the coverage gate. With that input, all gates block.
 
 - **Same drive, short root.** Keep slots on the repository's drive, outside every non-slot worktree; the default
   `<repo drive>:\.omr-slots\<planId>` is intentionally short. Configure a different root only in the global override.

@@ -9,6 +9,7 @@ import { readFileSync } from "node:fs";
 import * as configModule from "../../src/router/config";
 import * as gitTools from "../../src/router/git-tools";
 import * as executorModule from "../../src/executor/create";
+import * as platformModule from "../../src/executor/platform";
 import { createV2Runtime } from "../../src/compat/v2-client";
 
 const captured: { input?: Record<string, unknown> } = {};
@@ -33,7 +34,11 @@ function configuration(delegation = "tiers", leases = "enforce", require = "alwa
   return configModule.validateConfig({ ...bundled, routing: { delegation, leases: { mode: leases }, workRoots },
     enforcement: { verify: { require } } });
 }
-beforeEach(() => { vi.spyOn(configModule, "loadConfig").mockReturnValue(configuration()); });
+beforeEach(() => {
+  vi.spyOn(configModule, "loadConfig").mockReturnValue(configuration());
+  // The wiring under test is the Windows one; the G-16 case below drives the platform seam off Windows.
+  vi.spyOn(platformModule, "executorPlatformSupported").mockReturnValue(true);
+});
 afterEach(() => { vi.restoreAllMocks(); vi.clearAllMocks(); captured.input = undefined; });
 
 function context(extra: Record<string, unknown> = {}) {
@@ -68,6 +73,20 @@ describe("src/v2.ts: the host objects the plugin receives", () => {
     const prepare = vi.spyOn(executorModule, "prepareExecutor").mockResolvedValue({ ok: false, reason: "test repository unavailable" });
     await v2Plugin.setup(context({ location: { directory, project: { directory: root } } }) as unknown as Plugin.Context);
     expect(prepare).toHaveBeenCalledExactlyOnceWith(directory);
+  });
+
+  it("G-16: off Windows an eligible roles/enforce location runs no executor discovery and names the platform", async () => {
+    const root = process.platform === "win32" ? "D:/project" : "/project";
+    vi.mocked(configModule.loadConfig).mockReturnValue(configuration("roles", "enforce", "always", [root]));
+    vi.mocked(platformModule.executorPlatformSupported).mockReturnValue(false);
+    const spawn = vi.spyOn(gitTools, "spawnBounded").mockRejectedValue(new Error("unexpected discovery git"));
+    const prepare = vi.spyOn(executorModule, "prepareExecutor");
+    await v2Plugin.setup(context({ location: { directory: `${root}/sub`, project: { directory: root } } }) as unknown as Plugin.Context);
+    expect(prepare).not.toHaveBeenCalled();
+    expect(spawn).not.toHaveBeenCalled();
+    const access = captured.input?.routerExecutor as executorModule.ExecutorAccess;
+    expect(access.runtime()).toBeNull();
+    expect(access.unavailable()).toBe(`the plan executor is not available: ${platformModule.EXECUTOR_PLATFORM_REASON}`);
   });
 
   it("explains a missing child runner rather than leaving the executor not initialized", async () => {

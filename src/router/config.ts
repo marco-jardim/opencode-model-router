@@ -10,6 +10,7 @@ import {
 import { availableParallelism, homedir } from "node:os";
 import { dirname, isAbsolute, join, posix, resolve as resolvePath, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
+import { executorPlatformSupported } from "../executor/platform";
 import { EXECUTOR_LIMITS, type ExecutorConfig, type RunCommandRef } from "../executor/types";
 import { formatRouterLine } from "./build-info";
 import { parseJsonc } from "./jsonc";
@@ -3082,7 +3083,8 @@ function collectTaggedRoutingNotices(rawRouting: unknown, cfg: RouterConfig): Ar
       ...sanitizeRoleFloor(rawRouting.roleFloor).issues,
       ...sanitizeBackground(rawRouting.background).issues,
       ...sanitizeLeases(rawRouting.leases).issues,
-      ...sanitizeExecutor(rawRouting.executor).issues,
+      // QA-62C-2: the plan executor is inert off Windows (G-16), so its values are not validated there.
+      ...(executorPlatformSupported() ? sanitizeExecutor(rawRouting.executor).issues : []),
     ]) {
       tagged.push({ message, v2Only: true });
     }
@@ -3774,7 +3776,8 @@ function resolveExecutor(
 ): Readonly<ExecutorConfig> {
   const d = ROUTING_DEFAULTS.executor;
   const sanitized = sanitizeExecutor(raw);
-  for (const issue of sanitized.issues) {
+  // QA-62C-2: off Windows the executor is inert (G-16): invalid values still fall back to their defaults, silently.
+  for (const issue of executorPlatformSupported() ? sanitized.issues : []) {
     if (warnedRoutingIssues.has(issue)) continue;
     warnedRoutingIssues.add(issue);
     if (logger) logger.warn(issue);

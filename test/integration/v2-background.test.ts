@@ -212,7 +212,9 @@ describe("background dispatch: acknowledgement, in-flight list, completion annot
     h.emit(created(CHILD, ORCH));
     const call = await h.before(dispatch({ background: true }));
     await h.after({ ...call, status: "completed", result: structuredClone(RUNNING) });
-    await request(h, [user("continue")]); // the root request that teaches the adapter the parent is a root
+    // The root request that teaches the adapter the parent is a root; the attempt is listed in flight before its end event.
+    const before = await request(h, [user("continue")]);
+    expect(allText(before)).toContain("In flight (background): 1");
     h.childContext.set(CHILD, [
       { type: "user", id: "m1", content: [{ type: "text", text: "do the work" }] },
       { type: "assistant", id: "m2", content: [{ type: "text", text: "real host result" }] },
@@ -220,13 +222,20 @@ describe("background dispatch: acknowledgement, in-flight list, completion annot
     // A unique event id: the adapter drops an end event id it has already seen in this process.
     h.emit({ type: "session.execution.succeeded", id: "ev-end-typed-assistant", created: 2, data: { sessionID: CHILD } });
     await h.drain();
-    // The end handler awaits the timing store before it starts the processor: poll the tail until the attempt left the in-flight list.
+    // The end handler awaits the timing store before it starts the processor: poll until the attempt left the in-flight list.
+    // G-16: the whole context is checked, as in QA-2.1-21: once the processing settled there may be no turn-state tail at all
+    // (`tail()` threw then, so the poll only passed when it caught a tail before that; on Linux CI it never did).
     await vi.waitFor(async () => {
-      const state = tail(await request(h, [user("continue")]));
+      const state = allText(await request(h, [user("continue")]));
       expect(state).not.toContain("In flight (background)");
       expect(state).not.toContain("router guarantees pending");
     }, { timeout: 5000, interval: 50 });
-  });
+    // The settled outcome: the held attempt's verdict, posted to the parent, carries the text read from the typed `assistant`
+    // entry (as in DF-1-4, the verdict entry quotes the child's answer). The processor journals and runs the gate before it posts.
+    const verdicts = (): string[] => h.synthetic.filter((s) => s.text.startsWith("<router-verdict ")).map((s) => s.text);
+    await vi.waitFor(() => expect(verdicts()).toHaveLength(1), { timeout: 20_000 });
+    expect(verdicts()[0]).toContain("real host result");
+  }, 60_000);
 
   it("QA-2.1-21: the processing an end event starts is tracked: settled() (and dispose) wait for it, no polling", async () => {
     const h = await boot("auto");
@@ -402,7 +411,8 @@ describe("QA-DF1 round 2: the completion elements of a resumed background dispat
     await vi.waitFor(() => expect(verdicts(h)).toHaveLength(posted + 1), { timeout: 20_000 });
     expect(verdicts(h).at(-1)).toContain("DONE: turn two");
     expect(verdicts(h).slice(posted).join("\n")).not.toContain("NEED MORE: turn one");
-  });
+    // Every wait above is on a condition; two processed turns with fsync'd journal and verdict writes exceed 5 s on a slow CI disk.
+  }, 30_000);
 
   it("QA-DF1-20: an attempt its end left `child-ended` is read again on the parent's next request, with no new completion element", async () => {
     const h = await boot("auto");
@@ -715,7 +725,10 @@ describe("static engine: timing rows feed the background decision", () => {
     // The timing clock starts at execute.before (the host's wall clock); the end event carries the child's end time.
     await h.after({ ...call, status: "completed", result: { output: { sessionID: child, status: "completed", output: "done" }, content: "done", metadata: { sessionID: child } } });
     h.emit({ type: "session.execution.succeeded", id: `ev-slow-${n}`, created: Date.now() + durationMs, data: { sessionID: child } });
-    await h.drain();
+    // G-20: the end event's timing row reaches the duration model only after the timing store's (fsync'd) write, which the
+    // adapter tracks as background work (v2-hooks.ts, QA-2.1-21). `drain` only spins bounded microtask turns, so on a slow
+    // runner disk the 5th row was not observed yet when the next dispatch was decided; `settled` waits for that write.
+    await h.settled();
     return call;
   }
 

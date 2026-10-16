@@ -7,6 +7,7 @@
 import { lstatSync, realpathSync } from "node:fs";
 import { join, posix, win32 } from "node:path";
 import { permissionMatches } from "../../router/read-only";
+import { isPathSeparator, trimEndWhile } from "../../util/linear-trim";
 
 /** A win32 8.3 short-name segment (`PROGRA~1`, `MARQUI~1.TXT`): refused, never expanded (S11, P-11: fail closed). */
 export const SHORT_NAME_SEGMENT = /(?:^|[\\/])[^\\/~]{1,8}~\d+(?:\.[^\\/.]{0,3})?(?=[\\/]|$)/;
@@ -41,7 +42,8 @@ export function canonicalAuthorityPath(
   }
   if (!api.isAbsolute(text) && !api.isAbsolute(base)) return undefined;
   const sep = platform === "win32" ? "\\" : "/";
-  let head = api.isAbsolute(text) ? text : `${base.replace(/[\\/]+$/, "")}${sep}${text}`;
+  let head = text;
+  if (!api.isAbsolute(text)) head = `${trimEndWhile(base, isPathSeparator)}${sep}${text}`;
   const tail: string[] = [];
   const missing = (error: unknown): boolean => {
     const code = (error as { code?: unknown } | null)?.code;

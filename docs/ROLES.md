@@ -207,6 +207,12 @@ parent's directory.
   executor home cannot be resolved, no slots-root allowance is added (fail closed). When the directory OpenCode was
   started in lies outside every `routing.workRoots` entry, the worktrees are still listed and the executor home is still
   denied, but there is no executor slots-root allowance. See [Assembly and lifecycle](./EXECUTOR.md#assembly-and-lifecycle).
+  The plan executor is Windows only in this release: on other platforms it is inert, so role agents get no
+  slots-root allowance and no executor-home lookup runs. The executor home in the git common directory (a Windows host
+  runs the executor on a repository shared with, for example, WSL) is still denied, whether or not it exists yet: starting
+  at the listed worktree, else the directory OpenCode was started in, the router walks up to the nearest repository and
+  reads its `.git` (and its `commondir`; each at most 4 KiB, regular files only, a linked `.git` refused) to find
+  `<git common dir>/omr-executor` on disk, without running git. When no repository is found, nothing is denied.
 - **Canonical long form.** Write `routing.workRoots` entries in their canonical long spelling: an 8.3 short segment
   (`PROGRA~1`) is refused, because the host compares spellings and a short name can alias another directory.
 - **Over-match.** `*` crosses separators: `D:/git/omr-rta-*` allows every directory starting with `omr-rta-`, nested
@@ -822,7 +828,10 @@ before (`background: false` for a role-routed call).
 For execution of a written plan, see [the plan executor guide](EXECUTOR.md): `/plan` and `router_plan`, human approval,
 isolated slots, [leases and safety invariants](EXECUTOR.md#safety-model), recovery and the
 [owner checklist](EXECUTOR.md#owner-checklist-for-the-next-real-plan). It requires roles mode at start and enforced
-leases; plain role dispatches do not become plan tasks merely by running in the background.
+leases; plain role dispatches do not become plan tasks merely by running in the background. The plan executor is
+Windows only in this release: on platforms other than Windows `router_plan` and `/plan` are not registered, and when
+roles mode at start with enforced leases and verification not `never` would assemble it the router logs one notice per
+process, `plan executor requires Windows; router_plan and /plan are not registered`.
 
 ## File leases
 

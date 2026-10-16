@@ -20,6 +20,7 @@ import {
   validateSlotsDir,
   type RouterConfig,
 } from "../../src/router/config";
+import * as platformModule from "../../src/executor/platform";
 import { EXECUTOR_LIMITS } from "../../src/executor/types";
 import { removeDirWhenReleased } from "../helpers/remove-dir";
 
@@ -391,7 +392,39 @@ describe("routing.executor — run references, provision and python", () => {
 });
 
 describe("routing.executor — warnings and notices", () => {
-  beforeEach(() => resetRoutingWarnings());
+  // The executor (and so its validation) is Windows-only (G-16); these tests pin the platform seam to a supported one.
+  beforeEach(() => {
+    resetRoutingWarnings();
+    vi.spyOn(platformModule, "executorPlatformSupported").mockReturnValue(true);
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  it("QA-62C-2 off Windows (seam false) invalid executor values warn nowhere and still fall back to their defaults", () => {
+    vi.mocked(platformModule.executorPlatformSupported).mockReturnValue(false);
+    const logger = { warn: vi.fn() };
+    const routing: unknown = { executor: { maxParallel: 99, approve: "x", slotsDir: "/srv/slots" } };
+    const raw = { ...cfgWith({}), routing } as RouterConfig;
+    const executor = resolveRouting(raw, "v2", logger).executor;
+    expect(executor.maxParallel).toBe(4);
+    expect(executor.approve).toBe("ask");
+    expect(executor.slotsDir).toBeNull();
+    expect(logger.warn).not.toHaveBeenCalled();
+    const rawRouting = { executor: { wakeDebounceMs: 5, slotsDir: "/srv/slots" } };
+    expect(collectRoutingNotices(rawRouting, cfgWith(rawRouting.executor)).filter((m) => m.includes("routing.executor"))).toEqual([]);
+    expect(collectRoutingNotices({ executor: "fast" }, cfgWith({})).filter((m) => m.includes("routing.executor"))).toEqual([]);
+  });
+
+  it("QA-62C-2 on Windows (seam true) the same invalid executor values still warn, once each", () => {
+    const logger = { warn: vi.fn() };
+    const routing: unknown = { executor: { maxParallel: 99, slotsDir: "/srv/slots" } };
+    const raw = { ...cfgWith({}), routing } as RouterConfig;
+    expect(resolveRouting(raw, "v2", logger).executor.slotsDir).toBeNull();
+    const messages = logger.warn.mock.calls.map((call) => String(call[0]));
+    expect(messages).toContain("routing.executor.maxParallel must be an integer from 1 to 8 (got 99); using 4");
+    expect(messages.filter((m) => m.startsWith("routing.executor.slotsDir"))).toHaveLength(1);
+    expect(collectRoutingNotices({ executor: { slotsDir: "/srv/slots" } }, cfgWith({})).filter((m) => m.startsWith("routing.executor.slotsDir")))
+      .toHaveLength(1);
+  });
 
   it("resolveRouting warns once per invalid entry on v2 and applies the default", () => {
     const logger = { warn: vi.fn() };
@@ -522,6 +555,7 @@ describe("routing.executor — trust (D18): project-local override", () => {
     rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     rmSync(project, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     invalidateConfigCache();
+    vi.restoreAllMocks();
   });
 
   it("drops the five trusted keys from the project layer, keeps the others, and says so in one notice", () => {
@@ -735,6 +769,8 @@ describe("routing.executor — trust (D18): project-local override", () => {
   });
 
   it("QA-4.1-9: an invalid executor value is a v2-only notice, and configAsWritten still names its key", () => {
+    // Executor validation is Windows-only (G-16, QA-62C-2): pin the platform seam to a supported one.
+    vi.spyOn(platformModule, "executorPlatformSupported").mockReturnValue(true);
     writeGlobal({ routing: { executor: { maxParallel: 99 } } });
     const cfg = loadConfig(project);
     expect(cfg.routing?.executor?.maxParallel).toBeUndefined();

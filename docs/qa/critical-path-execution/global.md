@@ -411,6 +411,44 @@ empty, so the smoke gate above stands for the merged code. Run in `D:\git\omr-cp
   failure becomes a 6.2 finding (6.2.4-2).
 - CHANGELOG and `docs/CONFIG_REFERENCE.md` completed in `9829c3c` (docs only; docs-drift 135/135).
 
+### 6.2.4-2: PR #116 CI findings and fixes (2026-10-16/17)
+
+PR #116 (`7b34437`) failed CI: 34 tests on ubuntu (node 22/24, coverage), timing failures on every Windows job, and
+CodeQL (4 new alerts). Fixed in `cpx/p62`, validated through a CI-only draft PR #117 (`cpx/p62` → `cpx/main`, closed
+unmerged) and locally on Windows and on Linux (WSL Ubuntu, clean clone with the same diff).
+- **G-16 (blocking): the plan executor only works on Windows** (`routing.executor.slotsDir` must be a drive-letter
+  path; default `<drive>:\.omr-slots`). **Owner decision (option A):** Windows-only in this release. Off Windows on
+  OpenCode v2: no `router_plan`, no `/plan`, no plan help, no start-up discovery, no slots grant, one notice per process
+  (roles at start, leases `enforce`, verify not `never`); one seam `src/executor/platform.ts`. Real executor suites
+  run on win32 only; an all-platform suite asserts the inert behaviour. Linux-only test fixes: tool-paths expectation
+  (product splits on both separators, intended), hermetic provision PATH, v2-background polls the whole context,
+  docs-drift reads EXECUTOR.md line-ending agnostic (the Windows CI checkout has CRLF). Commit `096da6b`.
+- **G-17 (CI, test-only):** heartbeat and release waits synchronized on deterministic signals; git/IO-heavy tests
+  bounded with measured per-test timeouts. Commit `d31cbbc`.
+- **G-18 (CodeQL):** linear trailing-separator trim (`js/polynomial-redos`, `src/routing/roles/work-root.ts`) and a
+  full regex escape in the host-contract smoke (`js/incomplete-sanitization`). Commit `0b7d853`. The two
+  `js/bad-tag-filter` alerts in `src/executor/compile/parse.ts` are false positives (`-->` is the plan graph arrow,
+  no HTML is parsed) and are dismissed as such.
+- **Heavy QA of G-16..G-18** (`ses_eb9f914bbffeOjbtEi7ZYKrXrW`): round 1 — 6 minor, 6 nit (QA-62C-1..12), all fixed
+  (`e0141ec`, `466c841`): an on-disk executor-home deny off Windows (a repo shared with a Windows host), executor
+  config issues silenced off Windows, a process-global notice flag, the lock heartbeat retries after 1 s and warns
+  after 3 failures, partial win32 gating that keeps portable coverage, docs wording. Round 2
+  (`ses_eb9c68543ffezhPASg8VXqMMMU`): all 12 closed; 1 medium (QA-62C-13: the on-disk reader was unbounded and
+  FIFO-unsafe → now the hardened `nearestRepository`/`gitPointers`), fixed with QA-62C-14 (deny before the home
+  exists), -16, -17 in `3cde83b`. Round-2 lows QA-62C-15, -18, -19 deferred (below); no round 3 (no major).
+- **G-20 (CI, test-only):** remaining CI races (lock polls fired before the poll sleep was armed, timing rows read
+  before they were written, IO-bound cases) synchronized or bounded. Commit `6f2ba73`.
+- **G-21 (CI): owner decision (options B + C).** GitHub's Windows runners took 12-28 min per job with timing flakes.
+  Pull requests run Linux only; one Windows job (`test + coverage (node 22, windows-latest)`: typecheck + full default
+  suite with coverage) runs on master pushes and manual runs. The coverage gate merges Windows unit coverage when
+  present; without it `src/verify/exec.ts` and the `src/executor/` prefix are warn-only (`--warn-only-prefix`). No
+  local pre-push hook (owner decision). Commits `8b81baf`, `977c84b`.
+- **PR #117 CI at `977c84b`: all green** (test node 22/24, e2e, bun smoke, coverage, coverage gate, smoke-keyless;
+  Windows job skipped on the PR by design).
+- `verify-resource-budget.deferred` 3.1.2.f (e2e, p50 capture wait): measured 1101-7060 ms locally at `origin/master`
+  and 2820-5181 ms on this branch with the same command, and passed on PR #117's Linux e2e; no product overhead found
+  by QA (the measured hook is v1, unchanged); recorded with G-10's load-sensitive family.
+
 ## Deferred findings
 
 - **G-10 (minor, test):** load-sensitive tests (`v2-background` "QA-DF1-17", `routing-ladder-resume` "QA-2.3-2",
@@ -421,6 +459,12 @@ empty, so the smoke gate above stands for the merged code. Run in `D:\git\omr-cp
 - **G-14 (minor, pre-existing, host drift):** role-spikes S11 fails identically at `origin/master` `6ec3faa`; out of
   the plan's scope (A-6.2-2). The cause is not proven (QA-62F-6).
 - **PF-4:** routing-engine smoke `5-advisor`, pre-existing (fails at `7181165` too).
+- **QA-62C-15 (low):** off Windows a bare repository or a Git-for-Windows `gitdir: D:/…` pointer under WSL resolves no
+  common directory, so no executor-home deny (no warning for an unparsable `.git`). Fail-open only for a repo shared
+  with a Windows host; the hardened reader already refuses unsafe pointers.
+- **QA-62C-18 (low):** a heartbeat side file is left on a write error; with the 1 s retry a long failure streak
+  leaks more tmp files until the next acquire cleans them.
+- **QA-62C-19 (info):** wording cleanups (double log prefix, one 5 s in-flight wait, Windows leases-off asymmetry).
 - **Phase 6.1 deferrals:** the [Phase 6.1 consolidated table](phase-6.1.md#deferred-findings) remains authoritative,
   by reference under **A-6.2-2**; m-A from that queue was fixed here (folded into G-1).
 
@@ -432,6 +476,9 @@ empty, so the smoke gate above stands for the merged code. Run in `D:\git\omr-cp
   visible to the executor's venv.
 - G-4 follow-up: ordinary verification's `verify/wiring.ts` test search and committed-diff call still use bare git.
 - G-3: G13 remains UNMET, owner decision pending.
+- G-16: POSIX support for the plan executor (slots root, provision, environments) in a separate change.
+- G-21: the Windows CI job runs only on master pushes; a Windows regression first shows there. Watch its first run
+  after the #116 merge.
 
 ## Verdict
 

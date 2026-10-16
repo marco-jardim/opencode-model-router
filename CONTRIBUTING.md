@@ -12,7 +12,12 @@ npm run typecheck # tsc --noEmit
 ```
 
 There is no build step — the plugin ships TypeScript sources directly. CI runs the same
-two commands on Node 22 and 24, across ubuntu-latest and windows-latest.
+two commands on Node 22 and 24 on ubuntu-latest. Pull requests are Linux-only, including
+e2e and Bun smoke. Master pushes and manual (`workflow_dispatch`) runs also run one
+Windows job on Node 22: typecheck and the full default suite with coverage, without e2e.
+The coverage gate requires Linux unit and e2e inputs and merges Windows unit coverage
+when present. Without the Windows input, only `src/verify/exec.ts` and the `src/executor/`
+prefix are warn-only; every other gate still blocks. With it, all gates block.
 
 ## Golden snapshots
 

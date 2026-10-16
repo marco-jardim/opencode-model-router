@@ -2,6 +2,29 @@
 // make a location "outside" (nothing changes for a user without them).
 import { describe, expect, it } from "vitest";
 import { locationOutsideWorkRoots } from "../../src/router/work-roots";
+import { canonicalAuthorityPath } from "../../src/routing/roles/work-root";
+
+describe("G-18 canonicalAuthorityPath trailing separators", () => {
+  it.each<{ platform: NodeJS.Platform; base: string; expected: string }>([
+    { platform: "linux", base: "/work", expected: "/work/child" },
+    { platform: "linux", base: "/work/\\/", expected: "/work/child" },
+    { platform: "linux", base: "/", expected: "/child" },
+    { platform: "win32", base: "C:\\", expected: "C:\\child" },
+    { platform: "win32", base: "C:/", expected: "C:\\child" },
+    { platform: "win32", base: "C:\\work\\/\\/", expected: "C:\\work\\child" },
+    { platform: "win32", base: "C:\\link\\..\\work\\/", expected: "C:\\link\\..\\work\\child" },
+  ])("trims trailing separators from $base on $platform without normalising the base", ({ platform, base, expected }) => {
+    expect(canonicalAuthorityPath("child", base, { platform, realpath: path => path })).toBe(expected);
+  });
+
+  it("trims a 100,000-character run of trailing separators but preserves an interior run", () => {
+    const separators = "/\\".repeat(50_000);
+    const opts = { platform: "linux" as const, realpath: (path: string) => path };
+    expect(canonicalAuthorityPath("child", `/work${separators}`, opts)).toBe("/work/child");
+    const base = `/work${separators}nested`;
+    expect(canonicalAuthorityPath("child", base, opts)).toBe(`${base}/child`);
+  });
+});
 
 describe("DF-1-1 locationOutsideWorkRoots", () => {
   it("DF-1-1 unset or empty work roots: never outside", () => {
