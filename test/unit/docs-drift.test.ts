@@ -301,15 +301,21 @@ const ROUTING_DOCS = [
   "docs/CONFIG_REFERENCE.md",
 ] as const;
 
+/** Drops inline HTML tags in one scan: everything from a `<` to the next `>`, and an unclosed `<` to the end. */
+function stripTags(text: string): string {
+  let out = "";
+  let inTag = false;
+  for (const ch of text) {
+    if (ch === "<") inTag = true;
+    else if (ch === ">" && inTag) inTag = false;
+    else if (!inTag) out += ch;
+  }
+  return out;
+}
+
 /** GitHub's heading slug: lower case, no backticks or punctuation, spaces become hyphens. */
 function slugOf(heading: string): string {
-  return heading
-    .trim()
-    .toLowerCase()
-    .replace(/`/g, "")
-    // Drop inline HTML tags, then any stray angle bracket, so no tag can be rebuilt from nested fragments.
-    .replace(/<[^<>]*>/g, "")
-    .replace(/[<>]/g, "")
+  return stripTags(heading.trim().toLowerCase().replace(/`/g, ""))
     .replace(/[^\p{L}\p{N}\s_-]/gu, "")
     .replace(/\s/g, "-");
 }
