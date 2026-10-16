@@ -462,8 +462,8 @@ export interface RoleRegistrationOptions {
   /** The context7 MCP server is configured (its documentation tools become direct tools). */
   context7: boolean;
   /**
-   * The project directory: its repository's worktrees are listed, unless `routing.workRoots` is set and the directory lies
-   * outside every entry (`locationOutsideWorkRoots`, QA-DF1-19): then no worktree listing or executor-home lookup runs.
+   * The project directory: its repository's worktrees are listed. When `routing.workRoots` is set and the directory lies
+   * outside every entry (`locationOutsideWorkRoots`), no executor-home lookup runs (QA-5.1-5).
    */
   directory: string;
   /** The host's own agents at setup (name → seed definition); a removed #81 entry falls back to it. */
@@ -527,10 +527,10 @@ export async function registerRoleAgents(
     const hasLocalActions = [...table.roles.values()].some(roleHasLocalActions);
     let worktrees: string[] = [];
     let worktreeListingProblem: string | undefined;
-    // QA-DF1-19: a location outside configured `routing.workRoots` gets no worktree listing or worktree rules.
-    // Unset or empty `workRoots`: the worktrees are listed as before.
+    // G-12: the worktrees are listed whatever `routing.workRoots` contains (a glob for later-created worktrees must not
+    // drop the existing ones). Only the executor-home lookup below is skipped outside every configured work root.
     const outside = locationOutsideWorkRoots(opts.directory, routing.workRoots, process.platform, opts.realpath ?? nativeRealpath);
-    if (!outside && hasLocalActions) {
+    if (hasLocalActions) {
       try {
         worktrees = await (opts.listWorktrees ?? listWorktrees)(opts.directory);
       } catch (error) {

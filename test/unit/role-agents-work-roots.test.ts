@@ -1,7 +1,8 @@
 /**
- * QA-DF1-19: in roles mode a location outside a configured `routing.workRoots` runs no start-up git: the role agent
- * registration skips the worktree listing (`git worktree list --porcelain`) and keeps only the `workRoots` patterns as
- * `external_directory` rules. Without `routing.workRoots` the worktrees are listed wherever the location is (unchanged).
+ * QA-DF1-19, reverted by G-12: in roles mode the role agent registration lists the repository's worktrees
+ * (`git worktree list --porcelain`) whatever `routing.workRoots` contains, so a location outside every entry keeps its
+ * worktree roots as `external_directory` rules next to the `workRoots` patterns. Only the executor-home lookup is skipped
+ * outside every configured work root (QA-5.1-5).
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
@@ -50,7 +51,7 @@ function options(directory: string, listWorktrees: (directory: string) => Promis
 const sep = process.platform === "win32" ? "\\" : "/";
 const slash = (path: string): string => path.replaceAll("\\", "/");
 
-describe("QA-DF1-19 role agent registration outside routing.workRoots", () => {
+describe("QA-DF1-19/G-12 role agent registration and routing.workRoots", () => {
   it.each([
     ["tiers", "tiers", "enforce", "always"],
     ["leases off", "roles", "off", "always"],
@@ -83,7 +84,7 @@ describe("QA-DF1-19 role agent registration outside routing.workRoots", () => {
     expect(opts.warn).not.toHaveBeenCalled();
   });
 
-  it("QA-DF1-19 a location outside routing.workRoots lists no worktrees and keeps only the workRoots patterns", async () => {
+  it("QA-DF1-19/G-12 a location outside routing.workRoots still lists the worktrees and keeps the workRoots patterns", async () => {
     const base = temp();
     const outside = temp("omr-roles-wr-elsewhere-");
     const wt = join(base, "omr-wt");
@@ -93,13 +94,35 @@ describe("QA-DF1-19 role agent registration outside routing.workRoots", () => {
     const cfg = rolesConfig([`${slash(base)}/omr-*`]);
     cfg.routing = { ...cfg.routing, leases: { mode: "enforce" } };
     cfg.enforcement = { ...cfg.enforcement, verify: { require: "always" } };
+    // The listing goes through the seam; the executor-home lookup stays skipped outside every work root (QA-5.1-5).
     const spawn = vi.spyOn(gitTools, "spawnBounded").mockRejectedValue(new Error("unexpected start-up git"));
     const result = await registerRoleAgents({}, cfg, opts);
     expect(result.failed).toBe(false);
-    expect(list).not.toHaveBeenCalled();
+    expect(list).toHaveBeenCalledWith(outside);
     expect(spawn).not.toHaveBeenCalled();
-    expect(result.externalDirectory).toEqual([`${base}${sep}omr-*`]);
+    expect(result.externalDirectory).toEqual([join(wt, "*"), `${base}${sep}omr-*`]);
     expect(opts.warn).not.toHaveBeenCalled();
+  });
+
+  it("G-12 a workRoots glob for later-created worktrees does not drop the project's existing worktrees", async () => {
+    const base = temp();
+    const project = join(base, "project");
+    const wt1 = join(base, "wt-1");
+    mkdirSync(project);
+    mkdirSync(wt1);
+    const list = vi.fn(async () => [slash(project), slash(wt1)]);
+    const agents: Record<string, Record<string, unknown>> = {};
+    const result = await registerRoleAgents(agents, rolesConfig([`${slash(base)}/wt-late-*`]), options(project, list));
+    expect(result.failed).toBe(false);
+    expect(list).toHaveBeenCalledWith(project);
+    const late = `${base}${sep}wt-late-*`;
+    expect(result.externalDirectory).toEqual([join(project, "*"), join(wt1, "*"), late]);
+    const implementer = permissionRules(agents.implementer!.permission as PermissionMap)
+      .filter((rule) => rule.action === "external_directory" && rule.effect === "allow")
+      .map((rule) => rule.resource);
+    expect(implementer).toEqual(expect.arrayContaining([join(wt1, "*"), late]));
+    expect(evaluatePermission(permissionRules(agents.implementer!.permission as PermissionMap), "external_directory", join(wt1, "src", "x.ts")))
+      .toBe("allow");
   });
 
   it("QA-DF1-19 a location inside routing.workRoots (or below an entry) still lists the worktrees", async () => {

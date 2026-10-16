@@ -290,10 +290,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   session whose claim belongs to a live sibling instance, so that instance's records stay dormant and its verdict is
   the only one delivered. A dead owner (stale beat, or dead pid) is still recovered as before. Journal and claim
   records written by earlier builds read as before. OpenCode v1 is unchanged.
-- **OpenCode v2: no start-up git in a location outside `routing.workRoots`.** When `routing.workRoots` is configured and
-  non-empty, an instance loaded in a directory outside every entry skips the start-up reference GC and logs one info
-  line naming the skip; in roles mode, role agent registration there runs no `git worktree list` and the role agents
-  get only the `routing.workRoots` patterns as `external_directory` rules. The location check uses the documented
+- **OpenCode v2: no start-up reference GC in a location outside `routing.workRoots`.** When `routing.workRoots` is
+  configured and non-empty, an instance loaded in a directory outside every entry skips the start-up reference GC and
+  logs one info line naming the skip. Role agent registration in roles mode still lists the repository's worktrees
+  there (`git worktree list`, read-only), so a `routing.workRoots` glob meant for later-created worktrees does not drop
+  the existing ones from the role agents' `external_directory` rules. The location check uses the documented
   glob semantics (`*` crosses separators, as in the role agents' rules) and compares canonical paths. Without
   `routing.workRoots` nothing changes. OpenCode v1 is unchanged.
 - **OpenCode v2: `router_verify` on a held background handle reports the verdict its gate reached** (method, outcome,

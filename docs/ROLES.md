@@ -197,10 +197,7 @@ parent's directory.
   agents are registered, plus the `routing.workRoots` globs (global layer only, default `[]`), never `*`. A worktree
   created after the plugin started outside the trusted executor slots root is covered only by a matching
   `routing.workRoots` glob (or a restart). Roles without local actions (`researcher`) get no `external_directory`
-  rule. When `routing.workRoots` is set and the
-  directory OpenCode started in lies outside every entry (compared in its canonical form), the router runs no
-  `git worktree list` at start. The role agents then get the `routing.workRoots` globs and, when safely resolved, the
-  trusted executor slots-root allowance below.
+  rule.
 - **Executor slots root.** On v2, role agents with local actions may work under the trusted slots root:
   `routing.executor.slotsDir` from the bundled configuration or global override, or `<repo drive>:\.omr-slots` by
   default. Each plan uses `<root>\<planId>`. `routing.workRoots` is not needed for it, including slots created after
