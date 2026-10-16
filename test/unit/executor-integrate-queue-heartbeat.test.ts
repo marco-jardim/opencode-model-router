@@ -50,14 +50,20 @@ async function heartbeatOf(file: string): Promise<number> {
  * The product treats that as transient and retries at the next beat, and this fake clock never reaches that beat on its
  * own. That is why polling the file before the attempt finished timed out on CI. A beat that an outside reader (such as
  * an antivirus scan) still made fail is fired again at the same fake instant. The expected heartbeat stays the same,
- * and a beat that never lands still fails at the deadline.
+ * and a beat that never lands still fails at the deadline. QA-62C-7: a failed beat re-arms at the short retry delay
+ * (LOCK_HEARTBEAT_RETRY_MS, 1 s), which this fake clock holds like the normal period, so a re-fire runs that retry.
+ * QA-62C-8: at most BEAT_REFIRES re-fires; more means the beat keeps failing, which is reported, not hidden.
  */
+const BEAT_REFIRES = 3;
 async function beatSettled(clock: FakeClock, file: string, want: number, deadline: number): Promise<number> {
-  for (;;) {
+  for (let refires = 0; ; refires++) {
     clock.fire();
     while (clock.heldCount() === 0 && Date.now() < deadline) await realPause(5);
     const got = await heartbeatOf(file);
     if (got === want || clock.heldCount() === 0 || Date.now() >= deadline) return got;
+    if (refires >= BEAT_REFIRES) {
+      throw new Error(`beatSettled: the heartbeat is still ${got}, not ${want}, after ${refires} re-fires (more than ${BEAT_REFIRES} is a beat that keeps failing)`);
+    }
   }
 }
 

@@ -130,11 +130,13 @@ async function fixture(setting: "auto" | "configured" = "configured") {
 }
 
 describe("prepared execution-slot command resolution", () => {
-  // executor is Windows-only (G-16): with PATH="" a POSIX background check cannot find its `nice` wrapper (spawn nice ENOENT).
-  it.runIf(process.platform === "win32").each(["auto", "configured"] as const)("uses the registered %s suite/base/bisect/revert binary and environment, not integration's install", async setting => {
+  it.each(["auto", "configured"] as const)("uses the registered %s suite/base/bisect/revert binary and environment, not integration's install", async setting => {
     const f = await fixture(setting);
     const original = JSON.stringify(f.commands);
     expect(f.commands[0]).toMatchObject({ file: f.binary(f.integration), resolution: { cwd: f.integration, env: { VIRTUAL_ENV: join(f.integration, ".venv") } } });
+    // executor is Windows-only (G-16): with PATH="" a POSIX background check cannot find its `nice` wrapper (spawn nice ENOENT),
+    // so only the command resolution above runs everywhere; executing the suite, bisect and revert is checked on win32.
+    if (process.platform !== "win32") return;
     const verdict = await f.runner.run({ planId: "plan", phaseId: "p1", slot: f.ci, commit: f.c3, base: f.c0, commands: f.commands,
       ranges: [{ taskId: "T1", from: f.c0, to: f.c1 }, { taskId: "T2", from: f.c1, to: f.c2 }, { taskId: "T3", from: f.c2, to: f.c3 }] }, f.journal());
     expect(verdict).toEqual({ kind: "culprit", range: { taskId: "T2", from: f.c1, to: f.c2 }, ids: [], files: [] });
@@ -179,13 +181,16 @@ describe("prepared execution-slot command resolution", () => {
     expect(f.executed).toEqual([]);
   }, 30_000);
 
-  // executor is Windows-only (G-16): with PATH="" a POSIX background check cannot find its `nice` wrapper (spawn nice ENOENT).
-  it.runIf(process.platform === "win32").each([false, true])("preserves explicit environment overrides and explicit cwd=%s, even equal to inherited defaults", async overrideCwd => {
+  it.each([false, true])("preserves explicit environment overrides and explicit cwd=%s, even equal to inherited defaults", async overrideCwd => {
     const f = await fixture();
     const original = f.commands[0]!;
     const inheritedPath = Object.entries(original.resolution!.env).find(([key]) => key.toUpperCase() === "PATH")![1];
     const command = { ...original, ...(overrideCwd ? { cwd: f.integration } : {}),
       env: { [process.platform === "win32" ? "path" : "PATH"]: inheritedPath, VIRTUAL_ENV: "explicit-venv", PYTHONPATH: "explicit-imports" } };
+    // executor is Windows-only (G-16): with PATH="" a POSIX background check cannot find its `nice` wrapper (spawn nice ENOENT),
+    // so only the fixture's command resolution and its inherited PATH run everywhere; the run and what it must leave untouched
+    // in the command are checked on win32.
+    if (process.platform !== "win32") return;
     const result = await f.checks.runCommands({ slot: f.ci, commit: f.c0, commands: [command], prepare: true, mode: "full",
       priority: "background", signal: new AbortController().signal });
     expect(result.error).toBeNull();

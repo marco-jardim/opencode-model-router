@@ -65,6 +65,8 @@ import {
 export const PREEMPT_LIMIT = 3, LOCK_HEARTBEAT_MS = 30_000, LOCK_STALE_MS = 600_000, STALLED_POLL_MS = 5_000;
 /** QA-3.2-33: a repo-lock wait is reported once after this long. */
 export const LOCK_WAIT_REPORT_MS = 300_000;
+/** QA-62C-7: a failed repo-lock heartbeat is retried after at most this long; this many failures in a row are warned once. */
+export const LOCK_HEARTBEAT_RETRY_MS = 1_000, LOCK_HEARTBEAT_WARN_FAILURES = 3;
 /** QA-3.2-30: retries of a tag entry of a completed plan (after its 3 tries), with doubling delays from TAG_RETRY_BASE_MS. */
 export const TAG_RETRY_LIMIT = 3, TAG_RETRY_BASE_MS = 60_000;
 
@@ -410,8 +412,11 @@ export interface RepoLockWithTakeover extends RepoLock { readonly takeover: "dea
 export function createRepoLockFactory(o: {
   stateRoot: string; clock: Clock; pid: number; hostname: string;
   isPidAlive: (pid: number) => boolean; heartbeatMs?: number; staleMs?: number; waitReportMs?: number;
+  /** QA-62C-7: told once when the heartbeat failed LOCK_HEARTBEAT_WARN_FAILURES times in a row. */
+  logger?: Pick<Logger, "warn">;
 }): RepoLockFactory {
   const heartbeatMs = o.heartbeatMs ?? LOCK_HEARTBEAT_MS;
+  const heartbeatRetryMs = Math.min(heartbeatMs, LOCK_HEARTBEAT_RETRY_MS);
   const staleMs = o.staleMs ?? LOCK_STALE_MS;
   const waitReportMs = o.waitReportMs ?? LOCK_WAIT_REPORT_MS;
 
@@ -611,8 +616,12 @@ export function createRepoLockFactory(o: {
         const current = raw === null ? null : parseLockFile(raw);
         return current !== null && current.pid === o.pid && current.hostname === o.hostname && current.token === token;
       };
+      /** QA-62C-7: transient beat failures in a row; a success resets it. */
+      let failures = 0;
       const beatOnce = async (): Promise<void> => {
         if (released || lost.signal.aborted) return;
+        let failed: unknown = null;
+        let ok = false;
         try {
           const raw = await readRaw(file);
           if (released) return;
@@ -633,10 +642,26 @@ export function createRepoLockFactory(o: {
             await unlink(tmp).catch(() => undefined);
             throw e;
           }
-        } catch {
-          // A transient read or rename failure is retried at the next beat; only a missing or foreign lock file is a loss.
+          ok = true;
+        } catch (e) {
+          // A transient read or rename failure is retried soon (QA-62C-7); only a missing or foreign lock file is a loss.
+          failed = e;
         }
-        if (!released && !lost.signal.aborted) timer = o.clock.setTimer(heartbeatMs, beat);
+        if (released || lost.signal.aborted) return;
+        if (ok) {
+          failures = 0;
+        } else {
+          failures++;
+          if (failures === LOCK_HEARTBEAT_WARN_FAILURES) {
+            try {
+              o.logger?.warn(`integration queue: repo lock heartbeat failed ${failures} times in a row (${file}); retrying every ${heartbeatRetryMs} ms: ${message(failed)}`);
+            } catch {
+              // A reporting failure never stops the heartbeat.
+            }
+          }
+        }
+        // A failed beat re-arms at the short retry delay; a successful one at the normal period.
+        timer = o.clock.setTimer(ok ? heartbeatMs : heartbeatRetryMs, beat);
       };
       const beat = (): void => {
         const p = beatOnce();

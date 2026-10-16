@@ -2036,8 +2036,8 @@ describe("slot name, marker path, lock reason and safe dir", () => {
 // ---------------------------------------------------------------------------------------------------------------
 
 describe("SlotPool check-cleanup failures", () => {
-  // executor is Windows-only (G-16): registerSlot keys `D:\…` roots with the host's path functions, so only win32 matches them.
-  it.runIf(process.platform === "win32").each([
+  const WIN = process.platform === "win32";
+  it.each([
     ["git clean", "cleanForChecks", new ExecutorError("E_GIT", "clean failed", { op: "clean", code: 1, stderr: "" })],
     ["pointer verification", "verifySlotPointers", new ExecutorError("E_SLOT_BROKEN", "slot .git is missing", {})],
   ] as Array<[string, string, ExecutorError]>)("a failing %s is reported as E_SLOT_BROKEN and leaves the leased slot with its owner", async (_name, op, error) => {
@@ -2048,7 +2048,8 @@ describe("SlotPool check-cleanup failures", () => {
     await expect(h.pool.cleanForChecks("slot-1")).rejects.toMatchObject({ code: "E_SLOT_BROKEN" });
     // Only the stage states (creating, provisioning, resetting) break a slot; a lease stays with its owner.
     expect(h.marker("slot-1")).toMatchObject({ state: "leased", owner: "task-1" });
-    expect(slotEnvFor(slotPath("slot-1"), "win32")).not.toBeNull();
+    // executor is Windows-only (G-16): registerSlot keys `D:\…` roots with the host's path functions, so only win32 matches them.
+    if (WIN) expect(slotEnvFor(slotPath("slot-1"), "win32")).not.toBeNull();
     await h.pool.cleanForChecks("slot-1");
     // The failed attempt never reached the git clean log line (it threw first); the retry did.
     expect(h.git.log.filter(l => l.startsWith("cleanForChecks"))).toHaveLength(1);
@@ -2100,8 +2101,7 @@ describe("slot environment", () => {
     expect(applySlotEnv(env, null, P)).toBe(env);
   });
 
-  // executor is Windows-only (G-16): the missing nested path's null depends on the Windows temp-path canonical form.
-  it.runIf(process.platform === "win32")("applies inside a registered slot, in nested paths, and not outside or in a sibling with the same prefix", () => {
+  it("applies inside a registered slot, in nested paths, and not outside or in a sibling with the same prefix", () => {
     registerSlot({ root: slotA, managers: ["pip", "pnpm"] });
     const venv = join(real(slotA), ".venv");
     const env = slotEnvFor(slotA, P);
@@ -2109,7 +2109,8 @@ describe("slot environment", () => {
     expect(env?.set).toEqual({ VIRTUAL_ENV: venv });
     expect(env?.prependPath).toEqual([join(venv, WIN ? "Scripts" : "bin"), join(real(slotA), "node_modules", ".bin")]);
     expect(slotEnvFor(join(slotA, "sub", "deep"), P)?.root).toBe(real(slotA));
-    expect(slotEnvFor(join(slotA, "sub", "deep", "missing"), P)).toBeNull();
+    // executor is Windows-only (G-16): the missing nested path's null depends on the Windows temp-path canonical form.
+    if (WIN) expect(slotEnvFor(join(slotA, "sub", "deep", "missing"), P)).toBeNull();
     expect(slotEnvFor(slotB, P)).toBeNull();
     expect(slotEnvFor(outside, P)).toBeNull();
     expect(slotEnvFor(base, P)).toBeNull();
