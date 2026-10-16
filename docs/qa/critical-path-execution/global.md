@@ -159,6 +159,16 @@ pending 6.2.QA
   answers and whole-plan resume are not documented as a phase-unpause API: the code exposes no general such action.
   No checks run by this implementer; the orchestrator runs docs-drift.
 
+- **G-5 (minor, registration) — fixed; owner decision 2026-10-16: option (a).** `router_plan` and `/plan` now use
+  `rolesAtStart`, the same registration gate as `router_run`; v2 tiers sessions register neither. The `/router` help
+  gate also checks start-time registration (and preserves a user-defined `/plan`), so switching tiers to roles without
+  a restart cannot advertise an unregistered command. The v1 tool/command/help pins and goldens are untouched.
+  Registration tests now start in roles for caller/access/conflict behavior instead of relying on the old all-v2
+  premise; the unavailable-runtime case uses a missing lease prerequisite, and approval reloads retain roles mode.
+  Added tiers/roles and tiers-to-roles-without-restart regressions; retained all caller, conflict and v1 assertions.
+  EXECUTOR.md, README, OPENCODE_V2.md, ROLES.md and the registration sentence pins now state the roles-at-start rule.
+  No checks run by this implementer; typecheck and tests remain with the orchestrator.
+
 ## Deferred findings
 
 pending 6.2.QA
@@ -180,7 +190,22 @@ test/smoke/helpers`): 8 files, 226 passed. The R2-9 wording change required upda
 `routing.roleFloor` to the corrected text (verified against `GLOBAL_ONLY_ROLES_ROUTING_KEYS` and `sanitizeRoleFloor` in
 `src/router/config.ts`); the pin keeps the same strength.
 
-- **G-9 (minor, test, new): load-sensitive heartbeat test.** `test/unit/executor-integrate-queue.test.ts` "a re-armed
+- **G-9 (minor, test) — fixed: serial heartbeat isolation.** `test/unit/executor-integrate-queue.test.ts` "a re-armed
   heartbeat keeps beating on every period" timed out at 20 s once under the full scoped run (8 workers); it passes alone
-  and with its file. Same family as G-6 (real timers under CPU contention). Next step: move it to the serial project
-  added for G-6, keeping its assertion and timeout.
+  and with its file. Same family as G-6 (real timers under CPU contention). Moved only that case to
+  `test/unit/executor-integrate-queue-heartbeat.test.ts`, included only in the later single-fork `exec-serial` project
+  added for G-6. Its assertions, 20 s polling deadline, 60 s test/hook limits and helper retry limits are unchanged.
+  `exec-project-config.test.ts` pins both project selections, removal from the original file, one copy in the new
+  file, unchanged limits and `npm test`'s default `vitest run`, so default Vitest and npm runs still select it once.
+  No test was skipped, weakened or retimed. Validation remains with the orchestrator.
+
+### Orchestrator validation of G-5 and G-9 (2026-10-16)
+
+Owner decision 2026-10-16 for G-5: option (a), `router_plan` and `/plan` registered in roles mode at start only. The A4
+assembly test was updated to the new rule with stronger assertions (no `router_plan`, no `/plan`, no help; executor
+absence kept). The five docs-drift pins on the old "every v2 session" sentence now pin the new sentence; the three
+heartbeat assertions moved unchanged to `executor-integrate-queue-heartbeat.test.ts` (serial project).
+`npm run typecheck` exit 0; registration, command, project-config, heartbeat, queue, docs-drift, v2 unit, goldens and all
+of `test/integration`: 91 files, 2445 passed, 2 failed, 62 skipped. The two failures, `v2-background` "QA-DF1-17" and
+`routing-ladder-resume` "QA-2.3-2", pass alone twice each and with their files (82/82): load-sensitive like G-6/G-9,
+recorded as **G-10 (minor, test)**, deferred: move to the serial project if they recur at the final gate.

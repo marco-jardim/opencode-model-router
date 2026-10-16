@@ -27,7 +27,7 @@ describe("plan registration (Phase 5.1.2)", () => {
   const plugins: Hooks[] = [];
   const childSessionCreators = new WeakMap<Hooks, () => Promise<string>>();
 
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.resetModules(); // Re-arm the process notice only between tests; plugin instances within a test still share it.
     saved = Object.fromEntries(envKeys.map(key => [key, process.env[key]]));
     home = mkdtempSync(join(tmpdir(), "omr-plan-registration-"));
@@ -44,6 +44,8 @@ describe("plan registration (Phase 5.1.2)", () => {
     mkdirSync(temp, { recursive: true });
     for (const key of ["TMP", "TEMP", "TMPDIR"] as const) process.env[key] = temp;
     process.env.MODEL_ROUTER_ENFORCE = "1";
+    // G-5: caller/access/conflict tests exercise the registered surface, now roles-at-start only.
+    await configure({ routing: { delegation: "roles" } });
   });
 
   afterEach(async () => {
@@ -106,23 +108,41 @@ describe("plan registration (Phase 5.1.2)", () => {
 
   const call = (hooks: Hooks, args: RouterPlanArgs, sessionID = "root") => hooks.tool.router_plan!.execute(args, { sessionID, directory: project });
 
-  it.each(["tiers", "roles"])("v2 registers router_plan, command.plan and /router help in %s mode", async (delegation) => {
-    await configure({ routing: { delegation } });
+  it("v2 roles mode registers router_plan, command.plan and /router help like router_run", async () => {
     const hooks = await plugin("v2");
     expect(hooks.tool).toHaveProperty("router_plan");
+    expect(hooks.tool).toHaveProperty("router_run");
     const output = { command: {}, agent: {} };
     await hooks.config(output);
     expect(output.command).toHaveProperty("plan", expect.objectContaining({ template: "$ARGUMENTS" }));
     expect((await command(hooks, "router")).map(part => part.text).join("\n")).toContain("/plan");
   });
 
+  it("v2 tiers mode registers neither plan surface nor help, even after switching to roles without a restart", async () => {
+    await configure({ routing: { delegation: "tiers" } });
+    const hooks = await plugin("v2");
+    for (const delegation of ["tiers", "roles"]) {
+      await configure({ routing: { delegation } });
+      expect(hooks.tool).not.toHaveProperty("router_plan");
+      expect(hooks.tool).not.toHaveProperty("router_run");
+      const output = { command: {}, agent: {} };
+      await hooks.config(output);
+      expect(output.command).not.toHaveProperty("plan");
+      expect((await command(hooks, "router")).map(part => part.text).join("\n")).not.toContain("/plan");
+      expect(await command(hooks, "plan", "status")).toEqual([]);
+    }
+  });
+
   it("without an executor, router_plan status and /plan status answer the unavailable reason", async () => {
     const { createExecutorAccess } = await import("../../src/executor/create");
     const access = createExecutorAccess();
-    access.clear("routing.delegation must be roles at start");
+    // Roles still register the surfaces when another assembly prerequisite is missing.
+    await configure({ routing: { delegation: "roles", leases: { mode: "off" } } });
+    access.clear("routing.leases.mode must be enforce");
     const hooks = await plugin("v2", access);
     expect(await call(hooks, { action: "status" })).toContain(access.unavailable());
     expect((await command(hooks, "plan", "status"))[0]?.text).toContain(access.unavailable());
+    expect((await command(hooks, "router")).map(part => part.text).join("\n")).not.toContain("/plan");
   });
 
   it("v2 preserves a user-defined /plan, warns once, and keeps router_plan available", async () => {
@@ -137,6 +157,7 @@ describe("plan registration (Phase 5.1.2)", () => {
     await hooks.config(output);
     expect(output.command.plan).toBe(userPlan);
     expect(await command(hooks, "plan", "status")).toEqual([]);
+    expect((await command(hooks, "router")).map(part => part.text).join("\n")).not.toContain("/plan");
     expect(await call(hooks, { action: "status" })).toContain("tool still available");
     const conflicts = warn.mock.calls.map(([message]) => String(message)).filter(message => message.includes("/plan command conflict"));
     expect(conflicts).toHaveLength(1);
@@ -187,10 +208,10 @@ describe("plan registration (Phase 5.1.2)", () => {
     const { createExecutorAccess, lateRuntime } = await import("../../src/executor/create");
     const access = createExecutorAccess();
     access.set({ ...lateRuntime(createExecutorAccess()), status: async () => "Plan p1 [awaiting-approval] plan.md" });
-    await configure({ routing: { executor: { approve: "ask" } } });
+    await configure({ routing: { delegation: "roles", executor: { approve: "ask" } } });
     const hooks = await plugin("v2", access);
     expect(await call(hooks, { action: "status", planId: "p1" })).toContain("Stop here. This plan is not approved.");
-    await configure({ routing: { executor: { approve: "auto" } } });
+    await configure({ routing: { delegation: "roles", executor: { approve: "auto" } } });
     expect(await call(hooks, { action: "status", planId: "p1" })).not.toContain("Stop here.");
   });
 

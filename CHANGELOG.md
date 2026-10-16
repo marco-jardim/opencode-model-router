@@ -122,6 +122,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **OpenCode v2: register `router_plan` and `/plan` only in roles mode selected at start, like `router_run`.** Tiers
+  mode no longer carries the unusable plan-tool schema; switching to roles needs a restart. `/router` help never
+  advertises an unregistered or user-defined `/plan`. OpenCode v1's tool, command and help maps are unchanged.
 - **OpenCode v2: shorter serial integration entries.** Integration checks on the slot the queue has just rebased to the
   candidate no longer reset it a second time (clean and HEAD check only, falling back to the full prepare on a HEAD
   mismatch or provisioning drift), and the check-selection reads overlap the clean. Bisect probes, reruns, reverts and

@@ -1,7 +1,8 @@
 # Plan executor
 
-> **Status: assembled and registered on OpenCode v2 only.** The `router_plan` tool, the `/plan` command and the executor
-> instructions are registered on v2; running a plan requires the [assembly preconditions](#assembly-and-lifecycle).
+> **Status: OpenCode v2, roles mode only.** The `router_plan` tool and the `/plan` command are registered only when
+> roles mode is selected at start, like `router_run`; running a plan and its executor instructions require the
+> [assembly preconditions](#assembly-and-lifecycle).
 > OpenCode v1 is unchanged: no executor tool, command or instructions are registered there, and the
 > `routing.executor.*` keys are ignored with one notice per process (see
 > [OpenCode v1 fallback](ROLES.md#opencode-v1-fallback) for how v2-only features behave there).
@@ -75,7 +76,8 @@ or the running plan by hand. A dirty or diverged owner branch is not force-reset
 
 ## Assembly and lifecycle
 
-The tool and command are registered on **OpenCode v2 only**. The executor is assembled at plugin start only when:
+The tool and command are registered on **OpenCode v2 in roles mode only**, selected at start, like `router_run`.
+Tiers mode registers neither surface; switching to roles requires a restart. The executor is assembled at plugin start only when:
 
 - the project is a git repository;
 - `routing.delegation: "roles"` was selected **at start** (switching from tiers later needs a restart);
@@ -86,12 +88,12 @@ The tool and command are registered on **OpenCode v2 only**. The executor is ass
 Repository discovery runs only when the executor preconditions hold and the location is inside
 `routing.workRoots` (when configured); an ineligible location does no executor discovery.
 
-When assembly is unavailable, `/plan` and `router_plan` show
+In roles mode, when assembly is unavailable, the registered `/plan` and `router_plan` show
 `the plan executor is not available: <reason>` rather than launching work. The exact reasons are:
 
 | Reason | What to check |
 |---|---|
-| `routing.delegation must be roles at start` | Select roles mode and restart OpenCode. |
+| `routing.delegation must be roles at start` | Select roles mode and restart OpenCode; tiers mode registers no plan tool or command to show this internal reason. |
 | `routing.leases.mode must be enforce` | Enable enforced file leases. |
 | `no plan-task verifier` | The host must supply the plan-task verification engine. |
 | `enforcement.verify.require is never` | Choose a verification requirement other than `never`. |
@@ -156,10 +158,12 @@ plan file, and never claim completion while the plan is running.
 
 ## `/plan` command
 
-An existing user-defined `/plan` command is preserved: on v2 the router logs one conflict warning and leaves
+An existing user-defined `/plan` command is preserved: on v2 in roles mode the router logs one conflict warning and leaves
 `router_plan` available instead. On v1 that user command runs without an executor `/plan` notice.
 The v2 adapter checks the host's command registry before registering the executor command; registry rebuilds do not
 repeat the warning or replace the user's command.
+`/router` advertises `/plan` only when it was registered at start, is not user-defined, and the executor discovery
+preconditions hold (roles delegation, enforced leases, verification enabled and a location inside `routing.workRoots`).
 
 `/plan` turns what you type into an instruction for the orchestrator, which then calls `router_plan` with exact
 arguments. Input that does not parse prints the `/plan` help instead. Quote a path that holds spaces

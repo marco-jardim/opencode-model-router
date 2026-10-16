@@ -407,7 +407,7 @@ function readRepo(path: string): string | undefined {
 }
 
 // ---------------------------------------------------------------------------
-// Plan executor (assembled and registered on OpenCode v2 only): docs/EXECUTOR.md names every `/plan` subcommand, every
+// Plan executor (OpenCode v2, registered in roles mode at start): docs/EXECUTOR.md names every `/plan` subcommand, every
 // `router_plan` action and every `routing.executor` leaf key. Removing one from the doc fails these pins.
 // ---------------------------------------------------------------------------
 
@@ -668,14 +668,16 @@ describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
     );
   });
 
-  it("pins v2 registration, unchanged v1 maps, and the OPENCODE_V2.md handoff", () => {
+  it("pins v2 roles-at-start registration, unchanged v1 maps, and the OPENCODE_V2.md handoff", () => {
     const flat = doc.replace(/\s+/g, " ");
-    expect(flat).toContain("assembled and registered on OpenCode v2 only");
+    // G-5 replaces the old all-v2 registration promise with the equally explicit roles-at-start rule.
+    expect(flat).toContain("Status: OpenCode v2, roles mode only.");
+    expect(flat).toContain("roles mode is selected at start, like `router_run`");
     expect(flat).toContain("OpenCode v1 is unchanged: no executor tool, command or instructions are registered there");
     expect(doc).not.toMatch(/not active yet|not registered.*yet/);
     const entry = read("src/index.ts");
-    expect(entry).toContain("...(isV2Host && routerPlan !== undefined ? { router_plan:");
-    expect(entry).toContain("if (isV2Host && planCommand !== undefined)");
+    expect(entry).toContain("...(rolesAtStart && routerPlan !== undefined ? { router_plan:");
+    expect(entry).toContain("if (rolesAtStart && planCommand !== undefined)");
     expect(entry).toContain("opencodeConfig.command.plan =");
     expect(read("src/executor/create.ts")).toContain('if (context.routerHost === "v1") return undefined;');
     expect(read("src/v2.ts")).toContain('executor: (host) => createExecutor({ routerHost: "v2", directory }');
@@ -686,7 +688,7 @@ describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
     const v2 = read("docs/OPENCODE_V2.md");
     expect(v2).toContain("(EXECUTOR.md)");
     const section = sectionOf(v2, "## Plan executor").replace(/\s+/g, " ");
-    expect(section).toContain("The `router_plan` tool, the `/plan` command and the executor instructions are registered on OpenCode v2 only; OpenCode v1's tool, command and help maps are unchanged.");
+    expect(section).toContain("The `router_plan` tool and the `/plan` command are registered on OpenCode v2 in roles mode selected at start only, like `router_run`; executor instructions require an assembled runtime. OpenCode v1's tool, command and help maps are unchanged.");
     expect(section).not.toMatch(/not active yet|a later phase registers/);
   });
 
@@ -709,7 +711,7 @@ describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
   it("documents preservation of the user's /plan on both hosts (QA-5.1-13)", () => {
     const command = sectionOf(doc, "## `/plan` command").replace(/\s+/g, " ");
     expect(command).toContain("An existing user-defined `/plan` command is preserved");
-    expect(command).toContain("on v2 the router logs one conflict warning and leaves `router_plan` available");
+    expect(command).toContain("on v2 in roles mode the router logs one conflict warning and leaves `router_plan` available");
     expect(command).toContain("On v1 that user command runs without an executor `/plan` notice");
   });
 

@@ -63,12 +63,12 @@ export default defineConfig({
     projects: [
       {
         test: { ...projectDefaults, name: "default", include: ["test/**/*.test.ts"],
-          exclude: [...excluded, "test/unit/exec.test.ts"], sequence: { groupOrder: 0 } },
+          exclude: [...excluded, "test/unit/exec.test.ts", "test/unit/executor-integrate-queue-heartbeat.test.ts"], sequence: { groupOrder: 0 } },
       },
       {
-        // G-6 / P-2: lifecycle deadlines need an otherwise idle test pool, not longer timeouts.
+        // G-6 / P-2 and G-9: lifecycle/heartbeat deadlines need an otherwise idle test pool, not longer timeouts.
         // A separate group runs after the parallel suite; CLI --maxWorkers does not share its fork.
-        test: { ...projectDefaults, name: "exec-serial", include: ["test/unit/exec.test.ts"], exclude: excluded,
+        test: { ...projectDefaults, name: "exec-serial", include: ["test/unit/exec.test.ts", "test/unit/executor-integrate-queue-heartbeat.test.ts"], exclude: excluded,
           pool: "forks", maxWorkers: 1, fileParallelism: false, sequence: { groupOrder: 1 } },
       },
     ],

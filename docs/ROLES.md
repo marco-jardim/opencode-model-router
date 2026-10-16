@@ -863,7 +863,7 @@ registered.
 
 ## Roles mode is decided at plugin start
 
-Role agents, `router_run`, `router_request_authority` and the work-root resolver are registered only when the plugin
+Role agents, `router_run`, `router_plan`, `/plan`, `router_request_authority` and the work-root resolver are registered only when the plugin
 **started** with `routing.delegation: "roles"`. Switching the override to `roles` while OpenCode runs logs once
 
 > roles mode (OpenCode v2 only): routing.delegation is now `roles`, but this OpenCode instance started in tiers mode;
