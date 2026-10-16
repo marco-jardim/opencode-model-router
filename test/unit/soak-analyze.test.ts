@@ -5,7 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 // The CLI is deliberately plain ESM; vitest resolves its dynamic product/oracle TS imports.
 // @ts-expect-error Plain JS CLI has no declaration file.
-import { analyze, evidenceStatus, formatReport, main, resolveInputs } from "../../scripts/soak-analyze.mjs";
+import { analyze, evidenceStatus, formatReport, main, overallVerdict, reportExitCode, resolveInputs } from "../../scripts/soak-analyze.mjs";
 import { parseLogLine } from "../../src/routing/outcomes/persist";
 import { resolvePendingJournalDir } from "../../src/verify/pending";
 
@@ -85,7 +85,7 @@ async function populate(s: Setup, id: string, n: number, bad = false) {
     graph.tasks = ["a", "b", "c"].map(id => ({ ...graph.tasks[0], id })); graph.writeConflicts = [["a", "b"]];
     const rows = [scheduler("attach", graph)];
     for (let i = 0; i < n; i++) {
-      const taskRef = `plan:${["a", "b", "c"][i]}`;
+      const taskRef = `plan:${i % 2 ? "b" : "a"}`;
       rows.push(scheduler("lease-acquire", { taskRef, ok: true }));
       if (!bad || i !== 0) rows.push(scheduler("lease-release", { taskRef }));
     }
@@ -112,6 +112,50 @@ async function populate(s: Setup, id: string, n: number, bad = false) {
   }
 }
 
+async function completeIdleTelemetry(s: Setup, plans = 3) {
+  const rows: Row[] = (await readFile(path.join(s.observations, "123-fixture.jsonl"), "utf8"))
+    .trimEnd().split("\n").map(line => JSON.parse(line)).filter(row => row.kind !== "end");
+  for (let i = 0; i < plans; i++) {
+    const planId = `plan-${i}`, from = BASE + i * 20_000, to = from + 1_000;
+    const metric = { ...await json("idle-fragment.json"), fromAt: new Date(from).toISOString(), toAt: new Date(to).toISOString() };
+    const index = rows.findIndex(row => row.planId === planId && row.action === "ledger");
+    rows.splice(index, 0, scheduler("idle-close", { clockMs: to, ledgerSeq: 1, orchIdle: true,
+      detail: { fromMs: from, toMs: to, ms: 1_000, metric } }, to, planId));
+    const dir = path.join(s.observations, "executor", planId); await mkdir(dir, { recursive: true });
+    await jsonl(path.join(dir, "events.2.1.jsonl"), [
+      { seq: 2, batch: 2, last: true, at: new Date(to).toISOString(), type: "metric", metric },
+    ]);
+  }
+  await stream(s, rows);
+}
+
+async function observableEvidence(s: Setup, workingDays: number) {
+  await populate(s, "G1", workingDays);
+  const decisions = path.join(s.outcomes, "decisions.jsonl");
+  const rows = (await readFile(decisions, "utf8")).trimEnd().split("\n").map((line, i) =>
+    ({ ...JSON.parse(line), ts: new Date(BASE + i * 86_400_000).toISOString() }));
+  await jsonl(decisions, rows);
+  await populate(s, "G9", 3);
+  const file = path.join(s.observations, "123-fixture.jsonl");
+  const holds = (await readFile(file, "utf8")).trimEnd().split("\n").map(line => JSON.parse(line));
+  await stream(s, holds.filter(row => row.kind !== "end"), "holds.jsonl", "holds");
+  await rm(file);
+  await populate(s, "G8", 3);
+  const episodes: Row[] = (await readFile(file, "utf8")).trimEnd().split("\n")
+    .map(line => JSON.parse(line)).filter(row => row.kind !== "end");
+  // Put conflict-bearing lease facts inside a complete observed plan lifecycle, not
+  // a separate incomplete scheduler stream that would invalidate G8's inventory.
+  for (const row of episodes) if (row.planId === "plan-0" && ["attach", "ledger"].includes(row.action)) {
+    row.state.tasks.push({ ...row.state.tasks[0], id: "b", state: "done" });
+    row.state.writeConflicts = [["a", "b"]];
+  }
+  episodes.splice(2, 0, ...Array.from({ length: 3 }, () => [
+    scheduler("lease-acquire", { taskRef: "plan-0:a", ok: true }, BASE, "plan-0"),
+    scheduler("lease-release", { taskRef: "plan-0:a" }, BASE, "plan-0"),
+  ]).flat());
+  await stream(s, episodes); await completeIdleTelemetry(s);
+}
+
 describe("offline soak evidence statuses", () => {
   for (const id of IDS) {
     it.each([
@@ -119,7 +163,12 @@ describe("offline soak evidence statuses", () => {
     ] as const)(`${id}: %s`, async (status, n, bad) => {
       const s = await setup(); await populate(s, id, n, bad);
       const report = await analyze(s), c = report.criteria[id];
-      expect(c.status).toBe(status); expect(c.observed).toBe(n);
+      if (status === "ok" && ["G6", "G8", "G9"].includes(id)) {
+        const primary = { G6: "leaseNonOverlap", G8: "idleEpisodes", G9: "heldPendingAcrossRestart" }[id as "G6" | "G8" | "G9"];
+        expect(c.subcases[primary].status).toBe("ok");
+        expect(c.status).toBe("insufficient");
+      } else expect(c.status).toBe(status);
+      expect(c.observed).toBe(n);
       expect(c.violationCount > 0).toBe(bad);
       if (n) expect(c.evidence[0].file).toEqual(expect.any(String));
       if (bad) expect(c.violations[0]).toMatchObject({ id: expect.any(String), at: expect.any(String), reason: expect.any(String) });
@@ -260,13 +309,113 @@ describe("offline soak evidence statuses", () => {
     const before = await Promise.all(files.map(file => readFile(file)));
     const args = ["--observations", s.observations, "--outcomes", s.outcomes, "--pending", s.pending];
     const output = path.join(s.root, "report.json"); vi.spyOn(process.stdout, "write").mockReturnValue(true);
-    expect(await main([...args, "--json", output])).toBe(0);
+    expect(await main([...args, "--json", output])).toBe(2);
     expect(JSON.parse(await readFile(output, "utf8")).criteria.G2.status).toBe("ok");
     expect(await Promise.all(files.map(file => readFile(file)))).toEqual(before);
     await expect(main([...args, "--json", s.pending])).rejects.toThrow("pending journal");
     await expect(main([...args, "--json", path.join(s.observations, "report.json")])).rejects.toThrow("outside");
     await expect(main([...args, "--json", output])).rejects.toThrow();
     await expect(main(["--nonsense"])).rejects.toThrow("invalid argument");
+  });
+});
+
+describe("MA-2 subcase evidence and overall verdict", () => {
+  it("G6 lease acquisitions cannot pass shared-tree guards or deferred plugin verification", async () => {
+    const s = await setup(); await populate(s, "G6", 3);
+    const c = (await analyze(s)).criteria.G6;
+    expect(c.status).toBe("insufficient");
+    expect(c.subcases.leaseNonOverlap).toMatchObject({ status: "ok", observed: 3, violationCount: 0 });
+    for (const name of ["sharedTreeRead", "sharedTreeSearch", "sharedTreeRun", "deferredPluginVerification"]) {
+      expect(c.subcases[name]).toMatchObject({ status: "not-observable", observed: 0 });
+      expect(c.subcases[name].reason).toEqual(expect.any(String));
+    }
+  });
+  it("G6 does not count acquisitions with an empty writeConflicts inventory", async () => {
+    const s = await setup(); await populate(s, "G6", 3);
+    const rows = (await readFile(path.join(s.observations, "123-fixture.jsonl"), "utf8"))
+      .trimEnd().split("\n").map(line => JSON.parse(line)).filter(row => row.kind !== "end");
+    rows[0].state.writeConflicts = []; await stream(s, rows);
+    const c = (await analyze(s)).criteria.G6;
+    expect(c).toMatchObject({ status: "not-observed", observed: 0, violationCount: 0 });
+    expect(c.subcases.leaseNonOverlap.status).toBe("not-observed");
+  });
+  it("G8 episodes without executor fragments do not prove telemetry completeness", async () => {
+    const s = await setup(); await populate(s, "G8", 3);
+    const report = await analyze(s), c = report.criteria.G8;
+    expect(c.status).toBe("insufficient"); expect(report.unreadable).toBe(0);
+    expect(c.subcases.idleEpisodes).toMatchObject({ status: "ok", observed: 3 });
+    expect(c.subcases.telemetryCompleteness).toMatchObject({ status: "not-observed", observed: 0, missingPlanCount: 3 });
+  });
+  it("G8 requires matching fragments for every observed plan, not just three episodes elsewhere", async () => {
+    const s = await setup(); await populate(s, "G8", 4); await completeIdleTelemetry(s);
+    const c = (await analyze(s)).criteria.G8;
+    expect(c.subcases.idleEpisodes).toMatchObject({ status: "ok", observed: 4 });
+    expect(c.subcases.telemetryCompleteness).toMatchObject({ status: "insufficient", observed: 3, missingPlanCount: 1 });
+    expect(c.status).toBe("insufficient");
+  });
+  it("G8 passes both subcases with three independently matched ledger fragments", async () => {
+    const s = await setup(); await populate(s, "G8", 3); await completeIdleTelemetry(s);
+    const report = await analyze(s), c = report.criteria.G8;
+    expect(report.unreadableEvidence).toEqual([]);
+    expect(c).toMatchObject({ status: "ok", observed: 3, faultCount: 0, ledgerFragments: 3 });
+    expect(c.subcases.telemetryCompleteness).toMatchObject({ status: "ok", observed: 3, missingPlanCount: 0 });
+  });
+  it("G9 restored holds do not prove non-held deferred pending survived restart", async () => {
+    const s = await setup(); await populate(s, "G9", 3);
+    const c = (await analyze(s)).criteria.G9;
+    expect(c.status).toBe("insufficient");
+    expect(c.subcases.heldPendingAcrossRestart).toMatchObject({ status: "ok", observed: 3 });
+    expect(c.subcases.deferredPendingAcrossRestart).toMatchObject({ status: "not-observable", observed: 0 });
+  });
+  it("rejects four working days even with all currently observable required subcases ok", async () => {
+    const s = await setup(); await observableEvidence(s, 4);
+    const report = await analyze(s);
+    expect(report.coverage.workingDays).toBe(4);
+    expect(report.verdict.status).toBe("fail"); expect(report.verdict.reasons).toContain("working days: 4 < 5");
+  });
+  it("cannot pass A-6.1-3 with current formats even after five working days and all observable subcases ok", async () => {
+    const s = await setup(); await observableEvidence(s, 5);
+    const report = await analyze(s);
+    expect(report.unreadableEvidence).toEqual([]); expect(report.coverage.workingDays).toBe(5);
+    for (const id of ["G1", "G2", "G8"]) expect(report.criteria[id].status).toBe("ok");
+    expect(report.criteria.G6.subcases.leaseNonOverlap.status).toBe("ok");
+    expect(report.criteria.G9.subcases.heldPendingAcrossRestart.status).toBe("ok");
+    expect(report.verdict).toMatchObject({ status: "fail", declaredGaps: ["G3", "G11"] });
+    expect(report.verdict.reasons).toHaveLength(2);
+    expect(report.verdict.reasons[0]).toContain("sharedTreeRead=not-observable");
+    expect(report.verdict.reasons[0]).toContain("deferredPluginVerification=not-observable");
+    expect(report.verdict.reasons[1]).toContain("deferredPendingAcrossRestart=not-observable");
+    expect(reportExitCode(report)).toBe(2);
+    expect(formatReport(report)).toContain("Verdict: fail; declared gaps: G3, G11");
+    expect(formatReport(report)).toContain("not-observable");
+  });
+  it("only returns exit 0 for a passing policy verdict, 1 for any violation, otherwise 2", () => {
+    // Policy-only hypothetical: no current-format capture can make G6/G9's unobservable subcases ok.
+    const report = { coverage: { workingDays: 5 }, unreadable: 0, criteria: Object.fromEntries(IDS.map(id =>
+      [id, { status: ["G3", "G11"].includes(id) ? "not-observed" : "ok", violationCount: 0 }])) } as Row;
+    report.verdict = overallVerdict(report);
+    expect(report.verdict).toEqual({ status: "pass", reasons: [], declaredGaps: ["G3", "G11"] });
+    expect(reportExitCode(report)).toBe(0);
+    report.criteria.G11.status = "insufficient"; report.verdict = overallVerdict(report);
+    expect(report.verdict.status).toBe("fail"); expect(reportExitCode(report)).toBe(2);
+    report.unreadable = 1; report.verdict = overallVerdict(report);
+    expect(report.verdict.reasons).toContain("unreadable inputs: 1"); expect(reportExitCode(report)).toBe(2);
+    report.criteria.G3 = { status: "violated", violationCount: 1 }; report.verdict = overallVerdict(report);
+    expect(report.verdict.reasons).toContain("G3: violated"); expect(reportExitCode(report)).toBe(1);
+  });
+  it("lists absent optional outcomes and pending inputs without treating them as unreadable", async () => {
+    const s = await setup(); await rm(s.outcomes, { recursive: true }); await rm(s.pending);
+    const report = await analyze(s);
+    expect(report.missingInputs).toEqual([{ input: "outcomes", file: s.outcomes }, { input: "pending", file: s.pending }]);
+    expect(report.unreadable).toBe(0); expect(report.criteria.G1.status).toBe("not-observed");
+    expect(report.criteria.G2.status).toBe("not-observed"); expect(report.verdict.status).toBe("fail");
+    expect(formatReport(report)).toContain(`Missing inputs: ${JSON.stringify(report.missingInputs)}`);
+  });
+  it("rejects a missing explicit or environment-resolved observations directory", async () => {
+    const s = await setup(); await rm(s.observations, { recursive: true });
+    await expect(analyze(s)).rejects.toThrow(`--observations directory does not exist: ${s.observations}`);
+    await expect(resolveInputs({}, { MODEL_ROUTER_V2_OBSERVATIONS: s.observations }))
+      .rejects.toThrow(`--observations directory does not exist: ${s.observations}`);
   });
 });
 
@@ -363,13 +512,16 @@ describe("G2 durable journal deliveries", () => {
 });
 
 describe("real soak analyzer CLI (without Vitest's TypeScript transforms)", () => {
-  it.each(["empty", "fixtures"] as const)("runs on %s inputs from the repository root", async kind => {
+  it.each(["empty", "fixtures", "violation", "unreadable", "missing"] as const)("runs on %s inputs from the repository root", async kind => {
     const s = await setup();
     if (kind === "fixtures") {
       await populate(s, "G1", 3);
       await populate(s, "G2", 3);
       await populate(s, "G11", 3);
     }
+    if (kind === "violation") await populate(s, "G1", 3, true);
+    if (kind === "unreadable") await copyFile(path.join(fixtures, "malformed.jsonl"), s.pending);
+    if (kind === "missing") await rm(s.observations, { recursive: true });
     const output = path.join(s.root, "cli-report.json");
     const env = { ...process.env };
     // Inheriting VITEST would skip the CLI loader and hide exactly this regression.
@@ -381,15 +533,22 @@ describe("real soak analyzer CLI (without Vitest's TypeScript transforms)", () =
     });
     expect(result.error, result.stderr).toBeUndefined();
     expect(result.signal, result.stderr).toBeNull();
-    expect(result.status, result.stderr + result.stdout).toBe(0);
+    expect(result.status, result.stderr + result.stdout).toBe(kind === "violation" ? 1 : 2);
+    if (kind === "missing") {
+      expect(result.stderr).toContain(`--observations directory does not exist: ${s.observations}`);
+      await expect(readFile(output)).rejects.toThrow();
+      return;
+    }
     const report = JSON.parse(await readFile(output, "utf8"));
+    expect(report.verdict.status).toBe("fail"); expect(report.verdict.reasons.length).toBeGreaterThan(0);
+    expect(result.stdout).toContain("Verdict: fail");
     expect(Object.keys(report.criteria).sort()).toEqual([...IDS].sort());
-    expect(report.unreadable).toBe(0);
+    expect(report.unreadable).toBe(kind === "unreadable" ? 3 : 0);
     expect(result.stdout).toContain("Criterion");
     if (kind === "empty") {
       expect(Object.values(report.criteria).map((c: any) => c.status)).toEqual(IDS.map(() => "not-observed"));
       expect(Object.values(report.criteria).every((c: any) => c.observed === 0)).toBe(true);
-    } else {
+    } else if (kind === "fixtures") {
       for (const id of ["G1", "G2", "G11"]) expect(report.criteria[id]).toMatchObject({ status: "ok", observed: 3, violationCount: 0 });
     }
   }, 30_000);

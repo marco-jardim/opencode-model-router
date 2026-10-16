@@ -6,7 +6,9 @@
  * Collect at least five working days with MODEL_ROUTER_V2_OBSERVATIONS enabled.
  * Keep original files, including seals; a live/unsealed stream is insufficient evidence.
  * Missing evidence is never a pass. JSON defaults to ./soak-analysis.json, outside input trees.
- * Node >=22; like routing-stats.ts, imports product TS through an extensionless-import loader.
+ * Node >=22.13 (stripTypeScriptTypes); imports product TS through an extensionless-import loader.
+ * Exit codes: 0 only for verdict pass; 1 for any violation; 2 for unreadable input
+ * or a non-passing verdict due to insufficient, missing or unobservable evidence.
  * Also reads this checkout's git-common-dir/omr-executor. Optional archived journal copies:
  * <observations>/executor/<planId>/events.<seq>.<epoch>.jsonl
  * and history.jsonl. Optional g8-inputs.jsonl there supplies {plan,final,events,rawΣI} to
@@ -25,8 +27,28 @@ import { register } from "node:module";
 if (!process.env.VITEST) register("./soak-loader.mjs", import.meta.url);
 
 const IDS = ["G1", "G2", "G6", "G8", "G9", "G3", "G11"];
+const REQUIRED = ["G1", "G2", "G6", "G8", "G9"];
+const PRIMARY = { G6: "leaseNonOverlap", G8: "idleEpisodes", G9: "heldPendingAcrossRestart" };
 export function evidenceStatus(observed, violations) {
   return violations > 0 ? "violated" : observed === 0 ? "not-observed" : observed < 3 ? "insufficient" : "ok";
+}
+
+export function overallVerdict(report) {
+  const reasons = [], declaredGaps = [];
+  if (report.coverage.workingDays < 5) reasons.push(`working days: ${report.coverage.workingDays} < 5`);
+  if (report.unreadable) reasons.push(`unreadable inputs: ${report.unreadable}`);
+  for (const [id, c] of Object.entries(report.criteria)) {
+    if (!REQUIRED.includes(id) && c.status === "not-observed") { declaredGaps.push(id); continue; }
+    const gaps = Object.entries(c.subcases ?? {}).filter(([, s]) => s.status !== "ok")
+      .map(([name, s]) => `${name}=${s.status}`);
+    if (c.status !== "ok" || gaps.length) reasons.push(`${id}: ${c.status}${gaps.length ? `; subcases: ${gaps.join(", ")}` : ""}`);
+  }
+  return { status: reasons.length ? "fail" : "pass", reasons, declaredGaps };
+}
+
+export function reportExitCode(report) {
+  return Object.values(report.criteria).some(c => c.violationCount > 0) ? 1
+    : report.unreadable || report.verdict.status !== "pass" ? 2 : 0;
 }
 
 const MAX_LINE = 1024 * 1024;
@@ -73,8 +95,16 @@ async function productReaders() {
 export async function resolveInputs(options, env = process.env) {
   const readers = await productReaders();
   requireFact(str(options.observations ?? env.MODEL_ROUTER_V2_OBSERVATIONS), "--observations <dir> is required");
+  const observations = path.resolve(options.observations ?? env.MODEL_ROUTER_V2_OBSERVATIONS);
+  let observationStat;
+  try { observationStat = await stat(observations); }
+  catch (error) {
+    if (error.code === "ENOENT") throw new Error(`--observations directory does not exist: ${observations}`);
+    throw new Error(`cannot read --observations directory ${observations}: ${error.message}`);
+  }
+  requireFact(observationStat.isDirectory(), `--observations is not a directory: ${observations}`);
   return {
-    observations: path.resolve(options.observations ?? env.MODEL_ROUTER_V2_OBSERVATIONS),
+    observations,
     // Same meaning as routing.outcomes.path; config is not auto-loaded by the product stats CLI either.
     outcomes: readers.resolveOutcomesDir(options.outcomes, { tmpdir: tmpdir(), homedir: homedir() }),
     pending: path.resolve(options.pending ?? path.join(readers.resolvePendingJournalDir({ homedir: homedir(),
@@ -108,20 +138,40 @@ export async function analyze(options) {
   const until = options.until === undefined ? Infinity : Date.parse(options.until);
   requireFact(!Number.isNaN(since) && !Number.isNaN(until) && since <= until, "invalid --since/--until interval");
   const selected = at => finite(at) && at >= since && at <= until;
-  const criteria = Object.fromEntries(IDS.map(id => [id, { observed: 0, violations: [], violationCount: 0,
-    evidence: [], faults: [], faultCount: 0, status: "not-observed" }]));
+  const evidence = () => ({ observed: 0, violations: [], violationCount: 0,
+    evidence: [], faults: [], faultCount: 0, status: "not-observed" });
+  const notObservable = reason => ({ ...evidence(), status: "not-observable", reason });
+  const criteria = Object.fromEntries(IDS.map(id => [id, evidence()]));
+  criteria.G6.subcases = {
+    leaseNonOverlap: evidence(),
+    sharedTreeRead: notObservable("Shared-tree read guards are not recorded in the current wire format."),
+    sharedTreeSearch: notObservable("Shared-tree search omissions are not recorded in the current wire format."),
+    sharedTreeRun: notObservable("Shared-tree run guards are not recorded in the current wire format."),
+    deferredPluginVerification: notObservable("Deferred plugin verification lease guards are not recorded in the current wire format."),
+  };
+  criteria.G8.subcases = { idleEpisodes: evidence(), telemetryCompleteness: { ...evidence(), missingPlanCount: 0, missingPlans: [] } };
+  criteria.G9.subcases = {
+    heldPendingAcrossRestart: evidence(),
+    deferredPendingAcrossRestart: notObservable("Non-held deferred pending verification has no restart/adoption identity in journal v1 or completion observations."),
+  };
   const report = { version: 1, inputs, interval: { since: options.since ?? null, until: options.until ?? null }, criteria,
-    unreadable: 0, unreadableEvidence: [], coverage: { firstAt: null, lastAt: null, workingDays: 0,
+    unreadable: 0, unreadableEvidence: [], missingInputs: [], coverage: { firstAt: null, lastAt: null, workingDays: 0,
       note: "UTC weekdays containing evidence; not proof of five full working days. Rotations/compaction may remove history." },
     dogfood: { plansRun: 0, tasksIntegrated: 0, childProcesses: 0, restartsRecovered: 0, evidence: [] } };
   const sample = (list, value) => { if (list.length < MAX_EXAMPLES) list.push(value); };
-  const fault = (id, source, reason) => { criteria[id].faultCount++; sample(criteria[id].faults, { ...source, reason }); };
+  const targets = (id, subcase = PRIMARY[id]) => [criteria[id], ...(subcase ? [criteria[id].subcases[subcase]] : [])];
+  const fault = (id, source, reason, subcase) => {
+    for (const c of targets(id, subcase)) { c.faultCount++; sample(c.faults, { ...source, reason }); }
+  };
   const unreadable = (source, reason, ids = IDS) => {
     report.unreadable++; sample(report.unreadableEvidence, { ...source, reason });
     ids.forEach(id => fault(id, source, `unreadable: ${reason}`));
   };
-  const observe = (id, source, count = 1) => { criteria[id].observed += count; sample(criteria[id].evidence, source); };
-  const violate = (id, source, reason) => { criteria[id].violationCount++; sample(criteria[id].violations, { ...source, reason }); };
+  const observeCase = (c, source, count = 1) => { c.observed += count; sample(c.evidence, source); };
+  const observe = (id, source, count = 1) => { for (const c of targets(id)) observeCase(c, source, count); };
+  const violate = (id, source, reason) => {
+    for (const c of targets(id)) { c.violationCount++; sample(c.violations, { ...source, reason }); }
+  };
   const days = new Set();
   const cover = at => {
     if (!selected(at)) return;
@@ -153,6 +203,7 @@ export async function analyze(options) {
     try { return (await readdir(dir, { withFileTypes: true })).filter(e => e.isFile()).map(e => e.name).sort(); }
     catch (error) {
       if (error.code !== "ENOENT") unreadable({ file: dir }, error.message, ids);
+      else if (dir === inputs.outcomes) sample(report.missingInputs, { input: "outcomes", file: dir });
       return [];
     }
   };
@@ -167,7 +218,10 @@ export async function analyze(options) {
           await callback(row, line.text, reference(file, line.line, row));
         } catch (error) { unreadable(source, error.message, ids); }
       }
-    } catch (error) { if (error.code !== "ENOENT") unreadable({ file }, error.message, ids); }
+    } catch (error) {
+      if (error.code !== "ENOENT") unreadable({ file }, error.message, ids);
+      else if (file === inputs.pending) sample(report.missingInputs, { input: "pending", file });
+    }
   };
 
   // Reader is deliberately not createPersister/load: those APIs can quarantine or compact files.
@@ -316,23 +370,35 @@ export async function analyze(options) {
   }
 
   // Further processing is below; streams failing completeness never contribute passing evidence.
+  const episodePlans = new Map(), fragmentPlans = new Set();
   await analyzeObservations();
   finalizeHandles();
+  const completeness = criteria.G8.subcases.telemetryCompleteness;
+  for (const [planId, source] of episodePlans) if (!fragmentPlans.has(planId)) {
+    completeness.missingPlanCount++; sample(completeness.missingPlans, { ...source, id: planId });
+  }
   report.coverage.workingDays = days.size;
   for (const id of IDS) {
     const c = criteria[id];
+    for (const s of Object.values(c.subcases ?? {})) {
+      if (s.status === "not-observable") continue;
+      s.status = evidenceStatus(s.observed, s.violationCount);
+      if (s.status === "ok" && (s.faultCount || s.missingPlanCount)) s.status = "insufficient";
+      if (s.status === "not-observed" && s.faultCount) s.status = "insufficient";
+      s.evidenceTruncated = s.observed > s.evidence.length;
+    }
     c.status = evidenceStatus(c.observed, c.violationCount);
-    if (c.status === "ok" && c.faultCount) c.status = "insufficient";
+    if (c.status === "ok" && (c.faultCount || Object.values(c.subcases ?? {}).some(s => s.status !== "ok"))) c.status = "insufficient";
     if (id === "G8" && c.status === "not-observed" && c.faultCount) c.status = "insufficient";
     c.label = c.status === "not-observed" ? "not observed" : c.status;
     c.evidenceTruncated = c.observed > c.evidence.length;
   }
+  report.verdict = overallVerdict(report);
   return report;
 
   async function analyzeObservations() {
-    criteria.G6.sharedReads = 0;
     criteria.G6.slotRows = 0;
-    criteria.G6.scope = "Observed intra-plan writeConflicts + successful lease lifetimes. Cross-plan logical paths and shared reads are not in the current wire format (executor/observations.ts:200-209).";
+    criteria.G6.scope = "Lease non-overlap counts only successful acquisitions involving an inventoried conflict pair. Shared-tree guards and deferred plugin verification are not observable in the current wire format (executor/observations.ts:200-209).";
     criteria.G8.g8Ratio = "not applicable";
     criteria.G8.inventory = "Idle episodes reconstructed independently; no persisted ledger fragment inventory is inferred from idle-close.";
     const lost = new Map();
@@ -403,12 +469,13 @@ export async function analyze(options) {
             if (!state.ok) continue;
             const taskId = state.taskRef.startsWith(`${row.planId}:`) ? state.taskRef.slice(row.planId.length + 1) : state.taskRef;
             if (selected(at)) {
-              observe("G6", source);
               if (!Array.isArray(plan.conflicts) || planStreams.get(row.planId)?.size !== 1) {
                 fault("G6", source, "missing conflict inventory or lease continuity across streams");
               } else {
                 requireFact(plan.conflicts.every(pair => Array.isArray(pair) && pair.length === 2 && pair.every(str)), "invalid writeConflicts");
-                for (const pair of plan.conflicts) {
+                const pairs = plan.conflicts.filter(pair => pair.includes(taskId));
+                if (pairs.length) observe("G6", source);
+                for (const pair of pairs) {
                   const other = pair[0] === taskId ? pair[1] : pair[1] === taskId ? pair[0] : null;
                   if (other !== null && plan.held.has(other)) violate("G6", source,
                     `overlapping writer leases: ${taskId} and ${other} (same logical/prefix path per writeConflicts; acquired at ${plan.held.get(other).at})`);
@@ -442,6 +509,7 @@ export async function analyze(options) {
               const evidence = { file, id: planId, at: new Date(episode.toMs).toISOString(),
                 fromAt: new Date(episode.fromMs).toISOString(), ms: episode.ms, fromSeq: episode.fromSeq, toSeq: episode.toSeq };
               observe("G8", evidence);
+              bounded(episodePlans, planId, () => source);
               if (episode.ms > p.G8_IDLE_CEILING_MS) violate("G8", evidence, `idle episode ${episode.ms} ms > 10,000 ms`);
             }
             // Required smoke assertion too. Only known bound failures are violations; every other
@@ -466,7 +534,7 @@ export async function analyze(options) {
     criteria.G2.heldAnnotationAttempts = 0;
     criteria.G2.settleInvocations = 0;
     criteria.G2.deliverySemantics = "Held: each journal posted is one durable delivery (compat/background.ts:1037-1078); matching held-synthetic observations corroborate it, never add another. Deferred: terminal state=verified publishes the cached verdict and resolves the run (verify/pending.ts:2501-2527); repeated terminal snapshots/cached replays are not new settlements. processed closes dispatch bookkeeping, not verification. Late notices are optional; background PASS is silent (docs/VERIFICATION.md:203-204). Parent-message receipt is not independently logged.";
-    criteria.G9.restartEvidence = "restored-hold finish-dispatch observations prove adoption of persisted holds. Writer marks describe current writers, not historical restarts; journal v1 rows carry no process token.";
+    criteria.G9.restartEvidence = "restored-hold finish-dispatch observations prove adoption of persisted holds only. Non-held deferred pending recovery is not observable: writer marks describe current writers, not historical restarts; journal v1 rows carry no process token.";
     for (const [id, h] of handles) {
       const delivery = h.held ? h.posted : h.settles;
       const deliveries = h.held ? h.postedCount : h.settleCount;
@@ -567,7 +635,10 @@ export async function analyze(options) {
         });
         if (batch.length) unreadable({ file: path.join(dir, name) }, "uncommitted executor batch", ["G8", "G11"]);
       }
-      if (fragments.length) criteria.G8.ledgerFragments = (criteria.G8.ledgerFragments ?? 0) + fragments.length;
+      if (fragments.length) {
+        criteria.G8.ledgerFragments = (criteria.G8.ledgerFragments ?? 0) + fragments.length;
+        fragmentPlans.add(planId);
+      }
       if (fragments.length) {
         try {
           const owners = [...(planStreams.get(planId) ?? [])];
@@ -579,7 +650,8 @@ export async function analyze(options) {
             planId, parentSessionID: graph?.parentSessionID, finalLedgerSeq: graph?.state.ledgerSeq,
           });
           p.assertG8IdleEpisodes(oracle.episodes, fragments);
-        } catch (error) { fault("G8", { file: dir, id: planId }, `evidence insufficient: ${error.message}`); }
+          observeCase(criteria.G8.subcases.telemetryCompleteness, { file: dir, id: planId }, fragments.length);
+        } catch (error) { fault("G8", { file: dir, id: planId }, `evidence insufficient: ${error.message}`, "telemetryCompleteness"); }
       }
       // A ratio requires authored durations + frozen pre-run graph, not estimates.
       // Optional g8-inputs.jsonl contains {plan, final, events, rawΣI}; this is an
@@ -605,15 +677,21 @@ export async function analyze(options) {
 
 export function formatReport(report) {
   const rows = [["Criterion", "Observed", "Violations", "Unreadable/faults", "Status", "Evidence"]];
-  for (const [id, c] of Object.entries(report.criteria)) rows.push([id, c.observed, c.violationCount, c.faultCount,
-    c.label, c.evidence[0]?.file ?? c.faults[0]?.file ?? "none"]);
+  for (const [id, c] of Object.entries(report.criteria)) {
+    rows.push([id, c.observed, c.violationCount, c.faultCount, c.label, c.evidence[0]?.file ?? c.faults[0]?.file ?? "none"]);
+    for (const [name, s] of Object.entries(c.subcases ?? {})) rows.push([`  ${id}.${name}`, s.observed, s.violationCount,
+      s.faultCount, s.status, s.reason ?? s.evidence[0]?.file ?? s.faults[0]?.file ?? "none"]);
+  }
   const widths = rows[0].map((_, i) => Math.max(...rows.map(row => String(row[i]).length)));
   return rows.map(row => row.map((cell, i) => String(cell).padEnd(widths[i])).join("  ")).join("\n")
     + `\nUnreadable: ${report.unreadable}; UTC working days with evidence: ${report.coverage.workingDays} (target >= 5)\n`
     + `G1 modes: ${JSON.stringify(report.criteria.G1.modes)}; windows checked: ${report.criteria.G1.windowChecked}\n`
-    + `G6 shared reads: ${report.criteria.G6.sharedReads ?? 0} (not observed when zero); slot rows: ${report.criteria.G6.slotRows ?? 0}\n`
+    + `G6 slot rows: ${report.criteria.G6.slotRows ?? 0}\n`
     + `G8 ratio: ${JSON.stringify(report.criteria.G8.g8Ratio)}\n`
     + `Dogfood: ${JSON.stringify(report.dogfood)}\n`
+    + `Missing inputs: ${JSON.stringify(report.missingInputs)}\n`
+    + `Verdict: ${report.verdict.status}; declared gaps: ${report.verdict.declaredGaps.join(", ") || "none"}\n`
+    + report.verdict.reasons.map(reason => `  - ${reason}\n`).join("")
     + `Absence is not a pass. Samples capped at ${MAX_EXAMPLES}; totals are not capped. See JSON for violations and evidence gaps.\n`;
 }
 
@@ -647,7 +725,7 @@ export async function main(argv = process.argv.slice(2)) {
   await writeFile(output, JSON.stringify(report, null, 2) + "\n", { flag: "wx" });
   process.stdout.write(formatReport(report));
   process.stdout.write(`JSON: ${output}\n`);
-  return Object.values(report.criteria).some(c => c.status === "violated") ? 1 : report.unreadable ? 2 : 0;
+  return reportExitCode(report);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {

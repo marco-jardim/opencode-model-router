@@ -30,8 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retained with failure evidence before scratch cleanup. These are diagnostic observations only; executor
   behavior, offline checks and G1–G12 bounds are unchanged.
 - **CPX soak: `npm run soak:analyze` offline soak analyzer (amendment A-6.1-3).** It reads retained soak evidence and
-  reports, per criterion, what was observed, the violations found and a status; a criterion with no evidence is never
-  reported as a pass.
+  reports observations, violations and per-criterion and per-subcase status. Subcases the current logs cannot show
+  are reported as `not-observable`; an overall passing verdict requires at least five working days and every required
+  criterion to be `ok`. Absence of evidence is never a pass.
 - **OpenCode v2: `/router stats` shows a "Dispatch durations" table and an "Orchestrator cache-read share" line** when
   timing logs exist. The logs are written once the router wires the timing recorder.
 - **OpenCode v2: background dispatch.** A subagent dispatch whose predicted duration is long runs in the background
