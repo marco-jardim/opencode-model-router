@@ -477,6 +477,7 @@ function assembleExecutor(context: { directory: string }, options: CreateExecuto
         spawn: async (command, opts) => {
           const start = clock.now();
           const result = await runArgv(command.file, command.args, { cwd: command.cwd ?? opts.cwd, env: command.env,
+            ...(command.envMode === undefined ? {} : { envMode: command.envMode }),
             ...(opts.service === undefined ? {} : { service: opts.service }),
             signal: opts.signal, lowPriority: opts.lowPriority, timeoutMs: resolveRolesRouting(loadConfig(directory), "v2").run.timeoutMs });
           return { exitCode: result.code, timedOut: result.timedOut, stdout: result.stdout, stderr: result.stderr, durationMs: clock.now() - start };
@@ -489,7 +490,9 @@ function assembleExecutor(context: { directory: string }, options: CreateExecuto
         git: ops, igit, pool, leases: input.leases, checks, suite, lander, listener: input.listener,
         settle: (taskId, release) => {
           const poll = (): void => {
-            if (!taskLauncher.inFlight().some((flight) => flight.taskId === taskId)) {
+            // G-1: a child recovery adopted after a restart is in no launcher flight; the runtime still reports it live
+            // until it is stopped (or its slot held).
+            if (!taskLauncher.inFlight().some((flight) => flight.taskId === taskId) && runtime?.childLive?.(planId, taskId) !== true) {
               void release().catch((error: unknown) => log("warn", "settled release failed", String(error)));
               return;
             }

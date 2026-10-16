@@ -13,7 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   base risk, the rules estimate, the route line's `risk=` claim, the merged facts, any inherited resume risk and the
   effective risk, plus an optional bounded vocabulary label (a single word or a table id, never prompt text). Routing
   is unchanged; older rows stay readable.
-- **OpenCode v2: opt-in `routing.roleFloor: "gated"`** (global only, default `"strict"`). A role dispatch that may edit
+- **OpenCode v2: configurable `routing.roleFloor: "gated"`** (bundled `tiers.json` or global override, not project overrides;
+  code default `"strict"`). A role dispatch that may edit
   and run commands, whose detection is `grader`, whose risk is not `high`, whose return gate runs and whose role can
   be raised from `medium` straight to `heavy`, gets a `medium` authority floor instead of `heavy` (bounds reason
   `gated:authority`, recorded only when gating lowers the final floor). A verification FAIL, and for gated children also
@@ -145,6 +146,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **OpenCode v2: `/router` lists `/plan` only with executor-capable routing configuration.** Without a routing block,
+  help remains byte-identical to the legacy output; OpenCode v1 is unchanged.
 - **OpenCode v2: a task blocked by a reverted dependency keeps its unsaved work.** The integration queue no longer
   gives such a task's slot back to the pool unsaved. The work is first saved at the task's WIP ref (a failed save keeps
   the slot leased). A running task's slot is released once, by the executor, after its cancelled child has ended.
@@ -299,9 +302,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/router stats` orchestrator cache-read share is no longer over-counted. The recorder is shared per directory across
   the copies of one build; a recorder registered by a build with another registry version is left alone. OpenCode v1 is
   unchanged.
+- **Plan executor: a child adopted after a restart no longer writes into a released slot.** When its task is blocked by
+  a reverted dependency or the plan is aborted, the child is interrupted and awaited before its slot is saved and
+  released. If it cannot be stopped, the slot stays held with one blocking inbox item.
 
 ### Security
 
+- **OpenCode v2: executor check discovery uses absolute, guarded executables.** Git searches use hardened arguments
+  and environment; pytest resolves its interpreter outside guarded checkouts. Both use a credential-stripped run
+  environment with explicit full-environment replacement and Windows current-directory search protection, so process
+  inheritance cannot restore provider credentials. Other process callers retain their default environment merging.
 - **OpenCode v2 (v1 unchanged): an unbound plan child is refused every tool call.** A child session whose first message
   is a plan launcher prompt (`PLAN CONTEXT` followed by the launch header at its grammar position) but that has no
   matching plan binding is refused every tool call (fail closed). The prompt is recognized at the start of the message

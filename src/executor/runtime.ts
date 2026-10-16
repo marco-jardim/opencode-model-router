@@ -33,6 +33,7 @@ import type { ProcessIdentity } from "./process-identity";
 import { createQaLoop } from "./qa-loop";
 import {
   RECOVER_TAKEOVER_REASON,
+  RECOVERY_LIVENESS_MS,
   RECOVERY_POLL_MS,
   sameToplevel,
   type ReconcileFeed,
@@ -553,6 +554,13 @@ export interface ExecutorRuntimeHandle extends ExecutorRuntime {
    * held lease is retried by a tick of every attached plan, not only by the backoff tick.
    */
   onLeaseReleased(): void;
+  /**
+   * G-1: whether a child of `taskId` may still write in its slot: a launch in flight, a child recovery adopted whose end is
+   * not known, or the stop of such a child still running. The queue's `settle` (create.ts) gives a blocked task's slot back
+   * only once this is false. Asked for a blocked task, it starts the stop of its adopted child (the queue can poll before
+   * `onReverted` swept).
+   */
+  childLive?(planId: PlanId, taskId: TaskId): boolean;
 }
 
 const GIT_TIMEOUT_MS = 60_000;
@@ -1722,6 +1730,9 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
   async function retryHeldSave(p: PlanRt, slotName: string, outcome: string): Promise<SaveResult> {
     const key = `${p.planId}/${slotName}`;
     if (!SLOT_NAME_PATTERN.test(slotName) || quarantineHeld(p, slotName)) return "failed";
+    // G-1: the slot of an adopted child that did not stop is kept until the child ends or its item is answered.
+    if (outcome !== "answer" && adoptedHeld.has(key)) return "failed";
+    adoptedHeld.delete(key);
     let owner: string | null = null;
     let path: string;
     try {
@@ -2243,6 +2254,9 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       if (t0 === null || t0.state !== "ready" || l.status !== "running" || p.latch) return "skipped";
       // The task moved on while the step queued (an adopted late child, a retry): the token is not this attempt's.
       if (t0.attempts.length + 1 !== n) return "skipped";
+      // G-1: the stop of this task's adopted child still runs, or its failed stop holds the old slot: the pool would hand
+      // that slot back to the task (same owner) and the launch would reset it under the child.
+      if (adoptedStopHolds(p, taskId)) return "skipped";
       const fresh = t0.slot === null;
       const route = item.route;
       let slot: SlotLease | null = null;
@@ -2412,6 +2426,10 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
           d.log("warn", "cancel superseded failed", errorText(e));
         }
       }
+      // G-1: row 4 and R4 awaited; row 34 (a reverted dependency) or an abort may have closed attempt n meanwhile, and its
+      // slot is being released: no child is launched for an attempt that is no longer dispatched and open.
+      const t2 = own(p.writer.ledger, taskId);
+      if (t2 === null || t2.state !== "dispatched" || openAttempt(t2, n) === null) return "skipped";
       // 8. launch
       const req: LaunchRequest = {
         planId: p.planId,
@@ -3451,11 +3469,28 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
    * M1: `<plan>/<task>` -> the release `sweepBlocked` runs for the task's cancelled attempt `n`. The queue's release of
    * that task's slot waits for it instead of releasing the slot a second time.
    */
-  const blockedSweeps = new Map<string, { n: number; done: Promise<void> }>();
+  const blockedSweeps = new Map<string, BlockedSweep>();
+
+  /** One `blockedSweeps` entry. */
+  interface BlockedSweep {
+    n: number;
+    done: Promise<void>;
+    /** G-1: the sweep stops a child recovery adopted (`sweepAdopted`), not a launch of this process. */
+    adopted: boolean;
+    /** G-1: the adopted child, null for a launch's sweep. */
+    child: string | null;
+    /** G-1: `done` settled. */
+    settled: boolean;
+    /** G-1: how the adopted child's stop ended (null before, and for a launch's sweep). */
+    stop: AdoptedStop | null;
+    /** G-1: the slot the sweep releases or holds, once known. */
+    slot: string | null;
+  }
 
   /**
    * M8: a child whose task Q moved to blocked is cancelled; resources are released once its completion settles.
    * M1: this sweep is the only releaser of such a live task's slot (saved first, `releaseResources`), once per attempt.
+   * G-1: a child recovery adopted is in no launcher flight; `sweepAdopted` stops it.
    */
   function sweepBlocked(p: PlanRt): void {
     for (const f of d.launcher.inFlight()) {
@@ -3467,14 +3502,68 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       // A second revert's sweep finds the same attempt still in flight: it is released once.
       if (blockedSweeps.get(key)?.n === f.attempt) continue;
       const slotName = p.slotLeases.get(f.taskId)?.slot ?? null;
-      const done = bg("blocked cancel", async () => {
-        await d.launcher.cancel(f.taskId, f.attempt, "blocked");
-        await h.completion;
-        await releaseResources(p, f.taskId, slotName);
-        releaseToken(p, f.taskId, f.attempt, "other");
+      const sweep: BlockedSweep = { n: f.attempt, done: Promise.resolve(), adopted: false, child: null, settled: false, stop: null, slot: slotName };
+      sweep.done = bg("blocked cancel", async () => {
+        try {
+          await d.launcher.cancel(f.taskId, f.attempt, "blocked");
+          await h.completion;
+          await releaseResources(p, f.taskId, slotName);
+          releaseToken(p, f.taskId, f.attempt, "other");
+        } finally {
+          sweep.settled = true;
+        }
       });
-      blockedSweeps.set(key, { n: f.attempt, done });
+      blockedSweeps.set(key, sweep);
     }
+    for (const t of Object.values(p.writer.ledger.tasks)) {
+      const last = t.attempts[t.attempts.length - 1];
+      if (t.state === "blocked" && t.slot === null && last !== undefined) sweepAdopted(p, t.id, last.n, null);
+    }
+  }
+
+  /**
+   * G-1: the sweep of a blocked task whose attempt `n` ran a child recovery adopted (no launch of this process tracks it):
+   * the child is stopped (`stopAdoptedChild`) and the slot released (saved first, `releaseResources`) only once it ended.
+   * A failed stop keeps the slot leased to the task under a hold (`wipHold`: one blocking item) and releases nothing. Once
+   * per attempt (the existing sweep is returned); null when the task has no such child.
+   */
+  function sweepAdopted(p: PlanRt, taskId: TaskId, n: number, slot: string | null): BlockedSweep | null {
+    const key = `${p.planId}/${taskId}`;
+    const have = blockedSweeps.get(key);
+    if (have !== undefined && have.n === n) return have;
+    const child = adoptedChildOf(p, taskId, n);
+    if (child === null || p.disposed || disposed) return null;
+    const sweep: BlockedSweep = { n, done: Promise.resolve(), adopted: true, child, settled: false, stop: null, slot: p.slotLeases.get(taskId)?.slot ?? slot };
+    blockedSweeps.set(key, sweep);
+    sweep.done = bg("blocked adopted child stop", async () => {
+      try {
+        const r = await stopAdoptedChild(p, taskId, n, child);
+        sweep.stop = p.disposed || disposed ? "cut" : r;
+        if (sweep.stop === "cut") return;
+        if (sweep.stop === "held") {
+          if (sweep.slot !== null) await holdAdoptedSlot(p, taskId, sweep.slot, child, "dep-reverted");
+          return;
+        }
+        releaseToken(p, taskId, n, "other");
+        await releaseResources(p, taskId, sweep.slot);
+      } finally {
+        sweep.settled = true;
+      }
+    });
+    return sweep;
+  }
+
+  /**
+   * G-1: a stop of the task's adopted child still runs, or its failed stop holds the old slot (its item is open, the slot
+   * unsaved): no launch may take that slot. A settled sweep whose hold ended is dropped.
+   */
+  function adoptedStopHolds(p: PlanRt, taskId: TaskId): boolean {
+    const key = `${p.planId}/${taskId}`;
+    const s = blockedSweeps.get(key);
+    if (s === undefined || !s.adopted) return false;
+    if (!s.settled || (s.stop === "held" && s.slot !== null && wipFailRaised.has(`${p.planId}/${s.slot}`))) return true;
+    blockedSweeps.delete(key);
+    return false;
   }
 
   /**
@@ -3482,16 +3571,163 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
    * that sweep's to release: the sweep is awaited. Then, while the pool still leases the slot to the task (no sweep
    * ran, or a failed save kept it), the slot's work is saved before the release (`releaseSlotSaved`). The pool's
    * `acquire` would otherwise reset a dirty slot and lose its work. Never throws.
+   * G-1: the queue can release before `onReverted` swept: a child recovery adopted is stopped here first, and a failed
+   * stop keeps the slot under its hold. N-1: the save and release run under the task's mutex, so a launch step of the
+   * same task never saves or resets the slot meanwhile; the queue never awaits this in its serial lane.
    */
   async function releaseBlockedSlot(p: PlanRt, taskId: TaskId, slot: string): Promise<void> {
     const key = `${p.planId}/${taskId}`;
+    const t = own(p.writer.ledger, taskId);
+    const last = t === null || t.state !== "blocked" ? undefined : t.attempts[t.attempts.length - 1];
+    if (last !== undefined) sweepAdopted(p, taskId, last.n, slot);
     const sweep = blockedSweeps.get(key);
     if (sweep !== undefined) {
       await sweep.done;
+      if (sweep.stop === "cut") return;
+      if (sweep.stop === "held") {
+        // The slot stays leased to the task under its hold; the sweep raised it when it knew the slot.
+        if (sweep.slot === null && sweep.child !== null && (await slotHeldBy(p, taskId, slot))) {
+          sweep.slot = slot;
+          await holdAdoptedSlot(p, taskId, slot, sweep.child, "dep-reverted");
+        }
+        return;
+      }
       if (blockedSweeps.get(key) === sweep) blockedSweeps.delete(key);
     }
-    if (!(await slotHeldBy(p, taskId, slot))) return;
-    await releaseSlotSaved(p, taskId, slot, "dep-reverted");
+    await withTask(p, taskId, async () => {
+      if (!(await slotHeldBy(p, taskId, slot))) return;
+      await releaseSlotSaved(p, taskId, slot, "dep-reverted");
+    });
+  }
+
+  // ---------- G-1: stopping a child recovery adopted
+
+  /**
+   * G-1: how a stop of an adopted child ended: `stopped` (its terminal event or an idle context came, or nothing runs any
+   * more), `held` (the interrupt failed, or the bound passed without an end: it may still write), `cut` (the plan closed).
+   */
+  type AdoptedStop = "stopped" | "held" | "cut";
+
+  interface AdoptedStopWait {
+    readonly p: PlanRt;
+    outcome: AdoptedStop | null;
+    /** Ends the current poll sleep at once (a terminal event, a cut). */
+    wake: () => void;
+  }
+
+  /** G-1: the stops running now, by child session id; a terminal host event of the child ends its wait. */
+  const adoptedStops = new Map<string, AdoptedStopWait>();
+
+  /**
+   * G-1: `<plan>/<slot>` -> the adopted child whose failed stop holds the slot. No save retry but the item's answer
+   * releases it (`retryHeldSave`) until the child's terminal event comes.
+   */
+  const adoptedHeld = new Map<string, string>();
+
+  /** G-1: a failed stop keeps the slot leased to the task under a hold: one blocking item names it (`wipHold`). */
+  async function holdAdoptedSlot(p: PlanRt, taskId: TaskId, slot: string, child: string, outcome: string): Promise<void> {
+    adoptedHeld.set(`${p.planId}/${slot}`, child);
+    await wipHold(p, taskId, slot, `its release (${outcome}): its adopted child ${child} could not be stopped`);
+  }
+
+  /**
+   * G-1: the live child recovery adopted for attempt `n` of `taskId`: its handle is the settled one `restoreHandle` made
+   * (no launch of this process tracks it), it is re-bound or marked adopted, and no end of it is known (a registered
+   * recovered end is a finished child). Null otherwise.
+   */
+  function adoptedChildOf(p: PlanRt, taskId: TaskId, n: number): string | null {
+    const h = p.handles.get(taskId);
+    if (h === undefined || h.n !== n || !h.settled) return null;
+    const r = p.rebound.get(taskId);
+    const rebound = r !== undefined && r.n === n ? r.childSessionID : null;
+    if (rebound === null && !p.adoptedByRecovery.has(tokenKey(taskId, n))) return null;
+    const w = p.recoveredWork.get(taskId);
+    if (w !== undefined && w.n === n && w.work.kind === "end") return null;
+    return own(p.writer.ledger, taskId)?.attempts.find((a) => a.n === n)?.childSessionID ?? rebound;
+  }
+
+  function endAdoptedStop(child: string, outcome: AdoptedStop): void {
+    const w = adoptedStops.get(child);
+    if (w === undefined || w.outcome !== null) return;
+    w.outcome = outcome;
+    w.wake();
+  }
+
+  /** G-1: the stops of plan `p` (every plan when null) end as `cut`: the plan closes, nothing is released. */
+  function cutAdoptedStops(p: PlanRt | null): void {
+    for (const [child, w] of [...adoptedStops]) if (p === null || w.p === p) endAdoptedStop(child, "cut");
+  }
+
+  function stopOutcome(w: AdoptedStopWait): AdoptedStop | null {
+    return w.outcome;
+  }
+
+  /** G-1: the QA-4.2-28 rule: an `idle` last entry with an outcome is an end; a context that cannot be read is none. */
+  async function childIdle(child: string): Promise<boolean> {
+    try {
+      const ctx = await d.hosts.context(child);
+      const last = ctx.messages[ctx.messages.length - 1];
+      return last !== undefined && last.role === "idle" && last.outcome !== null;
+    } catch (e) {
+      d.log("warn", `context read of ${child} failed`, errorText(e));
+      return false;
+    }
+  }
+
+  /**
+   * G-1: stops the child recovery adopted for the closed attempt `n` of `taskId`: marked `interrupting` (its interrupt's
+   * own end is no unrequested interrupt), interrupted, its binding evicted, then awaited for its terminal event or an idle
+   * context, polled every RECOVERY_POLL_MS for at most RECOVERY_LIVENESS_MS (the probation window). A rejected interrupt
+   * that means nothing runs (`interruptSettled`) is a stop. Never throws; the adoption marks go in every case.
+   */
+  async function stopAdoptedChild(p: PlanRt, taskId: TaskId, n: number, child: string): Promise<AdoptedStop> {
+    if (p.disposed || disposed) return "cut";
+    const w: AdoptedStopWait = { p, outcome: null, wake: () => undefined };
+    adoptedStops.set(child, w);
+    p.interrupting.add(child);
+    p.probation.delete(child);
+    try {
+      let refused = false;
+      try {
+        await d.hosts.interrupt(child);
+      } catch (e) {
+        if (interruptSettled(e)) endAdoptedStop(child, "stopped");
+        else {
+          refused = true;
+          d.log("warn", `interrupt of the adopted child ${child} of ${taskId} failed; its slot is held`, errorText(e));
+        }
+      }
+      evictRebound(p, taskId, n);
+      const deadline = d.clock.now() + RECOVERY_LIVENESS_MS;
+      for (;;) {
+        const seen = stopOutcome(w);
+        if (seen !== null) return seen;
+        if (refused) return "held";
+        if (await childIdle(child)) return stopOutcome(w) ?? "stopped";
+        const left = deadline - d.clock.now();
+        if (stopOutcome(w) === null && left <= 0) {
+          d.log("warn", `the adopted child ${child} of ${taskId} did not end within ${RECOVERY_LIVENESS_MS} ms of its interrupt; its slot is held`);
+          return "held";
+        }
+        if (stopOutcome(w) !== null) continue;
+        await new Promise<void>((resolve) => {
+          const timer = d.clock.setTimer(Math.min(RECOVERY_POLL_MS, left), () => {
+            w.wake = () => undefined;
+            resolve();
+          });
+          w.wake = () => {
+            d.clock.clearTimer(timer);
+            w.wake = () => undefined;
+            resolve();
+          };
+        });
+      }
+    } finally {
+      if (adoptedStops.get(child) === w) adoptedStops.delete(child);
+      p.interrupting.delete(child);
+      p.adoptedByRecovery.delete(tokenKey(taskId, n));
+      evictRebound(p, taskId, n);
+    }
   }
 
   function makeListener(ref: { p: PlanRt | null }): IntegrationListener {
@@ -4208,6 +4444,9 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       await withTask(p, t.id, async () => {
         const x = own(p.writer.ledger, t.id);
         if (x === null || x.state !== t.state) return;
+        // m-A: as for `requeue-lost` (`applyFeed`): an end received while the interrupt ran is newer evidence than the
+        // feed; the registered completion pipeline processes it, its finished work is neither reset nor requeued as lost.
+        if (p.recoveredWork.get(t.id)?.work.kind === "end") return;
         if (x.state === "running") await requeueLost(p, x, f);
         else await resetSlotContents(p, x);
       });
@@ -4820,6 +5059,8 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
   async function closePlan(p: PlanRt): Promise<void> {
     p.disposed = true;
     p.latch = true;
+    // G-1: a stop of an adopted child releases nothing once its attachment closes (the next one recovers the slot).
+    cutAdoptedStops(p);
     p.attachment.abort();
     dropRecoveredWork(p, false);
     // An adopt closes this writer only after old-attachment pipelines have observed their cut.
@@ -5042,6 +5283,12 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
   function onHostEvent(e: HostSessionEvent): void {
     try {
       const sid = e.sessionID;
+      // G-1: the terminal event of an adopted child being stopped (its interrupt's own end included) ends that wait; a
+      // slot its failed stop held may be saved and released by a later retry now.
+      if (e.type === "execution.completed" || e.type === "execution.failed" || e.type === "execution.interrupted") {
+        endAdoptedStop(sid, "stopped");
+        for (const [k, child] of [...adoptedHeld]) if (child === sid) adoptedHeld.delete(k);
+      }
       if (e.type === "step.started") {
         boundedSet(providerBySession, sid, e.providerID);
         const st = stepState.get(sid);
@@ -5428,6 +5675,15 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       // Whole-plan cancellation stops progression; unlike a done task, it must not reopen gates or launch QA.
       p.latch = true;
       observe(p, "abort");
+      // G-1: the live children recovery adopted (no launch of this process tracks them) of the attempts this abort closes;
+      // read before `dropRecoveredWork` forgets the recovered ends that mark a finished child.
+      const adopted = new Map<TaskId, { n: number; child: string }>();
+      for (const t of Object.values(p.writer.ledger.tasks)) {
+        const a = t.attempts[t.attempts.length - 1];
+        if (a === undefined || a.outcome !== null || (t.state !== "dispatched" && t.state !== "running")) continue;
+        const child = adoptedChildOf(p, t.id, a.n);
+        if (child !== null) adopted.set(t.id, { n: a.n, child });
+      }
       // Request the cut, but never wait for an external verifier before queue abort and durable cancellation. Slot
       // cleanup below waits in the background instead, so a verifier that ignores the cut cannot deadlock abort.
       p.attachment.abort();
@@ -5482,6 +5738,33 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
           } finally {
             releasing.delete(f.taskId);
             // The finished plan's collection runs now (a held slot is retried there and refuses it), not at the next backoff.
+            bg("finished slot collection", () => collectFinished(p));
+          }
+        });
+      }
+      // G-1: an adopted child is interrupted and awaited (bounded) before its slot is saved and released; a failed stop
+      // keeps the slot leased under a hold (one blocking item), which also keeps the collection off its worktree.
+      for (const [id, { n, child }] of adopted) {
+        if (!cancelled.has(id) || live.has(id)) continue;
+        live.add(id);
+        const slotName = cancelled.get(id) ?? null;
+        const releasing = abortReleases.get(p) ?? new Set<TaskId>();
+        abortReleases.set(p, releasing);
+        releasing.add(id);
+        bg("abort adopted child stop", async () => {
+          try {
+            const r = await stopAdoptedChild(p, id, n, child);
+            if (r === "cut" || p.disposed || disposed) return;
+            releaseToken(p, id, n, "other");
+            if (r === "held") {
+              releaseLeases(p, id);
+              if (slotName !== null) await holdAdoptedSlot(p, id, slotName, child, "abort");
+              return;
+            }
+            await attachmentsSettled;
+            await releaseResources(p, id, slotName);
+          } finally {
+            releasing.delete(id);
             bg("finished slot collection", () => collectFinished(p));
           }
         });
@@ -5839,6 +6122,9 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         // R1a: the probation poll timer was one of `p.timers`; no poll re-arms after dispose.
         p.probationTimer = null;
       }
+      // G-1: the stops of adopted children end now (their slots stay leased; the next process recovers them), so the wait
+      // for running work below never waits for their bound.
+      cutAdoptedStops(null);
       await verifierCut;
       // Detach every plan from host feeds synchronously, before any optional verifier hook can yield.
       if (d.verifier.forget !== undefined) {
@@ -5892,6 +6178,20 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     recordMetric(planId, m) {
       const p = plans.get(planId);
       if (p !== undefined) metric(p, m);
+    },
+
+    childLive(planId, taskId) {
+      if (d.launcher.inFlight().some((f) => f.taskId === taskId)) return true;
+      const p = plans.get(planId);
+      if (p === undefined || p.disposed) return false;
+      const sweep = blockedSweeps.get(`${planId}/${taskId}`);
+      if (sweep !== undefined && !sweep.settled) return true;
+      const t = own(p.writer.ledger, taskId);
+      const last = t === null ? undefined : t.attempts[t.attempts.length - 1];
+      if (t === null || last === undefined) return false;
+      // The queue's settle can poll before `onReverted` swept: a blocked task's adopted child is stopped from here too.
+      if (t.state === "blocked") return sweepAdopted(p, taskId, last.n, null)?.settled === false;
+      return adoptedChildOf(p, taskId, last.n) !== null;
     },
 
     onLeaseReleased() {

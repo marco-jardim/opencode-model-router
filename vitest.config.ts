@@ -43,23 +43,35 @@ const mergedGates =
     ? Object.fromEntries(MERGED_PER_FILE_GATED.map((f) => [f, { ...MERGED_PER_FILE_MIN, perFile: true }]))
     : {};
 
+const projectDefaults = {
+  root: ".",
+  environment: "node" as const,
+  // Every project keeps the home redirect and dependency handling of the original pool.
+  setupFiles: ["test/setup/home-guard.ts"],
+  server: { deps: { inline: ["@opencode-ai/plugin"] } },
+};
+const excluded = ["test/smoke/**", "node_modules/**", "dist/**", "tmp/**"];
+
 export default defineConfig({
   test: {
     root: ".",
-    include: ["test/**/*.test.ts"],
-    exclude: ["test/smoke/**", "node_modules/**", "dist/**", "tmp/**"],
-    environment: "node",
     // Keeps every test off the real home directory (QA-1.1-17, plan amendment
     // A14): os.homedir() is mocked to the test's own HOME/USERPROFILE redirect or a
     // private temp dir, in any pool. Never run vitest with --pool=threads anyway.
-    setupFiles: ["test/setup/home-guard.ts"],
     // QA-2.1-R2-6: tags the run and removes the private temp dirs its workers created (skipped files included).
     globalSetup: ["test/setup/global-guard.ts"],
-    server: {
-      deps: {
-        inline: ["@opencode-ai/plugin"],
+    projects: [
+      {
+        test: { ...projectDefaults, name: "default", include: ["test/**/*.test.ts"],
+          exclude: [...excluded, "test/unit/exec.test.ts"], sequence: { groupOrder: 0 } },
       },
-    },
+      {
+        // G-6 / P-2: lifecycle deadlines need an otherwise idle test pool, not longer timeouts.
+        // A separate group runs after the parallel suite; CLI --maxWorkers does not share its fork.
+        test: { ...projectDefaults, name: "exec-serial", include: ["test/unit/exec.test.ts"], exclude: excluded,
+          pool: "forks", maxWorkers: 1, fileParallelism: false, sequence: { groupOrder: 1 } },
+      },
+    ],
     coverage: {
       provider: "v8",
       reportsDirectory: "coverage",

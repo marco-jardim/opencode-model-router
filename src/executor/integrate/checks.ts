@@ -5,7 +5,8 @@
 
 import { lstat, readdir, readFile, realpath, stat, unlink } from "node:fs/promises";
 import * as nodePath from "node:path";
-import { hardeningArgs } from "../../router/git-tools";
+import { gitEnvironment, gitExecutable, hardeningArgs, workRootGuards } from "../../router/git-tools";
+import { resolveCommandExecutable, runEnvironment } from "../../router/run-tools";
 import {
   detectRunner, isNoAffected, isScopedSpec, isUnverifiable, planRerun, planScopedRun, readResult,
   type ChangedPath, type RunnerFs, type TestSearchSeam,
@@ -42,6 +43,8 @@ export interface ResolvedCommand {
   resolution?: { cwd: string; env: Readonly<Record<string, string>> };
   /** Extra environment for the child (scoped test specs). */
   env?: Readonly<Record<string, string>>;
+  /** A resolved, sanitized environment must replace inheritance at the process seam. */
+  envMode?: "replace";
   /** Explicit working directory override (for example scoped test specs); default: the check's cwd. */
   cwd?: string;
 }
@@ -527,11 +530,24 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
   }
 
   async function resolveForSlot(c: ResolvedCommand, cwd: string): Promise<ResolvedCommand> {
+    if (c.source === "pytest") return resolvePython(c, c.cwd ?? cwd);
     if (c.resolution === undefined || c.ref === null) return c;
     // Executable, environment and checkout-dependent authorization all belong to the prepared slot, even when
     // its path is unchanged (base/bisect/revert). Only explicit overrides survive; never reuse the inherited plan.
     return { ...await resolveRef(c.ref, c.cwd ?? cwd),
       ...(c.cwd === undefined ? {} : { cwd: c.cwd }), ...(c.env === undefined ? {} : { env: c.env }) };
+  }
+
+  function resolvePython(c: ResolvedCommand, cwd: string): ResolvedCommand {
+    const guards = workRootGuards(cwd);
+    const env = runEnvironment(process.env, process.platform, undefined, { guards });
+    try {
+      const file = resolveCommandExecutable(c.file, { platform: process.platform, env }, guards);
+      return { ...c, file, resolution: { cwd, env: Object.fromEntries(Object.entries(env)
+        .filter((entry): entry is [string, string] => entry[1] !== undefined)) } };
+    } catch (e) {
+      throw new CheckResolveError(`pytest: ${errText(e)}`);
+    }
   }
 
   async function readSelection(cwd: string, commit: string) {
@@ -552,7 +568,7 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
       const python = cfg.python === "auto" ? "python" : cfg.python;
       const label = `${python} -m pytest`;
       if (d.allowCommand === undefined || d.allowCommand(label)) {
-        tests.push({ framework: "pytest", full: { label, file: python, args: ["-m", "pytest"], source: "pytest", ref: null } });
+        tests.push({ framework: "pytest", full: resolvePython({ label, file: python, args: ["-m", "pytest"], source: "pytest", ref: null }, cwd) });
       }
     }
     const extras: ResolvedCommand[] = [];
@@ -627,6 +643,8 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
   }
 
   async function exec(c: ResolvedCommand, cwd: string, signal: AbortSignal, low: boolean): Promise<CommandOutput> {
+    // Scoped/rerun planners can replace argv[0]; authorize it too, not just the full-suite interpreter.
+    if (c.source === "pytest") c = resolvePython(c, c.cwd ?? cwd);
     let command = c;
     if (c.resolution !== undefined) {
       const env = { ...c.resolution.env };
@@ -637,7 +655,7 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
         }
         env[key] = value;
       }
-      command = { ...c, env };
+      command = { ...c, env, envMode: "replace" };
     }
     const context = executions.get(signal);
     if (context === undefined) return d.spawn(command, { cwd: c.cwd ?? cwd, signal, lowPriority: low });
@@ -662,8 +680,11 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
   function search(cwd: string, signal: AbortSignal): TestSearchSeam {
     const git = async (root: string, args: readonly string[]) => {
       try {
+        const guards = workRootGuards(cwd);
+        const env = runEnvironment(gitEnvironment(), process.platform, undefined, { guards });
         const r = await d.spawn(
-          { label: "git", file: "git", args: ["--no-optional-locks", "-C", root, ...args], source: "run-command", ref: null, cwd },
+          { label: "git", file: gitExecutable(guards), args: [...hardeningArgs(), "-C", root, ...args], source: "run-command", ref: null, cwd,
+            env: Object.fromEntries(Object.entries(env).filter((entry): entry is [string, string] => entry[1] !== undefined)), envMode: "replace" },
           { cwd, signal, lowPriority: true },
         );
         return r.timedOut ? undefined : r;

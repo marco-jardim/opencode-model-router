@@ -3757,7 +3757,11 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           }
         } else {
           // #84 P2.2: `/router` lists the roles in roles mode on v2 (`rolesNow()` is empty in tiers mode and on v1).
-          text = buildRouterOutput(cfg, args, projectDir, rolesNow().size > 0 ? rolesNow().values() : undefined, approvalsAvailable, isV2Host);
+          // Match v2.ts's executor discovery prerequisites; an unconfigured v2 host keeps the legacy help.
+          const planAvailable = isV2Host && resolveRolesRouting(cfg, "v2").delegation === "roles"
+            && resolveRouting(cfg, "v2").leases.mode === "enforce" && cfg.enforcement?.verify?.require !== "never"
+            && !locationOutsideWorkRoots(ctx.directory, cfg.routing?.workRoots);
+          text = buildRouterOutput(cfg, args, projectDir, rolesNow().size > 0 ? rolesNow().values() : undefined, approvalsAvailable, planAvailable);
           // On the bare status view, surface stale or missing models inline.
           if (sub === "") {
             text += "\n" + routerStatusLines(cfg, ctx.routerHost === "v2" ? "v2" : "v1", logger, projectDir).join("\n");

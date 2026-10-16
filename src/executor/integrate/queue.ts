@@ -324,7 +324,7 @@ export interface IntegrationQueueDeps {
   /**
    * M1: gives back the slot of a task row 34 blocked. The runtime saves the slot's unsaved work first
    * (`releaseSlotSaved`), and a failed save keeps the slot leased. It never releases a slot whose cancelled child
-   * `sweepBlocked` is still releasing.
+   * `sweepBlocked` is still releasing. N-1: it takes the task's mutex, so the serial lane never awaits it.
    */
   releaseSlot: (taskId: TaskId, slot: string) => Promise<void>;
 }
@@ -2351,7 +2351,9 @@ class Queue implements IntegrationQueue {
         this.d.leases.releaseTask(r.id);
       };
       if (r.live) this.d.settle(r.id, release);
-      else await release();
+      // N-1: the runtime saves a ready dependent's slot under its task's mutex; that release is never awaited in this
+      // serial lane (a pipeline holding the mutex may wait on the lane through `checkPhase`).
+      else void release().catch((e: unknown) => this.d.logger.warn(`integration queue: slot release failed: ${message(e)}`));
     }
     this.safe(() => this.d.listener.onReverted(culprit.taskId));
     this.safe(() => this.d.listener.onGate(p, "pending"));

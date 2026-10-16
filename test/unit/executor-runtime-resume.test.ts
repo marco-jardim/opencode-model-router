@@ -1617,6 +1617,68 @@ describe("pdf2-1 round 4: blocked dependents, re-provisioning and slot paths", (
     expect((await h.ledger()).tasks.T1?.state).toBe("blocked");
   }, TEST_MS);
 
+  it("N-1: the queue's release of a READY dependent waits for a launch step of the same task: their saves never overlap", async () => {
+    // Every git step in the slot is counted while it runs; the relaunch's first one is held open.
+    const io = { slot: "", active: 0, max: 0, hold: null as Promise<void> | null, entered: (): void => {} };
+    const counting: GitRunner = {
+      run: async (args, o) => {
+        const inSlot = io.slot !== "" && o.cwd === io.slot;
+        if (inSlot) {
+          io.active += 1;
+          io.max = Math.max(io.max, io.active);
+        }
+        try {
+          const hold = inSlot ? io.hold : null;
+          if (hold !== null) {
+            io.hold = null;
+            io.entered();
+            await hold;
+          }
+          return await runGit(args, o.cwd);
+        } finally {
+          if (inSlot) io.active -= 1;
+        }
+      },
+    };
+    const h = await rig({ git: counting });
+    const inputs = captureInputs(h);
+    await h.start();
+    const first = await h.launched(1);
+    await h.child(first, "ses-1");
+    await writeFile(join(h.r.slot, "b.txt"), "dependent's unsaved work\n");
+    const gate = vi.spyOn(h.deps.launcher, "gate").mockReturnValue({ ok: false, reason: "no-context", wake: { reason: "stale-context", stateKey: "n1-ready" } });
+    first.end({ kind: "lost", childSessionID: "ses-1", reason: "runner-error", endedAt: h.deps.clock.iso() });
+    await untilState(h, "ready");
+    const { input, releaseSlot } = releaseSlotOf(inputs);
+    let resume: () => void = () => {};
+    io.hold = new Promise<void>((res) => { resume = res; });
+    const entered = new Promise<void>((res) => { io.entered = res; });
+    io.slot = h.r.slot;
+    // The context is back: the relaunch's launch step takes the task and starts its save before the slot's reset.
+    gate.mockRestore();
+    h.runtime.onLeaseReleased();
+    await entered;
+    // Row 34 for the READY dependent, then the queue's release of its slot, while that launch step holds the task.
+    await input.writer.append([
+      { type: "task-transition", taskId: "T1", from: "ready", to: "blocked", trigger: "dep-reverted", detail: null },
+      { type: "task-slot", taskId: "T1", slot: null, branch: null },
+    ]);
+    const released = releaseSlot("T1", "slot-1");
+    await h.pause(200);
+    expect(io.max).toBe(1);
+    expect(h.pool.release).not.toHaveBeenCalled();
+    resume();
+    await released;
+    await h.pause(100);
+    expect(io.max).toBe(1);
+    expect(h.pool.release).toHaveBeenCalledTimes(1);
+    expect(h.pool.release).toHaveBeenCalledWith("slot-1");
+    expect(await sh(h.r.top, "show", `refs/heads/${wipRef}:b.txt`)).toBe("dependent's unsaved work\n");
+    // The launch step found its task blocked after the save: no child was launched.
+    expect(h.launches).toHaveLength(1);
+    expect((await h.ledger()).tasks.T1?.state).toBe("blocked");
+  }, TEST_MS);
+
   it("minor-4: a failed save before the re-provisioning reset keeps the new slot leased under its hold and drops its cached lease", async () => {
     const io = { failSave: false, refuse: false };
     const h = await rig({

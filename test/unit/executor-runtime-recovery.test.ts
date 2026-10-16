@@ -14,12 +14,19 @@ import { createCapacityController } from "../../src/executor/capacity.js";
 import { createLedgerStore } from "../../src/executor/ledger.js";
 import { taskBranchName } from "../../src/executor/git.js";
 import { createTaskLauncher, type PlanBindInput, type PlanRoleBindings } from "../../src/executor/launch.js";
-import { createRecoveryService, type RecoveryDeps, type RecoveryEngine } from "../../src/executor/recovery.js";
+import {
+  createRecoveryService,
+  RECOVERY_LIVENESS_MS,
+  RECOVERY_POLL_MS,
+  type RecoveryDeps,
+  type RecoveryEngine,
+} from "../../src/executor/recovery.js";
 import {
   attemptTrailer,
   commitTaskInSlot,
   createExecutorRuntime,
   realCollaborators,
+  type CollaboratorInput,
   type ExecutorRuntimeHandle,
   type LeaseRegistryPort,
   type PlanCollaborators,
@@ -649,6 +656,8 @@ interface PlanParts {
   listener: IntegrationListener;
   queue: QueueDouble;
   policy: PolicyDouble;
+  /** M1/G-1: the queue's `releaseSlot` hook the runtime supplied (`IntegrationQueueDeps.releaseSlot`). */
+  releaseSlot: CollaboratorInput["releaseSlot"];
 }
 
 interface Harness {
@@ -744,7 +753,7 @@ async function mk(draft: LedgerV1): Promise<Harness> {
     collaborators: (i) => {
       const queue = new QueueDouble(log, i.writer, queueCfg, clock);
       const policy = new PolicyDouble(i.writer, clock);
-      st.parts = { writer: i.writer, leases: i.leases, waker: i.waker, listener: i.listener, queue, policy };
+      st.parts = { writer: i.writer, leases: i.leases, waker: i.waker, listener: i.listener, queue, policy, releaseSlot: i.releaseSlot };
       const c: PlanCollaborators = { queue, policy, qa: new QaDouble() };
       return c;
     },
@@ -1634,6 +1643,199 @@ describe("pdf2-1 round 4 minor-1: recovered ends dropped by an abort", () => {
     expect(h.bindings.evicted).toEqual(["ses-c1"]);
     expect(h.task("T1").attempts[0]).toMatchObject({ outcome: "interrupted", verdict: null });
     expect(h.verifier.calls).toEqual([]);
+  });
+});
+
+describe("G-1: a child recovery adopted is stopped before its slot goes back", () => {
+  /** Row 34 as the queue journals it for the running dependent T1 of a reverted task; returns T1's slot. */
+  async function row34(h: Harness): Promise<string> {
+    const slot = need(h.task("T1").slot, "slot of T1");
+    await h.parts().writer.append([
+      { type: "attempt-ended", taskId: "T1", n: 1, outcome: "interrupted", endedAt: h.clock.iso(), detail: "dep-reverted" },
+      tr("T1", "running", "blocked", "dep-reverted"),
+      { type: "task-slot", taskId: "T1", slot: null, branch: null },
+    ]);
+    return slot;
+  }
+
+  /** The interrupts (logged by `interruptImpl`) and the pool's releases since `mark`, in order. */
+  function trace(h: Harness, mark: number): string[] {
+    return h.log.slice(mark).filter((l) => l.startsWith("hosts.interrupt:") || l.startsWith("slots.release:"));
+  }
+
+  /** As create.ts's `settle`: the queue's release of T1's slot runs once the runtime no longer reports its child live. */
+  async function settledRelease(h: Harness, slot: string): Promise<void> {
+    await until(() => h.runtime.childLive?.(PLAN_ID, "T1") === false, "T1's child no longer live", () => ({ logs: h.logs }));
+    await need(h.parts().releaseSlot, "the releaseSlot hook")("T1", slot);
+  }
+
+  /** The open blocking items that hold `slot`. */
+  function holds(h: Harness, slot: string): InboxItem[] {
+    return h.ledger().inbox.filter((i) => i.answer === null && i.severity === "blocking" && i.text.startsWith(`the work in slot ${slot} `));
+  }
+
+  it("row 34 + onReverted: the adopted child is interrupted and its binding evicted; the slot goes back once, after its end", async () => {
+    const h = await adoptedAndRebound();
+    const mark = h.log.length;
+    h.hosts.interruptImpl = async (sid) => {
+      h.log.push(`hosts.interrupt:${sid}`);
+    };
+    const slot = await row34(h);
+    // The queue's settle polls before `onReverted`: the adopted child is reported live, nothing is released.
+    expect(h.runtime.childLive?.(PLAN_ID, "T1")).toBe(true);
+    h.parts().listener.onReverted("T1");
+    await until(() => h.hosts.interrupts.includes("ses-c1"), "the adopted child interrupted");
+    await pause(20);
+    expect(h.bindings.evicted).toEqual(["ses-c1"]);
+    expect(h.slots.released).toEqual([]);
+    expect(h.runtime.childLive?.(PLAN_ID, "T1")).toBe(true);
+    // The interrupt's own end: the wait ends, the slot is saved and goes back once (the queue's release finds it gone).
+    h.hosts.emit({ type: "execution.interrupted", sessionID: "ses-c1", at: h.clock.iso() });
+    await settledRelease(h, slot);
+    await h.runtime.settled();
+    expect(trace(h, mark)).toEqual(["hosts.interrupt:ses-c1", `slots.release:${slot}`]);
+    expect(h.slots.released).toEqual([slot]);
+    expect(h.hosts.interrupts).toEqual(["ses-c1"]);
+    expect(h.bindings.evicted).toEqual(["ses-c1"]);
+    expect(holds(h, slot)).toEqual([]);
+  });
+
+  it("an adopted child whose interrupt fails keeps its slot leased under the hold, with one blocking item; nothing is released", async () => {
+    const h = await adoptedAndRebound();
+    h.hosts.interruptImpl = async () => {
+      throw new Error("the host refused the interrupt");
+    };
+    const slot = await row34(h);
+    h.parts().listener.onReverted("T1");
+    await settledRelease(h, slot);
+    await h.runtime.settled();
+    expect(h.hosts.interrupts).toEqual(["ses-c1"]);
+    expect(h.slots.released).toEqual([]);
+    expect(h.slots.records.get(slot)?.state).toBe("leased");
+    const items = holds(h, slot);
+    expect(items).toHaveLength(1);
+    expect(items[0]?.text).toContain("its adopted child ses-c1 could not be stopped");
+    expect(h.bindings.evicted).toEqual(["ses-c1"]);
+  });
+
+  it("an adopted child that does not end within the bound after its interrupt keeps its slot held, as a failed interrupt", async () => {
+    const h = await adoptedAndRebound();
+    const slot = await row34(h);
+    h.parts().listener.onReverted("T1");
+    await until(() => h.hosts.interrupts.includes("ses-c1"), "the adopted child interrupted");
+    // No terminal event and no idle context: each poll step of the wait, up to the bound.
+    for (let ms = 0; ms <= RECOVERY_LIVENESS_MS && h.runtime.childLive?.(PLAN_ID, "T1") === true; ms += RECOVERY_POLL_MS) {
+      await pause(10);
+      h.clock.advance(RECOVERY_POLL_MS);
+    }
+    await settledRelease(h, slot);
+    await h.runtime.settled();
+    expect(h.logs.some((l) => l.includes("the adopted child ses-c1 of T1 did not end within"))).toBe(true);
+    expect(h.slots.released).toEqual([]);
+    expect(h.slots.records.get(slot)?.state).toBe("leased");
+    expect(holds(h, slot)).toHaveLength(1);
+  });
+
+  it("abort: the adopted child is interrupted and awaited; its slot is saved and released once, after its end", async () => {
+    const h = await adoptedAndRebound();
+    const mark = h.log.length;
+    h.hosts.interruptImpl = async (sid) => {
+      h.log.push(`hosts.interrupt:${sid}`);
+    };
+    const slot = need(h.task("T1").slot, "slot of T1");
+    await h.runtime.abort(PLAN_ID, ORCH);
+    expect(h.ledger().status).toBe("aborted");
+    await until(() => h.hosts.interrupts.includes("ses-c1"), "the adopted child interrupted");
+    await pause(20);
+    expect(h.bindings.evicted).toEqual(["ses-c1"]);
+    expect(h.slots.released).toEqual([]);
+    h.hosts.emit({ type: "execution.interrupted", sessionID: "ses-c1", at: h.clock.iso() });
+    await until(() => h.slots.released.length > 0, "the slot released after the child's end");
+    await h.runtime.settled();
+    expect(trace(h, mark)).toEqual(["hosts.interrupt:ses-c1", `slots.release:${slot}`]);
+    expect(h.slots.released).toEqual([slot]);
+    expect(h.bindings.evicted).toEqual(["ses-c1"]);
+  });
+
+  it("abort: an adopted child whose interrupt fails keeps its slot leased under the hold, with one blocking item", async () => {
+    const h = await adoptedAndRebound();
+    h.hosts.interruptImpl = async () => {
+      throw new Error("the host refused the interrupt");
+    };
+    const slot = need(h.task("T1").slot, "slot of T1");
+    await h.runtime.abort(PLAN_ID, ORCH);
+    await until(() => holds(h, slot).length > 0, "the hold's item", () => ({ logs: h.logs }));
+    await h.runtime.settled();
+    expect(h.hosts.interrupts).toEqual(["ses-c1"]);
+    // The finished plan's collection retries the held save and keeps the slot (no gc while the child may still run).
+    expect(h.slots.released).toEqual([]);
+    expect(h.slots.records.get(slot)?.state).toBe("leased");
+    expect(holds(h, slot)).toHaveLength(1);
+    expect(h.bindings.evicted).toEqual(["ses-c1"]);
+  });
+
+  it("launchStep: an attempt that row 34 closed while R4 awaited the launcher gets no child", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    const first = await h.runOf("T1", 1);
+    const cancelling = deferred<void>();
+    const proceed = deferred<void>();
+    const cancel = h.launcher.cancel.bind(h.launcher);
+    h.launcher.cancel = async (taskId, attempt, reason) => {
+      if (reason === "superseded") {
+        cancelling.resolve();
+        await proceed.promise;
+      }
+      await cancel(taskId, attempt, reason);
+    };
+    // Row 11: the first launch is not confirmed while its completion is pending, so the relaunch cancels it first (R4).
+    first.confirmation.resolve({ kind: "unconfirmed", reason: "timeout", error: null });
+    await cancelling.promise;
+    expect(h.state("T1")).toBe("dispatched");
+    expect(h.task("T1").attempts.map((a) => a.n)).toEqual([1, 2]);
+    await h.parts().writer.append([
+      { type: "attempt-ended", taskId: "T1", n: 2, outcome: "interrupted", endedAt: h.clock.iso(), detail: "dep-reverted" },
+      tr("T1", "dispatched", "blocked", "dep-reverted"),
+      { type: "task-slot", taskId: "T1", slot: null, branch: null },
+    ]);
+    proceed.resolve();
+    await h.runtime.settled();
+    expect(h.launcher.runOf("T1", 2)).toBeUndefined();
+    expect(h.log.filter((l) => l.startsWith("launcher.launch:"))).toEqual(["launcher.launch:T1#1"]);
+    expect(h.state("T1")).toBe("blocked");
+  });
+
+  it("m-A: a finished end received while refuseHeldChild interrupts a lease-held child is processed, never requeued as lost", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    await h.crash();
+    const reg = foreignLease(h);
+    h.hosts.activityValue = "active";
+    h.hosts.interruptImpl = async () => {
+      // The child finished as the interrupt went out: its end arrives while the interrupt runs.
+      await Promise.race([
+        h.runtime.onChildEnd("T1", 1, { kind: "completed", childSessionID: "ses-c1", text: "DONE: implemented", endedAt: h.clock.iso() }),
+        pause(1000),
+      ]);
+    };
+    h.engine();
+    await h.runtime.start();
+    await h.runtime.settled();
+    expect(h.hosts.interrupts).toEqual(["ses-c1"]);
+    expect(h.state("T1")).toBe("running");
+    expect(h.task("T1").attempts).toHaveLength(1);
+    expect(h.task("T1").attempts[0]?.outcome).toBeNull();
+    expect(h.launcher.runs).toEqual([]);
+    // The leases come back: the registered completion is committed and verified; the attempt is never lost.
+    reg.held.delete("src/T1.ts");
+    h.runtime.onLeaseReleased();
+    await untilEnqueued(h, "T1");
+    await h.runtime.settled();
+    expect(h.task("T1").attempts).toHaveLength(1);
+    expect(h.task("T1").attempts[0]).toMatchObject({ outcome: "succeeded", verdict: "pass" });
+    expect(h.verifier.calls).toEqual(["T1#1"]);
+    expect(h.launcher.runs).toEqual([]);
   });
 });
 

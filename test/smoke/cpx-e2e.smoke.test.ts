@@ -9,6 +9,7 @@ import { RoutingHost, ROOT, arr, obj, jsonl, redact, stopAllHosts, waitFor as wa
 import { CpxTimings, collectTimingJournal, timedWrapperSource, timingJournalSource, timingObserverSource, TIMING_DIRECTORY, type TimingRecord } from "./helpers/cpx-timing";
 import { assertG8IdleEpisodes, collectObservationFiles, G8_IDLE_CEILING_MS, reconstructIdleEpisodes, type IdleEpisode } from "./helpers/cpx-idle-oracle";
 import { freezeG8Plan, reconstructG8, workGraph, type GraphEdge, type PhaseGraph } from "./helpers/cpx-g8-oracle";
+import { assertRecoveryWakeSession, captureRestartAttempts, normalizedCommitSubjects, type RestartAttempt } from "./helpers/cpx-g9-oracle";
 import type { CpxReply, CpxRequest } from "./helpers/cpx-scripted-provider";
 import type { Attempt, ExecutorConfig, ExecutorEvent, LedgerV1 } from "../../src/executor/types";
 import { createLedgerStore, createNodeFileSystem } from "../../src/executor/ledger";
@@ -148,20 +149,6 @@ function checkpointRecovered(ledger: LedgerV1, taskId: string, interrupted: Atte
     attempts.some(attempt => attempt.n > interrupted.n && attempt.childSessionID !== null && attempt.childSessionID !== interrupted.childSessionID);
 }
 
-/** D16: lost attempts do not count; preserve every other subject byte and every integration entry. */
-function normalizedCommitSubjects(subjects: readonly string[], ledger: Pick<LedgerV1, "tasks">): string[] {
-  return subjects.map(subject => {
-    const colon = subject.indexOf(":");
-    const suffix = /\(attempt (\d+)\)$/.exec(subject);
-    if (colon < 0 || !suffix) return subject;
-    const taskId = subject.slice(0, colon);
-    if (!Object.hasOwn(ledger.tasks, taskId)) return subject;
-    const n = Number(suffix[1]);
-    const lost = ledger.tasks[taskId]!.attempts.filter(attempt => attempt.n < n && attempt.outcome === "lost").length;
-    return lost === 0 ? subject : `${subject.slice(0, suffix.index)}(attempt ${n - lost})`;
-  });
-}
-
 /** Only the current wake turn may refresh adopted context; old wake prose is never a polling instruction. */
 function recoveryWakeStatus(request: CpxRequest, root: string, planId: string, seen: Set<string>): { stateKey: string; reply: CpxReply } | undefined {
   if (header(request, "x-proof-session") !== root || header(request, "x-proof-kind") !== "primary") return undefined;
@@ -226,32 +213,6 @@ function assertCacheLayout(request: CpxRequest): void {
 }
 
 describe("CPX e2e assertion negative controls", () => {
-  describe("G9 counted integration commit subjects", () => {
-    const ledger = (attempts: Pick<Attempt, "n" | "outcome">[]): LedgerV1 => ({ tasks: { "2.1.4": { attempts } } } as unknown as LedgerV1);
-    const subject = (n: number): string => `2.1.4: Derive an artifact; recover its interrupted attempt. (attempt ${n})`;
-    it("normalizes a lost attempt 1 followed by integrated attempt 2 to counted attempt 1", () => {
-      const baseline = normalizedCommitSubjects([subject(1)], ledger([{ n: 1, outcome: "succeeded" }]));
-      const recovered = normalizedCommitSubjects([subject(2)], ledger([{ n: 1, outcome: "lost" }, { n: 2, outcome: "succeeded" }]));
-      expect(baseline).toEqual([subject(1)]);
-      expect(recovered).toEqual(baseline);
-    });
-    it.each(["interrupted", "failed"] as const)("keeps counted %s attempt 1, so integrated attempt 2 stays attempt 2", outcome => {
-      expect(normalizedCommitSubjects([subject(2)], ledger([{ n: 1, outcome }, { n: 2, outcome: "succeeded" }]))).toEqual([subject(2)]);
-    });
-    it("subtracts only this task's lost attempts before the integrated attempt", () => {
-      const final = ledger([{ n: 1, outcome: "lost" }, { n: 2, outcome: "failed" }, { n: 3, outcome: "lost" }, { n: 4, outcome: "succeeded" }, { n: 5, outcome: "lost" }]);
-      expect(normalizedCommitSubjects([subject(4)], final)).toEqual([subject(2)]);
-    });
-    it.each([0, 2])("retains %i integrations so missing or duplicated entries still fail equality", count => {
-      const normalized = normalizedCommitSubjects(Array.from({ length: count }, () => subject(2)), ledger([{ n: 1, outcome: "lost" }, { n: 2, outcome: "succeeded" }]));
-      expect(normalized).toHaveLength(count);
-      expect(normalized).not.toEqual([subject(1)]);
-    });
-    it("leaves unknown task IDs and subjects without an attempt suffix unchanged", () => {
-      const subjects = ["unknown: Derive an artifact (attempt 2)", "toString: Unknown task (attempt 2)", "2.1.4: Derive an artifact", "2.1.4: Keep (attempt 2) inside the title", "No task delimiter (attempt 2)"];
-      expect(normalizedCommitSubjects(subjects, ledger([{ n: 1, outcome: "lost" }, { n: 2, outcome: "succeeded" }]))).toEqual(subjects);
-    });
-  });
   it("startup recovery never invokes resume; deliberate resume requires an observed pause", async () => {
     const invocations: string[] = [];
     const resume = async () => { invocations.push("resume"); };
@@ -854,6 +815,7 @@ async function drive(name: typeof plans[number], repository: typeof repositories
   let heldGraderRequest: CpxRequest | undefined;
   let releaseVerdict = false;
   let restarted = false;
+  let restartAttempts: readonly RestartAttempt[] | undefined;
   let restartWakeFromIndex: number | undefined;
   let recoveryStatusCallID: string | undefined;
   const recoveryWakeKeys = new Set<string>();
@@ -1084,7 +1046,7 @@ async function drive(name: typeof plans[number], repository: typeof repositories
       if (restartWakeFromIndex !== undefined && request.index >= restartWakeFromIndex && planId && recoveryStatusTurns.length === 0) {
         const wake = recoveryWakeStatus(request, root, planId, recoveryWakeKeys);
         if (wake) {
-          recoveryStatusTurns.push({ wakeRequestIndex: request.index, statusReplyRequestIndex: request.index, stateKey: wake.stateKey, sessionID: root, arrivedAt: arrivals.get(request.index)! });
+          recoveryStatusTurns.push({ wakeRequestIndex: request.index, statusReplyRequestIndex: request.index, stateKey: wake.stateKey, sessionID: header(request, "x-proof-session")!, arrivedAt: arrivals.get(request.index)! });
           restartContext.wakeRequestIndex = request.index;
           timing.mark("host.recovery.status-reply", { requestIndex: request.index, sessionID: root, stateKey: wake.stateKey });
           front.replyNext(wake.reply, { when: candidate => candidate.index === request.index });
@@ -1407,7 +1369,12 @@ async function drive(name: typeof plans[number], repository: typeof repositories
         // Do not release the orphan's provider response until its original process has been killed.
         await collectDiagnostics(activeHost, "before-restart");
         const restartHookIndex = (await activeHost.hooks()).length;
-        await timing.span("host.restart", () => {
+        await timing.span("host.restart", async () => {
+          // Refresh after diagnostics: only this last pre-crash inventory may excuse a lost attempt.
+          const crashLedger = await store.read(immutableId);
+          restartAttempts = captureRestartAttempts(crashLedger);
+          observations.restartAttemptCheckpoint = crashLedger;
+          observations.restartAttempts = restartAttempts;
           // Arm at the crash boundary: the new host's wake may arrive before restart() finishes booting.
           restartWakeFromIndex = front.requests.length;
           restartContext.firstFreshRequestIndex = restartWakeFromIndex;
@@ -1437,7 +1404,7 @@ async function drive(name: typeof plans[number], repository: typeof repositories
         restartContext.statusToolCall = status.hook;
         recoveryStatusCallID = status.hook.callID;
         expect(front.requests[wake.wakeRequestIndex]?.served, "G9: the wake receives the scripted tool-use response").toBe("scripted");
-        expect(wake.sessionID, "G9: only the bound root answers the wake").toBe(root);
+        assertRecoveryWakeSession(front.requests[wake.wakeRequestIndex], root);
         expect(status.hook.tool, "G9: wake response invokes router_plan").toBe("router_plan");
         expect(status.hook.input, "G9: wake response only requests this plan's status").toEqual({ action: "status", planId: immutableId });
         expect(Date.parse(closed.endedAt!), "G9 ordering: orphan closes before the fresh wake request").toBeLessThanOrEqual(wake.arrivedAt);
@@ -1629,7 +1596,7 @@ async function drive(name: typeof plans[number], repository: typeof repositories
     observations.integrationHeadChecks = checkedHeads;
     // IDs, commit timestamps, and independent-task order may change on a REAL host. Preserve logical effects/counts.
     const rawCommits = git(activeHost.project, "log", "--format=%s", `${final.repo.baseCommit}..${final.integration.head}`).split("\n");
-    const commits = normalizedCommitSubjects(rawCommits, final)
+    const commits = normalizedCommitSubjects(rawCommits, final, restartAttempts)
       .map(subject => subject.replaceAll(immutableId, "<plan>").replace(/\b[0-9a-f]{7}\.\.[0-9a-f]{7}\b/g, "<range>")).sort();
     observations.rawCommits = rawCommits;
     observations.commits = commits;

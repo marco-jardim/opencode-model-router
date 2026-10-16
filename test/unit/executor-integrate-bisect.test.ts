@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   BackgroundRuns, CheckPrepareError, createIntegrateGit, createIntegrationChecks, createWriteGuard, isPlaceholderTestScript, observeFull,
   PREEMPT_BUDGET, selectFromFiles,
@@ -8,12 +8,13 @@ import type { SlotHandle, SlotOptions, SlotResult } from "../../src/verify/slot"
 import type {
   DetectedRunner, NoAffected, PlanScopedRunInput, RunResult as VerifyResult, ScopedSpec, Unverifiable,
 } from "../../src/verify/runner";
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as nodePath from "node:path";
 import { createLander, phaseTagName, samePath } from "../../src/executor/integrate/land";
 import { phaseTagName as gitPhaseTagName, type GitOps } from "../../src/executor/git";
 import { hardeningArgs } from "../../src/router/git-tools";
+import * as runTools from "../../src/router/run-tools";
 import { ExecutorError } from "../../src/executor/types";
 import type {
   Clock, ExecutorConfig, GitRunner, IntegrationStep, LedgerV1, RunCommandRef, SlotLease, SlotPool, SlotRecord,
@@ -54,7 +55,13 @@ vi.mock("../../src/verify/runner", async importOriginal => {
     readResult: (...a: Parameters<RunnerModule["readResult"]>) => (runnerHooks.readResult ?? actual.readResult)(...a),
   };
 });
+// These planner unit tests do not require an installed Python. The security regressions below restore the real resolver.
+beforeEach(() => {
+  vi.spyOn(runTools, "resolveCommandExecutable").mockImplementation(program => nodePath.resolve("/trusted-tools", program));
+});
 afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllEnvs();
   runnerHooks.planScopedRun = null;
   runnerHooks.detectRunner = null;
   runnerHooks.planRerun = null;
@@ -1030,10 +1037,11 @@ describe("integration checks: prepare and select", () => {
     const labels: string[] = [];
     const auto = checksEnv({ files: { "pytest.ini": "" }, allowCommand: l => { labels.push(l); return true; } });
     const sel = await auto.checks.select("/slot", "cand");
-    expect(sel.tests).toEqual([{ framework: "pytest", full: { label: "python -m pytest", file: "python", args: ["-m", "pytest"], source: "pytest", ref: null } }]);
+    expect(sel.tests).toEqual([{ framework: "pytest", full: { label: "python -m pytest", file: nodePath.resolve("/trusted-tools", "python"),
+      args: ["-m", "pytest"], source: "pytest", ref: null, resolution: { cwd: "/slot", env: expect.any(Object) } } }]);
     expect(labels).toEqual(["python -m pytest"]);
     const custom = checksEnv({ files: { "conftest.py": "" }, config: { python: "py3" } });
-    expect((await custom.checks.select("/slot", "cand")).tests[0]?.full).toMatchObject({ label: "py3 -m pytest", file: "py3" });
+    expect((await custom.checks.select("/slot", "cand")).tests[0]?.full).toMatchObject({ label: "py3 -m pytest", file: nodePath.resolve("/trusted-tools", "py3") });
     const denied = checksEnv({ files: { "pytest.ini": "" }, allowCommand: () => false });
     expect((await denied.checks.select("/slot", "cand")).tests).toEqual([]);
   });
@@ -1735,8 +1743,20 @@ describe("integration checks: verification slot (M12)", () => {
 describe("integration checks: test search and filesystem seams", () => {
   const PKG_TEST = { "package.json": JSON.stringify({ scripts: { test: "vitest run" } }) };
   const dirs: { root: string } = { root: "" };
+  const securityRoots: string[] = [];
   beforeAll(async () => { dirs.root = await mkdtemp(nodePath.join(tmpdir(), "omr-bisect-")); });
   afterAll(async () => { await rm(dirs.root, { recursive: true, force: true }); });
+  afterEach(async () => {
+    for (const root of securityRoots.splice(0)) await rm(root, { recursive: true, force: true });
+  });
+  async function securityFixture() {
+    const root = await mkdtemp(nodePath.join(tmpdir(), "omr-check-security-"));
+    securityRoots.push(root);
+    const cwd = nodePath.join(root, "slot"), tools = nodePath.join(root, "tools");
+    await mkdir(cwd);
+    await mkdir(tools);
+    return { cwd, tools };
+  }
 
   it("the search runs git through the spawner and maps exit codes, time-outs and failures to undefined", async () => {
     const replies: Array<CommandOutput | Error> = [];
@@ -1783,18 +1803,91 @@ describe("integration checks: test search and filesystem seams", () => {
     expect(got["contentTimeout"]).toBeUndefined();
     expect(got["contentThrow"]).toBeUndefined();
 
-    const calls = spawned.filter(s => s.c.file === "git");
+    const calls = spawned.filter(s => s.c.label === "git");
     expect(calls).toHaveLength(11);
+    for (const call of calls) expect(nodePath.isAbsolute(call.c.file)).toBe(true);
     expect(calls[0]).toMatchObject({ cwd: "/slot", low: true, c: { label: "git", source: "run-command", ref: null, cwd: "/slot" } });
     expect(calls[0]?.c.args).toEqual([
-      "--no-optional-locks", "-C", "/root", "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", ":(glob)**/a[*]b.ts",
+      ...hardeningArgs(), "-C", "/root", "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", ":(glob)**/a[*]b.ts",
     ]);
     expect(calls[1]?.c.args.slice(-3)).toEqual([":(glob)**/a[?]b", ":(glob)**/c[[]d[]]", ":(glob)**/e[\\\\]f"]);
     expect(calls[6]?.c.args).toEqual([
-      "--no-optional-locks", "-C", "/root", "grep", "-l", "-z", "-F", "-w", "--untracked", "-e", "needle", "--", "*.ts",
+      ...hardeningArgs(), "-C", "/root", "grep", "-l", "-z", "-F", "-w", "--untracked", "-e", "needle", "--", "*.ts",
     ]);
     expect(calls[7]?.c.args).not.toContain("-w");
   });
+
+  it("G-4: fake spawns receive absolute guarded git and Python, hardened argv and no credentials", async () => {
+    vi.mocked(runTools.resolveCommandExecutable).mockRestore();
+    const { cwd, tools } = await securityFixture();
+    const python = nodePath.join(tools, process.platform === "win32" ? "python.exe" : "python");
+    await writeFile(python, "fixture interpreter; never executed");
+    await writeFile(nodePath.join(cwd, nodePath.basename(python)), "untrusted interpreter");
+    const pathKey = Object.keys(process.env).find(k => k.toUpperCase() === "PATH") ?? "PATH";
+    vi.stubEnv(pathKey, [cwd, tools, process.env[pathKey]].join(nodePath.delimiter));
+    for (const key of ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "AWS_SECRET_ACCESS_KEY", "provider_token", "NODE_OPTIONS", "GIT_CONFIG_COUNT"]) {
+      vi.stubEnv(key, "must-not-reach-checks");
+    }
+    runnerHooks.planScopedRun = async input => {
+      await input.search.findByName(cwd, ["test_a.py"]);
+      await input.search.findByContent(cwd, "needle", ["*.py"]);
+      return unverifiable;
+    };
+    const { checks, spawned } = checksEnv({ files: { "pytest.ini": "" } });
+    expect(await checks.run(checkReq({ slot: { ...slot, path: cwd } }))).toMatchObject({ verdict: "pass" });
+    expect(spawned.map(s => s.c.label)).toEqual(["git", "git", "python -m pytest"]);
+    for (const { c } of spawned) {
+      expect(nodePath.isAbsolute(c.file)).toBe(true);
+      expect(nodePath.relative(cwd, c.file).startsWith("..")).toBe(true);
+      expect(Object.keys(c.env ?? {}).some(runTools.isCredentialEnv)).toBe(false);
+      expect(c.envMode).toBe("replace");
+      expect(c.env?.NODE_OPTIONS).toBeUndefined();
+      if (process.platform === "win32") expect(c.env?.NoDefaultCurrentDirectoryInExePath).toBe("1");
+      if (c.label === "git") {
+        expect(c.args.slice(0, hardeningArgs().length)).toEqual(hardeningArgs());
+        expect(c.env).toMatchObject({ GIT_CONFIG_NOSYSTEM: "1", GIT_TERMINAL_PROMPT: "0", GIT_OPTIONAL_LOCKS: "0" });
+        expect(c.env?.GIT_CONFIG_COUNT).toBeUndefined();
+      } else expect(c.file).toBe(python);
+    }
+    const refused = checksEnv({ files: { "pytest.ini": "" }, config: { python: nodePath.join(cwd, nodePath.basename(python)) } });
+    await expect(refused.checks.select(cwd, "cand")).rejects.toThrow(/inside the work root/);
+  });
+
+  it.runIf(process.platform === "win32")("G-4: the Windows spawn seam never selects planted slot-root git.exe or python.exe", async () => {
+    vi.mocked(runTools.resolveCommandExecutable).mockRestore();
+    const { cwd, tools } = await securityFixture();
+    const marker = nodePath.join(cwd, "planted-ran");
+    for (const file of [nodePath.join(cwd, "git.exe"), nodePath.join(cwd, "python.exe"), nodePath.join(tools, "python.exe")]) {
+      await writeFile(file, "spawn-seam fixture, not executed by the OS");
+    }
+    // Model Windows' cwd-before-PATH lookup at the spawn seam, without a compiler, shell or PowerShell dependency.
+    const spawnProbe = async (c: ResolvedCommand): Promise<CommandOutput> => {
+      const executable = nodePath.isAbsolute(c.file) ? c.file : nodePath.join(cwd, /\.(exe|com)$/i.test(c.file) ? c.file : `${c.file}.exe`);
+      if (nodePath.dirname(executable).toLowerCase() === cwd.toLowerCase()) {
+        await access(executable);
+        await writeFile(marker, c.file);
+      }
+      return noneOut();
+    };
+    // Positive controls: either old bare-name call selects the planted file and writes the marker.
+    for (const file of ["git", "python"]) {
+      await spawnProbe({ label: file, file, args: [], source: "run-command", ref: null });
+      await access(marker);
+      await rm(marker);
+    }
+    const pathKey = Object.keys(process.env).find(k => k.toUpperCase() === "PATH") ?? "PATH";
+    vi.stubEnv(pathKey, [cwd, tools, process.env[pathKey]].join(nodePath.delimiter));
+    runnerHooks.planScopedRun = async input => { await input.search.findByName(cwd, ["test_a.py"]); return unverifiable; };
+    const { checks, spawned } = checksEnv({ files: { "pytest.ini": "" }, spawn: spawnProbe });
+    expect(await checks.run(checkReq({ slot: { ...slot, path: cwd } }))).toMatchObject({ verdict: "pass" });
+    expect(spawned.map(s => s.c.label)).toEqual(["git", "python -m pytest"]);
+    for (const { c } of spawned) {
+      expect(nodePath.isAbsolute(c.file)).toBe(true);
+      expect(nodePath.relative(cwd, c.file).startsWith("..")).toBe(true);
+    }
+    expect(spawned[1]?.c.file).toBe(nodePath.join(tools, "python.exe"));
+    await expect(access(marker)).rejects.toMatchObject({ code: "ENOENT" });
+  }, 30_000);
 
   it("the filesystem seam reads real files, reports a missing file and tolerates an already deleted one", async () => {
     const file = nodePath.join(dirs.root, "f.txt");
