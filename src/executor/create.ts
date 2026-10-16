@@ -498,6 +498,8 @@ function assembleExecutor(context: { directory: string }, options: CreateExecuto
           };
           poll();
         },
+        // M1: the runtime saves a blocked dependent's slot before its release (it always supplies the hook).
+        releaseSlot: input.releaseSlot ?? ((_taskId, slot) => pool.release(slot)),
         locks: createRepoLockFactory({ stateRoot: join(home, "locks"), clock, pid: spawner.pid, hostname: spawner.hostname, isPidAlive: spawner.isAlive }),
         guard, clock, logger,
       });

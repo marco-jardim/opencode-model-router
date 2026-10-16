@@ -2227,7 +2227,8 @@ describe("late child adoption and the launch race (M27)", () => {
 });
 
 /** Real pool/marker transitions; only git and provisioning are doubles. No diagnostic pool queries in the runtime. */
-async function physicalPool(h: Harness, maxParallel: number) {
+/** `open`: false leaves the pool unopened and `h.deps.slots` as it is (the caller opens it lazily). */
+async function physicalPool(h: Harness, maxParallel: number, open = true) {
   const fs = createNodeFileSystem(), heads = new Map<string, string>();
   // Windows temp roots can contain an 8.3 alias; the real pool deliberately rejects non-canonical roots.
   const root = await fs.realpath(h.root);
@@ -2251,8 +2252,10 @@ async function physicalPool(h: Harness, maxParallel: number) {
   const pool = createSlotPool({ planId: PLAN_ID, repoKey: "repo-key", toplevel: REPO,
     slotsDir: join(root, "physical-slots"), markersDir: join(root, "markers"), executorHome: root,
     maxParallel, fs, git, clock: h.clock, provisioner });
-  await pool.open();
-  h.deps.slots = pool;
+  if (open) {
+    await pool.open();
+    h.deps.slots = pool;
+  }
   return { pool, fs, git, heads, provisioner };
 }
 
@@ -2797,6 +2800,44 @@ describe("physical slot observations", () => {
       await h.close(); sink?.close(); pool.close();
     }
     expect(new Set(results).size).toBe(1);
+  });
+});
+
+describe("pdf2-1 round 4 minor-3: slot observations of a restart", () => {
+  it("the attach after a restart observes slot-pool-open before any other slot row", async () => {
+    const rows: ObservationRecord[] = [];
+    const sink = createV2Observations({ write: line => { rows.push(JSON.parse(line)); } });
+    const h = await mk(planOf([task("T1")], { config: { maxParallel: 1 } }), sink);
+    h.launcher.gateValue = DISPOSED_GATE; // nothing launches: the restart's attach opens the pool
+    await h.begin();
+    await h.settled();
+    expect(h.ledger().status).toBe("running");
+    // As the production pools (create.ts PlanSlotPools): the plan's pool opens on its first operation.
+    const { pool } = await physicalPool(h, 1, false);
+    let opening: Promise<void> | null = null;
+    const ready = async (): Promise<typeof pool> => {
+      await (opening ??= pool.open());
+      return pool;
+    };
+    const lazy: SlotPool = {
+      acquire: async (...a) => (await ready()).acquire(...a),
+      acquireSpecial: async (...a) => (await ready()).acquireSpecial(...a),
+      reset: async (...a) => (await ready()).reset(...a),
+      noteCommit: async (...a) => (await ready()).noteCommit(...a),
+      cleanForChecks: async (...a) => (await ready()).cleanForChecks(...a),
+      release: async (...a) => (await ready()).release(...a),
+      get: async (...a) => (await ready()).get(...a),
+      list: async (...a) => (await ready()).list(...a),
+      gc: async (...a) => (await ready()).gc(...a),
+    };
+    h.deps.slotsFor = () => lazy;
+    await h.restart();
+    await h.settled();
+    sink.flush();
+    const slotActions = rows.flatMap(r => r.family === "scheduler" && String(r.action).startsWith("slot-") ? [String(r.action)] : []);
+    // `rebuildHeldSlots` reads the markers (opening the pool) after the plan's slot observations are registered.
+    expect(slotActions[0]).toBe("slot-pool-open");
+    await h.close(); sink.close(); pool.close();
   });
 });
 

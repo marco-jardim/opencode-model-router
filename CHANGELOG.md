@@ -145,6 +145,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **OpenCode v2: a task blocked by a reverted dependency keeps its unsaved work.** The integration queue no longer
+  gives such a task's slot back to the pool unsaved. The work is first saved at the task's WIP ref (a failed save keeps
+  the slot leased). A running task's slot is released once, by the executor, after its cancelled child has ended.
 - **OpenCode v2: recovered plan work keeps interrupted-attempt safety.** Re-provisioning saves an owned slot before
   releasing or resetting it and retains unsaved-work holds on failure. Recovered budget ends wait for root-context
   admission before resuming the same child; launcher-liveness evidence follows the current resume round. Abort drains

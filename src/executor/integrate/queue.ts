@@ -321,6 +321,12 @@ export interface IntegrationQueueDeps {
   planId: PlanId; writer: LedgerWriter; history: IntegrationHistory; git: GitOps; igit: IntegrateGit;
   pool: SlotPool; leases: LeaseService; checks: IntegrationChecks; suite: PhaseSuiteRunner; lander: Lander; listener: IntegrationListener;
   settle: (taskId: TaskId, release: () => Promise<void>) => void; locks: RepoLockFactory; guard: WriteGuard; clock: Clock; logger: Logger;
+  /**
+   * M1: gives back the slot of a task row 34 blocked. The runtime saves the slot's unsaved work first
+   * (`releaseSlotSaved`), and a failed save keeps the slot leased. It never releases a slot whose cancelled child
+   * `sweepBlocked` is still releasing.
+   */
+  releaseSlot: (taskId: TaskId, slot: string) => Promise<void>;
 }
 
 /** The serial-lane entry in flight (at most one, M4) or the background suite entry. */
@@ -2338,8 +2344,10 @@ class Queue implements IntegrationQueue {
     });
     if (this.disposed) return;
     for (const r of released) {
+      // M1: a blocked dependent's slot can hold unsaved work, so it goes back through the runtime's saved release, never
+      // `pool.release`. The runtime releases a live dependent's slot itself once its cancelled child ended.
       const release = async (): Promise<void> => {
-        if (r.slot !== null) await this.d.pool.release(r.slot).catch((e: unknown) => this.d.logger.warn(`integration queue: slot release failed: ${message(e)}`));
+        if (r.slot !== null) await this.d.releaseSlot(r.id, r.slot).catch((e: unknown) => this.d.logger.warn(`integration queue: slot release failed: ${message(e)}`));
         this.d.leases.releaseTask(r.id);
       };
       if (r.live) this.d.settle(r.id, release);

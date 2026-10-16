@@ -1575,6 +1575,8 @@ class Env {
   readonly guard = new GuardSpy();
   /** Task ids the queue handed to `settle` (live tasks released by a revert). */
   readonly settled: string[] = [];
+  /** M1: the slots the queue gave back through `releaseSlot`, as `<task>:<slot>`. */
+  readonly slotReleases: string[] = [];
   /** A real lock factory instead of the LockDouble (takes effect at the next open/restart). */
   locksOverride: RepoLockFactory | null = null;
   /** Integration-step events of an earlier history, served before the store's (read at the queue's first load). */
@@ -1592,6 +1594,8 @@ class Env {
       planId: PLAN_ID, writer: this.writer, git: this.git, igit: this.igit, pool: this.pool, leases: this.leases, checks: this.checks,
       suite: this.suite, lander: this.lander, listener: this.listener, locks: this.locksOverride ?? this.locks, guard: this.guard, clock: this.clock, logger: this.logger,
       settle: (id, release) => { this.settled.push(id); void release(); },
+      // M1: the runtime's saved release, as `<task>:<slot>`; the pool double releases the slot behind it.
+      releaseSlot: async (id, slot) => { this.slotReleases.push(`${id}:${slot}`); await this.pool.release(slot); },
       history: { steps: async () => [...this.historyExtra, ...(await this.store.exportPlan(PLAN_ID)).events.filter(isStep)] },
     });
   }
@@ -4180,6 +4184,35 @@ describe("checkPhase and suite gates", () => {
     expect(env.leases.released).toEqual(expect.arrayContaining(["D1", "D2"]));
     env.assertInvariants();
   });
+
+  it("M1: a blocked dependent's slot goes back through the runtime's saved release, never pool.release directly", async () => {
+    const env = await setup({ tasks: 2, batchMax: 1, mutate: l => {
+      l.phases.push({ id: "p2", title: "Phase 2", wave: "w1", dependsOn: [], gate: "pending", qaRound: 1, paused: false, tag: null });
+      l.waves[0]?.phases.push("p2");
+      l.tasks.D2 = taskNode("D2", { phase: "p2" });
+      l.edges.push({ from: "T1", to: "D2", kind: "structural", confidence: "high", evidence: "order" });
+    } });
+    env.suite.resolution = RUNS;
+    env.suite.onRun = culpritOf("T1");
+    let release!: () => void;
+    env.suite.runGate = new Promise<void>(resolve => { release = resolve; });
+    env.queue.enqueue(["T1", "T2"]);
+    await env.until(() => env.suite.runs.length === 1, "the held suite");
+    await env.writer.append([{ type: "task-transition", taskId: "D2", from: "pending", to: "ready", trigger: "deps-satisfied", detail: null }]);
+    await env.writer.append([
+      { type: "attempt-started", taskId: "D2", attempt: openAttempt(1) },
+      { type: "task-transition", taskId: "D2", from: "ready", to: "dispatched", trigger: "launch", detail: null },
+      { type: "task-slot", taskId: "D2", slot: "slot-d2", branch: `omr/${PLAN_ID}/t/D2` },
+    ]);
+    release();
+    await env.until(() => env.state("T1") === "reverted" && env.phase().gate === "pending" && env.quiet(), "the revert");
+    expect(env.state("D2")).toBe("blocked");
+    expect(env.settled).toEqual(["D2"]);
+    // The queue handed the slot to the runtime's saved release; the pool double saw only that release behind it.
+    expect(env.slotReleases).toEqual(["D2:slot-d2"]);
+    expect(env.pool.released.filter(s => s === "slot-d2")).toHaveLength(1);
+    env.assertInvariants();
+  });
 });
 
 describe("land failure modes", () => {
@@ -6419,6 +6452,7 @@ describe("history read failure", () => {
       planId: PLAN_ID, writer: env.writer, git: env.git, igit: env.igit, pool: env.pool, leases: env.leases, checks: env.checks,
       suite: env.suite, lander: env.lander, listener: env.listener, locks: env.locks, guard: env.guard, clock: env.clock, logger: env.logger,
       settle: (_id, release) => { void release(); },
+      releaseSlot: (_id, slot) => env.pool.release(slot),
       history: { steps: async () => {
         reads++;
         if (reads === 1) throw new Error("journal unreadable");

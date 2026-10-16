@@ -487,6 +487,12 @@ export interface RuntimeDeps {
     beforeSlotRelease?: (taskId: TaskId, slot: string, cause: Parameters<UnattendedPolicy["park"]>[1]) => Promise<boolean | void>;
     /** QA-PDF21-7: the options of a park item (`discard-wip`/`keep-wip` after a restore conflict). */
     parkOptions?: (taskId: TaskId, cause: Parameters<UnattendedPolicy["park"]>[1]) => readonly string[];
+    /**
+     * M1: the queue's release of the slot of a task row 34 blocked (`IntegrationQueueDeps.releaseSlot`). It saves first
+     * (`releaseSlotSaved`). For a child that `sweepBlocked` cancelled, it waits for the sweep's release and does not
+     * release the slot a second time.
+     */
+    releaseSlot?: (taskId: TaskId, slot: string) => Promise<void>;
   }): PlanCollaborators;
   pinOrchestrator(sessionID: string): () => void;
   log(level: "info" | "warn" | "error", msg: string, detail?: JsonValue): void;
@@ -1239,6 +1245,20 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     schedule(p);
   }
 
+  /**
+   * minor-1: clears the plan's recovered work (abort, close). Since 4070b22 the launcher keeps a `completed` child's
+   * binding until the end is processed, so a dropped recovered end releases that binding here
+   * (`releaseChildBinding`, idempotent). `token`: the abort closed the attempt, so its capacity token goes too.
+   */
+  function dropRecoveredWork(p: PlanRt, token: boolean): void {
+    for (const w of p.recoveredWork.values()) {
+      if (w.work.kind !== "end") continue;
+      releaseChildBinding(w.work.end);
+      if (token) releaseToken(p, w.taskId, w.n, "other");
+    }
+    p.recoveredWork.clear();
+  }
+
   /** The launcher's live context gate is also the admission gate for recovered verification (D14). */
   function admitRecoveredWork(p: PlanRt): void {
     if (p.recovering || p.disposed || disposed || p.passive) return;
@@ -1257,14 +1277,18 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         try {
           const t = own(p.writer.ledger, w.taskId);
           const a = t?.attempts[t.attempts.length - 1];
-          if (disposed || p.disposed || plans.get(p.planId) !== p || p.recoveredWork.get(w.taskId) !== w
-            || t === null || a === undefined || t.state !== w.state || a.n !== w.n || a.nonce !== w.nonce) return;
+          if (disposed || p.disposed || plans.get(p.planId) !== p || p.recoveredWork.get(w.taskId) !== w) return;
+          const moved = t === null || a === undefined || t.state !== w.state || a.n !== w.n || a.nonce !== w.nonce;
+          // A re-verify of a task that moved on has nothing left to do.
+          if (moved && w.work.kind === "reverify") return;
           // Context/leases may have changed while this task waited for its mutex. Never spend a grader rerun on admission.
           if (held() || !d.launcher.gate(p.writer.ledger.orchestrator.sessionID).ok) {
             parked = true;
             return;
           }
           if (w.work.kind === "reverify") await reverify(p, w.taskId, w.work.slotValid);
+          // N3 / minor-1: an end whose task moved on (e.g. row 34 closed the attempt) still needs its bookkeeping:
+          // `processEndNow` ignores a closed attempt and still releases its token and binding and forgets its session.
           else await processEndNow(p, w.taskId, w.n, w.work.end);
         } finally {
           if (p.recoveredWork.get(w.taskId) === w) {
@@ -1519,6 +1543,13 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
   async function saveSlotWork(p: PlanRt, slot: { slot: string; path: string; base?: string | null }, ref: string, message: string, trailer: string, taskId: TaskId | null, deferredMetrics?: MetricPayload[]): Promise<SaveResult> {
     if (quarantineHeld(p, slot.slot)) return "failed";
     if (!wipCapable(p)) return "clean";
+    // nit: an empty path names no directory (`gitPointers("")` and git itself would run in the process's cwd): the save
+    // fails and the slot is kept as it is.
+    if (slot.path === "") {
+      d.log("error", `slot ${slot.slot} has no path; its work cannot be saved and the slot is kept as it is`);
+      counter(p, "wip-failed", taskId === null ? { slot: slot.slot } : { taskId, slot: slot.slot }, deferredMetrics);
+      return "failed";
+    }
     const o = { cwd: slot.path, timeoutMs: GIT_TIMEOUT_MS };
     // Never let git climb from a metadata-less slot into an enclosing repository.
     if (slotGone(slot.path)) {
@@ -3416,21 +3447,51 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
 
   // ---------- integration results (Q -> Rt)
 
-  /** M8: a child whose task Q moved to blocked is cancelled; resources are released once its completion settles. */
+  /**
+   * M1: `<plan>/<task>` -> the release `sweepBlocked` runs for the task's cancelled attempt `n`. The queue's release of
+   * that task's slot waits for it instead of releasing the slot a second time.
+   */
+  const blockedSweeps = new Map<string, { n: number; done: Promise<void> }>();
+
+  /**
+   * M8: a child whose task Q moved to blocked is cancelled; resources are released once its completion settles.
+   * M1: this sweep is the only releaser of such a live task's slot (saved first, `releaseResources`), once per attempt.
+   */
   function sweepBlocked(p: PlanRt): void {
     for (const f of d.launcher.inFlight()) {
       const t = own(p.writer.ledger, f.taskId);
       if (t === null || t.state !== "blocked" || t.slot !== null) continue;
       const h = p.handles.get(f.taskId);
       if (h === undefined || h.n !== f.attempt) continue;
+      const key = `${p.planId}/${f.taskId}`;
+      // A second revert's sweep finds the same attempt still in flight: it is released once.
+      if (blockedSweeps.get(key)?.n === f.attempt) continue;
       const slotName = p.slotLeases.get(f.taskId)?.slot ?? null;
-      bg("blocked cancel", async () => {
+      const done = bg("blocked cancel", async () => {
         await d.launcher.cancel(f.taskId, f.attempt, "blocked");
         await h.completion;
         await releaseResources(p, f.taskId, slotName);
         releaseToken(p, f.taskId, f.attempt, "other");
       });
+      blockedSweeps.set(key, { n: f.attempt, done });
     }
+  }
+
+  /**
+   * M1: the queue's release of the slot of a task that row 34 blocked. A slot whose child `sweepBlocked` cancelled is
+   * that sweep's to release: the sweep is awaited. Then, while the pool still leases the slot to the task (no sweep
+   * ran, or a failed save kept it), the slot's work is saved before the release (`releaseSlotSaved`). The pool's
+   * `acquire` would otherwise reset a dirty slot and lose its work. Never throws.
+   */
+  async function releaseBlockedSlot(p: PlanRt, taskId: TaskId, slot: string): Promise<void> {
+    const key = `${p.planId}/${taskId}`;
+    const sweep = blockedSweeps.get(key);
+    if (sweep !== undefined) {
+      await sweep.done;
+      if (blockedSweeps.get(key) === sweep) blockedSweeps.delete(key);
+    }
+    if (!(await slotHeldBy(p, taskId, slot))) return;
+    await releaseSlotSaved(p, taskId, slot, "dep-reverted");
   }
 
   function makeListener(ref: { p: PlanRt | null }): IntegrationListener {
@@ -3726,6 +3787,11 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       },
       // QA-PDF21-7: the park after a restore conflict offers to discard the saved work or to keep it.
       parkOptions: (taskId) => (restoreParks.has(`${planId}/${taskId}`) ? [...WIP_PARK_OPTIONS] : []),
+      // M1: row 34's blocked dependents give their slots back saved, and a swept child's slot is released only once.
+      releaseSlot: async (taskId, slot) => {
+        const p = ref.p;
+        if (p !== null) await releaseBlockedSlot(p, taskId, slot);
+      },
     });
     // QA-4.2-29: one history export per attachment, shared by the capacity restore and the breaker step.
     const history = await exportHistory(planId, "capacity restore failed");
@@ -3789,10 +3855,12 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     for (const [taskId, h] of carriedHandles.get(planId) ?? []) if (!h.settled) p.handles.set(taskId, h);
     carriedHandles.delete(planId);
     ref.p = p;
+    // minor-3: registered before `rebuildHeldSlots`, whose marker read opens the pool: `slot-pool-open` and the
+    // initial slot rows of a restart or an adopt are observed, not dropped.
+    attachSlotObservations(d.observations, d.clock, writer);
     try { await rebuildHeldSlots(p); }
     catch (error) { d.log("warn", "slot holds will be rechecked before collection", errorText(error)); }
     plans.set(planId, p);
-    attachSlotObservations(d.observations, d.clock, writer);
     observeSchedulerLedger(d.observations, writer.ledger, "attach");
     observe(p, "runtime-attach");
     return p;
@@ -4326,7 +4394,10 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       if (verifiedResetBase === undefined) {
         const saved = await saveBeforeLaunchReset(p, t0, slot, slot.commit);
         if (saved === "failed") {
+          // minor-4: the slot stays leased under its hold (its work has no ref), but the cached lease goes: the ledger
+          // still names the stale slot, and a cache naming this one would hand it to the verifier or a release.
           await wipHold(p, taskId, slot.slot, "its re-provisioning reset");
+          if (p.slotLeases.get(taskId)?.slot === slot.slot) p.slotLeases.delete(taskId);
           return false;
         }
       }
@@ -4750,7 +4821,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     p.disposed = true;
     p.latch = true;
     p.attachment.abort();
-    p.recoveredWork.clear();
+    dropRecoveredWork(p, false);
     // An adopt closes this writer only after old-attachment pipelines have observed their cut.
     await Promise.allSettled([...p.attachmentWork]);
     p.offSlotRelease?.();
@@ -5360,7 +5431,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       // Request the cut, but never wait for an external verifier before queue abort and durable cancellation. Slot
       // cleanup below waits in the background instead, so a verifier that ignores the cut cannot deadlock abort.
       p.attachment.abort();
-      p.recoveredWork.clear();
+      dropRecoveredWork(p, true);
       try {
         await p.collab.queue.abort();
       } catch (e) {

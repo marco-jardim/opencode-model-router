@@ -1521,3 +1521,173 @@ describe("pdf2-1 (b): snapshot and restore helpers", () => {
     expect((await sh(r.slot, "rev-parse", "HEAD")).trim()).toBe(r.base);
   }, TEST_MS);
 });
+
+// ---------------------------------------------------------------------------------------------------------------
+// pdf2-1 round 4 (merge of cpx/main, re-check of 4070b22): each test fails without its fix
+// ---------------------------------------------------------------------------------------------------------------
+
+/** The collaborator inputs the runtime builds (its hooks for the queue), in attach order. */
+function captureInputs(h: Awaited<ReturnType<typeof rig>>): CollaboratorInput[] {
+  const inputs: CollaboratorInput[] = [];
+  const build = h.deps.collaborators;
+  h.deps.collaborators = (i) => {
+    inputs.push(i);
+    return build(i);
+  };
+  return inputs;
+}
+
+/** The queue's `releaseSlot` hook of the latest attachment (`IntegrationQueueDeps.releaseSlot`). */
+function releaseSlotOf(inputs: readonly CollaboratorInput[]): { input: CollaboratorInput; releaseSlot: NonNullable<CollaboratorInput["releaseSlot"]> } {
+  const input = inputs[inputs.length - 1];
+  if (input === undefined) throw new Error("no collaborator input");
+  const releaseSlot = input.releaseSlot;
+  if (releaseSlot === undefined) throw new Error("the runtime supplied no releaseSlot hook");
+  return { input, releaseSlot };
+}
+
+describe("pdf2-1 round 4: blocked dependents, re-provisioning and slot paths", () => {
+  const wipRef = wipRefName(PLAN, "T1");
+  const waitFor = (fn: () => void | Promise<void>): Promise<void> => vi.waitFor(fn, { timeout: WAIT_MS, interval: 20 });
+
+  it("M1: a READY dependent blocked by a reverted dependency keeps its unsaved work at its WIP ref", async () => {
+    const h = await rig();
+    const inputs = captureInputs(h);
+    await h.start();
+    const first = await h.launched(1);
+    await h.child(first, "ses-1");
+    await writeFile(join(h.r.slot, "b.txt"), "dependent's unsaved work\n");
+    // No relaunch: the lost attempt leaves T1 ready and still holding its unsaved slot (row 18).
+    vi.spyOn(h.deps.launcher, "gate").mockReturnValue({ ok: false, reason: "no-context", wake: { reason: "stale-context", stateKey: "m1-ready" } });
+    first.end({ kind: "lost", childSessionID: "ses-1", reason: "runner-error", endedAt: h.deps.clock.iso() });
+    await untilState(h, "ready");
+    expect((await h.ledger()).tasks.T1?.slot).toBe("slot-1");
+    const { input, releaseSlot } = releaseSlotOf(inputs);
+    // Row 34 as the queue journals it for a ready dependent of the reverted task, then the queue's release of its slot.
+    await input.writer.append([
+      { type: "task-transition", taskId: "T1", from: "ready", to: "blocked", trigger: "dep-reverted", detail: null },
+      { type: "task-slot", taskId: "T1", slot: null, branch: null },
+    ]);
+    await releaseSlot("T1", "slot-1");
+    // Saved before the release: the pool's next acquire resets the slot, the work stays at the WIP ref.
+    expect(await sh(h.r.top, "show", `refs/heads/${wipRef}:b.txt`)).toBe("dependent's unsaved work\n");
+    expect(h.pool.release).toHaveBeenCalledTimes(1);
+    expect(h.pool.release).toHaveBeenCalledWith("slot-1");
+    expect(await status(h.r.slot)).toBe("");
+  }, TEST_MS);
+
+  it("M1: a RUNNING dependent blocked by a reverted dependency is saved once and released by the runtime only", async () => {
+    const seen = { slot: null as string | null, snapshots: 0 };
+    const h = await rig({
+      inFlight: true,
+      // T0 stands for the reverted dependency: row 34 below makes T1 depend on it. Without an unsatisfied dependency the
+      // scheduler unblocks T1 at once (`promotable`) and relaunches it, and that launch's own pre-reset check of the
+      // slot is a second `status`: not a second save of the blocked attempt's work.
+      tasks: { T0: taskNode("T0", { phase: "p1", kind: "manual", state: "pending" }) },
+      git: faultyGit(() => null, async (args, cwd) => {
+        // Every save of the slot starts with this status read (`snapshotSlotWork`).
+        if (cwd === seen.slot && args[0] === "status" && args[1] === "--porcelain") seen.snapshots++;
+      }),
+    });
+    const inputs = captureInputs(h);
+    await h.start();
+    const first = await h.launched(1);
+    await h.child(first, "ses-1");
+    await writeFile(join(h.r.slot, "b.txt"), "running dependent's work\n");
+    seen.slot = h.r.slot;
+    const { input, releaseSlot } = releaseSlotOf(inputs);
+    // Row 34 for a running dependent: its open attempt ends in the same batch. T1 now depends on T0, which is not
+    // integrated (as a reverted dependency is not), so it stays blocked.
+    await input.writer.append([
+      { type: "edge-added", edge: { from: "T0", to: "T1", kind: "structural", confidence: "high", evidence: "the reverted dependency" } },
+      { type: "attempt-ended", taskId: "T1", n: 1, outcome: "interrupted", endedAt: h.deps.clock.iso(), detail: "dep-reverted" },
+      { type: "task-transition", taskId: "T1", from: "running", to: "blocked", trigger: "dep-reverted", detail: null },
+      { type: "task-slot", taskId: "T1", slot: null, branch: null },
+    ]);
+    // The queue's notification: the runtime cancels the live child (`sweepBlocked`).
+    input.listener.onReverted("T1");
+    await waitFor(() => { expect(first.settled).toBe(true); });
+    // As create.ts's `settle`: the queue's release runs once the child left the launcher.
+    await releaseSlot("T1", "slot-1");
+    await h.pause(100);
+    expect(h.pool.release).toHaveBeenCalledTimes(1);
+    expect(h.pool.release).toHaveBeenCalledWith("slot-1");
+    expect(seen.snapshots).toBe(1);
+    expect(await sh(h.r.top, "show", `refs/heads/${wipRef}:b.txt`)).toBe("running dependent's work\n");
+    expect((await h.ledger()).tasks.T1?.state).toBe("blocked");
+  }, TEST_MS);
+
+  it("minor-4: a failed save before the re-provisioning reset keeps the new slot leased under its hold and drops its cached lease", async () => {
+    const io = { failSave: false, refuse: false };
+    const h = await rig({
+      git: faultyGit(args => (io.failSave && args[0] === "add" ? "fail" : null)),
+      leaseRegistry: {
+        acquireWrite: () => (io.refuse ? { ok: false, reason: "held", holders: [{ holderID: "holder-x", taskRef: "other-plan:T9" }] } : { ok: true }),
+        holderOf: () => null,
+        releaseTask: () => {},
+      },
+    });
+    await h.start();
+    const first = await h.launched(1);
+    await h.child(first, "ses-1");
+    await h.runtime.dispose();
+    const branch = taskBranchName(PLAN, "T1");
+    await sh(h.r.top, "branch", branch, h.r.base);
+    const writer = await h.store.open(PLAN, h.deps.holder(ORCH));
+    await writer.append([
+      { type: "attempt-ended", taskId: "T1", n: 1, outcome: "succeeded", endedAt: h.deps.clock.iso(), detail: null },
+      { type: "task-transition", taskId: "T1", from: "running", to: "completed", trigger: "child-ended", detail: null },
+      { type: "task-slot", taskId: "T1", slot: "slot-1", branch },
+      { type: "task-transition", taskId: "T1", from: "completed", to: "verifying", trigger: "committed", detail: null },
+    ]);
+    await writer.close();
+    const feed = { taskId: "T1", from: "verifying", evidence: "none", action: "reverify", n: 1, childSessionID: "ses-1",
+      context: null, probation: null, mismatch: false, orphans: [], slotValid: false } satisfies import("../../src/executor/recovery").ReconcileFeed;
+    h.deps.recovery = { recover: async () => [{ planId: PLAN, actions: [feed] }], adopt: async () => {}, reconcile: async () => [feed] };
+    // The pool keeps recording slot-1 as T1's: the restart's lease retries never see it vanish.
+    h.pool.get.mockImplementation(async (slot) => slot !== "slot-1" ? null : {
+      schema: 1, slot: "slot-1", path: h.r.slot, kind: "task", planId: PLAN, repoKey: "repo", state: "leased",
+      owner: `plan:${PLAN}:T1`, commit: h.r.base, managers: [], manifests: {}, createdAt: h.deps.clock.iso(), updatedAt: h.deps.clock.iso(),
+    });
+    // The new slot R2 acquires holds work that cannot be saved.
+    h.pool.acquire.mockImplementationOnce(async (id, who, commit) => {
+      await writeFile(join(h.r.slot, "c.txt"), "left in slot-2\n");
+      io.failSave = true;
+      return { slot: "slot-2", path: h.r.slot, planId: id, owner: who, commit };
+    });
+    io.refuse = true; // T1's leases cannot be re-taken: T1 is held until they are back
+    const next = await h.restart();
+    await next.start();
+    await waitFor(async () => {
+      expect((await h.ledger()).inbox.some((i) => i.answer === null && i.text.startsWith("the work in slot slot-2 could not be saved"))).toBe(true);
+    });
+    await next.settled();
+    expect((await h.ledger()).tasks.T1).toMatchObject({ state: "verifying", slot: "slot-1" });
+    expect(h.pool.release).not.toHaveBeenCalledWith("slot-2"); // kept leased under its hold
+    // The leases come back: the held task verifies with the slot its ledger names, not the cached new slot.
+    io.failSave = false;
+    io.refuse = false;
+    const verify = vi.spyOn(h.deps.verifier, "verify");
+    next.onLeaseReleased();
+    await waitFor(() => { expect(verify).toHaveBeenCalled(); });
+    expect(verify.mock.calls[0]?.[1]).toMatchObject({ slot: "slot-1", path: h.r.slot });
+  }, TEST_MS);
+
+  it("nit: a slot whose path is empty fails its save without running git in the process's cwd", async () => {
+    const emptyCwd: string[] = [];
+    const h = await rig({
+      git: faultyGit((_args, cwd) => (cwd === "" ? "fail" : null), async (args, cwd) => {
+        if (cwd === "") emptyCwd.push(args.join(" "));
+      }),
+    });
+    // The pool hands out a lease without a path (never trusted as the process's cwd).
+    h.pool.acquire.mockImplementationOnce(async (id, who, commit) => ({ slot: "slot-1", path: "", planId: id, owner: who, commit }));
+    await h.start();
+    const skipped = (): number => h.journal.filter((e) => e.type === "metric" && e.metric.name === "counter"
+      && e.metric.key === "launch-skipped" && e.metric.labels.reason === "wip-save").length;
+    await waitFor(() => { expect(skipped()).toBeGreaterThan(0); });
+    expect(emptyCwd).toEqual([]);
+    expect(h.journal.some((e) => e.type === "metric" && e.metric.name === "counter" && e.metric.key === "wip-failed"
+      && e.metric.labels.slot === "slot-1")).toBe(true);
+  }, TEST_MS);
+});

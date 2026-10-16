@@ -1003,6 +1003,7 @@ async function queueSetup(spec: QueueSpec) {
   const newQueue = (writer: LedgerWriter) => createIntegrationQueue({
     planId: PLAN, writer, history: { steps: async () => [...historyExtra, ...(await historySteps(store, PLAN))] }, git: env.ops, igit: env.igit, pool: env.pool,
     leases: recordingLeases(released), checks, suite, lander, listener, settle: (_id, release) => { void release(); },
+    releaseSlot: (_id, slot) => env.pool.release(slot),
     locks: createRepoLockFactory({ stateRoot: lockRoot, clock: realClock(), pid: process.pid, hostname: hostname(), isPidAlive: (pid) => nodeSpawner().isAlive(pid) }),
     guard: env.guard, clock: realClock(), logger: { warn: (m) => { warnings.push(m); } },
   });

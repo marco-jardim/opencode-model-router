@@ -1533,6 +1533,110 @@ describe("short recovery barrier and context-admitted pipelines (D16)", () => {
   });
 });
 
+describe("pdf2-1 round 4 minor-1: recovered ends dropped by an abort", () => {
+  it("an abort releases the binding and the capacity token of a registered, unadmitted recovered end", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    await h.crash();
+    h.hosts.activityValue = "active"; // adopted: the forced capacity token is this attempt's
+    h.engine();
+    h.launcher.gateValue = { ok: false, reason: "awaiting-first-router-call",
+      wake: { reason: "stale-context", stateKey: "await-router-call:restart:ses-0" } };
+    const owners = new Map<string, string>();
+    const released: string[] = [];
+    h.deps.capacity = (o) => {
+      const c = createCapacityController(o);
+      return {
+        ...c,
+        acquire: (provider, heavy, taskId, attempt, opts) => {
+          const tok = c.acquire(provider, heavy, taskId, attempt, opts);
+          owners.set(tok.id, `${taskId}#${attempt}`);
+          return tok;
+        },
+        release: (tok, result) => {
+          released.push(`${owners.get(tok.id) ?? tok.id}:${result}`);
+          c.release(tok, result);
+        },
+      };
+    };
+    const bindingReleases: string[] = [];
+    const port: TaskLauncher = h.launcher;
+    port.releaseBinding = (child) => { bindingReleases.push(child); };
+    await h.runtime.start();
+    await h.runtime.settled();
+    expect(h.state("T1")).toBe("running");
+    // No root context: the end is registered as recovered work and not admitted.
+    await h.runtime.onChildEnd("T1", 1, { kind: "completed", childSessionID: "ses-c1", text: "DONE: implemented", endedAt: h.clock.iso() });
+    await h.runtime.settled();
+    expect(h.state("T1")).toBe("running");
+    expect(bindingReleases).toEqual([]);
+    expect(released).toEqual([]);
+    await h.runtime.abort(PLAN_ID, ORCH);
+    await h.runtime.settled();
+    expect(h.state("T1")).toBe("cancelled");
+    // The launcher's held binding of the completed child and the attempt's token are released, not kept until dispose.
+    expect(bindingReleases).toEqual(["ses-c1"]);
+    expect(released).toEqual(["T1#1:other"]);
+  });
+
+  it("N3: an admitted recovered end whose task moved on still releases its token, its bindings and its session", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    await h.crash();
+    h.hosts.activityValue = "active"; // adopted and re-bound: the forced capacity token and the rebound binding are its
+    h.engine();
+    h.launcher.gateValue = { ok: false, reason: "awaiting-first-router-call",
+      wake: { reason: "stale-context", stateKey: "await-router-call:restart:ses-0" } };
+    const owners = new Map<string, string>();
+    const released: string[] = [];
+    h.deps.capacity = (o) => {
+      const c = createCapacityController(o);
+      return {
+        ...c,
+        acquire: (provider, heavy, taskId, attempt, opts) => {
+          const tok = c.acquire(provider, heavy, taskId, attempt, opts);
+          owners.set(tok.id, `${taskId}#${attempt}`);
+          return tok;
+        },
+        release: (tok, result) => {
+          released.push(`${owners.get(tok.id) ?? tok.id}:${result}`);
+          c.release(tok, result);
+        },
+      };
+    };
+    const bindingReleases: string[] = [];
+    const port: TaskLauncher = h.launcher;
+    port.releaseBinding = (child) => { bindingReleases.push(child); };
+    await h.runtime.start();
+    await h.runtime.settled();
+    expect(h.bindings.binds.map((b) => b.childSessionID)).toEqual(["ses-c1"]);
+    // No root context: the end is registered as recovered work and waits for admission.
+    await h.runtime.onChildEnd("T1", 1, { kind: "completed", childSessionID: "ses-c1", text: "DONE: implemented", endedAt: h.clock.iso() });
+    await h.runtime.settled();
+    expect(h.state("T1")).toBe("running");
+    // Meanwhile the queue's row 34 closes the attempt (a reverted dependency): the parked end's identity moved on.
+    await h.parts().writer.append([
+      { type: "attempt-ended", taskId: "T1", n: 1, outcome: "interrupted", endedAt: h.clock.iso(), detail: "dep-reverted" },
+      tr("T1", "running", "blocked", "dep-reverted"),
+      { type: "task-slot", taskId: "T1", slot: null, branch: null },
+    ]);
+    expect(released.filter((r) => r.startsWith("T1#1:"))).toEqual([]);
+    expect(h.bindings.evicted).toEqual([]);
+    h.launcher.gateValue = OK_GATE;
+    h.runtime.onRouterToolCall(ORCH);
+    await until(() => released.some((r) => r.startsWith("T1#1:")), "the moved end's bookkeeping");
+    await h.runtime.settled();
+    // `processEndNow` ignores the closed attempt (nothing is committed or verified) and still does its bookkeeping.
+    expect(released.filter((r) => r.startsWith("T1#1:"))).toEqual(["T1#1:other"]);
+    expect(bindingReleases).toEqual(["ses-c1"]);
+    expect(h.bindings.evicted).toEqual(["ses-c1"]);
+    expect(h.task("T1").attempts[0]).toMatchObject({ outcome: "interrupted", verdict: null });
+    expect(h.verifier.calls).toEqual([]);
+  });
+});
+
 describe("start and locks (L2)", () => {
   it("a stale holder (dead pid, same host) is taken over with reason 'recover' and the plan is reconciled", async () => {
     const h = await mk(planOf([task("T1")]));

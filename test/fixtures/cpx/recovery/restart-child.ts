@@ -383,6 +383,7 @@ async function main(): Promise<void> {
       settle: (_id, release) => {
         void release();
       },
+      releaseSlot: i.releaseSlot ?? ((_id, slot) => pool.release(slot)),
       locks: createRepoLockFactory({ stateRoot: c.lockRoot, clock, pid: process.pid, hostname: hostname(), isPidAlive: (pid) => nodeSpawner().isAlive(pid) }),
       guard,
       clock,
