@@ -531,7 +531,7 @@ export async function registerRoleAgents(
     let worktreeListingProblem: string | undefined;
     // G-12: the worktrees are listed whatever `routing.workRoots` contains (a glob for later-created worktrees must not
     // drop the existing ones). Outside every configured work root the executor home is still denied when worktrees were
-    // listed (QA-62F-1); only the executor slots-root grant is skipped there.
+    // listed or the listing failed (QA-62F-1, QA-62F-9); only the executor slots-root grant is skipped there.
     const outside = locationOutsideWorkRoots(opts.directory, routing.workRoots, process.platform, opts.realpath ?? nativeRealpath);
     if (hasLocalActions) {
       try {
@@ -550,10 +550,10 @@ export async function registerRoleAgents(
     const slotsDir = executorRouting.executor.slotsDir;
     const executorEnabled = executorRouting.leases.mode === "enforce" && cfg.enforcement?.verify?.require !== "never";
     const executorProblems: Array<readonly [key: string, message: string]> = [];
-    // QA-62F-1: outside every work root the listed worktrees still get their allows, which cover the executor home in
-    // the git common directory, so the home is still resolved (one read-only, guarded rev-parse) and denied there. The
-    // slots-root grant below stays inside the work roots only.
-    if (executorEnabled && table.roles.size > 0 && (!outside || worktrees.length > 0)) {
+    // QA-62F-1, QA-62F-9: outside every work root, listed worktrees or configured roots can still cover the executor
+    // home in the git common directory, even when listing failed. Resolve the home (one read-only, guarded rev-parse)
+    // and deny it there; the slots-root grant below stays inside the work roots only.
+    if (executorEnabled && table.roles.size > 0 && (!outside || worktrees.length > 0 || worktreeListingProblem !== undefined)) {
       const realpath = opts.realpath ?? nativeRealpath;
       const homeDirectory = worktrees[0] ?? opts.directory;
       let home: string | undefined;
@@ -579,7 +579,7 @@ export async function registerRoleAgents(
           }
         }
         if (!notRepository) {
-          executorProblems.push(["roles:executor-home", `${PREFIX}the executor home could not be resolved (${problem}); role agents get no slots external_directory rule`]);
+          executorProblems.push(["roles:executor-home", `${PREFIX}the executor home could not be resolved (${problem}); the executor home is not denied and role agents get no slots external_directory rule`]);
         }
       }
       // An unresolved home cannot be protected by a final deny: do not grant the slots root either (D6).

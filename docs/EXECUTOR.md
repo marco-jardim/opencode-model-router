@@ -85,8 +85,10 @@ Tiers mode registers neither surface; switching to roles requires a restart. The
 - a plan-task verifier is available and `enforcement.verify.require` is **not** `"never"`;
 - the host supplies the lease registry and child runner, and no other executor owns the process.
 
-Repository discovery runs only when the executor preconditions hold and the location is inside
-`routing.workRoots` (when configured); an ineligible location does no executor discovery.
+Repository discovery for plan-executor assembly runs only when the executor preconditions hold and the location is
+inside `routing.workRoots` (when configured); assembly does no executor discovery at an ineligible location.
+Separately, with executor enforcement enabled, role registration still resolves the executor home read-only outside
+the work roots to deny it when worktrees were listed or their listing failed; it grants no executor slots-root allowance there.
 
 In roles mode, when assembly is unavailable, the registered `/plan` and `router_plan` show
 `the plan executor is not available: <reason>` rather than launching work. The exact reasons are:

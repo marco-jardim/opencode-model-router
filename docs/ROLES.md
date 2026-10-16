@@ -204,9 +204,9 @@ parent's directory.
   registration. This registered allowance does not widen a dispatch: each child still works only in its own validated
   work root. The executor home (`<git common dir>\omr-executor`) is denied, even if another directory allowance would
   cover it. A project-local `slotsDir` is ignored; a repository cannot grant itself an external slots root. If the
-  executor home cannot be resolved, no slots-root allowance is added (fail closed). Outside every `routing.workRoots`
-  entry the worktrees are still listed and the executor home is still denied, but there is no executor slots-root
-  allowance. See [Assembly and lifecycle](./EXECUTOR.md#assembly-and-lifecycle).
+  executor home cannot be resolved, no slots-root allowance is added (fail closed). When the directory OpenCode was
+  started in lies outside every `routing.workRoots` entry, the worktrees are still listed and the executor home is still
+  denied, but there is no executor slots-root allowance. See [Assembly and lifecycle](./EXECUTOR.md#assembly-and-lifecycle).
 - **Canonical long form.** Write `routing.workRoots` entries in their canonical long spelling: an 8.3 short segment
   (`PROGRA~1`) is refused, because the host compares spellings and a short name can alias another directory.
 - **Over-match.** `*` crosses separators: `D:/git/omr-rta-*` allows every directory starting with `omr-rta-`, nested

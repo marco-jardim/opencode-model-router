@@ -294,7 +294,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   configured and non-empty, an instance loaded in a directory outside every entry skips the start-up reference GC and
   logs one info line naming the skip. Role agent registration in roles mode still lists the repository's worktrees
   there (`git worktree list`, read-only), so a `routing.workRoots` glob meant for later-created worktrees does not drop
-  the existing ones from the role agents' `external_directory` rules. The location check uses the documented
+  the existing ones from the role agents' `external_directory` rules. With executor enforcement enabled, role agents
+  still deny the executor home there when worktrees were listed or their listing failed, and get no executor slots-root
+  allowance. The location check uses the documented
   glob semantics (`*` crosses separators, as in the role agents' rules) and compares canonical paths. Without
   `routing.workRoots` nothing changes. OpenCode v1 is unchanged.
 - **OpenCode v2: `router_verify` on a held background handle reports the verdict its gate reached** (method, outcome,

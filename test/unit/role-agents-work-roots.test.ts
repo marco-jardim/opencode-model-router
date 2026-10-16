@@ -2,8 +2,8 @@
  * QA-DF1-19, reverted by G-12: in roles mode the role agent registration lists the repository's worktrees
  * (`git worktree list --porcelain`) whatever `routing.workRoots` contains, so a location outside every entry keeps its
  * worktree roots as `external_directory` rules next to the `workRoots` patterns. Outside every configured work root the
- * executor home is still denied when worktrees were listed (QA-62F-1); only the executor slots-root grant is skipped there
- * (QA-5.1-5). The listing's git executable is chosen with the listed directory's work-root guards (QA-62F-4).
+ * executor home is still denied when worktrees were listed or the listing failed (QA-62F-1, QA-62F-9); only the executor
+ * slots-root grant is skipped there (QA-5.1-5). The listing's git executable uses the listed directory's work-root guards (QA-62F-4).
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
@@ -155,7 +155,36 @@ describe("QA-DF1-19/G-12 role agent registration and routing.workRoots", () => {
     expect(opts.warn).not.toHaveBeenCalled();
   });
 
-  it("QA-62F-1 outside routing.workRoots an unresolved executor home fails closed like inside: one warning, no slots allow", async () => {
+  it("QA-62F-9 outside routing.workRoots a failed worktree listing still resolves and denies the executor home without a slots allow", async () => {
+    const base = temp();
+    const outside = temp("omr-roles-wr-elsewhere-");
+    const slots = temp("omr-roles-wr-slots-");
+    const main = join(base, "omr-main");
+    mkdirSync(join(main, ".git"), { recursive: true });
+    const home = join(main, ".git", "omr-executor");
+    const cfg = rolesConfig([`${slash(base)}/omr-*`]);
+    cfg.routing = { ...cfg.routing, leases: { mode: "enforce" }, executor: { slotsDir: slots } };
+    cfg.enforcement = { ...cfg.enforcement, verify: { require: "always" } };
+    const list = vi.fn(async (): Promise<string[]> => { throw new Error("worktree listing unavailable"); });
+    const executorHome = vi.fn(async () => home);
+    const opts = { ...options(outside, list), executorHome };
+    const agents: Record<string, Record<string, unknown>> = {};
+    const result = await registerRoleAgents(agents, cfg, opts);
+    expect(result.failed).toBe(false);
+    expect(list).toHaveBeenCalledExactlyOnceWith(outside);
+    expect(executorHome).toHaveBeenCalledExactlyOnceWith(outside);
+    expect(result.externalDirectory).toEqual([`${base}${sep}omr-*`]);
+    expect(result.externalDirectory).not.toContain(join(slots, "*"));
+    expect(result.externalDirectoryDenied).toEqual([join(home, "*")]);
+    const policy = permissionRules(agents.implementer!.permission as PermissionMap);
+    expect(evaluatePermission(policy, "external_directory", join(main, "src", "x.ts"))).toBe("allow");
+    expect(evaluatePermission(policy, "external_directory", join(home, "ledger.json"))).toBe("deny");
+    expect(evaluatePermission(policy, "external_directory", join(slots, "plan", "slot-1", "x"))).toBe("deny");
+    expect(opts.warn).toHaveBeenCalledTimes(1);
+    expect(opts.warn).toHaveBeenCalledWith("roles:worktrees", expect.stringContaining("worktree listing unavailable"));
+  });
+
+  it("QA-62F-1 outside routing.workRoots an unresolved executor home gives one warning, home not denied, no slots allow", async () => {
     const base = temp();
     const outside = temp("omr-roles-wr-elsewhere-");
     const slots = temp("omr-roles-wr-slots-");
@@ -171,7 +200,9 @@ describe("QA-DF1-19/G-12 role agent registration and routing.workRoots", () => {
     expect(result.externalDirectory).toEqual([join(wt, "*"), `${base}${sep}omr-*`]);
     expect(result.externalDirectoryDenied).toEqual([]);
     expect(opts.warn).toHaveBeenCalledTimes(1);
-    expect(opts.warn).toHaveBeenCalledWith("roles:executor-home", expect.stringContaining("common directory unavailable"));
+    expect(opts.warn).toHaveBeenCalledWith("roles:executor-home", expect.stringContaining(
+      "the executor home could not be resolved (common directory unavailable); the executor home is not denied and role agents get no slots external_directory rule",
+    ));
   });
 
   it("G-12 a workRoots glob for later-created worktrees does not drop the project's existing worktrees", async () => {
@@ -407,7 +438,9 @@ describe.skipIf(process.platform !== "win32")("Phase 5.1.3 D6 executor external_
     expect(result.externalDirectoryDenied).toEqual([]);
     expect(evaluatePermission(rules(f.agents.implementer!), "external_directory", join(f.slots, "slot-1", "x"))).toBe("deny");
     expect(f.opts.warn).toHaveBeenCalledTimes(1);
-    expect(f.opts.warn).toHaveBeenCalledWith("roles:executor-home", expect.stringContaining("common directory unavailable"));
+    expect(f.opts.warn).toHaveBeenCalledWith("roles:executor-home", expect.stringContaining(
+      "the executor home could not be resolved (common directory unavailable); the executor home is not denied and role agents get no slots external_directory rule",
+    ));
   });
 
   it("D7 a non-repository directory gets no executor allow, deny or warning", async () => {
@@ -446,7 +479,9 @@ describe.skipIf(process.platform !== "win32")("Phase 5.1.3 D6 executor external_
     expect(result.externalDirectory).toEqual([join(f.main, "*")]);
     expect(result.externalDirectoryDenied).toEqual([]);
     expect(f.opts.warn).toHaveBeenCalledTimes(1);
-    expect(f.opts.warn).toHaveBeenCalledWith("roles:executor-home", expect.stringContaining("dubious ownership"));
+    expect(f.opts.warn).toHaveBeenCalledWith("roles:executor-home", expect.stringContaining(
+      "dubious ownership in repository); the executor home is not denied and role agents get no slots external_directory rule",
+    ));
   });
 
   it("uses the project directory for the executor home when no worktrees were listed", async () => {
