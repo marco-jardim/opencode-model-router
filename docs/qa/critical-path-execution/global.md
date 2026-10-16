@@ -45,7 +45,62 @@ with the clean reruns in `D:\git\omr-cpx-p62`. These are pre-flight observations
 
 ## Findings
 
-pending 6.2.QA
+Severities and statuses as recorded below in this file; "not stated" where the file gives none.
+
+| id | severity | area | status | where recorded |
+|---|---|---|---|---|
+| P-1 | not stated (real, pre-existing since `f2182e5`) | `/router` v2 help, routing-advisor QA-2.4-3 | fixed as G-2 | Pre-flight; Fixes, G-2 |
+| P-2 | not stated (flaky under load) | `exec.test.ts` process-lifecycle timing tests | fixed as G-6 | Pre-flight; Fixes, G-6 |
+| N-2 (input, pdf2-1 Round 5) | major impact, low likelihood | running dependent absent from `launcher.inFlight` vs its slot's release | fixed under G-1 (see note) | Smoke gate and carried inputs; Fixes, G-1 |
+| G-1 | major | executor: adopted child stopped before its slot goes back | fixed | Fixes |
+| G-2 | major, P-1 | executor help gating in `/router` | fixed | Fixes |
+| G-3 | major, docs | dogfood disclosure | fixed (disclosure completed; G13 remains UNMET, owner decision pending) | Fixes |
+| G-4 | minor, security | guarded check executables, full-environment replacement | fixed (`verify/wiring.ts` bare git recorded for follow-up) | Fixes |
+| G-5 | minor, registration | `router_plan` / `/plan` registration | fixed (owner decision 2026-10-16, option (a)) | Fixes; Orchestrator validation of G-5 and G-9 |
+| G-6 | minor, P-2 | serial process-lifecycle project | fixed | Fixes |
+| G-8 | minor, docs | automatic safety pauses disclosed and pinned | fixed | Fixes |
+| G-9 | minor, test | serial heartbeat isolation | fixed | Orchestrator validation of the 6.2.FIX batch |
+| G-10 | minor, test | load-sensitive integration tests | deferred: load-sensitive, each passes alone and with its file | Orchestrator validation of G-5 and G-9; of N-A, N-B and N-D |
+| G-11 | minor, test, pre-existing | v2-provider-e2e Windows path assertion | fixed | Fixes |
+| G-12 | major, regression of `7180ac8` / QA-DF1-19 | role registration worktree listing | fixed | Fixes |
+| G-13 | minor, stale smoke | role-spikes S2 and S6 background path | fixed | Fixes |
+| G-14 | minor, pre-existing, host drift | role-spikes S11 | deferred: identical failure at `origin/master` `6ec3faa`, out of scope (A-6.2-2) | Fixes; Focused QA of G-11..G-14 |
+| N-1 | not stated | `releaseBlockedSlot` save outside the task lock | fixed (folded into G-1) | Fixes, G-1 |
+| N-5 | not stated | latency of READY dependents' saves | fixed (cleared by G-1's N-1 change) | Fixes, G-1 |
+| m-A | not stated (Phase 6.1 deferred) | `refuseHeldChild` requeue/reset | fixed (folded into G-1) | Fixes, G-1 |
+| m-G | docs | soak analyzer runtime | fixed | Fixes |
+| R2-4 | minor, smoke oracle | checkpoint-scoped G9 attempt normalization | fixed | Fixes |
+| R2-8 | nit, smoke oracle | observed G9 wake-session evidence | fixed | Fixes |
+| R2-9 | docs | role-floor configuration wording | fixed | Fixes; Orchestrator validation of the 6.2.FIX batch |
+| N-A | major, regression of G-4 | integration-check pytest slot virtual environment | fixed | Fixes |
+| N-A-1 | major, focused QA of 306ad9e | pytest command moved to another slot | fixed | Fixes |
+| minor-1 | not stated | slot interpreter rewritten between selection and spawn | fixed (with N-A-1) | Fixes, N-A-1 |
+| N-B | minor, G-1 gap | abort during a blocked task's adopted-child stop | fixed | Fixes |
+| N-D | minor | late blocked-slot release vs relaunch | fixed (`cancelled` extension accepted by the orchestrator) | Fixes; Orchestrator validation of N-A, N-B and N-D |
+| minor-2/3 | docs | N-A wording | fixed | Fixes |
+| minor-4 | not stated | `releaseBlockedSlot` for a task ready again | fixed | Fixes |
+| minor-5 | not stated (QA: low-confidence edge) | N-B residual window | deferred: no reproduction, a fix would be speculative | Fixes |
+| minor-6 | not stated | pytest `ComSpec` on win32 | fixed | Fixes |
+| QA-62F-1 | major, security | executor-home deny outside the work roots | fixed | Focused QA of G-11..G-14 |
+| QA-62F-2 | minor, docs | outside-work-roots behaviour docs | fixed | Focused QA of G-11..G-14 |
+| QA-62F-3 | minor, coverage | S6 `auto` run | fixed | Focused QA of G-11..G-14 |
+| QA-62F-4 | nit | start-up `git worktree list` executable | fixed | Focused QA of G-11..G-14 |
+| QA-62F-5 | nit | `v2-provider-e2e` system content | fixed | Focused QA of G-11..G-14 |
+| QA-62F-6 | nit | G-14 root-cause wording | accepted (wording corrected) | Focused QA of G-11..G-14 |
+| QA-62F-7 | nit (docs) | EXECUTOR/CHANGELOG/ROLES wording | fixed | Focused QA round 2 |
+| QA-62F-8 | nit (wording) | unresolved-home warning | fixed | Focused QA round 2 |
+| QA-62F-9 | nit (low confidence) | home lookup after a failed listing | fixed | Focused QA round 2 |
+| PF-4 | not stated (known, pre-existing) | routing-engine smoke `5-advisor` | deferred: pre-existing, fails at `7181165` | Fixes, G-14; Final smoke gate |
+
+Notes:
+- N-2: G-1's entry names its fold-ins as N-1 and m-A, not N-2. **Orchestrator determination (2026-10-16): N-2 is
+  closed by G-1.** `pdf2-1.md:122` prescribes the N-2 fix as (a) interrupt a restart-adopted child and await its end
+  before the save in `releaseBlockedSlot`, and (b) re-check the task state just before the launch. G-1 does (a) with
+  `sweepAdopted`/`stopAdoptedChild` (interrupt, then wait for the terminal event or idle context, then save and
+  release once; a failed stop keeps the slot under `wipHold`) and `releaseBlockedSlot` keeping a held slot, and (b)
+  with `launchStep`'s re-check after R4 and just before `launcher.launch`. G-3's "remaining N-2 handoff" wording
+  predates G-1.
+- G-7 and N-C have no record in this file; no row is invented for them.
 
 ## Fixes
 
@@ -318,17 +373,58 @@ Orchestrator validation: typecheck exit 0; role-agents-work-roots, roles.registr
 role-agents, dispatch.worktree-list, routing-advisor integration: 333 passed, 1 skipped. Round 2 had no major
 finding, so no round 3 (§0.7).
 
+### Final smoke gate (A-6.2-1), 2026-10-16
+
+Head `fcf6b1b`, host OpenCode 2.0.26 (`OPENCODE_V2_BIN`), v1 lanes with 1.18.35 first on `PATH`, no
+`OPENCODE_CONFIG_DIR`/XDG overrides. Logs: `D:\git\omr-cpx-p61\.cpx-logs\gate62-final\`.
+
+- `smoke:cpx`: 74/74.
+- `smoke:cpx:provision`: 4/4.
+- `smoke:v2`: 2/2.
+- `smoke:v2:e2e`: 4/4.
+- `smoke:routing`: 12/13. The one failure is `5-advisor`, PF-4, pre-existing.
+- roles + role-spikes: 23/24. The one failure is S11, G-14, identical at `origin/master`.
+- `smoke:keyless`: 27 passed, 11 skipped.
+- `smoke:v1`: 27 passed, 11 skipped.
+- `smoke:cpx:e2e`: 22 passed, 3 failed, 9 skipped; the 3 failed cases rerun isolated: 3/3 passed.
+  - Two py-pip cases were environmental: the gate shell lacked `CPX_E2E_PYTHON`, and `py -3` resolves Python 3.14,
+    whose pytest is only in the user site, which the executor's venv does not see. This is the documented
+    prerequisite; rerun with `CPX_E2E_PYTHON=C:\Users\Marquinho\miniconda3\python.exe` (Python 3.13.11, pytest 9.0.2).
+  - One node-npm throughput case failed G8 ("idle with ready work at most 10,000 ms: expected 12831") and passed on
+    the isolated rerun: timing-sensitive on the real host, recorded with G-10's family, no product change.
+
+A power loss interrupted the gate after the keyless lane; the remaining lanes resumed on the same head (repository
+fsck clean).
+
 ## Deferred findings
 
-pending 6.2.QA
+- **G-10 (minor, test):** load-sensitive tests (`v2-background` "QA-DF1-17", `routing-ladder-resume` "QA-2.3-2",
+  `depth-guard-wiring` "shares one two-session walk across 50 concurrent task calls") each pass alone and with their
+  files. The final gate's node-npm G8 throughput case (passed on the isolated rerun) is recorded in the same family.
+- **minor-5 (N-B residual window):** low-confidence edge per the QA, no reproduction; a fix without one would be
+  speculative.
+- **G-14 (minor, pre-existing, host drift):** role-spikes S11 fails identically at `origin/master` `6ec3faa`; out of
+  the plan's scope (A-6.2-2). The cause is not proven (QA-62F-6).
+- **PF-4:** routing-engine smoke `5-advisor`, pre-existing (fails at `7181165` too).
+- **Phase 6.1 deferrals:** the [Phase 6.1 consolidated table](phase-6.1.md#deferred-findings) remains authoritative,
+  by reference under **A-6.2-2**; m-A from that queue was fixed here (folded into G-1).
 
 ## Handoffs
 
-pending 6.2.QA
+- G-14: refresh role-spikes S11 against the host in a separate change.
+- G-10: move the affected tests to the serial project if they recur.
+- `smoke:cpx:e2e` py-pip cases need `CPX_E2E_PYTHON` pointing at an interpreter with pytest when `py -3` has none
+  visible to the executor's venv.
+- G-4 follow-up: ordinary verification's `verify/wiring.ts` test search and committed-diff call still use bare git.
+- G-3: G13 remains UNMET, owner decision pending.
 
 ## Verdict
 
-pending 6.2.QA
+Every finding of the global QA rounds and the focused rounds is fixed or deferred with a recorded reason (see
+Findings and Deferred findings). The final smoke gate is green except the two pre-existing failures (PF-4, G-14)
+and the node-npm timing case, which passed on its isolated rerun (the two py-pip cases were environmental and
+passed when rerun with the documented `CPX_E2E_PYTHON` prerequisite). 6.2.FIX is ready to merge into `cpx/main` for
+6.2.4.
 
 ### Orchestrator validation of the 6.2.FIX batch (2026-10-16)
 
