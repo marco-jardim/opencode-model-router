@@ -1002,12 +1002,12 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
   const abortReleases = new WeakMap<PlanRt, Set<TaskId>>();
 
   /**
-   * No live child, no task in flight, no abort release running and no open integration entry: nothing of the plan still
-   * writes its slots.
+   * No live child, no task in flight, no abort release running, no stop of an adopted child running (N-B) and no open
+   * integration entry: nothing of the plan still writes its slots.
    */
   function idle(p: PlanRt): boolean {
     return p.inFlight.size === 0 && ![...p.handles.values()].some((h) => !h.settled) && (abortReleases.get(p)?.size ?? 0) === 0
-      && p.attachmentWork.size === 0 && p.writer.openIntegration().length === 0;
+      && p.attachmentWork.size === 0 && p.writer.openIntegration().length === 0 && !adoptedStopRunning(p);
   }
 
   /**
@@ -3548,9 +3548,22 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         await releaseResources(p, taskId, sweep.slot);
       } finally {
         sweep.settled = true;
+        // N-B: a finished plan's collection waited for this stop (`idle`); it runs now, not at the next backoff.
+        bg("finished slot collection", () => collectFinished(p));
       }
     });
     return sweep;
+  }
+
+  /**
+   * N-B: a sweep of one of the plan's tasks still stops a child recovery adopted: the child may still write its slot, and
+   * an abort registers no release for a blocked task (`abortReleases`), so the plan is not idle until the stop settled.
+   */
+  function adoptedStopRunning(p: PlanRt): boolean {
+    return Object.keys(p.writer.ledger.tasks).some((id) => {
+      const s = blockedSweeps.get(`${p.planId}/${id}`);
+      return s !== undefined && s.adopted && !s.settled;
+    });
   }
 
   /**
@@ -3574,10 +3587,15 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
    * G-1: the queue can release before `onReverted` swept: a child recovery adopted is stopped here first, and a failed
    * stop keeps the slot under its hold. N-1: the save and release run under the task's mutex, so a launch step of the
    * same task never saves or resets the slot meanwhile; the queue never awaits this in its serial lane.
+   * N-D: that release is fire-and-forget, so the task can be relaunched before the mutex is taken; the pool hands the
+   * relaunch the same slot (same owner). Under the mutex the slot goes back only while the task is still blocked with no
+   * slot in the ledger, at the attempt it was blocked in. An abort that cancelled the blocked task meanwhile releases no
+   * such slot itself (its ledger slot is null) and a cancelled task never relaunches: its slot still goes back here.
    */
   async function releaseBlockedSlot(p: PlanRt, taskId: TaskId, slot: string): Promise<void> {
     const key = `${p.planId}/${taskId}`;
     const t = own(p.writer.ledger, taskId);
+    const blockedAt = t === null ? undefined : t.attempts[t.attempts.length - 1]?.n;
     const last = t === null || t.state !== "blocked" ? undefined : t.attempts[t.attempts.length - 1];
     if (last !== undefined) sweepAdopted(p, taskId, last.n, slot);
     const sweep = blockedSweeps.get(key);
@@ -3595,6 +3613,9 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       if (blockedSweeps.get(key) === sweep) blockedSweeps.delete(key);
     }
     await withTask(p, taskId, async () => {
+      const now = own(p.writer.ledger, taskId);
+      if (now === null || (now.state !== "blocked" && now.state !== "cancelled") || now.slot !== null
+        || now.attempts[now.attempts.length - 1]?.n !== blockedAt) return;
       if (!(await slotHeldBy(p, taskId, slot))) return;
       await releaseSlotSaved(p, taskId, slot, "dep-reverted");
     });

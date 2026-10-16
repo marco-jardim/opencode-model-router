@@ -6,7 +6,8 @@
 import { lstat, readdir, readFile, realpath, stat, unlink } from "node:fs/promises";
 import * as nodePath from "node:path";
 import { gitEnvironment, gitExecutable, hardeningArgs, workRootGuards } from "../../router/git-tools";
-import { resolveCommandExecutable, runEnvironment } from "../../router/run-tools";
+import { resolveCommandExecutable, runEnvironment, slotToolExecutable } from "../../router/run-tools";
+import { applySlotEnv, slotEnvFor } from "../slots/env";
 import {
   detectRunner, isNoAffected, isScopedSpec, isUnverifiable, planRerun, planScopedRun, readResult,
   type ChangedPath, type RunnerFs, type TestSearchSeam,
@@ -538,11 +539,28 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
       ...(c.cwd === undefined ? {} : { cwd: c.cwd }), ...(c.env === undefined ? {} : { env: c.env }) };
   }
 
+  /**
+   * QA N-A: the pytest interpreter and environment as router_run's planRun builds them. The environment is the hardened
+   * run environment (credentials, npm/NODE_OPTIONS and guarded PATH entries dropped) with the slot environment applied
+   * (VIRTUAL_ENV, `.venv\Scripts` / `.venv/bin` first on PATH, PYTHONPATH/PYTHONHOME unset). argv[0] is the slot's own
+   * provisioned tool for a bare name (slotToolExecutable: it must match the pool's post-provisioning snapshot), else an
+   * absolute file outside the work root (resolveCommandExecutable); never a bare name resolved from the cwd.
+   */
   function resolvePython(c: ResolvedCommand, cwd: string): ResolvedCommand {
+    const platform = process.platform;
     const guards = workRootGuards(cwd);
-    const env = runEnvironment(process.env, process.platform, undefined, { guards });
+    const base = runEnvironment(process.env, platform, undefined, { guards });
+    const slotEnv = slotEnvFor(cwd, platform);
     try {
-      const file = resolveCommandExecutable(c.file, { platform: process.platform, env }, guards);
+      const host = { platform, env: base };
+      // An earlier resolution's slot tool (this slot's, or another slot's when a command moves to a prepared slot) is
+      // never taken as an absolute path: its bare name is looked up again for this slot. Any other path is kept as given.
+      // Its directory names the slot: a virtualenv interpreter may be a link to a base interpreter outside it.
+      const owner = nodePath.isAbsolute(c.file) ? slotEnvFor(nodePath.dirname(c.file), platform) : null;
+      const name = nodePath.basename(c.file);
+      const program = owner !== null && slotToolExecutable(name, owner, host, () => guards) === c.file ? name : c.file;
+      const file = slotToolExecutable(program, slotEnv, host, () => guards) ?? resolveCommandExecutable(program, host, guards);
+      const env = applySlotEnv(base, slotEnv, platform);
       return { ...c, file, resolution: { cwd, env: Object.fromEntries(Object.entries(env)
         .filter((entry): entry is [string, string] => entry[1] !== undefined)) } };
     } catch (e) {

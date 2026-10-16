@@ -1774,6 +1774,36 @@ describe("G-1: a child recovery adopted is stopped before its slot goes back", (
     expect(h.bindings.evicted).toEqual(["ses-c1"]);
   });
 
+  it("N-B: an abort during a blocked task's adopted-child stop collects and releases nothing until the stop settles", async () => {
+    const h = await adoptedAndRebound();
+    const mark = h.log.length;
+    h.hosts.interruptImpl = async (sid) => {
+      h.log.push(`hosts.interrupt:${sid}`);
+    };
+    // The finished plan's collection (`collectFinished`) ends with the pool's gc of the plan's slots.
+    vi.spyOn(h.slots, "gc").mockImplementation(async () => {
+      h.log.push("slots.gc");
+      return { removed: [], reported: [] };
+    });
+    const slot = await row34(h);
+    h.parts().listener.onReverted("T1");
+    await until(() => h.hosts.interrupts.includes("ses-c1"), "the adopted child interrupted");
+    // T1 is blocked: the abort registers no release of its own while the sweep's stop of the adopted child still runs.
+    await h.runtime.abort(PLAN_ID, ORCH);
+    expect(h.ledger().status).toBe("aborted");
+    await pause(20);
+    expect(h.slots.released).toEqual([]);
+    expect(h.log.slice(mark)).not.toContain("slots.gc");
+    expect(h.slots.records.get(slot)?.state).toBe("leased");
+    // The child's end settles the stop: the slot is saved and released, and only then is the finished plan collected.
+    h.hosts.emit({ type: "execution.interrupted", sessionID: "ses-c1", at: h.clock.iso() });
+    await until(() => h.log.slice(mark).includes("slots.gc"), "the finished plan collected after the stop", () => ({ logs: h.logs }));
+    await h.runtime.settled();
+    expect(h.log.slice(mark).filter((l) => l.startsWith("hosts.interrupt:") || l.startsWith("slots.release:") || l === "slots.gc"))
+      .toEqual(["hosts.interrupt:ses-c1", `slots.release:${slot}`, "slots.gc"]);
+    expect(h.slots.released).toEqual([slot]);
+  });
+
   it("launchStep: an attempt that row 34 closed while R4 awaited the launcher gets no child", async () => {
     const h = await mk(planOf([task("T1")]));
     await h.begin();

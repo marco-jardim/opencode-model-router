@@ -178,6 +178,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **OpenCode v2: integration check selection never treats a failed `git show` as a missing file.** Only git's explicit
   "path does not exist" error means absent; any other read failure fails the check as `prepare`, never a `no-checks`
   pass. A failed prepare now waits for its overlapped reads before the slot is retried.
+- **OpenCode v2: integration-check pytest uses the slot's virtual environment again.** Since the guarded-executable
+  change, pytest checks ran the host interpreter without the slot's environment. They again run the slot's provisioned
+  `.venv` interpreter with `VIRTUAL_ENV` set, the virtual environment first on `PATH` and `PYTHONPATH`/`PYTHONHOME`
+  unset, as `router_run` does; credentials stay stripped. A slot without a provisioned interpreter uses the absolute
+  host interpreter outside the slot, and a file planted in the slot is never run.
 - **OpenCode v2: QA fix tasks get a launchable route line for any repository path.** A repository or phase root that
   cannot be written safely into a route line (brackets, quotes, separators) is omitted, since the slot root is always
   appended at launch; fix tasks stored by the earlier build with an unbracketed line launch as well.
@@ -312,7 +317,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 
 - **OpenCode v2: executor check discovery uses absolute, guarded executables.** Git searches use hardened arguments
-  and environment; pytest resolves its interpreter outside guarded checkouts. Both use a credential-stripped run
+  and environment; pytest resolves its interpreter outside guarded checkouts, or takes the slot's provisioned
+  virtual-environment interpreter as `router_run` does. Both use a credential-stripped run
   environment with explicit full-environment replacement and Windows current-directory search protection, so process
   inheritance cannot restore provider credentials. Other process callers retain their default environment merging.
 - **OpenCode v2 (v1 unchanged): an unbound plan child is refused every tool call.** A child session whose first message

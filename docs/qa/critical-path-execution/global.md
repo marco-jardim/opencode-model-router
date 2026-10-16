@@ -169,6 +169,37 @@ pending 6.2.QA
   EXECUTOR.md, README, OPENCODE_V2.md, ROLES.md and the registration sentence pins now state the roles-at-start rule.
   No checks run by this implementer; typecheck and tests remain with the orchestrator.
 
+- **N-A (major, regression of G-4) — fixed: integration-check pytest uses the slot's virtual environment again.**
+  G-4's `resolvePython` built the child environment from `runEnvironment` alone and took argv[0] from
+  `resolveCommandExecutable`, which refuses anything inside the slot; with `envMode: "replace"` the slot environment
+  was skipped too. Pytest therefore ran the host interpreter without the slot's `.venv`. `resolvePython`
+  (`src/executor/integrate/checks.ts`) now matches router_run's `planRun`: the environment is
+  `applySlotEnv(runEnvironment(...), slotEnvFor(cwd))` (VIRTUAL_ENV, `.venv\Scripts` / `.venv/bin` first on PATH,
+  PYTHONPATH/PYTHONHOME unset), and argv[0] is `slotToolExecutable(...) ?? resolveCommandExecutable(...)`
+  (`slotToolExecutable` is now exported from `src/router/run-tools.ts`). G-4's guarantees stay: credentials stripped,
+  an absolute executable, never a bare name resolved from the cwd, `envMode: "replace"`. A slot interpreter is taken
+  only from a registered Python-manager slot's tool directories and only when it matches the pool's post-provisioning
+  snapshot; a file planted in the slot root or written into `.venv` later is never selected. An interpreter an earlier
+  resolution took from a slot (another slot's, when a command moves to a prepared slot) is re-resolved by its bare
+  name for the slot it runs in. Tests in `test/unit/executor-integrate-bisect.test.ts` (real `slotToolExecutable`,
+  real files): the provisioned `.venv` interpreter with the slot environment and no credential; the absolute host
+  python with the stripped environment for a slot without a provisioned interpreter and for one without a Python
+  manager; a command resolved in one slot runs the other slot's interpreter; on Windows, the spawn seam with a
+  registered slot still never selects the planted slot-root `python.exe`. Both G-4 tests are unchanged.
+- **N-B (minor, G-1 gap) — fixed: an abort waits for a blocked task's adopted-child stop.** `abort` registers
+  `abortReleases` only for dispatched/running tasks, so a blocked task whose sweep was still stopping its adopted child
+  left `idle()` true and `collectFinished` could collect the slot while the child ran. `idle()` now returns false while
+  a `blockedSweeps` entry of the plan stops an adopted child and has not settled; the settled sweep starts the finished
+  plan's collection at once. Test: `test/unit/executor-runtime-recovery.test.ts`, "N-B: an abort during a blocked
+  task's adopted-child stop collects and releases nothing until the stop settles".
+- **N-D (minor) — fixed: a late blocked-slot release never frees a relaunched task's slot.** The queue's release of a
+  READY dependent is fire-and-forget, so the task could be relaunched (same owner, same slot) before
+  `releaseBlockedSlot` took the task's mutex. Under the mutex it now releases only while the task is still `blocked`
+  (or `cancelled` by an abort, which never relaunches and releases no such slot itself), has no slot in the ledger and
+  is at the attempt it was blocked in. Test: `test/unit/executor-runtime-resume.test.ts`, "N-D: a late queue release
+  of a blocked dependent never frees the slot its relaunch leased again".
+  No checks run by this implementer for N-A, N-B or N-D; typecheck and tests remain with the orchestrator.
+
 ## Deferred findings
 
 pending 6.2.QA
@@ -209,3 +240,12 @@ heartbeat assertions moved unchanged to `executor-integrate-queue-heartbeat.test
 of `test/integration`: 91 files, 2445 passed, 2 failed, 62 skipped. The two failures, `v2-background` "QA-DF1-17" and
 `routing-ladder-resume` "QA-2.3-2", pass alone twice each and with their files (82/82): load-sensitive like G-6/G-9,
 recorded as **G-10 (minor, test)**, deferred: move to the serial project if they recur at the final gate.
+
+### Orchestrator validation of N-A, N-B and N-D (2026-10-16)
+
+`npm run typecheck` exit 0. Scoped run (test/unit/executor*, verify*, v2*, docs-drift, exec*, run-tools*, router-run*,
+test/golden and all of test/integration): 144 files, 5909 passed, 2 failed, 81 skipped; no `expect` removed versus
+a95a6ed. Both failures are G-10 (load-sensitive): `routing-ladder-resume` "QA-2.3-2" (second occurrence) and
+`depth-guard-wiring` "shares one two-session walk across 50 concurrent task calls"; each passes alone twice and with
+its file (93/93). N-D's release also accepts a `cancelled` task (an abort that cancels a blocked task never releases
+its slot itself, and a cancelled task cannot relaunch); the orchestrator accepts this extension.

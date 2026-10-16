@@ -1679,6 +1679,62 @@ describe("pdf2-1 round 4: blocked dependents, re-provisioning and slot paths", (
     expect((await h.ledger()).tasks.T1?.state).toBe("blocked");
   }, TEST_MS);
 
+  it("N-D: a late queue release of a blocked dependent never frees the slot its relaunch leased again", async () => {
+    // The relaunch's first git step in the slot is held open, so it holds the task's mutex.
+    const io = { slot: "", hold: null as Promise<void> | null, entered: (): void => {} };
+    const holding: GitRunner = {
+      run: async (args, o) => {
+        const hold = io.slot !== "" && o.cwd === io.slot ? io.hold : null;
+        if (hold !== null) {
+          io.hold = null;
+          io.entered();
+          await hold;
+        }
+        return runGit(args, o.cwd);
+      },
+    };
+    const h = await rig({ git: holding });
+    const inputs = captureInputs(h);
+    await h.start();
+    const first = await h.launched(1);
+    await h.child(first, "ses-1");
+    await writeFile(join(h.r.slot, "b.txt"), "dependent's unsaved work\n");
+    const gate = vi.spyOn(h.deps.launcher, "gate").mockReturnValue({ ok: false, reason: "no-context", wake: { reason: "stale-context", stateKey: "nd-ready" } });
+    first.end({ kind: "lost", childSessionID: "ses-1", reason: "runner-error", endedAt: h.deps.clock.iso() });
+    await untilState(h, "ready");
+    const { input, releaseSlot } = releaseSlotOf(inputs);
+    let resume: () => void = () => {};
+    io.hold = new Promise<void>((res) => { resume = res; });
+    const entered = new Promise<void>((res) => { io.entered = res; });
+    io.slot = h.r.slot;
+    // The context is back: the relaunch's launch step takes the task's mutex and starts its save before the slot's reset.
+    gate.mockRestore();
+    h.runtime.onLeaseReleased();
+    await entered;
+    // Row 34 for the READY dependent, then the queue's fire-and-forget release of its slot: it waits for the mutex.
+    await input.writer.append([
+      { type: "task-transition", taskId: "T1", from: "ready", to: "blocked", trigger: "dep-reverted", detail: null },
+      { type: "task-slot", taskId: "T1", slot: null, branch: null },
+    ]);
+    const released = releaseSlot("T1", "slot-1");
+    // The dependency recovers before the launch step re-reads its task, so the step relaunches T1 in the same slot.
+    await input.writer.append((cur) => (cur.tasks.T1?.state === "blocked"
+      ? [{ type: "task-transition", taskId: "T1", from: "blocked", to: "ready", trigger: "dep-recovered", detail: null }]
+      : []));
+    resume();
+    const second = await h.launched(2);
+    await released;
+    await h.pause(100);
+    expect(second.req.attempt).toBe(2);
+    // The late release found T1 relaunched: the slot of attempt 2 is neither saved away nor given back to the pool.
+    expect(h.pool.release).not.toHaveBeenCalled();
+    const t1 = (await h.ledger()).tasks.T1;
+    expect(t1?.state).toBe("dispatched");
+    expect(t1?.slot).toBe("slot-1");
+    expect(t1?.attempts.map((a) => a.n)).toEqual([1, 2]);
+    expect(await readFile(join(h.r.slot, "b.txt"), "utf8")).toBe("dependent's unsaved work\n");
+  }, TEST_MS);
+
   it("minor-4: a failed save before the re-provisioning reset keeps the new slot leased under its hold and drops its cached lease", async () => {
     const io = { failSave: false, refuse: false };
     const h = await rig({

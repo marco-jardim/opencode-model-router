@@ -8,13 +8,15 @@ import type { SlotHandle, SlotOptions, SlotResult } from "../../src/verify/slot"
 import type {
   DetectedRunner, NoAffected, PlanScopedRunInput, RunResult as VerifyResult, ScopedSpec, Unverifiable,
 } from "../../src/verify/runner";
-import { access, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { realpathSync } from "node:fs";
+import { access, lstat, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as nodePath from "node:path";
 import { createLander, phaseTagName, samePath } from "../../src/executor/integrate/land";
 import { phaseTagName as gitPhaseTagName, type GitOps } from "../../src/executor/git";
 import { hardeningArgs } from "../../src/router/git-tools";
 import * as runTools from "../../src/router/run-tools";
+import { registerSlot, unregisterSlot } from "../../src/executor/slots/env";
 import { ExecutorError } from "../../src/executor/types";
 import type {
   Clock, ExecutorConfig, GitRunner, IntegrationStep, LedgerV1, RunCommandRef, SlotLease, SlotPool, SlotRecord,
@@ -1744,9 +1746,12 @@ describe("integration checks: test search and filesystem seams", () => {
   const PKG_TEST = { "package.json": JSON.stringify({ scripts: { test: "vitest run" } }) };
   const dirs: { root: string } = { root: "" };
   const securityRoots: string[] = [];
+  /** N-A: slot roots a test registered in the process-wide slot registry. */
+  const registeredSlots: string[] = [];
   beforeAll(async () => { dirs.root = await mkdtemp(nodePath.join(tmpdir(), "omr-bisect-")); });
   afterAll(async () => { await rm(dirs.root, { recursive: true, force: true }); });
   afterEach(async () => {
+    for (const root of registeredSlots.splice(0)) unregisterSlot(root);
     for (const root of securityRoots.splice(0)) await rm(root, { recursive: true, force: true });
   });
   async function securityFixture() {
@@ -1886,6 +1891,170 @@ describe("integration checks: test search and filesystem seams", () => {
       expect(nodePath.relative(cwd, c.file).startsWith("..")).toBe(true);
     }
     expect(spawned[1]?.c.file).toBe(nodePath.join(tools, "python.exe"));
+    await expect(access(marker)).rejects.toMatchObject({ code: "ENOENT" });
+  }, 30_000);
+
+  // N-A (regression of G-4): pytest runs the slot's provisioned virtual environment again, as router_run's planRun does.
+  const WIN = process.platform === "win32";
+  const PYTHON_EXE = WIN ? "python.exe" : "python";
+
+  /**
+   * A slot root with a planted interpreter (G-4) first on PATH, a host interpreter on PATH after it, and the inherited
+   * credentials and foreign Python variables a pytest child must not see. The test registers the slot itself.
+   */
+  async function venvFixture() {
+    const { cwd, tools } = await securityFixture();
+    const hostPython = nodePath.join(tools, PYTHON_EXE);
+    await writeFile(hostPython, "fixture host interpreter; never executed");
+    await writeFile(nodePath.join(cwd, PYTHON_EXE), "untrusted interpreter");
+    const root = realpathSync.native(cwd);
+    const scripts = nodePath.join(root, ".venv", WIN ? "Scripts" : "bin");
+    await mkdir(scripts, { recursive: true });
+    const pathKey = Object.keys(process.env).find(k => k.toUpperCase() === "PATH") ?? "PATH";
+    vi.stubEnv(pathKey, [cwd, tools, process.env[pathKey]].join(nodePath.delimiter));
+    for (const key of ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "AWS_SECRET_ACCESS_KEY", "provider_token", "NODE_OPTIONS"]) {
+      vi.stubEnv(key, "must-not-reach-checks");
+    }
+    vi.stubEnv("PYTHONPATH", nodePath.join(tools, "foreign-site"));
+    vi.stubEnv("PYTHONHOME", tools);
+    vi.stubEnv("VIRTUAL_ENV", nodePath.join(tools, "foreign-venv"));
+    return { cwd, tools, root, scripts, hostPython };
+  }
+
+  function register(root: string, managers: readonly string[], bins: Array<{ path: string; size: number; mtimeMs: number }>): void {
+    registerSlot({ root, managers, bins });
+    registeredSlots.push(root);
+  }
+
+  /** A provisioned interpreter in the slot's `.venv`, recorded as the pool's post-provisioning snapshot records it. */
+  async function provisionedPython(scripts: string): Promise<{ path: string; size: number; mtimeMs: number }> {
+    const path = nodePath.join(scripts, PYTHON_EXE);
+    await writeFile(path, "fixture venv interpreter; never executed");
+    const st = await lstat(path);
+    return { path, size: st.size, mtimeMs: st.mtimeMs };
+  }
+
+  /** The child environment of a pytest spawn: replaced, absolute argv[0], no credential, no foreign Python path. */
+  function strippedEnv(c: ResolvedCommand, cwd: string): { env: Readonly<Record<string, string>>; entries: string[] } {
+    expect(nodePath.isAbsolute(c.file)).toBe(true);
+    expect(c.file).not.toBe(nodePath.join(cwd, PYTHON_EXE));
+    expect(c.envMode).toBe("replace");
+    const env: Readonly<Record<string, string>> = c.env ?? {};
+    const keys = Object.keys(env);
+    expect(keys.some(runTools.isCredentialEnv)).toBe(false);
+    expect(keys.filter(k => /^(PYTHONPATH|PYTHONHOME|NODE_OPTIONS)$/i.test(k))).toEqual([]);
+    if (WIN) expect(env.NoDefaultCurrentDirectoryInExePath).toBe("1");
+    const pathKeys = keys.filter(k => (WIN ? k.toUpperCase() === "PATH" : k === "PATH"));
+    expect(pathKeys).toHaveLength(1);
+    const entries = (env[pathKeys[0] ?? "PATH"] ?? "").split(nodePath.delimiter);
+    // The slot root, where the planted interpreter lies, is never on the child's PATH.
+    expect(entries.map(e => e.toLowerCase())).not.toContain(cwd.toLowerCase());
+    return { env, entries };
+  }
+
+  async function pytestRun(cwd: string): Promise<ResolvedCommand> {
+    runnerHooks.planScopedRun = async () => unverifiable;
+    const { checks, spawned } = checksEnv({ files: { "pytest.ini": "" } });
+    expect(await checks.run(checkReq({ slot: { ...slot, path: cwd } }))).toMatchObject({ verdict: "pass" });
+    expect(spawned.map(s => s.c.label)).toEqual(["python -m pytest"]);
+    const c = spawned[0]?.c;
+    if (c === undefined) throw new Error("no pytest spawn");
+    return c;
+  }
+
+  it("N-A: a registered Python-manager slot runs pytest with its provisioned .venv interpreter and the slot environment", async () => {
+    vi.mocked(runTools.resolveCommandExecutable).mockRestore();
+    const f = await venvFixture();
+    const venv = await provisionedPython(f.scripts);
+    register(f.cwd, ["uv"], [venv]);
+    const c = await pytestRun(f.cwd);
+    expect(c.file).toBe(venv.path);
+    const { env, entries } = strippedEnv(c, f.cwd);
+    expect(Object.keys(env).filter(k => k.toUpperCase() === "VIRTUAL_ENV")).toEqual(["VIRTUAL_ENV"]);
+    expect(env.VIRTUAL_ENV).toBe(nodePath.join(f.root, ".venv"));
+    expect(entries[0]).toBe(f.scripts);
+    expect(entries).toContain(f.tools);
+  });
+
+  it.runIf(process.platform !== "win32")("N-A: a provisioned .venv interpreter that links to a base interpreter outside the slot runs as the slot's", async () => {
+    vi.mocked(runTools.resolveCommandExecutable).mockRestore();
+    const f = await venvFixture();
+    const link = nodePath.join(f.scripts, PYTHON_EXE);
+    await symlink(f.hostPython, link);
+    const st = await lstat(link);
+    register(f.cwd, ["uv"], [{ path: link, size: st.size, mtimeMs: st.mtimeMs }]);
+    const c = await pytestRun(f.cwd);
+    // The in-slot spelling (the virtualenv's argv[0]), re-checked at the spawn through the slot's directory.
+    expect(c.file).toBe(link);
+    const { env, entries } = strippedEnv(c, f.cwd);
+    expect(env.VIRTUAL_ENV).toBe(nodePath.join(f.root, ".venv"));
+    expect(entries[0]).toBe(f.scripts);
+  });
+
+  it.each([
+    { name: "a Python manager but no provisioned interpreter (one written later is not in the snapshot)", managers: ["pip"], python: true },
+    { name: "no Python manager", managers: ["npm"], python: false },
+  ])("N-A: a slot with $name falls back to the absolute host python with the stripped environment", async ({ managers, python }) => {
+    vi.mocked(runTools.resolveCommandExecutable).mockRestore();
+    const f = await venvFixture();
+    register(f.cwd, managers, []);
+    await writeFile(nodePath.join(f.scripts, PYTHON_EXE), "written after provisioning; never executed");
+    const c = await pytestRun(f.cwd);
+    expect(c.file).toBe(f.hostPython);
+    const { env, entries } = strippedEnv(c, f.cwd);
+    if (python) {
+      expect(env.VIRTUAL_ENV).toBe(nodePath.join(f.root, ".venv"));
+      expect(entries[0]).toBe(f.scripts);
+    } else {
+      expect(Object.keys(env).filter(k => k.toUpperCase() === "VIRTUAL_ENV")).toEqual([]);
+      expect(entries.map(e => e.toLowerCase())).not.toContain(f.scripts.toLowerCase());
+    }
+    expect(entries).toContain(f.tools);
+  });
+
+  it("N-A: a pytest command resolved in one slot runs another slot's own interpreter there, never the first slot's", async () => {
+    vi.mocked(runTools.resolveCommandExecutable).mockRestore();
+    const a = await venvFixture();
+    const aPython = await provisionedPython(a.scripts);
+    register(a.cwd, ["uv"], [aPython]);
+    const b = await venvFixture();
+    const bPython = await provisionedPython(b.scripts);
+    register(b.cwd, ["uv"], [bPython]);
+    const { checks, spawned } = checksEnv({ files: { "pytest.ini": "" } });
+    const full = (await checks.select(a.cwd, "cand")).tests[0]?.full;
+    if (full === undefined) throw new Error("no pytest selection");
+    expect(full.file).toBe(aPython.path);
+    const r = await checks.runCommands({ slot: { ...slot, path: b.cwd }, commit: "cand", commands: [full], mode: "full",
+      priority: "foreground", signal: new AbortController().signal, prepare: false });
+    expect(r).toMatchObject({ verdict: "pass" });
+    const c = spawned.find(s => s.c.label === "python -m pytest")?.c;
+    if (c === undefined) throw new Error("no pytest spawn");
+    expect(c.file).toBe(bPython.path);
+    const { env, entries } = strippedEnv(c, b.cwd);
+    expect(env.VIRTUAL_ENV).toBe(nodePath.join(b.root, ".venv"));
+    expect(entries[0]).toBe(b.scripts);
+    expect(entries.map(e => e.toLowerCase())).not.toContain(a.scripts.toLowerCase());
+  });
+
+  it.runIf(process.platform === "win32")("N-A: with a registered slot the Windows spawn seam still never selects the planted slot-root python.exe", async () => {
+    vi.mocked(runTools.resolveCommandExecutable).mockRestore();
+    const f = await venvFixture();
+    const venv = await provisionedPython(f.scripts);
+    register(f.cwd, ["uv"], [venv]);
+    const marker = nodePath.join(f.cwd, "planted-ran");
+    // As the G-4 seam test: Windows looks in the cwd before PATH for a bare name.
+    const spawnProbe = async (c: ResolvedCommand): Promise<CommandOutput> => {
+      const executable = nodePath.isAbsolute(c.file) ? c.file : nodePath.join(f.cwd, /\.(exe|com)$/i.test(c.file) ? c.file : `${c.file}.exe`);
+      if (nodePath.dirname(executable).toLowerCase() === f.cwd.toLowerCase()) {
+        await access(executable);
+        await writeFile(marker, c.file);
+      }
+      return noneOut();
+    };
+    runnerHooks.planScopedRun = async () => unverifiable;
+    const { checks, spawned } = checksEnv({ files: { "pytest.ini": "" }, spawn: spawnProbe });
+    expect(await checks.run(checkReq({ slot: { ...slot, path: f.cwd } }))).toMatchObject({ verdict: "pass" });
+    expect(spawned.map(s => s.c.file)).toEqual([venv.path]);
     await expect(access(marker)).rejects.toMatchObject({ code: "ENOENT" });
   }, 30_000);
 
