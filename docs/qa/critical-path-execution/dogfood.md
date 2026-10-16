@@ -1,7 +1,7 @@
 # Dogfood record — critical-path execution plan
 
 Plan §0.12-4 (fault policy) and §0.12-5 (metrics). Time windows: before DF-1 (build `cpx/df0` = `b716ee9`, release 2.7.0),
-after DF-1, under DF-2. Deviations are recorded as `DF-<n>-<k>` with their evidence.
+after DF-1 (including DF-1.1, DF-1.2 and DF-1.3), under DF-2. Deviations are recorded as `DF-<n>-<k>` with their evidence.
 
 ## Window "before DF-1" (2026-10-10 18:55 → 2026-10-12, build `cpx/df0`)
 
@@ -390,3 +390,206 @@ Build `cpx/df1.1` = `9fa7607` (`D:\git\omr-cpx-dogfood-df1.1`), loaded since 202
   `D:\git\opencode-model-router`). Critical per handover §6 ("any effect on the other implementation"): dispatching is
   stopped until the owner decides. Uncommitted work in `D:\git\omr-cpx-p31` (`schedule.ts`, `capacity.ts`, `expand.ts`
   and tests, partial) is kept as is.
+
+### Recovery and rollback record after DF-1.1
+
+Source: [handover §7](../../plans/critical-path-execution-handover.md#7-live-state-011--keep-current), including its
+superseded switch instructions. These are the recorded rollback paths, **not claims that each rollback was executed**:
+
+- **DF-1.1 → DF-1:** drain holds with `router_verify pending:true`, change the process-scoped config copy's router
+  entry back to `D:\git\omr-cpx-dogfood-df1`, then relaunch. The DF-1.1-3 stop instead led to the owner's
+  **2026-10-12 isolation decision**: use separate `XDG_DATA_HOME` / `XDG_STATE_HOME` and a fresh session, not the shared
+  session DB. At **18:22**, nonce `omr-selfcheck-c41e9a07b3d2`, run `c39fd4cd`, the isolated **DF-1.1** self-check
+  passed: 2.0.26, one router per booted location (`D:\git\omr-cpx-main`, `C:\Users\Marquinho`), no main-checkout
+  location, one `router_verify`. This recovered isolation; it did not undo the incident or prove continuous DF-build use.
+- **DF-1.2 → DF-1.1:** restore `%LOCALAPPDATA%\omr-cpx\opencode.json.df1.1.bak`; restoration also hot-reloads.
+- **DF-1.3 → DF-1.2:** restore the saved `opencode.json.df1.2.bak` copy; also a hot rollback.
+- **DF-2 → DF-1.3:** restore `%LOCALAPPDATA%\omr-cpx\opencode-config\opencode.json.df1.3.bak` over the
+  process-scoped `opencode.json`, then restart in session `ses_ece022575ffeHA4667snTmxoLu` with the isolated data/state
+  directories. The later DF-2 fallback was an abort/purge and a change of execution method, not evidence of this
+  plugin rollback being executed.
+
+No executed config rollback is recorded in these handover entries. The base-build execution during DF-1.1-3 was
+unintended cross-server interference, not an owner-selected rollback.
+
+## Window "after DF-1.2"
+
+Build `cpx/df1.2` = `92f09d1` (`D:\git\omr-cpx-dogfood-df1.2`), merged from `cpx/pdf1-2` into `cpx/main`.
+The [handover §7](../../plans/critical-path-execution-handover.md#7-live-state-011--keep-current), progress entry
+**2026-10-12 20:05**, records the switch and **DF-1.2-1**: at **23:02:16Z** the running 2.0.26 server hot-reloaded
+the config and loaded `file:///D:/git/omr-cpx-dogfood-df1.2/server.ts` twice (once per location) in the **same run
+`c39fd4cd`**, without an owner restart. In-flight 3.2.6b `ses_ecddf6e4affeIYzoSyo9Cyj5Nk` vanished from the
+in-flight list and was resumed. §0.12's assumption that a switch requires a restart was false on this host.
+
+DF-1.1-1 (caller-agent propagation for background graders, `3add1e5`) and DF-1.1-2 (turn-recorder duplication,
+`7026208`) fixes shipped through pdf1-2, with QA fixes and merge `92f09d1`. The handover still marks the live
+background `d=none` grader re-probe as owed; QA dispatches after the reload were to supply it, not a recorded pass.
+DF-1.1-4 (leases colliding across worktrees) still required serializing hub-file writers until DF-1.3.
+
+This window used orchestrator-managed dispatches, not an executor plan. Its next recorded switch is DF-1.3 at
+**2026-10-13 04:59Z**. Aggregate dispatch count, forced-foreground share, cache-read share, durations and
+idle-with-ready are **not measured** for this window; no new cache-probe pass is inferred. DF-1.2-1's mitigation
+was to switch only at a quiet point with no dispatch in flight; no hot-reload recovery fix is recorded here.
+
+## Window "after DF-1.3"
+
+Build `cpx/df1.3` = `1893d42` (`D:\git\omr-cpx-dogfood-df1.3`), the pdf1-3 merge into `cpx/main`.
+The [handover §7](../../plans/critical-path-execution-handover.md#7-live-state-011--keep-current), 4.2 round-1 entry,
+records the **2026-10-13 04:59Z** hot switch (no restart): run `c39fd4cd` loaded
+`omr-cpx-dogfood-df1.3/server.ts` twice, once per location. Ordinary dispatch leases were now per checkout,
+fixing **DF-1.1-4** (`7a3b68c`, QA fixes `6109fad` / `921eacb`, merged `1893d42`); plan-task leases remained
+repository-wide. The pre-DF-2 handover also records the old build's `ignoring unknown routing key: routing.repoParents`
+notice after the 2.8.0 sync; DF-2 supplies the synced build.
+
+Phases 4.1, 4.2 and 5.1 remained orchestrator-managed before the DF-2 switch. This window ends at that switch,
+self-checked on **2026-10-13 ≈19:50Z** below; no more precise switch time is claimed. Aggregate dispatch count,
+forced-foreground share, cache-read share, durations and idle-with-ready are **not measured** for this window.
+
+## Window DF-2
+
+### Under DF-2: switch and self-check
+
+Source: [handover §7](../../plans/critical-path-execution-handover.md#7-live-state-011--keep-current), DF-2 switch and
+self-check entries. Build **`cpx/df2` = `f3af7c7`** (`D:\git\omr-cpx-dogfood-df2`), session
+`ses_ece022575ffeHA4667snTmxoLu`, passed the **2026-10-13 ≈19:50Z** self-check in run **`79d6febf`**:
+
+- **DF2.4.0 pass:** OpenCode 2.0.26; `opencode-anthropic-fix` and
+  `file:///D:/git/omr-cpx-dogfood-df2/server.ts` once per location (`D:\git\omr-cpx-main`, `C:\Users\Marquinho`,
+  known QA-DF1-13 deviation); dogfood HEAD equals the tag; one `router_verify` tool.
+- **DF2.4.a pass:** pre-restart runner `ses_ec935cbc0ffeweHZssJjXOOQ4S`'s handle
+  `vrf_3f3b162e6a59c7d5dc6b7668` survived and returned `unverifiable` (drift not checkable, no changed files),
+  not `unknown handle`; the `pendingTtlMs` override was then removed. This is persistence evidence, not a verified pass.
+- **DF2.4.b pass:** `router_plan` was registered (`E_LEDGER_NOT_FOUND`, no ledgers before compile); the orchestrator
+  could not observe the user-only `/plan` command.
+- **DF2.4.c pass with DF-2-1:** whole-plan compile produced **180 tasks, 20 phases, 368 edges, 69 manual**, zero
+  cycles, one residue task `6.1.2` (A-DF2-2). The dry run had **369 edges**; the repository view gained
+  `phase-6.1.md` between runs. The draft was aborted/purged and its scratch worktree removed.
+
+### Provenance and executor attempt
+
+Post-freeze record copied in summary from `D:\git\omr-cpx-p61\.cpx-logs\handover-df2.copy.md`
+(read-only handover copy). **That copy ends at smoke run 7, 2026-10-14T00:52:13.3543560-03:00; it contains no
+6.1.4 results.** The final metrics below are copied from the committed [Phase 6.1 report](phase-6.1.md),
+"Real-host smoke results", "Owner amendment A-6.1-4" and "Verdict", not attributed to the handover copy.
+
+- **2026-10-13T16:57:46.8596402-03:00:** the owner approved `critical-path-execution-plan-6-1-db-6-1`
+  ("aprovado"): **9 tasks, 17 edges, work 41m, CP 34m, width 2**. `cpx/main` was clean at `a682009` before approve.
+- **2026-10-13T17:04:00.1603405-03:00:** first launches, `6.1.1` and `6.1.2`, after the approval turn.
+  At **2026-10-13T17:26:29.9108549-03:00** the orchestrator paused the plan: repeated park/relaunch resets lost
+  work, and `6.1.2` could not finish within one dispatch budget. Q-7 remained unanswered rather than restarting
+  the thrash loop. The owner chose fix phase `pdf2-1` at **2026-10-13T17:29:58.7123138-03:00**.
+- An owner restart at **2026-10-13T18:42:57.0646063-03:00**, before pdf2-1 QA finished, still loaded `cpx/df2`;
+  the plan recovered **paused, 3/9**, with launch gated on the first router call. The QA dispatch was lost and
+  re-dispatched. At the later requested restart stop, **2026-10-13T19:19:28.1597987-03:00**, the plan was still
+  paused 3/9 on `cpx/df2`. Recovery of a paused plan is not end-to-end completion evidence.
+
+### DF-2 faults and dispositions
+
+DF-2-1/-2 come from the committed handover; DF-2-3..-7 from the post-freeze copy and
+[pdf2-1](pdf2-1.md). Later fix status is separate from the original observations: **`cpx/pdf2-1` was merged into
+`cpx/main` as `992816b`**, after QA rounds 4–5 (`013a529`, `e3a844a`, report `416b410`); it was not re-switched
+into dogfood for this plan. Notes do not acquire invented code fixes.
+
+| ID | Observation | Status / where fixed |
+|---|---|---|
+| DF-2-1 (minor) | Whole-plan compile had 368 edges versus dry-run 369 after `phase-6.1.md` appeared in the repository view. | Explained and accepted in `cpx/main` handover DF2.4.c; no code fix required. |
+| DF-2-2 (note) | Executor home resolves to `<git common dir>\omr-executor` = `D:\git\opencode-model-router\.git\omr-executor`; only `locks\repos\<key>` remained after purge. | Disclosed to owner in `cpx/main` handover; shared git storage, reached only through `router_plan`, not a code fault/fix. |
+| DF-2-3 (note) | `test-files` excludes `test/smoke`, so plan children cannot run their own smoke-config checks. | Orchestrator-run smoke workaround recorded; child/grader criteria exclusion fixed with DF-2-7 in pdf2-1 → `cpx/main` `992816b`, not a new child smoke capability. |
+| DF-2-4 (blocking) | Park/relaunch reset unsaved work: 6.1.1 attempt 3's finished work and 6.1.2's prior 22 files were lost; 6.1.2 could not finish in one budget. | Budget resumes and WIP save/restore fixed in pdf2-1; round-4 M1 saved blocked dependents (`e3a844a`), verified in round 5; merged into `cpx/main` `992816b`. Related N-2 remains mandatory 6.2 input, not a claim that all slot-safety faults are closed. |
+| DF-2-5 | Executor launches omitted `CAP:` and route `budget=`, leaving children at the baseline read cap. | Launch cap/budget contract fixed in pdf2-1 → `cpx/main` `992816b`; round-4 minor-2 (advisory cap on a restart-adopted resume) remains deferred as recorded there. |
+| DF-2-6 (major) | Ledger/integration base `62af9e6` differed from live `cpx/main` `a682009`, preventing fast-forward landing. | Fresh base-branch lookup, approve-time `E_STALE_BASE` and special-slot integration-head base fixed in pdf2-1 → `cpx/main` `992816b`; not proof of a successful dogfood landing. |
+| DF-2-7 (minor) | "(orchestrator shell)" criteria reached children/graders and caused repeated escalations. | Prompt and grader filtering fixed in pdf2-1 → `cpx/main` `992816b`; checks remain the orchestrator's responsibility. |
+
+Additional deviations recorded in the post-freeze copy (historical dispositions):
+
+| ID | Observation and disposition recorded in the copy |
+|---|---|
+| DF-2-8 (orchestrator) | Q-1/Q-4 quoted the plan; Q-2/Q-3/Q-5/Q-6 also carried invented orchestrator instructions (read/edit alternation, continuation, file checks and a restated feature spec), outside the rule allowing only the human's answer or plan text. Subsequent answers must follow the rule. |
+| DF-2-9 | The attempted router-wide whole-line CAP parser change was reverted: inline `CAP:N` is a documented behaviour. The executor instead puts its CAP line first (first-wins) and neutralises task/shared-context directives. |
+| DF-2-11 | At 2026-10-13T21:10:23.6228293-03:00 the owner selected the **openai** preset: fast `gpt-6-luna-fast`, medium `gpt-6.1-sol-fast`, heavy `gpt-6-astra-fast`. Registration changes after restart; earlier QA ran on `claude-opus-5-5`. The copy records the model change for subsequent DF2.QA/6.1.QA, not proof of a `df2.1` switch. |
+
+pdf2-1 QA in the copy was **not closed**:
+
+- Round 1, `ses_ec8c81694ffeftu7AfIEtdyxOI` at `2ff683d`: not ready (resume header, unsafe save/release paths,
+  criteria filtering and other findings). Fixes committed as `8e632fb`.
+- Round 2, `ses_ec8706a26ffe7lfvP6lId69UyC` at `8e632fb`: not ready (exhausted guard round on resume, stale
+  lease base/WIP overwrite and other findings). Fixes committed as `ecaf1b0`.
+- Bounded round 3, `ses_ec83a3632ffe6De2MreaWZLko8` at `ecaf1b0`: **2 critical, 4 major** remained, including
+  non-durable unsaved-slot holds, purge racing abort save, cross-instance resume guards, overlapping resumes,
+  role-floor budget selection and treating a slot without `.git` as clean. A planned `cpx/df2.1` switch was not completed.
+  Later fix/merge evidence is in [pdf2-1](pdf2-1.md), not a successful re-run of this dogfood attempt.
+
+### Fallback and subsequent scripted runs
+
+**2026-10-13T21:29:48.2039134-03:00:** the owner chose the **DF-2 fallback**: Phase 6.1 runs as a normal,
+orchestrator-managed phase in `D:\git\omr-cpx-p61` (`cpx/p61`, base `a682009`); **G13 is not met** and must be
+disclosed with the DF-2 faults. The paused plan was **aborted and purged**, lifting the freeze. pdf2-1 continued
+separately, to merge after QA, **not to be switched into dogfood for this plan**.
+
+Read-only salvage preserved 6.1.1's **26746-byte diff** and 6.1.2's **37 files**, without editing slots. Scratch
+commits/tags `cpx/df2-salvage-6.1.1` = `b10be70` and `cpx/df2-salvage-6.1.2` = `1b6253a` have parent `a682009`
+and an `Omr-Wip` trailer. Salvage applied cleanly in p61 (**39 files**); 6.1.1 was committed as `09d7b40` after
+orchestrator checks. This was salvage, not executor integration/landing.
+
+The handover's subsequent smoke history is failure evidence, not a green gate: runs 1–7 were red. It records driver
+problems and product faults: no-change completion failed to reconcile phase gates; phase/base checks ran in the
+integration tree instead of the prepared CI slot; inferred writers launched as explorers; and the G6 holder had no
+until-integrated lease. At run 7 the latter two were still being classified. Product fixes were required to be ported
+to pdf2-1. Another recorded deviation: the executor-fix implementer ran the full test script twice against the
+never-full-suite rule. The later committed Phase 6.1 report supersedes these in-progress snapshots.
+
+### Final scripted measurements (Phase 6.1 report, not the handover copy)
+
+These are **scripted executor fixture runs under the fallback**, not Phase 6.1 executed end to end by the executor.
+Runs **24–26** each passed **32 tests**, with **9 documented `unmeasured` skips**, on code **`2b2cb58`**:
+
+| Run | Checkout / suite wall-clock | Fixture | Makespan | g8Ratio | Max idle-with-ready |
+|---|---|---|---|---|---|
+| 24 | Working worktree, `2b2cb58`; ~1839 s | node-npm | 134.2 s | 1.47 | 6.6 s |
+| 24 | Same run | node-pnpm | 141.3 s | 1.49 | 7.6 s |
+| 24 | Same run | py-pip | 130.4 s | 1.52 | 6.3 s |
+| 25 | Working worktree, HEAD `9b8593f` (docs above `2b2cb58`); ~1738 s | node-npm | 118.5 s | 1.35 | 6.5 s |
+| 25 | Same run | node-pnpm | 128.6 s | 1.40 | 7.0 s |
+| 25 | Same run | py-pip | 128.5 s | 1.50 | 8.8 s |
+| 26 (6.1.4) | Detached `D:\git\omr-cpx-e2e`, HEAD `9b8593f`, after `npm ci`; ~1854 s | node-npm | 125.9 s | 1.41 | 6.3 s |
+| 26 (6.1.4) | Same run | node-pnpm | 146.1 s | 1.53 | 8.0 s |
+| 26 (6.1.4) | Same run | py-pip | 132.4 s | 1.54 | 9.4 s |
+
+`g8Ratio = makespan / (1.3 × max(CP_eff, W_auth/p, ΣI_service))`; target **≤ 1.0, not met** in these runs.
+Under **A-6.1-2** this is measured/disclosed, not a Phase 6.1 acceptance gate. The **10 s** idle ceiling is unchanged;
+run 26's py-pip maximum **9.4 s** is a timing risk for the soak/6.2. The detached checkout was clean after the run
+and removed. `6e643fd` and `532f209` landed after run 26 started; it did **not** run at those later heads.
+
+### Metrics limits
+
+The handover records approval/launch/pause/fallback timestamps and authored estimates, **not a completed repository
+plan makespan**. It supplies no aggregate dispatch count, forced-foreground share, cache-read share, lease-refusal
+total, idle total or maximum successful retained-context age for this DF-2 attempt. None is inferred from fixture
+timings. **Forced-foreground dispatch share: not measured** for DF-1/DF-1.1, DF-1.2, DF-1.3 and DF-2; the sources
+give no numerator/denominator for those windows. The pre-feature DF-0 baseline is recorded separately above.
+
+## §0.13 incidents
+
+- **DF-1-1 — the orchestrator read an off-limits directory.** In run `27717102`, after host-initiated read-only
+  project probes booted `D:\git\opencode-model-router`, the orchestrator listed
+  `D:\git\opencode-model-router\.opencode` modification times **once** to check for writes (newest: **2026-08-19**).
+  This was a §0.13 read violation, not merely a host probe; no further orchestrator access was recorded. The router
+  also ran read-only `git worktree list --porcelain` there at startup (QA-DF1-19 correction above). Startup hardening
+  shipped in pdf1-1 (`51d3c51`, `7180ac8`), merged as `9fa7607`; it does not erase the incident.
+- **DF-1.1-3 — the owner's background service ran this plan's sessions on the base build.** The shared-DB OpenCode
+  2.0.27 service, run `6d23db21`, loaded `file:///D:/git/opencode-model-router/server.ts` and drained/rebound this
+  plan's sessions, including orchestrator `ses_ecf5bd114ffe5QT3S5xVTAQcF4`; turns alternated with DF-1.1 run
+  `59ec52b7`. Phase 3.1 children errored or were rebound to the base build's work root. This affected the other
+  implementation and broke continuous dogfood-build use; dispatching stopped at **2026-10-12 19:17Z** pending the
+  owner. The owner's separate-data/state-directory decision and isolated run `c39fd4cd` recovered isolation, not a
+  retroactive §0.13 pass. This was not an intentional build rollback.
+
+## G13 status
+
+**G13: UNMET — owner decision pending.** Phase 6.1 did not complete the required executor chain
+compile → launch → verify → integrate → phase suite → QA loop → fast-forward into `cpx/main`; it used the fallback.
+DF-1-1 and DF-1.1-3 also violate the untouched-checkout/isolation and continuous-build-use claims; the aggregate
+forced-foreground share is not measured, and later fixes were not a successful re-run of the DF-2 attempt. The
+later green scripted runs do not repair those gaps. Phase 6.1 was accepted on 2026-10-15 with G13 unmet,
+G8's bound not met and the real-use soak pending (**A-6.1-3**, narrowed by **A-6.1-6**). Only observable soak
+subcases are in scope; the not-observable G6/G9 subcases and G3/G11 remain declared gaps, never passes.

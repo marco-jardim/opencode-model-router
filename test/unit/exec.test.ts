@@ -211,6 +211,22 @@ describe("runArgv", () => {
     expect(JSON.parse(r.stdout)).toEqual({ x: "yes", path: true });
   }, 20000);
 
+  it.each([undefined, { OMR_EXEC_X: "yes" }])("G-4: explicit environment replacement inherits nothing (env=%j)", async env => {
+    vi.stubEnv("OPENAI_API_KEY", "fixture-credential");
+    vi.stubEnv("OMR_EXEC_AMBIENT", "inherited-only");
+    try {
+      const r = await runArgv(process.execPath, ["-e", "process.stdout.write(JSON.stringify({"
+        + "secret: process.env.OPENAI_API_KEY ?? null, ambient: process.env.OMR_EXEC_AMBIENT ?? null, x: process.env.OMR_EXEC_X ?? null }))"], {
+        cwd: tmpdir(), timeoutMs: 20000, env, envMode: "replace",
+      });
+      expect(r.code).toBe(0);
+      expect(r.stderr).toBe("");
+      expect(JSON.parse(r.stdout)).toEqual({ secret: null, ambient: null, x: env?.OMR_EXEC_X ?? null });
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  }, 20000);
+
   it.runIf(isWin)("lets an env override win whatever the case of the inherited key (Windows-only: its environment names are case-insensitive)", async () => {
     const probe = "const keys = Object.keys(process.env).map(k => k.toUpperCase());"
       + "process.stdout.write(JSON.stringify({ path: process.env.PATH, temp: process.env.TEMP, paths: keys.filter(k => k === 'PATH').length, temps: keys.filter(k => k === 'TEMP').length }))";

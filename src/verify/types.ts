@@ -72,8 +72,10 @@ export interface ExecOptions {
   signal?: AbortSignal;
   /** Run the process (and its descendants) at below-normal OS priority. */
   lowPriority?: boolean;
-  /** Merged over process.env; never replaces it. */
+  /** Merged over process.env by default; see envMode for a complete, sanitized environment. */
   env?: Record<string, string>;
+  /** `replace` uses only env (empty when omitted), without process.env or automatic slot-environment injection. */
+  envMode?: "merge" | "replace";
 }
 
 /** Execution-only seam; an adapter doing preparation must forward `service` to the instrumented process layer. */

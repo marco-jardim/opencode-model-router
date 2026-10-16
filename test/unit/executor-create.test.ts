@@ -930,6 +930,39 @@ describe("createExecutor assembly seams", () => {
     }
   }, 15_000);
 
+  it("G-4: a real integration-check child does not regain provider credentials from process.env", async () => {
+    const h = await queueRig();
+    const cwd = await mkdtemp(join(tmpdir(), "omr-check-child-env-")); roots.push(cwd);
+    vi.stubEnv("OPENAI_API_KEY", "fixture-credential-must-not-reach-check");
+    try {
+      const env = Object.fromEntries(Object.entries(runToolsModule.runEnvironment({ ...process.env, OMR_CHECK_KEEP: "yes" }, process.platform))
+        .filter((entry): entry is [string, string] => entry[1] !== undefined));
+      const realRun = execModule.runArgv, outputs: execModule.ShellResult[] = [];
+      const run = vi.spyOn(execModule, "runArgv").mockImplementation(async (file, args, opts) => {
+        const result = await realRun(file, args, opts);
+        outputs.push(result);
+        return result;
+      });
+      const checks = checksModule.createIntegrationChecks({ ...h.checksDeps,
+        preemptForeground: async () => {}, acquire: async () => ({ lost: false, release: async () => {} }),
+      });
+      const result = await checks.runCommands({
+        slot: { slot: "s1", path: cwd, planId: h.value.planId, owner: "integration", commit: h.value.integration.head },
+        commit: h.value.integration.head, mode: "full", priority: "foreground", signal: new AbortController().signal, prepare: false,
+        commands: [{ label: "environment probe", file: process.execPath,
+          args: ["-e", "process.stdout.write(JSON.stringify({ secret: process.env.OPENAI_API_KEY ?? null, keep: process.env.OMR_CHECK_KEEP }))"],
+          source: "run-command", ref: null, resolution: { cwd, env } }],
+      });
+      expect(result).toMatchObject({ verdict: "pass", error: null });
+      expect(run).toHaveBeenCalledExactlyOnceWith(process.execPath, expect.any(Array), expect.objectContaining({ cwd, envMode: "replace" }));
+      expect(outputs).toHaveLength(1);
+      expect(outputs[0]?.stderr).toBe("");
+      expect(JSON.parse(outputs[0]?.stdout ?? "")).toEqual({ secret: null, keep: "yes" });
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  }, 15_000);
+
   it("settle waits for the child runner, releases once, logs a failed release, and dispose clears polling timers", async () => {
     const h = await queueRig(), release = vi.fn(async () => {});
     const flights = vi.spyOn(h.deps.launcher, "inFlight").mockReturnValue([{ taskId: "T1", attempt: 1, childSessionID: "child", startedAt: h.deps.clock.iso() }]);

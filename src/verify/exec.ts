@@ -213,7 +213,7 @@ function run(file: string, args: string[], shell: boolean, opts: RunOptions, nic
     try {
       const spawnOptions: SpawnOptions = {
         cwd: opts.cwd,
-        env: mergeEnv(opts.env, opts.cwd),
+        env: opts.envMode === "replace" ? { ...opts.env } : mergeEnv(opts.env, opts.cwd),
         shell,
         windowsHide: true,
         // Its own process group on POSIX, so the whole tree can be signalled at once.

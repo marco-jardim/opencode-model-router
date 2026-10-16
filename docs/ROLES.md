@@ -197,18 +197,16 @@ parent's directory.
   agents are registered, plus the `routing.workRoots` globs (global layer only, default `[]`), never `*`. A worktree
   created after the plugin started outside the trusted executor slots root is covered only by a matching
   `routing.workRoots` glob (or a restart). Roles without local actions (`researcher`) get no `external_directory`
-  rule. When `routing.workRoots` is set and the
-  directory OpenCode started in lies outside every entry (compared in its canonical form), the router runs no
-  `git worktree list` at start. The role agents then get the `routing.workRoots` globs and, when safely resolved, the
-  trusted executor slots-root allowance below.
+  rule.
 - **Executor slots root.** On v2, role agents with local actions may work under the trusted slots root:
   `routing.executor.slotsDir` from the bundled configuration or global override, or `<repo drive>:\.omr-slots` by
   default. Each plan uses `<root>\<planId>`. `routing.workRoots` is not needed for it, including slots created after
   registration. This registered allowance does not widen a dispatch: each child still works only in its own validated
   work root. The executor home (`<git common dir>\omr-executor`) is denied, even if another directory allowance would
   cover it. A project-local `slotsDir` is ignored; a repository cannot grant itself an external slots root. If the
-  executor home cannot be resolved, no slots-root allowance is added (fail closed). See
-  [Assembly and lifecycle](./EXECUTOR.md#assembly-and-lifecycle).
+  executor home cannot be resolved, no slots-root allowance is added (fail closed). When the directory OpenCode was
+  started in lies outside every `routing.workRoots` entry, the worktrees are still listed and the executor home is still
+  denied, but there is no executor slots-root allowance. See [Assembly and lifecycle](./EXECUTOR.md#assembly-and-lifecycle).
 - **Canonical long form.** Write `routing.workRoots` entries in their canonical long spelling: an 8.3 short segment
   (`PROGRA~1`) is refused, because the host compares spellings and a short name can alias another directory.
 - **Over-match.** `*` crosses separators: `D:/git/omr-rta-*` allows every directory starting with `omr-rta-`, nested
@@ -606,7 +604,8 @@ edit + execution never runs on `fast`: an edit can change what a script does, so
 code the agent wrote. After a verification FAIL the router raises the child's floor for its next resume itself; the
 orchestrator never sets `tier=` or `model` for that.
 
-**Gated floor (`routing.roleFloor: "gated"`, opt-in, global only, OpenCode v2 only).**
+**Gated floor (`routing.roleFloor: "gated"`, OpenCode v2 only).** The bundled `tiers.json` can set this mode;
+the global override can change it (the code default is `"strict"`). Project overrides cannot set it.
 This table applies only when verification actually runs **at return**: enforcement is on, not bypassed,
 `verify.require` is not `never`, the verification placement is allowed, verification is not deferred, and the
 effective acceptance is not `none`. It also requires that the next tier above `medium` within the role's ceiling and
@@ -862,7 +861,7 @@ registered.
 
 ## Roles mode is decided at plugin start
 
-Role agents, `router_run`, `router_request_authority` and the work-root resolver are registered only when the plugin
+Role agents, `router_run`, `router_plan`, `/plan`, `router_request_authority` and the work-root resolver are registered only when the plugin
 **started** with `routing.delegation: "roles"`. Switching the override to `roles` while OpenCode runs logs once
 
 > roles mode (OpenCode v2 only): routing.delegation is now `roles`, but this OpenCode instance started in tiers mode;

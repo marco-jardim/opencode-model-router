@@ -852,9 +852,69 @@ Each phase implements only the branch named here (plan §0.2).
 Phases 2.2, 2.3, 2.4 and 3.2 have no host-contract branch. All hooks are registered on v2 only, in
 `src/compat/v2-hooks.ts`: 2.1 adds the context, compaction, tool and event wiring, and 3.1 adds the retry hook and the
 launch wiring. Phase 5.1 assembles and registers the executor. The ADR is Accepted as of 2026-10-15; this accepts the
-decisions, not every global criterion or Phase 6.1 itself. Phase 6.2.0 adds the measured results and retained-context
-age evidence. The Phase 6.2 PR discloses G8's measured bound, unmet G13 and the real-use soak's evidence and gaps under
-plan amendment A-6.1-3; absence of evidence is not a pass.
+decisions, not every global criterion. Phase 6.2.0 records the measured results below, including the absence of a
+maximum successful DF-2 retained-context age. The Phase 6.2 PR discloses G8's measured bound, unmet G13 and the
+real-use soak's evidence and gaps under plan amendment A-6.1-3, narrowed by A-6.1-6; absence of evidence is not a pass.
+
+## Measured results — 2026-10-16
+
+### Scripted end-to-end runs (6.1.3 / 6.1.4)
+
+Source: [Phase 6.1 report](../qa/critical-path-execution/phase-6.1.md), "Real-host smoke results" and
+"Owner amendment A-6.1-4". Runs **24–26** of `npm run smoke:cpx:e2e` were green on **code `2b2cb58`**, each
+**32 passed / 9 documented `unmeasured` skips**. Runs 24 and 25 were in the working worktree; run 26 was
+**6.1.4**, the single clean detached-checkout run after `npm ci`, counting as the third green under **A-6.1-4**.
+
+| Run | Head / suite wall-clock | Fixture | Makespan | g8Ratio | Max idle-with-ready |
+|---|---|---|---|---|---|
+| 24 | `2b2cb58`; ~1839 s | node-npm | 134.2 s | 1.47 | 6.6 s |
+| 24 | Same run | node-pnpm | 141.3 s | 1.49 | 7.6 s |
+| 24 | Same run | py-pip | 130.4 s | 1.52 | 6.3 s |
+| 25 | `9b8593f` (docs above `2b2cb58`); ~1738 s | node-npm | 118.5 s | 1.35 | 6.5 s |
+| 25 | Same run | node-pnpm | 128.6 s | 1.40 | 7.0 s |
+| 25 | Same run | py-pip | 128.5 s | 1.50 | 8.8 s |
+| 26 (6.1.4) | Detached `9b8593f`; ~1854 s | node-npm | 125.9 s | 1.41 | 6.3 s |
+| 26 (6.1.4) | Same run | node-pnpm | 146.1 s | 1.53 | 8.0 s |
+| 26 (6.1.4) | Same run | py-pip | 132.4 s | 1.54 | 9.4 s |
+
+**G8 interpretation (A-6.1-1, amended by A-6.1-2):**
+`g8Ratio = makespan / (1.3 × max(CP_eff, W_auth/p, ΣI_service))`, target **≤ 1.0**.
+The **1.3** factor is already in the denominator; ΣI_service is inside `max`, not added outside it.
+**The bound was not met** in any of these fixture runs (**g8Ratio 1.35–1.54**). Under the owner's **A-6.1-2**
+decision this is a **measured, disclosed metric, not a Phase 6.1 acceptance gate**, and must accompany G13 in the
+Phase 6.2 PR. `CP_eff` uses the pre-run dependency graph and attributable intrinsic service; queue/preparation/resource
+waits and idle never enlarge the bound. `service-unattributed` grading is recognized evidence at zero intrinsic
+credit, making the computed bound conservative. Missing/malformed evidence still fails closed.
+
+The independent predicate-A **10,000 ms idle ceiling** and service-evidence integrity remained asserted.
+Run 26's py-pip maximum **9.4 s**, up from **8.8 s**, is a soak/6.2 timing risk, not permission to raise that ceiling.
+The detached worktree `D:\git\omr-cpx-e2e` was clean after run 26 and removed. `6e643fd` and `532f209` landed after
+that run started; neither touches `src/` or what the smoke loads, but run 26 ran at **`9b8593f`**, not those heads.
+Raw logs/evidence directories cited by the phase report are untracked local scratch, not committed artifacts.
+
+### Dogfood (G13)
+
+Sources: the [dogfood record](../qa/critical-path-execution/dogfood.md) and its post-freeze **Window DF-2** summary;
+the [executor guide](../EXECUTOR.md#measured-on-its-own-implementation) gives the operator-facing time windows.
+
+| Window | What ran and measured result | Deviations / verdict |
+|---|---|---|
+| Before DF-1 (`cpx/df0` = `b716ee9`) | Phases 0.P–2.4 used orchestrated dispatches, not the executor. First/last phase-commit windows span 2026-10-10 18:55 → 2026-10-12 and include an owner shutdown. 0 background dispatches; shared-store 452 dispatches / 114 resumes is an upper bound. | No deviations recorded; cache/duration telemetry unavailable, idle not reconstructible, forced-foreground share not meaningful. Baseline, not executor proof. |
+| After DF-1 (`226d967`) | Self-checks 2026-10-12 12:04–12:25 UTC−3, follow-ups to 12:40. Background and held sequencing passed; leases partial. Host-DB cache p50 0.964 / weighted 0.853 over 39 steps was supporting evidence only. | Grader denial/false PASS, stale resumes, absent turn rows, false restart settlements, cross-plugin cache and isolation deviations; DF-1 open, foreground workaround binding. No aggregate forced-foreground share. |
+| After DF-1.1 (`9fa7607`) | Loaded 2026-10-12 16:06:54 UTC−3; lease re-probes passed. Router cache p50 7.1%, p10 4.9% over 13 turns, with duplicate/restarting rows. | Cache probe failed; graders still denied. STOP at 19:17Z: another server drained/rebound plan sessions and affected the other implementation. No continuous-build/isolation pass or executor makespan. |
+| DF-2 | Owner approved 9 tasks / 17 edges / work 41m / CP 34m / width 2 on 2026-10-13T16:57:46.8596402-03:00; first launches 17:04:00.1603405, pause 17:26:29.9108549. Restart recovered paused, 3/9. | Work loss/budget thrashing, read caps, stale base and orchestrator-shell criteria faults. Owner chose fallback at 21:29:48.2039134; plan aborted/purged, salvage applied in `cpx/p61`. No executor landing or completed repository-plan makespan. |
+
+The supplied DF-2 handover copy ends at smoke run 7, not 6.1.4; final run 24–26 measurements above come from
+`phase-6.1.md`. No aggregate forced-foreground share or maximum age of a successful retained-context launch is
+recorded for DF-2. **D14 guard 4 / O7 therefore gains no longer-lifetime claim** from this attempt; the host-contract
+proof remains **60 s with an idle parent**. Missing metrics are not reconstructed from fixture timings.
+
+**G13: UNMET — owner decision pending.** The **2026-10-13 owner fallback** replaced the required repository-plan
+executor chain (compile → launch → verify → integrate → phase suite → QA loop → fast-forward into `cpx/main`)
+with a normal orchestrated phase after DF-2 faults. Green scripted fixtures and later pdf2-1 fixes are not a
+retroactive dogfood pass. Phase 6.1 was accepted on **2026-10-15** with these disclosures; the real-use soak remains
+pending under **A-6.1-3**, narrowed by **A-6.1-6** to observable subcases. Unobserved G3/G11 and structurally
+not-observable G6/G9 subcases are declared gaps, not passes. Global verification remains Phase 6.2's obligation.
 
 ## Open observations
 
@@ -1010,3 +1070,6 @@ O11(b), recorded against the real provider).
     decision-row positive control. Retry delays for persistent faults are recorded, not asserted.
   - D4's hint target is the last non-blank text part of the last real message, else its last `tool-result` or `media`
     part, else no hint (QA-1.2-12, -16; O12 observed).
+- **2026-10-16** — Phase 6.2.0 measured results: runs 24–26 (6.1.4 clean-checkout run 26), per-fixture makespan,
+  g8Ratio and max idle; G8 bound not met, measured/disclosed under A-6.1-2. Dogfood time windows record the DF-2
+  fallback, unmet G13, missing aggregate/retained-context-age evidence and pending soak with declared gaps.

@@ -450,9 +450,9 @@ function matchesSnapshot(found: string, bins: readonly SlotBin[], platform: Node
  * `.exe`/`.com` only on win32). On Windows the Node tools in `node_modules\.bin` are `.cmd`/`.ps1` shims, which are not
  * executables here, so only Python `.exe` files (the virtualenv's `Scripts`) are taken from the slot on that platform;
  * on POSIX the `.bin` entries are links to the package scripts and are taken. Absolute paths, names not found there, and every work root that is not
- * a slot fall through unchanged.
+ * a slot fall through unchanged. The integration checks' pytest interpreter uses the same lookup (QA N-A).
  */
-function slotToolExecutable(program: string, slotEnv: SlotEnv | null, host: RunHost, guards: () => readonly string[]): string | undefined {
+export function slotToolExecutable(program: string, slotEnv: SlotEnv | null, host: RunHost, guards: () => readonly string[]): string | undefined {
   if (slotEnv === null || !/^[A-Za-z0-9_][A-Za-z0-9_.+-]{0,99}$/.test(program)) return undefined;
   const win = host.platform === "win32";
   if (win && /\.(cmd|bat|ps1)$/i.test(program)) return undefined;

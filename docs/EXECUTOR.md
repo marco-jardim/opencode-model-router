@@ -1,7 +1,8 @@
 # Plan executor
 
-> **Status: assembled and registered on OpenCode v2 only.** The `router_plan` tool, the `/plan` command and the executor
-> instructions are registered on v2; running a plan requires the [assembly preconditions](#assembly-and-lifecycle).
+> **Status: OpenCode v2, roles mode only.** The `router_plan` tool and the `/plan` command are registered only when
+> roles mode is selected at start, like `router_run`; running a plan and its executor instructions require the
+> [assembly preconditions](#assembly-and-lifecycle).
 > OpenCode v1 is unchanged: no executor tool, command or instructions are registered there, and the
 > `routing.executor.*` keys are ignored with one notice per process (see
 > [OpenCode v1 fallback](ROLES.md#opencode-v1-fallback) for how v2-only features behave there).
@@ -75,7 +76,8 @@ or the running plan by hand. A dirty or diverged owner branch is not force-reset
 
 ## Assembly and lifecycle
 
-The tool and command are registered on **OpenCode v2 only**. The executor is assembled at plugin start only when:
+The tool and command are registered on **OpenCode v2 in roles mode only**, selected at start, like `router_run`.
+Tiers mode registers neither surface; switching to roles requires a restart. The executor is assembled at plugin start only when:
 
 - the project is a git repository;
 - `routing.delegation: "roles"` was selected **at start** (switching from tiers later needs a restart);
@@ -83,15 +85,17 @@ The tool and command are registered on **OpenCode v2 only**. The executor is ass
 - a plan-task verifier is available and `enforcement.verify.require` is **not** `"never"`;
 - the host supplies the lease registry and child runner, and no other executor owns the process.
 
-Repository discovery runs only when the executor preconditions hold and the location is inside
-`routing.workRoots` (when configured); an ineligible location does no executor discovery.
+Repository discovery for plan-executor assembly runs only when the executor preconditions hold and the location is
+inside `routing.workRoots` (when configured); assembly does no executor discovery at an ineligible location.
+Separately, with executor enforcement enabled, role registration still resolves the executor home read-only outside
+the work roots to deny it when worktrees were listed or their listing failed; it grants no executor slots-root allowance there.
 
-When assembly is unavailable, `/plan` and `router_plan` show
+In roles mode, when assembly is unavailable, the registered `/plan` and `router_plan` show
 `the plan executor is not available: <reason>` rather than launching work. The exact reasons are:
 
 | Reason | What to check |
 |---|---|
-| `routing.delegation must be roles at start` | Select roles mode and restart OpenCode. |
+| `routing.delegation must be roles at start` | Select roles mode and restart OpenCode; tiers mode registers no plan tool or command to show this internal reason. |
 | `routing.leases.mode must be enforce` | Enable enforced file leases. |
 | `no plan-task verifier` | The host must supply the plan-task verification engine. |
 | `enforcement.verify.require is never` | Choose a verification requirement other than `never`. |
@@ -156,10 +160,12 @@ plan file, and never claim completion while the plan is running.
 
 ## `/plan` command
 
-An existing user-defined `/plan` command is preserved: on v2 the router logs one conflict warning and leaves
+An existing user-defined `/plan` command is preserved: on v2 in roles mode the router logs one conflict warning and leaves
 `router_plan` available instead. On v1 that user command runs without an executor `/plan` notice.
 The v2 adapter checks the host's command registry before registering the executor command; registry rebuilds do not
 repeat the warning or replace the user's command.
+`/router` advertises `/plan` only when it was registered at start, is not user-defined, and the executor discovery
+preconditions hold (roles delegation, enforced leases, verification enabled and a location inside `routing.workRoots`).
 
 `/plan` turns what you type into an instruction for the orchestrator, which then calls `router_plan` with exact
 arguments. Input that does not parse prints the `/plan` help instead. Quote a path that holds spaces
@@ -396,6 +402,46 @@ Defaults are `failureRatio = 0.4` (range **0.1–1**), `minAttempts = 5` and `co
 ranges **1–50**). Opening pauses that phase and creates one critical `B-` item; other independent phases are not
 paused by that item. Answering it unpauses the phase only when no other open critical item belongs to that phase.
 
+### Other automatic safety pauses
+
+The circuit breaker is **not the only automatic stop**. G10 is recorded as **the circuit breaker plus these bounded
+safety pauses, each with one inbox item**, rather than a claim that only breaker samples can stop work.
+Whole-plan pauses stop new launches; they are distinct from parking one task or pausing one phase. Inspect the inbox
+and exported ledger, fix the underlying cause, then explicitly `/plan resume <planId>`; answering a failure item alone
+is not a whole-plan resume.
+
+| Whole-plan reason (ledger) | Inbox item / what the owner sees |
+|---|---|
+| `launch-lost-streak:<taskId>` | One blocking `F-` item: `3 consecutive launches were lost before their child started (last: <taskId>, <reason>); the plan is paused, resume it once the cause is fixed`. Losses are counted per launch capture, not once for every parallel child lost under it. |
+| `lost-streak:<taskId>` | One blocking `F-` item: `task <taskId> lost 3 consecutive attempts (<detail>); the plan is paused`. The consecutive details are `unrequested-interrupt` or `runner-error`, not counted verification failures. |
+| `integration-resume-failed` | One critical `F-` item: `the integration queue of plan <planId> could not resume (<error>); the plan is paused, resume it once the cause is fixed`. An explicit resume retries the queue's resume. |
+| `integration-bug` | One critical `F-` item: `Integration queue bug: a journal batch was rejected (<error>). The plan is paused and this queue has stopped: restart the executor (the new queue's resume() reconciles), then unpause.` An illegal ledger transition stops the queue; resume alone does not replace it. |
+| `integration-infrastructure` | One critical `F-` item gives the operation/error, then `The plan is paused; unpause to retry.` Work stays queued, or the stalled integration entry stays open; the integration branch is not advanced unchecked. |
+| `integration-lock-lost` | One critical `F-` item: `The repository lock for <repoKey> was lost (taken over or removed) while integration entry <entryId> was running; no further git write was made. The plan is paused; unpause to roll the entry back and retry.` The entry id is `(none)` when no entry was running. |
+| `integration-branch-moved` | One critical `F-` item reports one of: `The integration branch ref refs/heads/<branch> does not exist (journaled head <head>). The plan is paused.`; `The integration branch <branch> is at <tip>, not at the journaled head <head>. The plan is paused.`; `The compare-and-swap of <branch> from <head> to <candidate> failed (<error>). The plan is paused.`; or, during resume, `The integration branch <branch> is at <tip>, not at the journaled head <head>, and no journaled fast-forward explains it. Integration is halted; nothing was changed.` A missing ref before fast-forward uses this reason too. |
+| `ff-refused` | One critical `F-` item: `git merge --ff-only <candidate> was refused in the integration worktree (head <head>). The plan is paused; resume() rolls the entry back.` |
+| `integration-branch-missing` | One critical `F-` item during resume: `The integration branch ref refs/heads/<branch> does not exist in <toplevel> (journaled head <head>). The plan's compile/start step (5.1) must create the integration branch and its integration worktree slot before integration can run. Integration is halted; nothing was changed.` |
+
+Phase-suite and revert failures pause **only the affected phase**, with one critical `F-` item each. The QA cap also
+pauses only its phase, with a critical `R-` item instead. Independent work may continue:
+
+| Phase reason (ledger) | Inbox item / what the owner sees |
+|---|---|
+| `suite-unresolvable` | `The phase suite of <phaseId> cannot be resolved: <reason>. Phase <phaseId> is paused.` The configured suite cannot be run as resolved. |
+| `suite-unattributed` | `Phase <phaseId> suite at <commit> failed (<ids>) and the failure is not attributable to a task of the phase: <why>. Phase <phaseId> is paused.` Missing base/parse/isolation evidence is not a guessed culprit. |
+| `revert-conflict` | `Reverting <taskId> (<from>..<to>) for the phase <phaseId> suite failure conflicts at <at> in: <paths>. Phase <phaseId> is paused.` The item includes inspection commands labelled `never run by the executor`. |
+| `revert-insufficient` | `Reverting <taskId> did not make the integration checks pass (<ids>). The branch is unchanged; phase <phaseId> is paused.` A failed revert check is not integrated. |
+| `qa-cap` | Critical `R-` item: `phase <phaseId> QA round <round> of <max> still has blocking findings:` followed by finding lines (`<severity> <id>: <problem> [<files>]`). The phase gate is `awaiting-qa`. |
+
+Unlike a breaker answer, answering these `F-` items does **not** clear the phase's pause flag, and `/plan resume`
+resumes the whole plan, not individual phases. There is no general phase-unpause action. Preserve the export and
+diagnose the failure; arrange owner-led recovery or a corrected recompiled plan, retaining integrated and WIP work.
+Never clear the ledger flag by hand or run the conflict's inspection commands in the live integration worktree.
+
+For `qa-cap`, the owner answers the `R-` item with `accept` (defer the remaining findings and pass the gate) or `fix`
+(create another fix/re-review round). Either clears this phase's pause only when no other open critical item belongs
+to the phase; round **999** offers only `accept`. See [QA loop](#qa-loop).
+
 ## QA loop
 
 A phase QA task returns a JSON report. The parser uses the **last fenced `json` block** of the final answer, or the
@@ -496,6 +542,19 @@ for durable evidence. Do not repair the journal or markers by hand.
 | `E_PROVISION` | Read the manager/slot and error tail. Commit the correct root manifest and lockfile, install the manager outside the work root on absolute PATH entries, or set a trusted global provision/interpreter override. Do not share another checkout's dependencies. |
 | Lease refusal / contaminated run | Wait for the named holder or answer the parked task's inbox item once the conflict is resolved; repeating the same tool call does not release a lease. |
 | Failed or unverifiable task | Inspect the verification/commit failure and attempt count; fix the cause before exhausting retries or answering a breaker. Missing git identity and a declared writer with no diff are failures, not successful no-ops. |
+| Plan paused: `launch-lost-streak:<taskId>`; blocking `F-` says launches were lost before their child started | Fix the launch/context/host cause named by the item, then `/plan resume <planId>` to retry with the streak reset. Do not repeatedly poll or relaunch against the same fault. |
+| Plan paused: `lost-streak:<taskId>`; blocking `F-` names consecutive lost attempts | Inspect the child's `unrequested-interrupt` / `runner-error` evidence; fix the runner or interruption cause before explicitly resuming. These uncounted losses are not a verification pass. |
+| Plan paused: `integration-resume-failed`; critical `F-` says the queue could not resume | Preserve the export and error; fix the resume failure, then `/plan resume <planId>` to retry queue reconciliation. Do not edit the journal to bypass it. |
+| Plan paused: `integration-bug`; critical `F-` says a journal batch was rejected and the queue stopped | Preserve the rejected-batch error/export, fix the defect, **restart the executor**, then explicitly resume. The new queue reconciles; an inbox answer or resume alone cannot revive the stopped queue. |
+| Plan paused: `integration-infrastructure`; critical `F-` ends with `unpause to retry` | Fix the named repository-lock, git-access or check-execution problem, then `/plan resume <planId>`. Queued/open work is retained; never force integration past unrun checks. |
+| Plan paused: `integration-lock-lost`; critical `F-` says the repository lock was `lost (taken over or removed)` and no further git write was made | Preserve the export and identify the competing writer or lock removal. Wait for legitimate ownership to be released; do not delete another holder's lock. Once the cause is fixed, `/plan resume <planId>` reacquires the lock and rolls the entry back for retry. |
+| Plan paused: `integration-branch-moved`; critical `F-` says the ref `does not exist`, is `not at the journaled head`, the `compare-and-swap` failed, or `no journaled fast-forward explains it` | Preserve the export, actual ref tip, journaled head and error; investigate external ref changes/deletion or the compare-and-swap failure. Arrange owner-led recovery or a corrected recompiled plan before explicitly resuming. Do not force-reset the integration branch or edit the ledger to bypass the mismatch. |
+| Plan paused: `ff-refused`; critical `F-` says `git merge --ff-only <candidate> was refused in the integration worktree (head <head>)` | Preserve the export and diagnose the git refusal against the recorded candidate/head. Fix the cause, then `/plan resume <planId>` rolls the entry back. Do not force a merge or rewrite published integration history. |
+| Plan paused: `integration-branch-missing`; critical `F-` says the ref does not exist and the `compile/start step (5.1) must create the integration branch and its integration worktree slot` | Preserve the export and journaled head; diagnose missing startup resources. Arrange owner-led recovery or a corrected recompiled plan that creates the branch and integration slot before retrying. Repeated resume cannot create them; do not fabricate refs or journal entries by hand. |
+| Phase paused: `suite-unresolvable` or `suite-unattributed`; critical `F-` explains unresolved checks or unattributable failures | Preserve suite/base evidence; correct the configuration or attribution problem. Arrange owner-led recovery/recompilation if needed: answering `F-` or resuming the whole plan does not unpause this phase. |
+| Phase paused: `revert-conflict`; critical `F-` lists paths and inspection commands | Inspect the exported range/conflict in a separate scratch worktree, never the live integration tree. Resolve the underlying conflict through owner-led recovery or a corrected plan; do not assume an inbox answer unpauses the phase. |
+| Phase paused: `revert-insufficient`; critical `F-` says checks still fail and the branch is unchanged | Diagnose the remaining failing ids/tests before owner-led recovery or recompilation. Do not force the failed revert into integration or manually clear the phase flag. |
+| Phase paused: `qa-cap`; gate `awaiting-qa`, critical `R-` says `phase <phaseId> QA round <round> of <max> still has blocking findings:` | Review the listed findings, then `/plan answer --plan <planId> <id> accept` to defer them and pass, or `fix` for another fix/re-review round (only `accept` at round 999). This clears the phase pause only if no other open critical item belongs to the phase; `/plan resume` is not the cap decision. |
 | Quiet `running` child after restart | D16 uses launcher liveness plus stored tool history: a provably dead same-host launcher with no tool in flight requeues immediately. An open tool call keeps the 60 s probation because its process tree may survive; do not reset its slot yourself. |
 | Recovery or re-verification cannot progress | Supply a fresh context with a root `router_plan action=status` call in the owning session; recovered verification waits without spending grader retries. If the owning session is gone, the owner runs `router_plan action=adopt` from their session so the plan gets a live root. If it still cannot progress, preserve the export and host error evidence; never force a task to passed. |
 | Landing or GC refused | Clean/resolve the owner's checkout without discarding work; landing is fast-forward only. GC requires a finished, non-live plan; paused plans deliberately retain slots. |
@@ -542,11 +601,95 @@ The throughput smoke reconstructs and records these values; they are **not field
 
 The [Phase 6.1 report](qa/critical-path-execution/phase-6.1.md) records evidence and limitations. Under **A-6.1-3**, the
 remaining `unmeasured` subcases need a real-use soak, not new synthetic smoke cases: at least **5 working days** with
-observations enabled on real plans, analysed offline by `scripts/soak-analyze.mjs`. Each observable criterion
+observations enabled on real plans, analysed offline by `scripts/soak-analyze.mjs` (`npm run soak:analyze`,
+**Node >= 22.13** required). Each observable criterion
 (G1, G2, G6, G8, G9) needs at least **3 observed occurrences and zero violations**. Unobserved criteria (expected G3,
 G11) are disclosed gaps in the Phase 6.2 PR alongside G13 and G8's bound; G5 stays with 2.3 and G12's full matrix with
 6.2. The soak is also executor dogfood evidence toward G13, which remains unmet until the owner decides. The owner
 may change the soak criteria; absence of evidence is never a pass.
+
+## Measured on its own implementation
+
+These **G13 time windows** come from the [dogfood record](qa/critical-path-execution/dogfood.md), including its
+post-freeze DF-2 summary. They distinguish using the router for delegation from running a plan through the executor.
+Commit-window wall-clock and scripted fixture makespan are not interchangeable.
+
+- **Before DF-1 — `cpx/df0` = `b716ee9`, 2026-10-10 18:55 → 2026-10-12.** Phases 0.P–2.4 used orchestrated
+  dispatches, not the plan executor. The record gives first/last phase commits (local UTC−3), including an owner
+  shutdown from 2026-10-11 ≈11:30 to 2026-10-12 ≈08:00. There were **0 background dispatches**; all ran in the
+  foreground, so the forced-foreground share is not meaningful. The shared outcome store reported **452 routed
+  dispatches / 114 orchestrator resumes**, an **upper bound**, not this plan's isolated count. Cache/duration telemetry
+  was unavailable and idle-with-ready was not reconstructible. No deviations recorded; this is the pre-feature
+  baseline, not executor completion evidence.
+- **After DF-1 — `cpx/df1` = `226d967`, loaded 2026-10-12 12:03:38 UTC−3.** Router self-checks ran
+  **12:04–12:25**, with follow-ups to **12:40**; pdf1-1 fixes were orchestrated, not an executor plan. Background,
+  held-result sequencing and cleanup passed; leases were partial and router cache telemetry was not measurable.
+  The shared store counted **11 dispatches, 7 belonging to these probes**. Host-DB cache evidence only: first
+  **39 steps**, p50 **0.964**, weighted **0.853**, not the missing router turn metric. Deviations included denied
+  graders, false PASS tags, stale resumed results, missing turn rows, false restart settlements, a cross-plugin cache
+  breakpoint fault and isolation probes. **DF-1 remained open**, with foreground resumes and foreground-or-checked
+  producers as binding workarounds; their aggregate forced-foreground share was **not measured**.
+- **After DF-1.1 — `cpx/df1.1` = `9fa7607`, loaded 2026-10-12 16:06:54 UTC−3.** Lease re-probes passed,
+  including the delivered contamination annotation; telemetry appeared, but cache p50 was **7.1%** (p10 **4.9%**,
+  **13 turns**) and failed the probe's **0.5** threshold. Duplicate/restarting rows over-counted turns; the live
+  cross-plugin cache fix was still absent and background graders were still denied. The foreground workaround stayed;
+  forced-foreground share was **not measured**, and no executor makespan was recorded. **STOP at 2026-10-12 19:17Z**:
+  the owner's background service ran this plan's sessions on the base build (DF-1.1-3), affecting Phase 3.1 children
+  and the other implementation. This window cannot establish continuous DF-build use or clean isolation. The owner
+  chose separate data/state directories; the fresh isolated DF-1.1 self-check passed at **18:22 UTC−3**, run `c39fd4cd`.
+- **After DF-1.2 — `cpx/df1.2` = `92f09d1`, hot-loaded 2026-10-12 23:02:16Z.** pdf1-2 shipped background
+  caller-agent propagation and turn-recorder fixes. In the same 2.0.26 run `c39fd4cd`, the config reloaded without an
+  owner restart, once per location; in-flight 3.2.6b `ses_ecddf6e4affeIYzoSyo9Cyj5Nk` vanished from the list and
+  was resumed (**DF-1.2-1**). The handover still owed the live grader re-probe. Hub writers remained serialized
+  across worktrees pending DF-1.1-4's fix. This was orchestrator-managed work, not an executor plan; aggregate
+  dispatch counts, forced-foreground share, cache, duration and idle metrics are **not measured**. Next switch:
+  **2026-10-13 04:59Z**.
+- **After DF-1.3 — `cpx/df1.3` = `1893d42`, hot-loaded 2026-10-13 04:59Z.** Run `c39fd4cd` loaded the
+  router twice, once per location, without a restart. pdf1-3 fixed DF-1.1-4's cross-worktree lease collisions:
+  ordinary holders are per checkout; plan-task holders remain repository-wide. Work through Phase 5.1 remained
+  orchestrator-managed until the DF-2 switch, self-checked at **≈19:50Z**. Aggregate dispatch counts, forced-foreground
+  share, cache, duration and idle metrics are **not measured**; no cache-probe pass is inferred.
+- **Under DF-2 — `cpx/df2` = `f3af7c7`, executor attempt, then owner fallback.** On **2026-10-13 ≈19:50Z**,
+  run `79d6febf` passed the 2.0.26 build self-check; a pre-restart handle survived but returned `unverifiable`, not
+  a verified pass. Whole-plan compile: **180 tasks / 20 phases / 368 edges / 69 manual**, zero cycles; the draft
+  was aborted/purged. The one-edge dry-run delta (**DF-2-1**) was explained/accepted; the shared git executor home
+  (**DF-2-2**) was disclosed to the owner; child smoke checks needed the orchestrator (**DF-2-3**). On
+  **2026-10-13** (UTC−3), Phase 6.1 approval at
+  **16:57:46.8596402** described **9 tasks / 17 edges / work 41m / CP 34m / width 2**; first launches were at
+  **17:04:00.1603405**. Work-loss resets and budget thrashing (**DF-2-4**) forced a pause at **17:26:29.9108549**;
+  missing launch cap/budget **DF-2-5**, stale base **DF-2-6** and orchestrator-shell
+  criteria **DF-2-7** also required pdf2-1. Restart recovery was observed
+  **paused, 3/9**, not completed. At **21:29:48.2039134** the owner chose normal-phase execution in `cpx/p61`;
+  the executor plan was aborted/purged and salvaged work was applied outside its integration chain. No completed
+  repository-plan makespan or maximum successful retained-context age is recorded; forced-foreground share is
+  **not measured**. pdf2-1's fixes later merged into `cpx/main` as `992816b`, not a `df2.1` dogfood switch or re-run;
+  its related N-2 slot-safety finding was carried to 6.2. The dogfood record lists each fault's disposition and caveats.
+  The later **scripted executor fixtures**, not the repository plan, passed runs **24–26** on code `2b2cb58`:
+  suite wall-clock **~1839 / ~1738 / ~1854 s**, respectively, each **32 passed / 9 documented `unmeasured` skips**.
+  Run 26 was 6.1.4's clean detached checkout at `9b8593f`. Across those runs, **g8Ratio 1.35–1.54** missed the
+  **≤1.0** target (measured/disclosed under A-6.1-2); max idle reached **9.4 s** against the unchanged **10 s** ceiling.
+  Per-fixture values are in [ADR 0007](adr/0007-critical-path-execution.md#measured-results--2026-10-16).
+
+**Rollback record:** the handover records DF-1.1 → DF-1 (drain holds, change the config entry, relaunch), DF-1.2 →
+DF-1.1 (`opencode.json.df1.1.bak`, hot), DF-1.3 → DF-1.2 (`opencode.json.df1.2.bak`, hot), and DF-2 → DF-1.3
+(`opencode.json.df1.3.bak`, restart). These are rollback paths, not recorded executed config rollbacks. Isolation
+recovery stayed on DF-1.1; the later DF-2 abort/purge changed execution method, not proof of a plugin rollback.
+
+**§0.13 incidents (not clean-isolation passes):** **DF-1-1** included the orchestrator reading
+`D:\git\opencode-model-router\.opencode` modification times **once**, after the host booted that off-limits location;
+the router also ran a read-only startup worktree listing there (later hardened in pdf1-1). **DF-1.1-3** was the owner's
+OpenCode 2.0.27 background service, run `6d23db21`, draining/rebinding this plan's sessions using the base router
+`file:///D:/git/opencode-model-router/server.ts`, alternating with DF-1.1 run `59ec52b7`. This affected the other
+implementation; it was not an intentional rollback. The [dogfood incident record](qa/critical-path-execution/dogfood.md#013-incidents)
+preserves the evidence and isolation recovery without erasing either incident.
+
+**G13 is UNMET — owner decision pending.** Phase 6.1 did not run through compile → launch → verify → integrate →
+phase suite → QA loop → fast-forward into `cpx/main` end to end; the owner selected the fallback after DF-2 faults.
+The §0.13 incidents also defeat the untouched-checkout and continuous-build-use claims; forced-foreground share is
+not measured. These deviations and missing aggregates are not silently treated as passes. Later fixes
+and green scripted fixtures do not retroactively complete that dogfood run. The real-use soak remains pending under
+A-6.1-3, narrowed by A-6.1-6 to observable subcases; structurally unobservable G6/G9 subcases and G3/G11 are declared
+gaps, not passes. G13 and G8's missed bound must be disclosed in Phase 6.2.
 
 ## Owner checklist for the next real plan
 

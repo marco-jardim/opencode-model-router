@@ -207,7 +207,11 @@ async function boot(repo: string, runner?: ChildRunner) {
   return { access, prepared, surface, state, sessionHooks, emit, dispose: cleanup,
     deps: state.executor === null ? null : assembledDeps[assembledDeps.length - 1] ?? null,
     turnState: registries[registries.length - 1],
-    call: (args: RouterPlanArgs, sessionID = "root") => surface.tool.router_plan!.execute(args, { sessionID, directory: repo }),
+    call(args: RouterPlanArgs, sessionID = "root") {
+      const tool = surface.tool.router_plan;
+      if (tool === undefined) throw new Error("router_plan is not registered in this integration fixture; roles mode is required at start");
+      return tool.execute(args, { sessionID, directory: repo });
+    },
     async command(command: string, args = "", sessionID = "root") {
       const output = { parts: [] as { type: string; text: string }[] };
       await surface["command.execute.before"]({ command, arguments: args, sessionID }, output);
@@ -511,9 +515,27 @@ describe("assembled executor through v2 registration", () => {
     const plugin = await boot(fixture.repo);
     expect(plugin.state.executor).toBeNull();
     expect(plugin.access.unavailable()).toContain(reason);
-    expect(await plugin.call({ action: "status" })).toContain(reason);
-    expect(await plugin.command("plan", "status")).toContain(reason);
+    expect(plugin.access.runtime()).toBeNull();
+    expect(plugin.deps).toBeNull();
+    expect(assembledDeps).toEqual([]);
+    expect(runtimeModule.createExecutorRuntime).not.toHaveBeenCalled();
+    expect(poolModule.createSlotPool).not.toHaveBeenCalled();
+    expect(provisionModule.createProvisioner).not.toHaveBeenCalled();
+    if (delegation === "tiers") {
+      // G-5: tiers no longer register an unusable plan surface just to explain the missing executor.
+      expect(plugin.surface.tool).not.toHaveProperty("router_plan");
+      const output = { command: {}, agent: {} };
+      await plugin.surface.config(output);
+      expect(output.command).not.toHaveProperty("plan");
+      expect(await plugin.command("plan", "status")).toBe("");
+      expect(await plugin.command("plan", "approve plan-a")).toBe("");
+      expect(await plugin.command("router")).not.toContain("/plan");
+    } else {
+      expect(await plugin.call({ action: "status" })).toContain(reason);
+      expect(await plugin.command("plan", "status")).toContain(reason);
+    }
     expect(await readdir(join(fixture.repo, ".git"))).not.toContain("omr-executor");
+    await expect(stat(fixture.slotsRoot)).rejects.toMatchObject({ code: "ENOENT" });
   }, 30_000);
 
   it("A10: refuses a child session but lets the root read the real runtime", async () => {

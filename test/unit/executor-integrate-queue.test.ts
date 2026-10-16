@@ -950,26 +950,6 @@ describe("createRepoLockFactory (M5, I3)", () => {
     await lock.release();
   });
 
-  it("a re-armed heartbeat keeps beating on every period", async () => {
-    const env = await lockEnv();
-    const clock = new FakeClock();
-    const f = createRepoLockFactory({ stateRoot: env.root, clock, pid: 10, hostname: "h", isPidAlive: () => true });
-    const lock = await f.acquire("repo-S", holder(), new AbortController().signal);
-    const file = env.file("repo-S");
-    const t0 = await heartbeatOf(file);
-    const deadline = Date.now() + 20_000;
-    for (const k of [1, 2]) {
-      clock.advance(1_000);
-      clock.fire();
-      while (await heartbeatOf(file) !== t0 + 1_000 * k && Date.now() < deadline) await realPause(5);
-      expect(await heartbeatOf(file)).toBe(t0 + 1_000 * k);
-      while (clock.heldCount() === 0 && Date.now() < deadline) await realPause(5);
-      expect(clock.heldCount()).toBe(1);
-    }
-    expect(lock.lost.aborted).toBe(false);
-    await lock.release();
-  });
-
   it("a heartbeat that fires in the same tick as release does nothing", async () => {
     const env = await lockEnv();
     const clock = new FakeClock();

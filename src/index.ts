@@ -1949,7 +1949,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       await logger.flush();
     },
     tool: {
-      ...(isV2Host && routerPlan !== undefined ? { router_plan: {
+      ...(rolesAtStart && routerPlan !== undefined ? { router_plan: {
         ...routerPlan,
         execute: async (args, context) => await planActionCallerAllowed(context?.sessionID, args?.action, args?.planId)
           ? routerPlan.execute(args, context)
@@ -3448,7 +3448,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
         description:
           "Model-router controls (e.g., /router enforce off|advisory|enforced, /router overrides, /router models)",
       };
-      if (isV2Host && planCommand !== undefined) {
+      if (rolesAtStart && planCommand !== undefined) {
         if (userPlanCommandDefined) {
           if (!warnedPlanCommandConflict) {
             warnedPlanCommandConflict = true;
@@ -3594,7 +3594,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           }
           return; // No model-visible part on v1.
         }
-        if (userPlanCommandDefined) return; // Let the host's /plan run without executor instructions.
+        if (!rolesAtStart || userPlanCommandDefined) return; // Leave unregistered or user-defined /plan commands alone.
         if (planCommand !== undefined) {
           const args: string = input.arguments ?? "";
           const parsed = parsePlanCommand(args);
@@ -3757,7 +3757,11 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           }
         } else {
           // #84 P2.2: `/router` lists the roles in roles mode on v2 (`rolesNow()` is empty in tiers mode and on v1).
-          text = buildRouterOutput(cfg, args, projectDir, rolesNow().size > 0 ? rolesNow().values() : undefined, approvalsAvailable, isV2Host);
+          // Match registration at start and v2.ts's executor discovery prerequisites; never advertise an unregistered command.
+          const planAvailable = rolesAtStart && !userPlanCommandDefined && resolveRolesRouting(cfg, "v2").delegation === "roles"
+            && resolveRouting(cfg, "v2").leases.mode === "enforce" && cfg.enforcement?.verify?.require !== "never"
+            && !locationOutsideWorkRoots(ctx.directory, cfg.routing?.workRoots);
+          text = buildRouterOutput(cfg, args, projectDir, rolesNow().size > 0 ? rolesNow().values() : undefined, approvalsAvailable, planAvailable);
           // On the bare status view, surface stale or missing models inline.
           if (sub === "") {
             text += "\n" + routerStatusLines(cfg, ctx.routerHost === "v2" ? "v2" : "v1", logger, projectDir).join("\n");

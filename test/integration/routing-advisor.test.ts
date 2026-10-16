@@ -7,14 +7,16 @@
  */
 import { spawnSync } from "node:child_process";
 import { supportsPlainNodeTypeScript } from "../helpers/node-typescript";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import ModelRouterPlugin from "../../src/index";
+import { PLAN_HELP_LINES } from "../../src/commands/output";
 import type { RouterPluginInput } from "../../src/compat/child-session";
-import { invalidateConfigCache, loadConfig, overridePath, routerStatusLines, validateConfig } from "../../src/router/config";
+import { invalidateConfigCache, loadConfig, overridePath, resolveRolesRouting, routerStatusLines, validateConfig } from "../../src/router/config";
+import { locationOutsideWorkRoots } from "../../src/router/work-roots";
 import { DECISIONS_FILE, acquireOutcomes, createSideLogs, makeKey, nodePersistDeps } from "../../src/routing/outcomes";
 import type { DecisionRow, DispatchTimingRow, OrchestratorTurnRow } from "../../src/routing/outcomes";
 import { readLastCheckpoint } from "../../src/routing/commands/stats";
@@ -1948,6 +1950,35 @@ describe("cost doctor in the plugin", { timeout: 60_000 }, () => {
     expect(host.agentCalls()).toBe(0);
     expect(host.catalogCalls()).toBe(0);
     expect(host.providerCalls()).toBe(1); // the model check `/router` always made: one call, as before
+  });
+
+  it("G-2: v2 with executor-capable routing lists every plan help line", async () => {
+    const { hooks } = await plugin({ routing: { delegation: "roles", leases: { mode: "enforce" }, outcomes: { path: store } } });
+    const text = await ask(hooks);
+    for (const line of PLAN_HELP_LINES) expect(text).toContain(line);
+  });
+
+  it.each([
+    {},
+    { delegation: "tiers", leases: { mode: "enforce" } },
+    { delegation: "roles", leases: { mode: "off" } },
+  ])("G-2: routing that cannot assemble an executor does not list plan help: %j", async routing => {
+    const { hooks } = await plugin({ routing: { ...routing, outcomes: { path: store } } });
+    expect(await ask(hooks)).not.toContain(PLAN_HELP_LINES[0]);
+  });
+
+  it("G-2: a v2 location outside the executor work roots does not list plan help", async () => {
+    const directory = join(home, "another-location");
+    mkdirSync(directory);
+    // Windows TEMP can contain an 8.3 component; workRoots deliberately refuses that spelling.
+    // Use a real, canonical entry and prove it survived config loading before testing the gate.
+    const workRoot = realpathSync.native(directory);
+    const { hooks } = await plugin({ routing: { delegation: "roles", leases: { mode: "enforce" },
+      workRoots: [workRoot], outcomes: { path: store } } });
+    const routing = resolveRolesRouting(loadConfig(home), "v2");
+    expect(routing.workRoots).toEqual([workRoot]);
+    expect(locationOutsideWorkRoots(home, routing.workRoots)).toBe(true);
+    expect(await ask(hooks)).not.toContain(PLAN_HELP_LINES[0]);
   });
 
   it("QA-2.4-3: with a routing block the doctor reads the SAME config.providers() call as the model check, never routerCatalog", async () => {

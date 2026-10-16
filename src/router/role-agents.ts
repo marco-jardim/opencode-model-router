@@ -19,7 +19,7 @@ import { lstatSync, realpathSync, statSync } from "node:fs";
 import { join, posix, win32 } from "node:path";
 import { resolveExecutorHome } from "../executor/paths";
 import { resolveActiveTiers, resolveRolesRouting, resolveRouting, slotsDirProblem, type RouterConfig, type TierConfig } from "./config";
-import { GIT_TOOL_NAMES, gitEnvironment, gitExecutable, hardeningArgs, inheritedSafeDirectoryArgs, spawnBounded } from "./git-tools";
+import { GIT_TOOL_NAMES, gitEnvironment, gitExecutable, hardeningArgs, inheritedSafeDirectoryArgs, spawnBounded, workRootGuards } from "./git-tools";
 import { positiveBudget, REFUSAL_CAP, ROUTE_BUDGET_RAISE_MAX, TIER_GUARD_BUDGET } from "./guard-profile";
 import { PLUGIN_AGENT, pluginAgentMarker, pluginAgentPolicy, type PluginAgentMarker } from "./plugin-agents";
 import { CONTEXT7_DOC_TOOLS, permissionMatches, type PermissionMap } from "./read-only";
@@ -184,7 +184,8 @@ const WORKTREE_LIST_TIMEOUT_MS = 10_000;
  */
 export async function listWorktrees(directory: string): Promise<string[]> {
   const started = performance.now();
-  const executable = gitExecutable();
+  // QA-62F-4: the executable is chosen outside the listed directory's work root, like the executor-home lookup.
+  const executable = gitExecutable(workRootGuards(directory));
   const trusted = await inheritedSafeDirectoryArgs(executable, WORKTREE_LIST_TIMEOUT_MS);
   const result = await spawnBounded(executable, [...hardeningArgs(), ...trusted, "worktree", "list", "--porcelain"], directory, {
     env: gitEnvironment(), timeoutMs: Math.max(1, WORKTREE_LIST_TIMEOUT_MS - (performance.now() - started)), maxBytes: 1024 * 1024,
@@ -462,8 +463,9 @@ export interface RoleRegistrationOptions {
   /** The context7 MCP server is configured (its documentation tools become direct tools). */
   context7: boolean;
   /**
-   * The project directory: its repository's worktrees are listed, unless `routing.workRoots` is set and the directory lies
-   * outside every entry (`locationOutsideWorkRoots`, QA-DF1-19): then no worktree listing or executor-home lookup runs.
+   * The project directory: its repository's worktrees are listed. When `routing.workRoots` is set and the directory lies
+   * outside every entry (`locationOutsideWorkRoots`), the executor slots root is not granted (QA-5.1-5) and the
+   * executor-home lookup runs only when worktrees were listed, to deny the home their allows cover (QA-62F-1).
    */
   directory: string;
   /** The host's own agents at setup (name → seed definition); a removed #81 entry falls back to it. */
@@ -527,10 +529,11 @@ export async function registerRoleAgents(
     const hasLocalActions = [...table.roles.values()].some(roleHasLocalActions);
     let worktrees: string[] = [];
     let worktreeListingProblem: string | undefined;
-    // QA-DF1-19: a location outside configured `routing.workRoots` gets no worktree listing or worktree rules.
-    // Unset or empty `workRoots`: the worktrees are listed as before.
+    // G-12: the worktrees are listed whatever `routing.workRoots` contains (a glob for later-created worktrees must not
+    // drop the existing ones). Outside every configured work root the executor home is still denied when worktrees were
+    // listed or the listing failed (QA-62F-1, QA-62F-9); only the executor slots-root grant is skipped there.
     const outside = locationOutsideWorkRoots(opts.directory, routing.workRoots, process.platform, opts.realpath ?? nativeRealpath);
-    if (!outside && hasLocalActions) {
+    if (hasLocalActions) {
       try {
         worktrees = await (opts.listWorktrees ?? listWorktrees)(opts.directory);
       } catch (error) {
@@ -547,7 +550,10 @@ export async function registerRoleAgents(
     const slotsDir = executorRouting.executor.slotsDir;
     const executorEnabled = executorRouting.leases.mode === "enforce" && cfg.enforcement?.verify?.require !== "never";
     const executorProblems: Array<readonly [key: string, message: string]> = [];
-    if (!outside && executorEnabled && table.roles.size > 0) {
+    // QA-62F-1, QA-62F-9: outside every work root, listed worktrees or configured roots can still cover the executor
+    // home in the git common directory, even when listing failed. Resolve the home (one read-only, guarded rev-parse)
+    // and deny it there; the slots-root grant below stays inside the work roots only.
+    if (executorEnabled && table.roles.size > 0 && (!outside || worktrees.length > 0 || worktreeListingProblem !== undefined)) {
       const realpath = opts.realpath ?? nativeRealpath;
       const homeDirectory = worktrees[0] ?? opts.directory;
       let home: string | undefined;
@@ -573,11 +579,11 @@ export async function registerRoleAgents(
           }
         }
         if (!notRepository) {
-          executorProblems.push(["roles:executor-home", `${PREFIX}the executor home could not be resolved (${problem}); role agents get no slots external_directory rule`]);
+          executorProblems.push(["roles:executor-home", `${PREFIX}the executor home could not be resolved (${problem}); the executor home is not denied and role agents get no slots external_directory rule`]);
         }
       }
       // An unresolved home cannot be protected by a final deny: do not grant the slots root either (D6).
-      if (home !== undefined && hasLocalActions && (slotsDir !== null || process.platform === "win32")) {
+      if (!outside && home !== undefined && hasLocalActions && (slotsDir !== null || process.platform === "win32")) {
         // Match create.ts's location toplevel, not Git's first (main) worktree on another drive.
         let toplevel: string | undefined;
         try {

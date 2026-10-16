@@ -13,7 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   base risk, the rules estimate, the route line's `risk=` claim, the merged facts, any inherited resume risk and the
   effective risk, plus an optional bounded vocabulary label (a single word or a table id, never prompt text). Routing
   is unchanged; older rows stay readable.
-- **OpenCode v2: opt-in `routing.roleFloor: "gated"`** (global only, default `"strict"`). A role dispatch that may edit
+- **OpenCode v2: configurable `routing.roleFloor: "gated"`** (bundled `tiers.json` or global override, not project overrides;
+  code default `"strict"`). A role dispatch that may edit
   and run commands, whose detection is `grader`, whose risk is not `high`, whose return gate runs and whose role can
   be raised from `medium` straight to `heavy`, gets a `medium` authority floor instead of `heavy` (bounds reason
   `gated:authority`, recorded only when gating lowers the final floor). A verification FAIL, and for gated children also
@@ -121,6 +122,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **OpenCode v2: register `router_plan` and `/plan` only in roles mode selected at start, like `router_run`.** Tiers
+  mode no longer carries the unusable plan-tool schema; switching to roles needs a restart. `/router` help never
+  advertises an unregistered or user-defined `/plan`. OpenCode v1's tool, command and help maps are unchanged.
 - **OpenCode v2: shorter serial integration entries.** Integration checks on the slot the queue has just rebased to the
   candidate no longer reset it a second time (clean and HEAD check only, falling back to the full prepare on a HEAD
   mismatch or provisioning drift), and the check-selection reads overlap the clean. Bisect probes, reruns, reverts and
@@ -145,6 +149,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **OpenCode v2: `/router` lists `/plan` only with executor-capable routing configuration.** Without a routing block,
+  help remains byte-identical to the legacy output; OpenCode v1 is unchanged.
 - **OpenCode v2: a task blocked by a reverted dependency keeps its unsaved work.** The integration queue no longer
   gives such a task's slot back to the pool unsaved. The work is first saved at the task's WIP ref (a failed save keeps
   the slot leased). A running task's slot is released once, by the executor, after its cancelled child has ended.
@@ -172,6 +178,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **OpenCode v2: integration check selection never treats a failed `git show` as a missing file.** Only git's explicit
   "path does not exist" error means absent; any other read failure fails the check as `prepare`, never a `no-checks`
   pass. A failed prepare now waits for its overlapped reads before the slot is retried.
+- **OpenCode v2: integration-check pytest uses the slot's virtual environment again.** Since the guarded-executable
+  change, pytest checks ran the host interpreter without the slot's environment. They again run the slot's provisioned
+  `.venv` interpreter with `VIRTUAL_ENV` set, the virtual environment first on `PATH` and `PYTHONPATH`/`PYTHONHOME`
+  unset, as `router_run` does; credentials stay stripped and `ComSpec` is the validated system shell on Windows. The
+  `.venv` interpreter is accepted only when it matches the slot's post-provisioning snapshot (path, size and
+  modification time), the same trust rule as `router_run`. Otherwise the absolute host interpreter outside the slot runs.
+  A file planted in the slot root is never selected. As in `router_run`, a slot without a detected Python manager gets
+  no virtual environment (and unsets `PYTHONPATH`, `PYTHONHOME` and `VIRTUAL_ENV`); only outside a registered slot do
+  the host's values pass through. The interpreter is resolved again from the configuration for every slot a command
+  runs in, never reused from another slot.
 - **OpenCode v2: QA fix tasks get a launchable route line for any repository path.** A repository or phase root that
   cannot be written safely into a route line (brackets, quotes, separators) is omitted, since the slot root is always
   appended at launch; fix tasks stored by the earlier build with an unbracketed line launch as well.
@@ -274,10 +290,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   session whose claim belongs to a live sibling instance, so that instance's records stay dormant and its verdict is
   the only one delivered. A dead owner (stale beat, or dead pid) is still recovered as before. Journal and claim
   records written by earlier builds read as before. OpenCode v1 is unchanged.
-- **OpenCode v2: no start-up git in a location outside `routing.workRoots`.** When `routing.workRoots` is configured and
-  non-empty, an instance loaded in a directory outside every entry skips the start-up reference GC and logs one info
-  line naming the skip; in roles mode, role agent registration there runs no `git worktree list` and the role agents
-  get only the `routing.workRoots` patterns as `external_directory` rules. The location check uses the documented
+- **OpenCode v2: no start-up reference GC in a location outside `routing.workRoots`.** When `routing.workRoots` is
+  configured and non-empty, an instance loaded in a directory outside every entry skips the start-up reference GC and
+  logs one info line naming the skip. Role agent registration in roles mode still lists the repository's worktrees
+  there (`git worktree list`, read-only), so a `routing.workRoots` glob meant for later-created worktrees does not drop
+  the existing ones from the role agents' `external_directory` rules. With executor enforcement enabled, role agents
+  still deny the executor home there when worktrees were listed or their listing failed, and get no executor slots-root
+  allowance. The location check uses the documented
   glob semantics (`*` crosses separators, as in the role agents' rules) and compares canonical paths. Without
   `routing.workRoots` nothing changes. OpenCode v1 is unchanged.
 - **OpenCode v2: `router_verify` on a held background handle reports the verdict its gate reached** (method, outcome,
@@ -299,9 +318,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/router stats` orchestrator cache-read share is no longer over-counted. The recorder is shared per directory across
   the copies of one build; a recorder registered by a build with another registry version is left alone. OpenCode v1 is
   unchanged.
+- **Plan executor: a child adopted after a restart no longer writes into a released slot.** When its task is blocked by
+  a reverted dependency or the plan is aborted, the child is interrupted and awaited before its slot is saved and
+  released. If it cannot be stopped, the slot stays held with one blocking inbox item.
 
 ### Security
 
+- **OpenCode v2: executor check discovery uses absolute, guarded executables.** Git searches use hardened arguments
+  and environment; pytest resolves its interpreter outside guarded checkouts, or takes the slot's provisioned
+  virtual-environment interpreter as `router_run` does. Both use a credential-stripped run
+  environment with explicit full-environment replacement and Windows current-directory search protection, so process
+  inheritance cannot restore provider credentials. Other process callers retain their default environment merging.
 - **OpenCode v2 (v1 unchanged): an unbound plan child is refused every tool call.** A child session whose first message
   is a plan launcher prompt (`PLAN CONTEXT` followed by the launch header at its grammar position) but that has no
   matching plan binding is refused every tool call (fail closed). The prompt is recognized at the start of the message

@@ -407,7 +407,7 @@ function readRepo(path: string): string | undefined {
 }
 
 // ---------------------------------------------------------------------------
-// Plan executor (assembled and registered on OpenCode v2 only): docs/EXECUTOR.md names every `/plan` subcommand, every
+// Plan executor (OpenCode v2, registered in roles mode at start): docs/EXECUTOR.md names every `/plan` subcommand, every
 // `router_plan` action and every `routing.executor` leaf key. Removing one from the doc fails these pins.
 // ---------------------------------------------------------------------------
 
@@ -477,8 +477,32 @@ function executorDocProblems(doc: string, surface = executorDocSurface): string[
   return problems;
 }
 
+/** G-8: runtime events, queue pause/halt helpers and queue/QA phase events, not a hand-maintained reason list. */
+function executorSafetyPauseReasons(runtime: string, queue: string, qaLoop: string): { plan: string[]; phase: string[] } {
+  const plan = [...runtime.matchAll(/type:\s*"status-changed",\s*from:\s*"running",\s*to:\s*"paused",\s*reason:\s*(?:"([^"\n]+)"|`([^`\n]+)`)/g)]
+    .map((m) => (m[1] ?? m[2])!.replace(/\$\{([^}]+)\}/g, "<$1>"));
+  plan.push(...[...queue.matchAll(/\bthis\.pauseEvents\([^,\n]+,\s*"([^"\n]+)"\)/g)].map((m) => m[1]!));
+  // halt/resumeHalt forward their second argument to pauseEvents through a variable.
+  plan.push(...[...queue.matchAll(/\bthis\.(?:halt|resumeHalt)\(\s*[^,]+,\s*"([^"\n]+)"\s*,/g)].map((m) => m[1]!));
+  const phase = [...`${queue}\n${qaLoop}`.matchAll(/type:\s*"phase-paused",\s*phaseId:\s*[\w.]+,\s*paused:\s*true,\s*reason:\s*"([^"\n]+)"/g)]
+    .map((m) => m[1]!);
+  return { plan: [...new Set(plan)].sort(), phase: [...new Set(phase)].sort() };
+}
+
+function executorSafetyPauseDocProblems(doc: string, pauses: ReturnType<typeof executorSafetyPauseReasons>): string[] {
+  const reasons = [...pauses.plan, ...pauses.phase];
+  return ["## Unattended operation", "## Troubleshooting"].flatMap((heading) => {
+    const section = sectionOf(doc, heading);
+    return reasons.filter((reason) => !section.includes(`\`${reason}\``)).map((reason) => `${heading}: ${reason}`);
+  });
+}
+
 describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
   const doc = read("docs/EXECUTOR.md");
+  const runtimeSource = read("src/executor/runtime.ts");
+  const queueSource = read("src/executor/integrate/queue.ts");
+  const qaLoopSource = read("src/executor/qa-loop.ts");
+  const safetyPauses = executorSafetyPauseReasons(runtimeSource, queueSource, qaLoopSource);
 
   it("sees the surface it pins", () => {
     expect(planSubcommands(PLAN_HELP_LINES).sort()).toEqual(
@@ -616,14 +640,54 @@ describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
     expect(sectionOf(doc, "## Recovery")).toContain("**60 s**");
   });
 
-  it("pins v2 registration, unchanged v1 maps, and the OPENCODE_V2.md handoff", () => {
+  it("names code-derived automatic safety pause reasons in unattended operation and troubleshooting (G-8)", () => {
+    // Non-vacuity: three runtime guards, six distinct queue guards, four phase-suite/revert guards and the QA cap.
+    expect(safetyPauses.plan).toHaveLength(9);
+    expect(safetyPauses.phase).toHaveLength(5);
+    expect(executorSafetyPauseDocProblems(doc, safetyPauses)).toEqual([]);
+    expect(sectionOf(doc, "## Unattended operation").replace(/\s+/g, " ")).toContain(
+      "the circuit breaker plus these bounded safety pauses, each with one inbox item",
+    );
+  });
+
+  it("detects removal of each safety reason from either required section (G-8 mutation self-test)", () => {
+    for (const heading of ["## Unattended operation", "## Troubleshooting"]) {
+      const section = sectionOf(doc, heading);
+      for (const reason of [...safetyPauses.plan, ...safetyPauses.phase]) {
+        const mutated = doc.replace(section, section.replaceAll(`\`${reason}\``, "`removed-pause`"));
+        expect(executorSafetyPauseDocProblems(mutated, safetyPauses), `${heading}: ${reason}`).toEqual([`${heading}: ${reason}`]);
+      }
+    }
+  });
+
+  it("detects source additions in runtime, queue pause/halt helpers and queue/QA phase events (G-8 mutation self-test)", () => {
+    const added = executorSafetyPauseReasons(
+      runtimeSource + '\n{ type: "status-changed", from: "running", to: "paused", reason: "new-runtime-pause" }',
+      queueSource + [
+        '\nthis.pauseEvents(l, "new-queue-pause");',
+        'this.halt(live, "new-halt-pause", "halt message");',
+        'this.resumeHalt(report, "new-resume-halt-pause", "resume halt message");',
+        '{ type: "phase-paused", phaseId: p, paused: true, reason: "new-phase-pause" }',
+      ].join("\n"),
+      qaLoopSource + '\n{ type: "phase-paused", phaseId: phase.id, paused: true, reason: "new-qa-pause" }',
+    );
+    expect(executorSafetyPauseDocProblems(doc, added)).toEqual(
+      ["## Unattended operation", "## Troubleshooting"].flatMap((heading) =>
+        ["new-halt-pause", "new-queue-pause", "new-resume-halt-pause", "new-runtime-pause", "new-phase-pause", "new-qa-pause"]
+          .map((reason) => `${heading}: ${reason}`)),
+    );
+  });
+
+  it("pins v2 roles-at-start registration, unchanged v1 maps, and the OPENCODE_V2.md handoff", () => {
     const flat = doc.replace(/\s+/g, " ");
-    expect(flat).toContain("assembled and registered on OpenCode v2 only");
+    // G-5 replaces the old all-v2 registration promise with the equally explicit roles-at-start rule.
+    expect(flat).toContain("Status: OpenCode v2, roles mode only.");
+    expect(flat).toContain("roles mode is selected at start, like `router_run`");
     expect(flat).toContain("OpenCode v1 is unchanged: no executor tool, command or instructions are registered there");
     expect(doc).not.toMatch(/not active yet|not registered.*yet/);
     const entry = read("src/index.ts");
-    expect(entry).toContain("...(isV2Host && routerPlan !== undefined ? { router_plan:");
-    expect(entry).toContain("if (isV2Host && planCommand !== undefined)");
+    expect(entry).toContain("...(rolesAtStart && routerPlan !== undefined ? { router_plan:");
+    expect(entry).toContain("if (rolesAtStart && planCommand !== undefined)");
     expect(entry).toContain("opencodeConfig.command.plan =");
     expect(read("src/executor/create.ts")).toContain('if (context.routerHost === "v1") return undefined;');
     expect(read("src/v2.ts")).toContain('executor: (host) => createExecutor({ routerHost: "v2", directory }');
@@ -634,7 +698,7 @@ describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
     const v2 = read("docs/OPENCODE_V2.md");
     expect(v2).toContain("(EXECUTOR.md)");
     const section = sectionOf(v2, "## Plan executor").replace(/\s+/g, " ");
-    expect(section).toContain("The `router_plan` tool, the `/plan` command and the executor instructions are registered on OpenCode v2 only; OpenCode v1's tool, command and help maps are unchanged.");
+    expect(section).toContain("The `router_plan` tool and the `/plan` command are registered on OpenCode v2 in roles mode selected at start only, like `router_run`; executor instructions require an assembled runtime. OpenCode v1's tool, command and help maps are unchanged.");
     expect(section).not.toMatch(/not active yet|a later phase registers/);
   });
 
@@ -657,7 +721,7 @@ describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
   it("documents preservation of the user's /plan on both hosts (QA-5.1-13)", () => {
     const command = sectionOf(doc, "## `/plan` command").replace(/\s+/g, " ");
     expect(command).toContain("An existing user-defined `/plan` command is preserved");
-    expect(command).toContain("on v2 the router logs one conflict warning and leaves `router_plan` available");
+    expect(command).toContain("on v2 in roles mode the router logs one conflict warning and leaves `router_plan` available");
     expect(command).toContain("On v1 that user command runs without an executor `/plan` notice");
   });
 
@@ -711,6 +775,25 @@ describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
     expect(workRoots).toContain("The executor home (`<git common dir>\\omr-executor`) is denied");
     expect(workRoots).toContain("A project-local `slotsDir` is ignored");
     expect(workRoots).toContain("no slots-root allowance is added (fail closed)");
+    // QA-62F-1/QA-62F-2/QA-62F-7: the start-up directory determines whether the slots root is granted; the home is still denied.
+    expect(workRoots).toContain("When the directory OpenCode was started in lies outside every `routing.workRoots` entry, the worktrees are still listed and the executor home is still denied, but there is no executor slots-root allowance");
+    expect(read("docs/CONFIG_REFERENCE.md").replace(/\s+/g, " ")).toContain(
+      "the executor home (`<git common dir>\\omr-executor`) is still denied there, but there is no executor slots-root allowance",
+    );
+  });
+
+  it("QA-62F-7 distinguishes plan-executor assembly discovery from read-only role registration outside work roots", () => {
+    const assembly = sectionOf(doc, "## Assembly and lifecycle").replace(/\s+/g, " ");
+    expect(assembly).toContain(
+      "Repository discovery for plan-executor assembly runs only when the executor preconditions hold and the location is inside `routing.workRoots` (when configured); assembly does no executor discovery at an ineligible location.",
+    );
+    expect(assembly).toContain(
+      "Separately, with executor enforcement enabled, role registration still resolves the executor home read-only outside the work roots to deny it when worktrees were listed or their listing failed; it grants no executor slots-root allowance there.",
+    );
+    const unreleased = sectionOf(read("CHANGELOG.md"), "## [Unreleased]").replace(/\s+/g, " ");
+    expect(unreleased).toContain(
+      "With executor enforcement enabled, role agents still deny the executor home there when worktrees were listed or their listing failed, and get no executor slots-root allowance.",
+    );
   });
 
   it("pins plan-task deadline constants, formulae, shared transient re-runs and backoffs", () => {
@@ -1642,7 +1725,8 @@ describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () =
   it("the gated floor table is authorityFloor with a return gate for every grant, detection, risk and scope", () => {
     expect(gatedFloorTableProblems(guide)).toEqual([]);
     expect(flat).toContain('`routing.roleFloor: "strict"`, the default');
-    expect(flat).toContain('`routing.roleFloor: "gated"`, opt-in, global only, OpenCode v2 only');
+    expect(flat).toContain('**Gated floor (`routing.roleFloor: "gated"`, OpenCode v2 only).**');
+    expect(flat).toContain('the global override can change it (the code default is `"strict"`). Project overrides cannot set it.');
     expect(flat).toContain("Otherwise the strict table applies.");
     expect(flat).toContain("Deferred `testsPass` does not qualify.");
     expect(flat).toContain("`raise:verification-fail:heavy`");

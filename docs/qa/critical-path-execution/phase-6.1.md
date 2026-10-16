@@ -3,6 +3,7 @@
 Runs under DF-2, through the plan executor (DF2.5): compiled with `phases=["6.1"] doneBefore="6.1"`, launched into
 slots under `D:\git\.omr-cpx-slots\<planId>`, integrated into `omr/<planId>/integration`, landed into `cpx/main`.
 Findings and fixes are written from `router_plan action=status` after the landing (freeze rule, DF-2).
+(superseded: Phase 6.1 ran under the DF-2 fallback in D:\git\omr-cpx-p61, see line 43 and the Verdict)
 
 ## Pre-flight
 

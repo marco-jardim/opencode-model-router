@@ -5,7 +5,9 @@
 
 import { lstat, readdir, readFile, realpath, stat, unlink } from "node:fs/promises";
 import * as nodePath from "node:path";
-import { hardeningArgs } from "../../router/git-tools";
+import { gitEnvironment, gitExecutable, hardeningArgs, workRootGuards } from "../../router/git-tools";
+import { resolveCommandExecutable, resolveSystemShell, runEnvironment, slotToolExecutable } from "../../router/run-tools";
+import { applySlotEnv, slotEnvFor } from "../slots/env";
 import {
   detectRunner, isNoAffected, isScopedSpec, isUnverifiable, planRerun, planScopedRun, readResult,
   type ChangedPath, type RunnerFs, type TestSearchSeam,
@@ -42,6 +44,8 @@ export interface ResolvedCommand {
   resolution?: { cwd: string; env: Readonly<Record<string, string>> };
   /** Extra environment for the child (scoped test specs). */
   env?: Readonly<Record<string, string>>;
+  /** A resolved, sanitized environment must replace inheritance at the process seam. */
+  envMode?: "replace";
   /** Explicit working directory override (for example scoped test specs); default: the check's cwd. */
   cwd?: string;
 }
@@ -527,11 +531,60 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
   }
 
   async function resolveForSlot(c: ResolvedCommand, cwd: string): Promise<ResolvedCommand> {
+    // A pytest command only comes from a selection: its interpreter is derived from the configuration for this slot.
+    if (c.source === "pytest") return resolvePython(c, c.cwd ?? cwd, true);
     if (c.resolution === undefined || c.ref === null) return c;
     // Executable, environment and checkout-dependent authorization all belong to the prepared slot, even when
     // its path is unchanged (base/bisect/revert). Only explicit overrides survive; never reuse the inherited plan.
     return { ...await resolveRef(c.ref, c.cwd ?? cwd),
       ...(c.cwd === undefined ? {} : { cwd: c.cwd }), ...(c.env === undefined ? {} : { env: c.env }) };
+  }
+
+  /** The configured pytest interpreter (`python`: a bare name or an absolute path; "auto" is the bare `python`). */
+  function configuredPython(): string {
+    const python = d.ledger().config.python;
+    return python === "auto" ? "python" : python;
+  }
+
+  /**
+   * QA N-A-1: the full pytest commands resolved from the configured interpreter (a planner's spec is a new object). Their
+   * argv[0] is derived from the configuration again at every resolution (a command moved to a prepared slot, each spawn),
+   * never taken from an earlier one: that slot's interpreter may have been rewritten, re-provisioned or unregistered since,
+   * and another slot's absolute path is outside this slot's guards.
+   */
+  const fromConfig = new WeakSet<ResolvedCommand>();
+
+  /**
+   * QA N-A: the pytest interpreter and environment as router_run's planRun builds them. The environment is the hardened
+   * run environment (credentials, npm/NODE_OPTIONS and guarded PATH entries dropped, ComSpec the validated system shell
+   * on win32) with the slot environment applied (VIRTUAL_ENV, `.venv\Scripts` / `.venv/bin` first on PATH,
+   * PYTHONPATH/PYTHONHOME unset). argv[0] is the slot's own provisioned tool for a bare name (slotToolExecutable: it must
+   * match the pool's post-provisioning snapshot), else an absolute file outside the work root (resolveCommandExecutable);
+   * never a bare name resolved from the cwd. `configured`: argv[0] is the configured interpreter (N-A-1), else the
+   * planner's (a scoped or rerun spec planned in this cwd).
+   */
+  function resolvePython(c: ResolvedCommand, cwd: string, configured: boolean): ResolvedCommand {
+    const platform = process.platform;
+    const guards = workRootGuards(cwd);
+    let shell: string | undefined;
+    if (platform === "win32") {
+      // As planRun: ComSpec for anything the child starts is the validated system shell when one exists.
+      try { shell = resolveSystemShell({ platform, env: process.env }, guards); } catch { shell = undefined; }
+    }
+    const base = runEnvironment(process.env, platform, shell, { guards });
+    const slotEnv = slotEnvFor(cwd, platform);
+    try {
+      const host = { platform, env: base };
+      const program = configured ? configuredPython() : c.file;
+      const file = slotToolExecutable(program, slotEnv, host, () => guards) ?? resolveCommandExecutable(program, host, guards);
+      const env = applySlotEnv(base, slotEnv, platform);
+      const resolved: ResolvedCommand = { ...c, file, resolution: { cwd, env: Object.fromEntries(Object.entries(env)
+        .filter((entry): entry is [string, string] => entry[1] !== undefined)) } };
+      if (configured) fromConfig.add(resolved);
+      return resolved;
+    } catch (e) {
+      throw new CheckResolveError(`pytest: ${errText(e)}`);
+    }
   }
 
   async function readSelection(cwd: string, commit: string) {
@@ -549,10 +602,10 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
     const tests: TestComponent[] = [];
     if (sel.node) tests.push({ framework: "node", full: await resolveRef({ script: "test", args: [] }, cwd) });
     if (sel.pytest) {
-      const python = cfg.python === "auto" ? "python" : cfg.python;
+      const python = configuredPython();
       const label = `${python} -m pytest`;
       if (d.allowCommand === undefined || d.allowCommand(label)) {
-        tests.push({ framework: "pytest", full: { label, file: python, args: ["-m", "pytest"], source: "pytest", ref: null } });
+        tests.push({ framework: "pytest", full: resolvePython({ label, file: python, args: ["-m", "pytest"], source: "pytest", ref: null }, cwd, true) });
       }
     }
     const extras: ResolvedCommand[] = [];
@@ -627,6 +680,9 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
   }
 
   async function exec(c: ResolvedCommand, cwd: string, signal: AbortSignal, low: boolean): Promise<CommandOutput> {
+    // Scoped/rerun planners can replace argv[0]; authorize it too, not just the full-suite interpreter. A full command's
+    // interpreter is derived from the configuration again (N-A-1): one rewritten since its selection falls back as there.
+    if (c.source === "pytest") c = resolvePython(c, c.cwd ?? cwd, fromConfig.has(c));
     let command = c;
     if (c.resolution !== undefined) {
       const env = { ...c.resolution.env };
@@ -637,7 +693,7 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
         }
         env[key] = value;
       }
-      command = { ...c, env };
+      command = { ...c, env, envMode: "replace" };
     }
     const context = executions.get(signal);
     if (context === undefined) return d.spawn(command, { cwd: c.cwd ?? cwd, signal, lowPriority: low });
@@ -662,8 +718,11 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
   function search(cwd: string, signal: AbortSignal): TestSearchSeam {
     const git = async (root: string, args: readonly string[]) => {
       try {
+        const guards = workRootGuards(cwd);
+        const env = runEnvironment(gitEnvironment(), process.platform, undefined, { guards });
         const r = await d.spawn(
-          { label: "git", file: "git", args: ["--no-optional-locks", "-C", root, ...args], source: "run-command", ref: null, cwd },
+          { label: "git", file: gitExecutable(guards), args: [...hardeningArgs(), "-C", root, ...args], source: "run-command", ref: null, cwd,
+            env: Object.fromEntries(Object.entries(env).filter((entry): entry is [string, string] => entry[1] !== undefined)), envMode: "replace" },
           { cwd, signal, lowPriority: true },
         );
         return r.timedOut ? undefined : r;

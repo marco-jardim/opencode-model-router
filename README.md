@@ -1234,7 +1234,7 @@ Put `{ "routing": { "delegation": "roles" } }` in the global override file and *
 
 ## Executing plans
 
-On **OpenCode v2**, `/plan run <path>` asks the orchestrator to compile a Markdown plan into a durable task ledger and
+On **OpenCode v2 in roles mode selected at start**, `/plan run <path>` asks the orchestrator to compile a Markdown plan into a durable task ledger and
 dependency graph through `router_plan`. It shows the task count, critical path, expected makespan and manual tasks.
 With the default `routing.executor.approve: "ask"`, compilation **does not start work**: review the summary, then use
 `/plan approve <planId>` or explicitly approve that plan after seeing its summary. A request to run it is not approval;
@@ -1247,6 +1247,7 @@ to request fast-forward landing into a clean checkout. The ledger survives a res
 
 The executor requires roles mode selected at start, enforced leases, a git repository and an available plan-task
 verifier (`enforcement.verify.require` must not be `"never"`). OpenCode v1 registers no executor tool or command.
+`router_plan` and `/plan` are registered only in roles mode at start, like `router_run`; tiers mode registers neither.
 See [the executor guide](docs/EXECUTOR.md) for setup, every command/action/config key, the safety model, Windows notes,
 recovery, troubleshooting, metrics and the owner checklist; [ADR 0007](docs/adr/0007-critical-path-execution.md) records
 the decisions. `/annotate-plan` below only annotates a plan; it does not execute it.
