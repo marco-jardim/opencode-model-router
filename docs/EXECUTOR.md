@@ -677,7 +677,9 @@ recovery stayed on DF-1.1; the later DF-2 abort/purge changed execution method, 
 
 **§0.13 incidents (not clean-isolation passes):** **DF-1-1** included the orchestrator reading
 `D:\git\opencode-model-router\.opencode` modification times **once**, after the host booted that off-limits location;
-the router also ran a read-only startup worktree listing there (later hardened in pdf1-1). **DF-1.1-3** was the owner's
+the router also ran a read-only startup worktree listing there (skipped outside `routing.workRoots` by pdf1-1; that
+skip was reverted by G-12 in Phase 6.2 because it dropped existing worktrees, so the read-only listing runs again, now
+with guarded git). **DF-1.1-3** was the owner's
 OpenCode 2.0.27 background service, run `6d23db21`, draining/rebinding this plan's sessions using the base router
 `file:///D:/git/opencode-model-router/server.ts`, alternating with DF-1.1 run `59ec52b7`. This affected the other
 implementation; it was not an intentional rollback. The [dogfood incident record](qa/critical-path-execution/dogfood.md#013-incidents)
