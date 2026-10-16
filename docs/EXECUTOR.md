@@ -415,9 +415,13 @@ is not a whole-plan resume.
 | `integration-resume-failed` | One critical `F-` item: `the integration queue of plan <planId> could not resume (<error>); the plan is paused, resume it once the cause is fixed`. An explicit resume retries the queue's resume. |
 | `integration-bug` | One critical `F-` item: `Integration queue bug: a journal batch was rejected (<error>). The plan is paused and this queue has stopped: restart the executor (the new queue's resume() reconciles), then unpause.` An illegal ledger transition stops the queue; resume alone does not replace it. |
 | `integration-infrastructure` | One critical `F-` item gives the operation/error, then `The plan is paused; unpause to retry.` Work stays queued, or the stalled integration entry stays open; the integration branch is not advanced unchecked. |
+| `integration-lock-lost` | One critical `F-` item: `The repository lock for <repoKey> was lost (taken over or removed) while integration entry <entryId> was running; no further git write was made. The plan is paused; unpause to roll the entry back and retry.` The entry id is `(none)` when no entry was running. |
+| `integration-branch-moved` | One critical `F-` item reports one of: `The integration branch ref refs/heads/<branch> does not exist (journaled head <head>). The plan is paused.`; `The integration branch <branch> is at <tip>, not at the journaled head <head>. The plan is paused.`; `The compare-and-swap of <branch> from <head> to <candidate> failed (<error>). The plan is paused.`; or, during resume, `The integration branch <branch> is at <tip>, not at the journaled head <head>, and no journaled fast-forward explains it. Integration is halted; nothing was changed.` A missing ref before fast-forward uses this reason too. |
+| `ff-refused` | One critical `F-` item: `git merge --ff-only <candidate> was refused in the integration worktree (head <head>). The plan is paused; resume() rolls the entry back.` |
+| `integration-branch-missing` | One critical `F-` item during resume: `The integration branch ref refs/heads/<branch> does not exist in <toplevel> (journaled head <head>). The plan's compile/start step (5.1) must create the integration branch and its integration worktree slot before integration can run. Integration is halted; nothing was changed.` |
 
-Phase-suite and revert failures pause **only the affected phase**, with one critical `F-` item each; independent work
-may continue:
+Phase-suite and revert failures pause **only the affected phase**, with one critical `F-` item each. The QA cap also
+pauses only its phase, with a critical `R-` item instead. Independent work may continue:
 
 | Phase reason (ledger) | Inbox item / what the owner sees |
 |---|---|
@@ -425,11 +429,16 @@ may continue:
 | `suite-unattributed` | `Phase <phaseId> suite at <commit> failed (<ids>) and the failure is not attributable to a task of the phase: <why>. Phase <phaseId> is paused.` Missing base/parse/isolation evidence is not a guessed culprit. |
 | `revert-conflict` | `Reverting <taskId> (<from>..<to>) for the phase <phaseId> suite failure conflicts at <at> in: <paths>. Phase <phaseId> is paused.` The item includes inspection commands labelled `never run by the executor`. |
 | `revert-insufficient` | `Reverting <taskId> did not make the integration checks pass (<ids>). The branch is unchanged; phase <phaseId> is paused.` A failed revert check is not integrated. |
+| `qa-cap` | Critical `R-` item: `phase <phaseId> QA round <round> of <max> still has blocking findings:` followed by finding lines (`<severity> <id>: <problem> [<files>]`). The phase gate is `awaiting-qa`. |
 
 Unlike a breaker answer, answering these `F-` items does **not** clear the phase's pause flag, and `/plan resume`
 resumes the whole plan, not individual phases. There is no general phase-unpause action. Preserve the export and
 diagnose the failure; arrange owner-led recovery or a corrected recompiled plan, retaining integrated and WIP work.
 Never clear the ledger flag by hand or run the conflict's inspection commands in the live integration worktree.
+
+For `qa-cap`, the owner answers the `R-` item with `accept` (defer the remaining findings and pass the gate) or `fix`
+(create another fix/re-review round). Either clears this phase's pause only when no other open critical item belongs
+to the phase; round **999** offers only `accept`. See [QA loop](#qa-loop).
 
 ## QA loop
 
@@ -536,9 +545,14 @@ for durable evidence. Do not repair the journal or markers by hand.
 | Plan paused: `integration-resume-failed`; critical `F-` says the queue could not resume | Preserve the export and error; fix the resume failure, then `/plan resume <planId>` to retry queue reconciliation. Do not edit the journal to bypass it. |
 | Plan paused: `integration-bug`; critical `F-` says a journal batch was rejected and the queue stopped | Preserve the rejected-batch error/export, fix the defect, **restart the executor**, then explicitly resume. The new queue reconciles; an inbox answer or resume alone cannot revive the stopped queue. |
 | Plan paused: `integration-infrastructure`; critical `F-` ends with `unpause to retry` | Fix the named repository-lock, git-access or check-execution problem, then `/plan resume <planId>`. Queued/open work is retained; never force integration past unrun checks. |
+| Plan paused: `integration-lock-lost`; critical `F-` says the repository lock was `lost (taken over or removed)` and no further git write was made | Preserve the export and identify the competing writer or lock removal. Wait for legitimate ownership to be released; do not delete another holder's lock. Once the cause is fixed, `/plan resume <planId>` reacquires the lock and rolls the entry back for retry. |
+| Plan paused: `integration-branch-moved`; critical `F-` says the ref `does not exist`, is `not at the journaled head`, the `compare-and-swap` failed, or `no journaled fast-forward explains it` | Preserve the export, actual ref tip, journaled head and error; investigate external ref changes/deletion or the compare-and-swap failure. Arrange owner-led recovery or a corrected recompiled plan before explicitly resuming. Do not force-reset the integration branch or edit the ledger to bypass the mismatch. |
+| Plan paused: `ff-refused`; critical `F-` says `git merge --ff-only <candidate> was refused in the integration worktree (head <head>)` | Preserve the export and diagnose the git refusal against the recorded candidate/head. Fix the cause, then `/plan resume <planId>` rolls the entry back. Do not force a merge or rewrite published integration history. |
+| Plan paused: `integration-branch-missing`; critical `F-` says the ref does not exist and the `compile/start step (5.1) must create the integration branch and its integration worktree slot` | Preserve the export and journaled head; diagnose missing startup resources. Arrange owner-led recovery or a corrected recompiled plan that creates the branch and integration slot before retrying. Repeated resume cannot create them; do not fabricate refs or journal entries by hand. |
 | Phase paused: `suite-unresolvable` or `suite-unattributed`; critical `F-` explains unresolved checks or unattributable failures | Preserve suite/base evidence; correct the configuration or attribution problem. Arrange owner-led recovery/recompilation if needed: answering `F-` or resuming the whole plan does not unpause this phase. |
 | Phase paused: `revert-conflict`; critical `F-` lists paths and inspection commands | Inspect the exported range/conflict in a separate scratch worktree, never the live integration tree. Resolve the underlying conflict through owner-led recovery or a corrected plan; do not assume an inbox answer unpauses the phase. |
 | Phase paused: `revert-insufficient`; critical `F-` says checks still fail and the branch is unchanged | Diagnose the remaining failing ids/tests before owner-led recovery or recompilation. Do not force the failed revert into integration or manually clear the phase flag. |
+| Phase paused: `qa-cap`; gate `awaiting-qa`, critical `R-` says `phase <phaseId> QA round <round> of <max> still has blocking findings:` | Review the listed findings, then `/plan answer --plan <planId> <id> accept` to defer them and pass, or `fix` for another fix/re-review round (only `accept` at round 999). This clears the phase pause only if no other open critical item belongs to the phase; `/plan resume` is not the cap decision. |
 | Quiet `running` child after restart | D16 uses launcher liveness plus stored tool history: a provably dead same-host launcher with no tool in flight requeues immediately. An open tool call keeps the 60 s probation because its process tree may survive; do not reset its slot yourself. |
 | Recovery or re-verification cannot progress | Supply a fresh context with a root `router_plan action=status` call in the owning session; recovered verification waits without spending grader retries. If the owning session is gone, the owner runs `router_plan action=adopt` from their session so the plan gets a live root. If it still cannot progress, preserve the export and host error evidence; never force a task to passed. |
 | Landing or GC refused | Clean/resolve the owner's checkout without discarding work; landing is fast-forward only. GC requires a finished, non-live plan; paused plans deliberately retain slots. |

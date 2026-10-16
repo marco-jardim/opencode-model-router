@@ -477,12 +477,14 @@ function executorDocProblems(doc: string, surface = executorDocSurface): string[
   return problems;
 }
 
-/** G-8: literal runtime pause events, queue pause helpers and phase pause events, not a hand-maintained reason list. */
-function executorSafetyPauseReasons(runtime: string, queue: string): { plan: string[]; phase: string[] } {
+/** G-8: runtime events, queue pause/halt helpers and queue/QA phase events, not a hand-maintained reason list. */
+function executorSafetyPauseReasons(runtime: string, queue: string, qaLoop: string): { plan: string[]; phase: string[] } {
   const plan = [...runtime.matchAll(/type:\s*"status-changed",\s*from:\s*"running",\s*to:\s*"paused",\s*reason:\s*(?:"([^"\n]+)"|`([^`\n]+)`)/g)]
     .map((m) => (m[1] ?? m[2])!.replace(/\$\{([^}]+)\}/g, "<$1>"));
   plan.push(...[...queue.matchAll(/\bthis\.pauseEvents\([^,\n]+,\s*"([^"\n]+)"\)/g)].map((m) => m[1]!));
-  const phase = [...queue.matchAll(/type:\s*"phase-paused",\s*phaseId:\s*\w+,\s*paused:\s*true,\s*reason:\s*"([^"\n]+)"/g)]
+  // halt/resumeHalt forward their second argument to pauseEvents through a variable.
+  plan.push(...[...queue.matchAll(/\bthis\.(?:halt|resumeHalt)\(\s*[^,]+,\s*"([^"\n]+)"\s*,/g)].map((m) => m[1]!));
+  const phase = [...`${queue}\n${qaLoop}`.matchAll(/type:\s*"phase-paused",\s*phaseId:\s*[\w.]+,\s*paused:\s*true,\s*reason:\s*"([^"\n]+)"/g)]
     .map((m) => m[1]!);
   return { plan: [...new Set(plan)].sort(), phase: [...new Set(phase)].sort() };
 }
@@ -499,7 +501,8 @@ describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
   const doc = read("docs/EXECUTOR.md");
   const runtimeSource = read("src/executor/runtime.ts");
   const queueSource = read("src/executor/integrate/queue.ts");
-  const safetyPauses = executorSafetyPauseReasons(runtimeSource, queueSource);
+  const qaLoopSource = read("src/executor/qa-loop.ts");
+  const safetyPauses = executorSafetyPauseReasons(runtimeSource, queueSource, qaLoopSource);
 
   it("sees the surface it pins", () => {
     expect(planSubcommands(PLAN_HELP_LINES).sort()).toEqual(
@@ -638,9 +641,9 @@ describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
   });
 
   it("names code-derived automatic safety pause reasons in unattended operation and troubleshooting (G-8)", () => {
-    // Non-vacuity: three runtime guards, two distinct queue guards, and four phase-suite/revert guards.
-    expect(safetyPauses.plan).toHaveLength(5);
-    expect(safetyPauses.phase).toHaveLength(4);
+    // Non-vacuity: three runtime guards, six distinct queue guards, four phase-suite/revert guards and the QA cap.
+    expect(safetyPauses.plan).toHaveLength(9);
+    expect(safetyPauses.phase).toHaveLength(5);
     expect(executorSafetyPauseDocProblems(doc, safetyPauses)).toEqual([]);
     expect(sectionOf(doc, "## Unattended operation").replace(/\s+/g, " ")).toContain(
       "the circuit breaker plus these bounded safety pauses, each with one inbox item",
@@ -657,14 +660,21 @@ describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
     }
   });
 
-  it("detects source additions in runtime, queue helpers and phase events (G-8 mutation self-test)", () => {
+  it("detects source additions in runtime, queue pause/halt helpers and queue/QA phase events (G-8 mutation self-test)", () => {
     const added = executorSafetyPauseReasons(
       runtimeSource + '\n{ type: "status-changed", from: "running", to: "paused", reason: "new-runtime-pause" }',
-      queueSource + '\nthis.pauseEvents(l, "new-queue-pause");\n{ type: "phase-paused", phaseId: p, paused: true, reason: "new-phase-pause" }',
+      queueSource + [
+        '\nthis.pauseEvents(l, "new-queue-pause");',
+        'this.halt(live, "new-halt-pause", "halt message");',
+        'this.resumeHalt(report, "new-resume-halt-pause", "resume halt message");',
+        '{ type: "phase-paused", phaseId: p, paused: true, reason: "new-phase-pause" }',
+      ].join("\n"),
+      qaLoopSource + '\n{ type: "phase-paused", phaseId: phase.id, paused: true, reason: "new-qa-pause" }',
     );
     expect(executorSafetyPauseDocProblems(doc, added)).toEqual(
       ["## Unattended operation", "## Troubleshooting"].flatMap((heading) =>
-        ["new-queue-pause", "new-runtime-pause", "new-phase-pause"].map((reason) => `${heading}: ${reason}`)),
+        ["new-halt-pause", "new-queue-pause", "new-resume-halt-pause", "new-runtime-pause", "new-phase-pause", "new-qa-pause"]
+          .map((reason) => `${heading}: ${reason}`)),
     );
   });
 
