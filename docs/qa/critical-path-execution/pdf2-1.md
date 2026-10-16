@@ -107,3 +107,23 @@ save. The test's T1 had no dependency, so after row 34 the scheduler unblocked i
 satisfied dependencies) and relaunched it. That launch's own pre-reset check of the slot was the second read. The test
 now gives T1 an unsatisfied dependency, as a reverted dependency is. The assertion is unchanged: one save, one release,
 both by the runtime.
+
+## Round 5 — focused re-review of e3a844a (2026-10-16)
+
+Heavy QA round 2 on the round-4 fixes. Verdict: **merge cpx/pdf2-1 into cpx/main**. M1, minor-1/N3, minor-3, minor-4
+and the empty-path nit are confirmed fixed. The RUNNING-dependent test change (dependency T0→T1 added, assertion
+unchanged) is a legitimate scenario fix: the second status read was the test task's own relaunch, which a dependent of a
+reverted task cannot do in production (`schedule.ts` promotable/unblock both need the dependency integrated).
+Orchestrator checks at e3a844a: typecheck exit 0; scoped executor/verify/v2/docs-drift/golden plus four integration
+files: 74 files, 4216 passed, 3 skipped; no `expect` removed versus 013a529.
+
+| ID | Finding | Status | Reason / next step |
+|---|---|---|---|
+| N-2 (major impact, low likelihood, pre-existing on cpx/main) | A running dependent that is not in `launcher.inFlight` — a restart-adopted child (`restoreHandle` stores a settled handle) or one dispatched but not yet launched — is not cancelled by `sweepBlocked`; its slot is saved, reset and released while the child still runs, and the leftover child can write into a slot another task acquired. | **open — mandatory 6.2.QA/6.2.FIX input** | Pre-existing (cpx/p61 queue released without saving); this merge improves it. Fix: interrupt a restart-adopted child (`rebound`/`adoptedByRecovery`, `hosts.interrupt`) and await its end before the save in `releaseBlockedSlot`; re-check the task state just before `launcher.launch`. Not deferrable under A-6.2-2. |
+| N-1 (minor) | A READY dependent's save in `releaseBlockedSlot` runs outside the task lock and can overlap a launch step of the same task on the same slot. | deferred | Needs `withTask` without awaiting ready releases in the queue's serial lane (deadlock risk with `checkTaskPhase`); follow-up with N-2. |
+| N-5 (minor) | READY dependents' saves are awaited before live dependents are cancelled, delaying the cancel by the save time. | deferred | Latency only; follow-up with N-1. |
+| relaunch-during-sweep (minor) | A blocked task relaunched while `sweepBlocked` is still saving would share the slot. | deferred | Not reachable through row 34: unblocking needs the reverted dependency re-integrated (a full attempt-and-integration cycle). |
+| N-3 (nit, pre-existing) | `slotHeldBy` returns true when the pool lookup fails; as a release gate it should fail closed. | deferred | Cosmetic hardening. |
+| N-4 (nit) | `blockedSweeps` entries are not removed when the queue's release never runs. | deferred | At most one entry per task; harmless. |
+
+The bounded heavy QA re-check of 4070b22 is closed: its round-1 major (M1) is fixed and re-verified.
