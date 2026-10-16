@@ -396,6 +396,21 @@ Head `fcf6b1b`, host OpenCode 2.0.26 (`OPENCODE_V2_BIN`), v1 lanes with 1.18.35 
 A power loss interrupted the gate after the keyless lane; the remaining lanes resumed on the same head (repository
 fsck clean).
 
+### 6.2.4 pre-flight rerun on `cpx/main` (2026-10-16)
+
+Merge `87629fc` (`cpx/p62` into `cpx/main`): `git diff fcf6b1b 87629fc -- src test package.json package-lock.json` is
+empty, so the smoke gate above stands for the merged code. Run in `D:\git\omr-cpx-p62` fast-forwarded to `87629fc`
+(no `.opencode\`, no `OPENCODE_CONFIG_DIR`); logs `D:\git\omr-cpx-p61\.cpx-logs\p62-final-*.log`.
+- `npm run typecheck`: exit 0.
+- `npx vitest run --coverage --coverage.reportOnFailure --maxWorkers=8`: 314 files, **20265 passed, 1 failed, 87
+  skipped**; coverage **statements 95.63%, branches 92.21%, functions 96.66%, lines 97.28%**, no threshold error.
+- **G-15 (minor, test, load-sensitive) — deferred with G-10.** The failure, `test/unit/roles.runtime.test.ts`
+  "annotates an ESCALATE: authority return …", hit the default 5 s timeout under the 8-worker coverage run. It passes
+  alone three times and with its file (95/95). Not a G-12 regression: its own duration with its file at 8 workers is
+  658 ms at `8c8c6e0` and 530 ms at `87629fc` (file totals 25.1 s and 26.9 s). CI's coverage gate reruns it; a CI
+  failure becomes a 6.2 finding (6.2.4-2).
+- CHANGELOG and `docs/CONFIG_REFERENCE.md` completed in `9829c3c` (docs only; docs-drift 135/135).
+
 ## Deferred findings
 
 - **G-10 (minor, test):** load-sensitive tests (`v2-background` "QA-DF1-17", `routing-ladder-resume` "QA-2.3-2",
