@@ -477,8 +477,29 @@ function executorDocProblems(doc: string, surface = executorDocSurface): string[
   return problems;
 }
 
+/** G-8: literal runtime pause events, queue pause helpers and phase pause events, not a hand-maintained reason list. */
+function executorSafetyPauseReasons(runtime: string, queue: string): { plan: string[]; phase: string[] } {
+  const plan = [...runtime.matchAll(/type:\s*"status-changed",\s*from:\s*"running",\s*to:\s*"paused",\s*reason:\s*(?:"([^"\n]+)"|`([^`\n]+)`)/g)]
+    .map((m) => (m[1] ?? m[2])!.replace(/\$\{([^}]+)\}/g, "<$1>"));
+  plan.push(...[...queue.matchAll(/\bthis\.pauseEvents\([^,\n]+,\s*"([^"\n]+)"\)/g)].map((m) => m[1]!));
+  const phase = [...queue.matchAll(/type:\s*"phase-paused",\s*phaseId:\s*\w+,\s*paused:\s*true,\s*reason:\s*"([^"\n]+)"/g)]
+    .map((m) => m[1]!);
+  return { plan: [...new Set(plan)].sort(), phase: [...new Set(phase)].sort() };
+}
+
+function executorSafetyPauseDocProblems(doc: string, pauses: ReturnType<typeof executorSafetyPauseReasons>): string[] {
+  const reasons = [...pauses.plan, ...pauses.phase];
+  return ["## Unattended operation", "## Troubleshooting"].flatMap((heading) => {
+    const section = sectionOf(doc, heading);
+    return reasons.filter((reason) => !section.includes(`\`${reason}\``)).map((reason) => `${heading}: ${reason}`);
+  });
+}
+
 describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
   const doc = read("docs/EXECUTOR.md");
+  const runtimeSource = read("src/executor/runtime.ts");
+  const queueSource = read("src/executor/integrate/queue.ts");
+  const safetyPauses = executorSafetyPauseReasons(runtimeSource, queueSource);
 
   it("sees the surface it pins", () => {
     expect(planSubcommands(PLAN_HELP_LINES).sort()).toEqual(
@@ -614,6 +635,37 @@ describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
     expect(sectionOf(doc, "## Unattended operation")).toContain("**`F > ratio·N`**");
     expect(sectionOf(doc, "## QA loop")).toContain("`<phaseId>.FIX<round>-<index>`");
     expect(sectionOf(doc, "## Recovery")).toContain("**60 s**");
+  });
+
+  it("names code-derived automatic safety pause reasons in unattended operation and troubleshooting (G-8)", () => {
+    // Non-vacuity: three runtime guards, two distinct queue guards, and four phase-suite/revert guards.
+    expect(safetyPauses.plan).toHaveLength(5);
+    expect(safetyPauses.phase).toHaveLength(4);
+    expect(executorSafetyPauseDocProblems(doc, safetyPauses)).toEqual([]);
+    expect(sectionOf(doc, "## Unattended operation").replace(/\s+/g, " ")).toContain(
+      "the circuit breaker plus these bounded safety pauses, each with one inbox item",
+    );
+  });
+
+  it("detects removal of each safety reason from either required section (G-8 mutation self-test)", () => {
+    for (const heading of ["## Unattended operation", "## Troubleshooting"]) {
+      const section = sectionOf(doc, heading);
+      for (const reason of [...safetyPauses.plan, ...safetyPauses.phase]) {
+        const mutated = doc.replace(section, section.replaceAll(`\`${reason}\``, "`removed-pause`"));
+        expect(executorSafetyPauseDocProblems(mutated, safetyPauses), `${heading}: ${reason}`).toEqual([`${heading}: ${reason}`]);
+      }
+    }
+  });
+
+  it("detects source additions in runtime, queue helpers and phase events (G-8 mutation self-test)", () => {
+    const added = executorSafetyPauseReasons(
+      runtimeSource + '\n{ type: "status-changed", from: "running", to: "paused", reason: "new-runtime-pause" }',
+      queueSource + '\nthis.pauseEvents(l, "new-queue-pause");\n{ type: "phase-paused", phaseId: p, paused: true, reason: "new-phase-pause" }',
+    );
+    expect(executorSafetyPauseDocProblems(doc, added)).toEqual(
+      ["## Unattended operation", "## Troubleshooting"].flatMap((heading) =>
+        ["new-queue-pause", "new-runtime-pause", "new-phase-pause"].map((reason) => `${heading}: ${reason}`)),
+    );
   });
 
   it("pins v2 registration, unchanged v1 maps, and the OPENCODE_V2.md handoff", () => {
@@ -1642,7 +1694,8 @@ describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () =
   it("the gated floor table is authorityFloor with a return gate for every grant, detection, risk and scope", () => {
     expect(gatedFloorTableProblems(guide)).toEqual([]);
     expect(flat).toContain('`routing.roleFloor: "strict"`, the default');
-    expect(flat).toContain('`routing.roleFloor: "gated"`, opt-in, global only, OpenCode v2 only');
+    expect(flat).toContain('**Gated floor (`routing.roleFloor: "gated"`, OpenCode v2 only).**');
+    expect(flat).toContain('the global override can change it (the code default is `"strict"`). Project overrides cannot set it.');
     expect(flat).toContain("Otherwise the strict table applies.");
     expect(flat).toContain("Deferred `testsPass` does not qualify.");
     expect(flat).toContain("`raise:verification-fail:heavy`");

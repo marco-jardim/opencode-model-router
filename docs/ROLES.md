@@ -606,7 +606,8 @@ edit + execution never runs on `fast`: an edit can change what a script does, so
 code the agent wrote. After a verification FAIL the router raises the child's floor for its next resume itself; the
 orchestrator never sets `tier=` or `model` for that.
 
-**Gated floor (`routing.roleFloor: "gated"`, opt-in, global only, OpenCode v2 only).**
+**Gated floor (`routing.roleFloor: "gated"`, OpenCode v2 only).** The bundled `tiers.json` can set this mode;
+the global override can change it (the code default is `"strict"`). Project overrides cannot set it.
 This table applies only when verification actually runs **at return**: enforcement is on, not bypassed,
 `verify.require` is not `never`, the verification placement is allowed, verification is not deferred, and the
 effective acceptance is not `none`. It also requires that the next tier above `medium` within the role's ceiling and
