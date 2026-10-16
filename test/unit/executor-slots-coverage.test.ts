@@ -230,6 +230,8 @@ function harness(o: { maxParallel?: number; fs?: MemFs; logger?: boolean } = {})
   const pool = createSlotPool({
     planId: PLAN, repoKey: "repo-key", toplevel: TOP, slotsDir: SLOTS, markersDir: MARKERS, executorHome: HOME,
     maxParallel: o.maxParallel ?? 4, git, fs, clock, provisioner: prov, platform: "win32",
+    // The ledger's integration head (a valid id), so special-slot tests exercise their own refusal paths.
+    integrationHead: () => C1,
     ...(o.logger === false ? {} : { logger: { warn: (m: string) => { warnings.push(m); } } }),
   });
   const marker = (slot: string): SlotRecord => {
@@ -393,6 +395,7 @@ describe("SlotPool on a POSIX host", () => {
     const pool = createSlotPool({
       planId: PLAN, repoKey: "repo-key", toplevel: "/repo/main", slotsDir: `/omr-slots/${PLAN}`, markersDir: "/omr-home/markers",
       executorHome: "/omr-home", maxParallel: 2, git, fs, clock: autoClock(), provisioner: fakeProvisioner(fs), platform: "linux",
+      integrationHead: () => C1,
     });
     await pool.open();
     const lease = await pool.acquire(PLAN, "task-1", C1);

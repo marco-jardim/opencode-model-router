@@ -91,7 +91,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   assembled at start (plan state, executor instructions, host events, retry stop, ordered disposal). Plan-task
   verification is cancelled first at disposal, a verdict decided before disposal is still journaled, manual `gc` of a
   completed plan waits for pending phase tags, and `purge` creates no directories, removes the empty plan directory and
-  skips collection for an invalid `slotsDir` when the plan holds no slot markers.
+  skips collection for an invalid `slotsDir` when the plan holds no slot markers. A `NEED MORE: budget` end resumes
+  the same child session as many times as the guard's cumulative call multiplier allows (`BUDGET_RESUMES`), then
+  parks as `budget-cap`; each budget resume starts a new guard round for that child across plugin locations (its per-dispatch budget and read
+  count restart, the cumulative ceiling stays). A superseded run's late rejection cannot interrupt or unregister its resumed round.
+  Plan children keep their resolved tier for both round budgets and cumulative ceilings. An editing task's
+  child gets the executor's `CAP:12` read cap (its `[cap: n/12]` and `CAP REACHED` banners, as a routed child's `CAP`)
+  and its route's `budget=` as its call budget; interrupted, parked or lost attempts keep
+  their uncommitted work on `omr/<plan>/wip/<task>` for the next attempt; WIP refs remain until purge, including after
+  abort. Unsaved-slot holds are rebuilt after restarts; gc and purge retry saving before collection. Purge waits up to
+  30 seconds for abort cleanup and refuses if it is still pending. Successful clean or presaved releases clear rebuilt
+  holds too, preventing duplicate abort releases; retained gc predicates still refuse any remaining hold.
+  Metadata-less slot directories are quarantined,
+  not counted as clean, and pool gc preserves uncommitted work unless the caller explicitly marks it saved.
+  Orchestrator-shell filtering drops only the semicolon-delimited clause marked `(orchestrator shell)`, not its
+  neighbours, and compilation warns on mixed criteria lines. A block left with no criteria and no checks falls back to
+  the inferred DoD. A cap written in the plan is neutralised with the task's other directives, and shared-context
+  directives are neutralised at compile, keeping the stored text identical at launch; editing tasks receive the
+  executor's own `CAP:12`, placed first (right after `PLAN CONTEXT`, before the shared context and the task text), so
+  it is the first cap token in the child prompt even when a plan token split across lines survives neutralisation.
+  Compilation takes the base branch tip from the repository toplevel (detached HEAD is refused) using the
+  full branch ref, so a same-named tag cannot confuse it; approval reads the actual plan's ledger rather than deriving
+  its id from the slots directory and refuses a moved base with `E_STALE_BASE`. Integration/CI worktrees start from
+  the ledger's integration head. Disposal no longer waits on a launch begun after it started: once a plan is disposing,
+  the runtime hands the launcher no new child and no budget resume. A park whose slot work could not be saved keeps
+  the slot on the parked task (the ledger accepts a slot on a parked task for this), so the slot is never reset or
+  released while that work is unsaved. After an abort, slot collection (automatic or `gc`) waits until each cancelled
+  child's slot was saved and released, or held when its save failed, so a slot is never collected mid-save.
 
 ### Changed
 
@@ -119,6 +145,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **OpenCode v2: a task blocked by a reverted dependency keeps its unsaved work.** The integration queue no longer
+  gives such a task's slot back to the pool unsaved. The work is first saved at the task's WIP ref (a failed save keeps
+  the slot leased). A running task's slot is released once, by the executor, after its cancelled child has ended.
+- **OpenCode v2: recovered plan work keeps interrupted-attempt safety.** Re-provisioning saves an owned slot before
+  releasing or resetting it and retains unsaved-work holds on failure. Recovered budget ends wait for root-context
+  admission before resuming the same child; launcher-liveness evidence follows the current resume round. Abort drains
+  attachment verification before saving/releasing its slots, and collection waits for those pipelines too.
 - **OpenCode v2: executor recovery no longer deadlocks when a task was verifying at restart.** Recovered
   re-verification (and a finished child's completion) no longer blocks the recovery barrier: it waits for the owning
   root's next router call, then runs. An adopt cuts the old attachment's graders, and a cut observation is no longer graded as a counted

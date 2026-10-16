@@ -313,13 +313,13 @@ export function createV2Runtime(ctx: Plugin.Context, options: V2RuntimeOptions =
       } catch (error) {
         service?.end(signal.aborted ? "interrupted" : "error");
         controller.abort();
-        if (childID) {
+        if (childID && activeChildren.get(childID) === controller) {
           try { await ctx.session.interrupt({ sessionID: childID }); } catch { /* keep the original dispatch failure */ }
         }
         throw strayResume ?? error;
       } finally {
         withdrawMark?.(); // a hook that never fired must not leave a mark behind
-        if (childID) {
+        if (childID && activeChildren.get(childID) === controller) {
           childSystems.delete(childID);
           activeChildren.delete(childID);
         }

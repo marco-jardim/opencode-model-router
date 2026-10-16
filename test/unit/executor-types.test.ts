@@ -1,9 +1,11 @@
 // test/unit/executor-types.test.ts
 // Phase 1.4 task 1.4.4: unit tests for the cross-phase executor contract in src/executor/types.ts (memo §12).
 import { describe, expect, it } from "vitest";
+import { GUARD_CUMULATIVE_MULTIPLIER } from "../../src/router/guard-profile";
 import {
   ABSOLUTE_PATH_PATTERN,
   ATTEMPT_OUTCOMES,
+  BUDGET_RESUMES,
   CHILD_END_GRACE_MS,
   ContextSupersededError,
   DURABLE_TASK_STATES,
@@ -48,6 +50,7 @@ import {
   LEDGER_STATUSES,
   LEDGER_STATUS_TRANSITIONS,
   NONCE_PATTERN,
+  ORCHESTRATOR_SHELL_RE,
   PLAN_ID_PATTERN,
   TASK_ID_PATTERN,
   TASK_KINDS,
@@ -57,6 +60,7 @@ import {
   TRANSITION_OWNERS,
   TRANSITION_TRIGGERS,
   VERDICTS,
+  WIP_TRAILER,
   canGateTransition,
   canStatusTransition,
   canTransition,
@@ -66,6 +70,7 @@ import {
   executionFailureOutcome,
   formatLaunchHeader,
   hasAttemptsLeft,
+  isAttemptResumedEvent,
   isBreakerFailure,
   isDurableEvent,
   isFindingsReport,
@@ -93,10 +98,12 @@ import type {
   CapacityController,
   CapacityView,
   ChildEnd,
+  ChildRunRequest,
   ChildRunner,
   Clock,
   DispatchBookkeeping,
   Edge,
+  ExpandInput,
   ExecutorConfig,
   ExecutorEventInput,
   ExecutorRuntime,
@@ -347,11 +354,24 @@ describe("constants and enumerations", () => {
     expect([...VERDICTS]).toEqual(["pass", "fail", "unverifiable"]);
   });
 
+  it("QA-PDF21-2-18: every budget round of an attempt fits the guard's cumulative ceiling, and one more would not", () => {
+    // The first launch plus BUDGET_RESUMES resumes, each with a full per-dispatch budget, stay within budget × multiplier.
+    for (const budget of [1, 25, 50]) {
+      const cumulative = budget * GUARD_CUMULATIVE_MULTIPLIER;
+      expect((BUDGET_RESUMES + 1) * budget).toBeLessThanOrEqual(cumulative);
+      expect((BUDGET_RESUMES + 2) * budget).toBeGreaterThan(cumulative);
+    }
+  });
+
   it("exposes the documented numeric constants and patterns", () => {
     expect(LEDGER_SCHEMA).toBe(1);
     expect(LAUNCH_CONFIRM_TIMEOUT_MS).toBe(30_000);
     expect(CHILD_END_GRACE_MS).toBe(5_000);
     expect(HEAVY_CAP_PER_PROVIDER).toBe(2);
+    expect(BUDGET_RESUMES).toBe(GUARD_CUMULATIVE_MULTIPLIER - 1);
+    expect(WIP_TRAILER).toBe("Omr-Wip");
+    expect(ORCHESTRATOR_SHELL_RE.test("Plan (ORCHESTRATOR SHELL)")).toBe(true);
+    expect(ORCHESTRATOR_SHELL_RE.test("orchestrator shell")).toBe(false);
     expect(PLAN_ID_PATTERN.test("abc")).toBe(true);
     expect(PLAN_ID_PATTERN.test("ab")).toBe(false);
     expect(PLAN_ID_PATTERN.test("a".repeat(41))).toBe(true);
@@ -426,7 +446,7 @@ describe("constants and enumerations", () => {
 const ALL_TRIGGERS: readonly TransitionTrigger[] = [
   "deps-satisfied", "dep-parked", "dep-blocked", "abort", "launch", "dep-reverted", "adopt", "reported-done", "dep-added",
   "child-created", "launch-lost", "launch-task-error", "child-ended", "child-failed", "lease-unresolvable", "qa-unparsable",
-  "escalate", "ambiguity", "child-lost", "capacity-stop", "lease-needed", "committed", "no-changes", "commit-failed",
+  "escalate", "ambiguity", "budget-cap", "child-lost", "capacity-stop", "lease-needed", "committed", "no-changes", "commit-failed",
   "verify-pass", "verify-fail", "dequeued", "fast-forwarded", "rebase-conflict", "checks-failed", "suite-culprit", "retry",
   "exhausted", "answered", "dep-recovered",
 ];
@@ -995,6 +1015,35 @@ describe("ExecutorError", () => {
     const f = new ExecutorError("E_SEQ_GAP", "gap", { expected: 3, got: 5 });
     expect(f.detail).toEqual({ expected: 3, got: 5 });
   });
+
+  it("supports the stale-base contract code", () => {
+    expect(new ExecutorError("E_STALE_BASE", "base moved").code).toBe("E_STALE_BASE");
+  });
+});
+
+describe("attempt-resumed event guard", () => {
+  const event = { type: "attempt-resumed", taskId: "T2", n: 2, resumes: 1, at: T0, seq: 6, batch: 6, last: true };
+
+  it("accepts a well-formed journal event", () => {
+    expect(isAttemptResumedEvent(event)).toBe(true);
+    expect(isAttemptResumedEvent(clone(event))).toBe(true);
+    expect(isDurableEvent({ type: "attempt-resumed", taskId: "T2", n: 2, resumes: 1 })).toBe(true);
+  });
+
+  it("rejects malformed fields and missing required fields", () => {
+    for (const key of Object.keys(event)) {
+      const missing: Record<string, unknown> = { ...event };
+      delete missing[key];
+      expect(isAttemptResumedEvent(missing), `missing ${key}`).toBe(false);
+    }
+    for (const patch of [
+      { type: "attempt-ended" }, { taskId: "constructor" }, { taskId: 1 },
+      { n: 0 }, { n: 1.5 }, { n: "2" }, { resumes: 0 }, { resumes: -1 },
+      { resumes: 1.5 }, { resumes: "1" }, { resumes: Number.NaN }, { resumes: Number.POSITIVE_INFINITY },
+      { at: "yesterday" }, { seq: 0 }, { batch: 0 }, { last: "true" },
+    ]) expect(isAttemptResumedEvent({ ...event, ...patch }), JSON.stringify(patch)).toBe(false);
+    for (const value of [null, undefined, [], "attempt-resumed"]) expect(isAttemptResumedEvent(value)).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -1007,6 +1056,19 @@ describe("ledger guards", () => {
     expect(isLedgerV1(l)).toBe(true);
     expect(isLedgerV1(clone(l))).toBe(true);
     expect(ledgerSchemaOf(l)).toBe(1);
+  });
+
+  it("accepts attempts with and without the optional resumes counter", () => {
+    const l = buildLedger();
+    const a = attemptOf(taskOf(l, "T2"), 1);
+    expect(a.resumes).toBeUndefined();
+    expect(isLedgerV1(l)).toBe(true);
+    for (const resumes of [0, 1, BUDGET_RESUMES]) {
+      a.resumes = resumes;
+      expect(isLedgerV1(l)).toBe(true);
+    }
+    delete a.resumes;
+    expect(isLedgerV1(l)).toBe(true);
   });
 
   it("accepts the defaults config, explicit command refs and a provision record", () => {
@@ -1660,7 +1722,8 @@ function oracleTaskCodes(t: TaskNode): Set<string> {
   if (A.some((a, i) => a.n !== i + 1)) out.add("attempt-n");
   if (flying ? !(openAt.length === 1 && openAt[0] === A.length - 1) : openAt.length > 0) out.add("open-attempt");
   const holdsSlot = ["dispatched", "running", "completed", "verifying", "verified", "integrating"];
-  const noSlot = ["pending", "blocked", "parked", "done", "cancelled", "integrated", "reverted"];
+  // QA-PDF21-3 amends A1-7: a parked task may keep the slot whose work could not be saved.
+  const noSlot = ["pending", "blocked", "done", "cancelled", "integrated", "reverted"];
   if (holdsSlot.includes(t.state) && t.slot === null) out.add("slot-required");
   if (noSlot.includes(t.state) && t.slot !== null) out.add("slot-forbidden");
   if (["verifying", "verified", "integrating"].includes(t.state) && t.branch === null) out.add("branch-required");
@@ -2092,6 +2155,34 @@ const HOST_ERROR: HostError = { type: "provider.rate-limit", status: 429, messag
 const EDGE: Edge = { from: "T1", to: "T3", kind: "learned", confidence: "low", evidence: "e" };
 
 describe("typed test doubles for every interface", () => {
+  it("keeps child resume, launch resume and restored expansion fields optional", () => {
+    const child: ChildRunRequest = {
+      parentSessionID: "ses-0", prompt: "TASK", agent: "implementer", model: ROUTE.model,
+      cwd: LEASE.path, signal: new AbortController().signal, detached: true, context: CONTEXT_REF,
+      onCreated: async () => undefined,
+    };
+    expect(child.resumeSessionID).toBeUndefined();
+    const resumedChild: ChildRunRequest = { ...child, resumeSessionID: "ses-1" };
+    expect(resumedChild.resumeSessionID).toBe("ses-1");
+
+    expect(REQUEST.resume).toBeUndefined();
+    const resumedLaunch: LaunchRequest = { ...REQUEST, resume: { childSessionID: "ses-1" } };
+    expect(resumedLaunch.resume?.childSessionID).toBe("ses-1");
+
+    const expansion: ExpandInput = {
+      ledger: LEDGER, taskId: "T3", attempt: 2, nonce: NONCE, slot: LEASE,
+      env: { worktrees: [], longPaths: true },
+    };
+    expect(expansion.restored).toBeUndefined();
+    const restoredExpansion: import("../../src/executor/expand").ExpandInput = {
+      ...expansion, restored: { attempt: 1, files: 2 },
+    };
+    expect(restoredExpansion.restored).toEqual({ attempt: 1, files: 2 });
+
+    const cause: Parameters<UnattendedPolicy["park"]>[1] = "budget-cap";
+    expect(cause).toBe("budget-cap");
+  });
+
   it("LedgerStore", async () => {
     const { calls, hit } = tracker();
     const writer = {} as LedgerWriter;

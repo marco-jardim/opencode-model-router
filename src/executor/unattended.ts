@@ -1,10 +1,11 @@
 // UnattendedPolicy (task 4.2.2): the inbox, parking, answers and the circuit breaker (memo phase-4.2.md §1-§3).
 import type {
   Attempt, ExecutorConfig, ExecutorEventInput, InboxItem, InboxKind, IsoTime, JsonValue, LeaseService, LedgerV1,
-  LedgerWriter, PhaseId, QaLoop, TaskId, TaskState, UnattendedPolicy, Waker, Clock,
+  LedgerWriter, PhaseId, QaLoop, TaskId, TaskState, TransitionTrigger, UnattendedPolicy, Waker, Clock,
 } from "./types.js";
 import {
-  ExecutorError, QA_CAP_OPTIONS, countsTowardMaxAttempts, formatInboxId, isBreakerFailure, nextInboxNumber,
+  ExecutorError, QA_CAP_OPTIONS, TRANSITION_TRIGGERS, countsTowardMaxAttempts, formatInboxId, isBreakerFailure,
+  nextInboxNumber,
 } from "./types.js";
 import { edgeSatisfied } from "./schedule.js";
 
@@ -20,6 +21,15 @@ export interface UnattendedDeps {
   qa: Pick<QaLoop, "onCapAnswer">;
   clock: Clock;
   log: UnattendedLog;
+  /**
+   * pdf2-1 (b): called by `park` before the batch that clears the task's slot (`task-slot slot:null`), while the task still
+   * holds `slot`; the runtime saves the slot's work there. QA-PDF21-3: `false` or a throw means the work could not be
+   * saved: the park goes on but keeps the slot (no `task-slot slot:null`, no lease release), so nothing resets or
+   * releases it; the runtime raises the blocking item that names the slot.
+   */
+  beforeSlotRelease?(taskId: TaskId, slot: string, cause: ParkCause): Promise<boolean | void>;
+  /** QA-PDF21-7: the options of the park item `park` writes for `taskId` (none by default). */
+  parkOptions?(taskId: TaskId, cause: ParkCause): readonly string[];
 }
 
 export const INBOX_TEXT_MAX = 4000; // U3
@@ -205,7 +215,19 @@ export function parkItemOf(l: Readonly<LedgerV1>, t: Readonly<LedgerV1["tasks"][
   return cands[0];
 }
 
-const RUNNING_CAUSES: readonly ParkCause[] = ["escalate", "ambiguity", "qa-unparsable"];
+const RUNNING_CAUSES: readonly ParkCause[] = ["escalate", "ambiguity", "qa-unparsable", "budget-cap"];
+
+/**
+ * pdf2-1 (a): the `running -> parked` trigger of a running cause: the cause itself (`budget-cap` included, which
+ * `TRANSITION_TRIGGERS["running>parked"]` admits). A cause the table does not admit for that pair is refused here, before
+ * any batch, rather than by the ledger's replay.
+ */
+export function runningParkTrigger(cause: ParkCause): { trigger: TransitionTrigger; detail: string | null } {
+  if (TRANSITION_TRIGGERS["running>parked"]?.includes(cause) !== true) {
+    throw new ExecutorError("E_INVALID_INPUT", `${cause} does not park a running task`, { cause });
+  }
+  return { trigger: cause, detail: null };
+}
 const EXHAUSTED_FROM: readonly TaskState[] = ["conflict", "failed", "reverted"];
 
 export function createUnattendedPolicy(d: UnattendedDeps): UnattendedPolicy {
@@ -268,8 +290,26 @@ export function createUnattendedPolicy(d: UnattendedDeps): UnattendedPolicy {
     const out: {
       item: InboxItem | null; written: boolean; releaseSlot: boolean; feed: { phaseId: PhaseId; nonce: string } | null;
     } = { item: null, written: false, releaseSlot: false, feed: null };
-    if (taskOf(d.writer.ledger, taskId) === undefined) {
+    const t0 = taskOf(d.writer.ledger, taskId);
+    if (t0 === undefined) {
       throw new ExecutorError("E_INVALID_INPUT", `unknown task ${taskId}`, { taskId });
+    }
+    // pdf2-1 (b): the slot's work is saved before the batch below clears the slot. QA-PDF21-3: a failed save keeps it on
+    // the parked task (A1-7 lets a parked task hold a slot for this; before that amendment the batch was refused).
+    let keptSlot: string | null = null;
+    if (t0.slot !== null && d.beforeSlotRelease !== undefined) {
+      try {
+        if ((await d.beforeSlotRelease(taskId, t0.slot, cause)) === false) keptSlot = t0.slot;
+      } catch (e) {
+        keptSlot = t0.slot;
+        d.log("warn", "saving the slot's work before the park failed; the slot is kept", e instanceof Error ? e.message : String(e));
+      }
+    }
+    let options: string[] = [];
+    try {
+      options = [...(d.parkOptions?.(taskId, cause) ?? [])];
+    } catch (e) {
+      d.log("warn", "park options failed", e instanceof Error ? e.message : String(e));
     }
     await d.writer.append((l) => {
       out.written = false;
@@ -302,14 +342,14 @@ export function createUnattendedPolicy(d: UnattendedDeps): UnattendedPolicy {
           events.push({ type: "attempt-context", taskId, n: last.n, context: bounded });
           if (cause === "qa-unparsable") out.feed = { phaseId: t.phase ?? "", nonce: last.nonce };
         }
-        events.push({ type: "task-transition", taskId, from: "running", to: "parked", trigger: cause, detail: null });
+        events.push({ type: "task-transition", taskId, from: "running", to: "parked", ...runningParkTrigger(cause) });
       } else {
         // QA-4.2-5: the same marker as the running causes, so `answer` can tell the park item from any other item.
         const last = t.attempts[t.attempts.length - 1];
         if (last !== undefined) events.push({ type: "attempt-context", taskId, n: last.n, context: bounded });
         events.push({ type: "task-transition", taskId, from: t.state, to: "parked", trigger: "exhausted", detail: null });
       }
-      if (t.slot !== null) {
+      if (t.slot !== null && t.slot !== keptSlot) {
         events.push({ type: "task-slot", taskId, slot: null, branch: t.branch });
         out.releaseSlot = true;
       }
@@ -325,7 +365,7 @@ export function createUnattendedPolicy(d: UnattendedDeps): UnattendedPolicy {
       const kind = parkItemKind(cause);
       const item: InboxItem = {
         id: formatInboxId(kind.kind, nextInboxNumber(l)), kind: kind.kind, severity: kind.severity, taskId, text: bounded,
-        options: [], answer: null, createdAt: now,
+        options: [...options], answer: null, createdAt: now,
       };
       events.push({ type: "inbox-added", item });
       for (const dep of pendingDependentsClosure(l, taskId)) {

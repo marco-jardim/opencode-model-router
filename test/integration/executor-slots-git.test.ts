@@ -538,7 +538,16 @@ describe("slot pool on real git", () => {
     const stray = join(s.slotsDir, "stray");
     mkdirSync(stray);
     writeFileSync(join(stray, "keep.txt"), "mine\n");
-    const out = await s.pool.gc(async (planId) => planId === PLAN);
+    // link-out is deliberately untracked (a directory on Windows, a symlink on POSIX), not a clean slot.
+    expect((await s.ops.statusPorcelain(slot)).some((entry) => entry.xy === "??" && /^link-out(?:\/|$)/.test(entry.path))).toBe(true);
+    const refused = await s.pool.gc(async (planId) => planId === PLAN);
+    expect(refused.removed).toEqual([]);
+    expect(refused.reported).toContainEqual(expect.stringContaining("uncommitted changes"));
+    expect(existsSync(slot)).toBe(true);
+    expect(read(join(precious, "gold.txt"))).toBe("keep\n");
+    // Exercise the destructive link sweep only with the caller's explicit saved-work confirmation. The fixture
+    // owns these disposable links; their original contents remain in precious, outside the slot.
+    const out = await s.pool.gc(async (planId) => planId === PLAN, { savedSlots: new Set([slot]) });
     expect(out.removed).toEqual([slot]);
     expect(out.reported).toEqual([`${stray}: unmarked`]);
     expect(existsSync(slot)).toBe(false);

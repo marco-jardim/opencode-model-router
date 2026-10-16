@@ -103,6 +103,10 @@ function headerOf(ctx: HostSessionContext | null, sharedContext: string | undefi
   return shared === null ? null : parseLaunchHeader(prompt, shared);
 }
 
+/**
+ * Everything between "PLAN CONTEXT\n" and the blank line before the header line. For an editing task that span starts
+ * with the executor's read-cap line (DF-2-9); `parseLaunchHeader` reads it back as a prompt without the optional line.
+ */
 function inferSharedContext(prompt: string): string | null {
   const open = "PLAN CONTEXT\n";
   if (!prompt.startsWith(open)) return null;
@@ -325,7 +329,10 @@ export function createRecoveryService(d: RecoveryDeps): RecoveryEngine {
       })();
       const records = await launchers;
       if (records === null) return "unknown";
-      const matches = records.filter((r) => r.taskId === t.id && r.n === String(a.n) && r.nonce === a.nonce && r.child === child);
+      // Resumes reuse the attempt/nonce/child. Only the current durable resume round can prove launcher death;
+      // an older process's evidence must not mark a child resumed by this process as inactive.
+      const matches = records.filter((r) => r.taskId === t.id && r.n === String(a.n) && r.nonce === a.nonce && r.child === child
+        && (r.resumes === undefined ? (a.resumes ?? 0) === 0 : r.resumes === String(a.resumes ?? 0)));
       if (matches.length !== 1) return "unknown";
       const r = matches[0]!;
       // Malformed or ambiguous history is not proof of death.

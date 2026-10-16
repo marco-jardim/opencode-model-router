@@ -21,6 +21,7 @@ import {
   canGateTransition,
   canStatusTransition,
   canTransition,
+  isAttemptResumedEvent,
   isDurableEvent,
   isHistoryEvent,
   isLedgerV1,
@@ -398,6 +399,17 @@ function applyEvent(l: LedgerV1, e: ExecutorEvent, ctx: BatchCtx): string | null
       a.childSessionID = e.childSessionID;
       a.outcome = null;
       a.endedAt = null;
+      break;
+    }
+    case "attempt-resumed": {
+      const t = taskOf(l, e.taskId);
+      if (t === null) return "task-missing";
+      const a = latestAttempt(t);
+      if (t.state !== "running") return "attempt-resumed-state";
+      if (a === null || a.n !== e.n || a.outcome !== null) return "attempt-resumed-target";
+      if (!isAttemptResumedEvent(e)) return "attempt-resumed-shape";
+      if (e.resumes !== (a.resumes ?? 0) + 1) return "attempt-resumed-count";
+      a.resumes = e.resumes;
       break;
     }
     case "attempt-ended": {

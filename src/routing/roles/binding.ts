@@ -38,6 +38,7 @@ import { isAbsolute } from "node:path";
 import type { AuthorityAction } from "../../router/roles";
 import { GRANT_NOTES, type DispatchGrant } from "./policy";
 import { leaseTaskRef } from "../../executor/types";
+import { forgetExecutorChildRound } from "../../executor/child-guards";
 
 export interface PendingDispatch {
   parentSessionID: string;
@@ -68,6 +69,8 @@ export interface PlanChildIdentity {
 }
 
 export interface Binding {
+  /** Resolved executor route tier; its budget and cumulative ceiling must not fall back to the role floor. */
+  tier?: string;
   /** Set only for a plan child ({@link bindPlanChild}). */
   role?: string;
   /** Set only for a plan child ({@link bindPlanChild}). */
@@ -480,6 +483,7 @@ export async function bind(childSessionID: string, getSession: SessionLookup, op
 
 export interface PlanChildBindInput {
   childSessionID: string;
+  tier?: string;
   role: string;
   agent: string;
   workRoot: string;
@@ -487,6 +491,11 @@ export interface PlanChildBindInput {
   planId: string;
   taskId: string;
   attempt: number;
+  /**
+   * QA-PDF21-2-20: the call budget of the plan child's route (its `budget=`), as a routed dispatch's binding carries; absent or
+   * null: the role's default budget.
+   */
+  budget?: number | null;
 }
 
 /**
@@ -512,8 +521,10 @@ export function bindPlanChild(input: PlanChildBindInput): void {
   }
   const known = new Set<string>(ACTION_ORDER);
   const actions = ordered(input.grant.filter((a): a is AuthorityAction => known.has(a)));
+  const tier = input.tier ?? existing?.binding.tier;
   const binding: Binding = {
     role: input.role,
+    ...(tier === undefined ? {} : { tier }),
     plan: {
       planId: input.planId, taskId: input.taskId, attempt: input.attempt,
       taskRef: leaseTaskRef(input.planId, input.taskId), scope: "until-integrated",
@@ -523,7 +534,10 @@ export function bindPlanChild(input: PlanChildBindInput): void {
     grant: { actions, notes: [], workRoot: root },
     candidates: [],
     decisionID: null,
-    budget: null,
+    // QA-PDF21-2-20: the route's `budget=`; a re-bind of the same child that names none keeps the budget it was bound with.
+    budget: input.budget === undefined
+      ? existing?.binding.budget ?? null
+      : typeof input.budget === "number" && Number.isInteger(input.budget) && input.budget > 0 ? input.budget : null,
   };
   reg.inflight.delete(id);
   remember(reg.bound, id, { binding, parentSessionID: undefined, agent: input.agent }, BOUND_MAX);
@@ -591,6 +605,7 @@ export function evictCall(parentSessionID: string, callID: string): void {
  * so neither a running lookup nor a later registration can attach anything to it.
  */
 export function evict(sessionID: string): void {
+  forgetExecutorChildRound(sessionID);
   const reg = registry();
   const now = Date.now();
   remember(reg.deleted, sessionID, now, DELETED_MAX);
@@ -614,6 +629,7 @@ export function dropBindingCacheForTests(childSessionID: string): void {
 /** Test only: empties the process-wide registry. */
 export function resetBindingRegistryForTests(): void {
   const reg = registry();
+  for (const child of reg.bound.keys()) forgetExecutorChildRound(child);
   reg.pending.clear();
   reg.bound.clear();
   reg.inflight.clear();

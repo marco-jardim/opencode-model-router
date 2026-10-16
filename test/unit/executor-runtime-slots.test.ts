@@ -520,7 +520,7 @@ describe("U1: runtime plan-scoped slots", () => {
     const h = await rig(check);
     await h.compile(draft("plan-a"));
     await expect(h.runtime.approve("plan-a", "owner-plan-a")).rejects.toMatchObject({ code: "E_INVALID_INPUT" });
-    expect(check).toHaveBeenCalledWith("C:/slots/plan-a", REPO);
+    expect(check).toHaveBeenCalledWith("C:/slots/plan-a", REPO, "plan-a");
     expect((await h.store.exportPlan("plan-a")).events.some(event => event.type === "plan-approved")).toBe(false);
     expect((await h.store.read("plan-a")).status).toBe("awaiting-approval");
     expect(h.slotsFor).not.toHaveBeenCalled();
@@ -535,7 +535,7 @@ describe("U1: runtime plan-scoped slots", () => {
     await h.compile(value);
     const approving = h.runtime.approve("plan-a", "owner-plan-a");
     await vi.waitFor(() => expect(check).toHaveBeenCalledOnce(), { timeout: 2_000 });
-    expect(check).toHaveBeenCalledWith(defaultSlotsDir(REPO, "plan-a"), REPO);
+    expect(check).toHaveBeenCalledWith(defaultSlotsDir(REPO, "plan-a"), REPO, "plan-a");
     expect((await h.store.exportPlan("plan-a")).events.some(event => event.type === "plan-approved")).toBe(false);
     release(); await approving;
     expect((await h.store.exportPlan("plan-a")).events.filter(event => event.type === "plan-approved")).toHaveLength(1);

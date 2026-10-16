@@ -687,8 +687,9 @@ Reader roles are never denied for "non-producing" reads; producer roles keep the
 only when it carries `CAP:N` or `CAP:none` (or when a `subagentTiers` entry maps the role's name to a tier, see
 [Migration](#migration-from-subagenttiers-and-agents)); without one, only the total budget above bounds it.
 
-**Budgets stop a child only in `enforced` mode.** The router's guard enforces role budgets (and the read-only cap) only
-when the effective `enforcement.mode` is `enforced`. In `advisory` mode (the shipped default) it only warns: the child
+**Budgets stop a child only in `enforced` mode.** The router's guard enforces total role budgets only
+when the effective `enforcement.mode` is `enforced`; numeric read-only caps are advisory banners, not hard stops.
+In `advisory` mode (the shipped default) it only warns: the child
 is never stopped by the router, and only the host's own `steps` limit (above) ends a run that goes on. A child that
 is out of budget (or of refusals) in `advisory` mode and returns `NEED MORE: budget` is still a budget stop: the
 router records a `budget` signal and the parent's result gets the `[router budget]` note. In `off` mode the guard does

@@ -2,17 +2,21 @@
  * Phase 3.1.4: task expansion (the launch prompt of one plan task attempt).
  *
  * Design memo: docs/qa/critical-path-execution/phase-3.1.md M36 and §8 "expand.ts (3.1.4)".
- * Pure except `loadExpansionEnv`, which reads the worktree list and `core.longpaths` through the `GitRunner` seam.
+ * Pure except optional diagnostic logging and `loadExpansionEnv`, which reads the worktree list and
+ * `core.longpaths` through the `GitRunner` seam.
  * The route line is re-serialized from whitelisted tokens; plan text never reaches it.
  */
 import * as path from "node:path";
 import { DETECTIONS, NEEDS, RISKS, SCOPES, TASK_CLASSES } from "../routing/classify/types";
+import { ROUTE_BUDGET_MAX } from "../routing/classify/route-line";
+import { neutralizeDirectives } from "../verify/pending";
 import { slotEnvFor } from "./slots/env";
 import {
   ABSOLUTE_PATH_PATTERN,
   ExecutorError,
   FINDINGS_FORMAT,
   formatLaunchPrompt,
+  stripOrchestratorShell,
   type GitRunner,
   type LedgerV1,
   type SlotLease,
@@ -45,15 +49,34 @@ export interface ExpandInput {
   nonce: string;
   slot: SlotLease;
   env: ExpansionEnv;
+  /** The previous attempt's work restored as uncommitted changes. */
+  restored?: { attempt: number; files: number };
+  /** Best-effort diagnostic for ignored route budgets; defaults to a console warning. */
+  log?(message: string, detail?: unknown): void;
 }
 
 /** The expansion: the full launch prompt, the re-serialized route line and the slot-relative check inputs. */
 export interface ExpandedTask {
   prompt: string;
   routeLine: string;
+  /**
+   * QA-PDF21-2-20 (optional, additive): the route line's `budget=` (`routeBudgetOf(routeLine)`), the launch request's
+   * `routeBudget`; null when the line names none.
+   */
+  routeBudget?: number | null;
   acceptance: string | null;
   verify: string | null;
   workRoot: string;
+}
+
+/**
+ * QA-PDF21-2-20: the `budget=` of a re-serialized route line (`renderRouteLine`: whitelisted tokens, an in-range budget only),
+ * or null when it names none. The launch request carries it into the plan child's binding, as a routed dispatch's binding.
+ */
+export function routeBudgetOf(routeLine: string): number | null {
+  const m = /^\[route [^\]\r\n]*?\bbudget=(\d+)\]$/.exec(routeLine.trim());
+  const n = m?.[1] === undefined ? 0 : Number(m[1]);
+  return Number.isInteger(n) && n >= 1 && n <= ROUTE_BUDGET_MAX ? n : null;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -285,10 +308,11 @@ interface RouteFields {
   d: string | null;
   tier: string | null;
   pin: boolean | null;
+  budget: number | null;
 }
 
-function parseRouteFields(line: string, kind: TaskNode["kind"]): RouteFields {
-  const f: RouteFields = { cls: null, risk: null, scope: null, needs: [], d: null, tier: null, pin: null };
+function parseRouteFields(line: string, kind: TaskNode["kind"], log?: ExpandInput["log"]): RouteFields {
+  const f: RouteFields = { cls: null, risk: null, scope: null, needs: [], d: null, tier: null, pin: null, budget: null };
   const trimmed = line.trim();
   if (trimmed === "") return f;
   // Earlier QA ledgers stored bare fix-route bodies. This compatibility case still uses the same strict parser.
@@ -307,11 +331,21 @@ function parseRouteFields(line: string, kind: TaskNode["kind"]): RouteFields {
     const raw = eq === -1 ? null : token.slice(eq + 1).toLowerCase();
     if (seen.has(key)) routeFail(`duplicate field ${key}`);
     seen.add(key);
-    if (key === "root" || key === "budget") continue; // replaced by the slot / not carried
+    if (key === "root") continue; // replaced by the slot
     if (key === "pin") {
       if (raw === null || raw === "true" || raw === "yes" || raw === "1") f.pin = true;
       else if (raw === "false" || raw === "no" || raw === "0") f.pin = false;
       else routeFail("value of pin is outside its token pattern", { value: raw.slice(0, 40) });
+      continue;
+    }
+    if (key === "budget") {
+      const n = raw !== null && /^\d+$/.test(raw) ? Number(raw) : 0;
+      if (n >= 1 && n <= ROUTE_BUDGET_MAX) f.budget = n;
+      else {
+        try {
+          log?.("route expansion ignored invalid or out-of-range budget", { value: raw?.slice(0, 40) ?? null });
+        } catch { /* logging never fails expansion */ }
+      }
       continue;
     }
     if (raw === null || (key !== "needs" && !TOKEN_VALUE_RE.test(raw))) {
@@ -338,15 +372,16 @@ function parseRouteFields(line: string, kind: TaskNode["kind"]): RouteFields {
 
 /**
  * The route line sent with the attempt (M36): re-serialized from the whitelisted tokens class, risk, scope, needs, d,
- * `root=<slotPath>` (quoted when the path holds a space), tier and pin. `task.route.tier` and `task.route.pin` (`[tier:X]` gives `tier=X pin`) win over the
+ * `root=<slotPath>` (quoted when the path holds a space), tier, pin and budget. `task.route.tier` and `task.route.pin` (`[tier:X]` gives `tier=X pin`) win over the
  * line's own `tier=`/`pin`. A value outside its token pattern, or holding whitespace, `]` or a line break, fails with
- * E_LAUNCH_TASK. The plan text (title, text, subtasks) is never read here.
+ * E_LAUNCH_TASK, except invalid/out-of-range budgets, which are ignored as by the route compiler. The plan text
+ * (title, text, subtasks) is never read here.
  */
-export function renderRouteLine(task: TaskNode, slotPath: string): string {
+export function renderRouteLine(task: TaskNode, slotPath: string, log: ExpandInput["log"] = console.warn): string {
   if (!ROOT_VALUE_RE.test(slotPath) || /(?:^|[\\/])\.\.(?:[\\/]|$)/.test(slotPath)) {
     routeFail("the slot path is not a usable root= value", { slotPath: slotPath.slice(0, 120) });
   }
-  const f = parseRouteFields(task.route.line, task.kind);
+  const f = parseRouteFields(task.route.line, task.kind, log);
   const tier = task.route.tier ?? f.tier;
   if (tier !== null && !isMemberOf(ROUTE_TIERS, tier)) routeFail("unknown tier", { value: String(tier).slice(0, 40) });
   const pin = task.route.pin || f.pin === true;
@@ -360,6 +395,7 @@ export function renderRouteLine(task: TaskNode, slotPath: string): string {
   parts.push(ROOT_NEEDS_QUOTES_RE.test(slotPath) ? `root="${slotPath}"` : `root=${slotPath}`);
   if (tier !== null) parts.push(`tier=${tier}`);
   if (pin) parts.push("pin");
+  if (f.budget !== null) parts.push(`budget=${f.budget}`);
   return `[route ${parts.join(" ")}]`;
 }
 
@@ -399,23 +435,45 @@ function environmentLines(slot: SlotLease): string[] {
  * The task block of one attempt (M36 "taskBlock order"). Plan text (title, text, subtasks, acceptance criteria) has
  * every in-repo absolute path rewritten through `map` first. `\n` only, no trailing spaces.
  */
-export function renderTaskBlock(ledger: Readonly<LedgerV1>, task: TaskNode, slot: SlotLease, map: PathMap): string {
+export function renderTaskBlock(
+  ledger: Readonly<LedgerV1>, task: TaskNode, slot: SlotLease, map: PathMap, restored?: ExpandInput["restored"],
+): string {
   void ledger;
   const rw = (s: string): string => rewriteAbsolutePaths(s, map);
+  let skipped = false;
+  const childText = (text: string): string => text.split(/\r\n|\n|\r/).flatMap((line) => {
+    const m = /^(\s*criteria\s*:\s*)(.*)$/i.exec(line);
+    if (m === null) return [line];
+    const { kept, dropped } = stripOrchestratorShell(m[2] ?? "");
+    skipped ||= dropped;
+    if (!dropped) return [line];
+    return kept === null ? [] : [`${m[1]}${kept}`];
+  }).join("\n");
   const out: string[] = [];
   out.push(`TASK ${task.id}: ${rw(task.title)}`);
-  if (task.text.trim() !== "") out.push(rw(task.text));
-  if (task.subtasks.length > 0) {
+  const text = childText(task.text);
+  if (text.trim() !== "") out.push(rw(text));
+  if (restored !== undefined) {
+    // QA-PDF21-2 nit: a seeded salvage commit has no attempt of its own (attempt 0): it is named as salvaged work.
+    const origin = restored.attempt === 0
+      ? `Previous work (salvaged, ${restored.files} files)`
+      : `Your previous attempt's work (attempt ${restored.attempt}, ${restored.files} files)`;
+    out.push("", `${origin} is already in your work root as uncommitted changes. Continue it; do not start over.`);
+  }
+  const subtasks = task.subtasks.map(childText).filter((s) => s.trim() !== "");
+  if (subtasks.length > 0) {
     out.push("", "SUBTASKS");
-    task.subtasks.forEach((s, i) => out.push(`${i + 1}. ${rw(s)}`));
+    subtasks.forEach((s, i) => out.push(`${i + 1}. ${rw(s)}`));
   }
   const list = (paths: readonly string[]): string => (paths.length === 0 ? "(none)" : paths.join(", "));
   out.push("", `Writes: ${list(task.footprint.writes)}`, `Reads: ${list(task.footprint.reads)}`);
   out.push("", "ENVIRONMENT", ...environmentLines(slot));
   if (task.acceptance !== null) {
-    const criteria = acceptanceCriteria(rw(task.acceptance));
+    const { criteria, skipped: skippedAcceptance } = acceptanceCriteria(rw(task.acceptance));
+    skipped ||= skippedAcceptance;
     if (criteria.length > 0) out.push("", "ACCEPTANCE", ...criteria.map((c) => `- ${c}`));
   }
+  if (skipped) out.push("", "Checks marked (orchestrator shell) are run by the orchestrator after you return; do not run or request them.");
   const latest = task.attempts[task.attempts.length - 1];
   if (latest !== undefined && latest.context.trim() !== "") out.push("", "ATTEMPT CONTEXT", rw(latest.context));
   out.push("", "MUST NOT DO", ...MUST_NOT_DO_RULES.map((r) => `- ${r}`));
@@ -424,13 +482,17 @@ export function renderTaskBlock(ledger: Readonly<LedgerV1>, task: TaskNode, slot
 }
 
 /** The `criteria:` lines of an `[acceptance]` block as plain sentences (the machine checks are not shown to the child). */
-function acceptanceCriteria(block: string): string[] {
+function acceptanceCriteria(block: string): { criteria: string[]; skipped: boolean } {
   const out: string[] = [];
+  let skipped = false;
   for (const raw of block.split(/\r\n|\n|\r/)) {
     const m = /^\s*criteria\s*:\s*(.+?)\s*$/i.exec(raw);
-    if (m?.[1] !== undefined) out.push(m[1]);
+    if (m?.[1] === undefined) continue;
+    const { kept, dropped } = stripOrchestratorShell(m[1]);
+    skipped ||= dropped;
+    if (kept !== null) out.push(kept);
   }
-  return out;
+  return { criteria: out, skipped };
 }
 
 /** The prefix maps of one expansion (M36 "Prefixes"). */
@@ -465,16 +527,21 @@ export function expandTask(i: ExpandInput): ExpandedTask {
   const task = Object.prototype.hasOwnProperty.call(i.ledger.tasks, i.taskId) ? i.ledger.tasks[i.taskId] : undefined;
   if (task === undefined) fail("task is not in the ledger", { taskId: i.taskId });
   const map = buildPathMap(i.ledger, task, i.slot, i.env);
-  const routeLine = renderRouteLine(task, i.slot.path);
-  const taskBlock = renderTaskBlock(i.ledger, task, i.slot, map);
+  const routeLine = renderRouteLine(task, i.slot.path, i.log);
+  const taskBlock = renderTaskBlock(i.ledger, task, i.slot, map, i.restored);
+  // TaskNode carries no parsed CAP, and a cap written in the plan is neutralized with the rest of the task text. An editing
+  // task gets the executor's own read-cap line right after "PLAN CONTEXT", before the shared context and the task text, so
+  // it is the first read-cap token the router sees (the first one wins, DF-2-9).
   const prompt = formatLaunchPrompt(
-    i.ledger.sharedContext,
+    i.ledger.sharedContext, // The fixed launch/recovery prefix must match the ledger byte for byte.
     { planId: i.ledger.planId, taskId: i.taskId, attempt: i.attempt, nonce: i.nonce },
-    taskBlock,
+    neutralizeDirectives(taskBlock),
+    parseRouteFields(routeLine, task.kind).needs.includes("edit"),
   );
   return {
     prompt,
     routeLine,
+    routeBudget: routeBudgetOf(routeLine),
     acceptance: task.acceptance === null ? null : rewriteAbsolutePaths(task.acceptance, map),
     verify: task.verify === "none" ? null : task.verify,
     workRoot: i.slot.path,

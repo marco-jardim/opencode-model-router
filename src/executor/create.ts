@@ -71,7 +71,7 @@ export class PlanSlotPools {
     release: async () => { throw new ExecutorError("E_PLAN_STATE", "a slot operation requires a plan"); },
     get: async () => null,
     list: async (id) => id === undefined ? (await Promise.all([...this.entries.keys()].map((plan) => this.of(plan).list()))).flat() : this.of(id).list(),
-    gc: (finished) => this.gc(finished),
+    gc: (finished, opts) => this.gc(finished, opts),
   };
 
   of(planId: PlanId): SlotPool {
@@ -83,7 +83,11 @@ export class PlanSlotPools {
       if (entry.closed) return Promise.reject(new ExecutorError("E_PLAN_STATE", `slots of plan ${planId} are closed`));
       entry.pool ??= this.deps.store.read(planId).then(async (ledger) => {
         const pool = this.deps.makePool(ledger);
-        try { await pool.open(); } catch (error) { pool.close(); throw error; }
+        try {
+          if (ledger.status === "completed" || ledger.status === "aborted") await pool.open({ create: false });
+          else await pool.open();
+        }
+        catch (error) { pool.close(); throw error; }
         if (entry.closed) { pool.close(); throw new ExecutorError("E_PLAN_STATE", `slots of plan ${planId} are closed`); }
         pool.onTaskSlotReleased?.(() => {
           if (entry.closed) return;
@@ -94,6 +98,16 @@ export class PlanSlotPools {
         return pool;
       });
       return entry.pool;
+    };
+    // An invalid slotsDir with no markers has nothing to save (the purge has the same exception).
+    const inspect = async <T>(read: (pool: OpenPool) => Promise<T>, empty: T): Promise<T> => {
+      if (entry.closed) return empty;
+      try {
+        return await read(await get());
+      } catch (error) {
+        if (error instanceof ExecutorError && error.code === "E_INVALID_INPUT" && await this.deps.markers?.(planId) === 0) return empty;
+        throw error;
+      }
     };
     const view: SlotPool = {
       acquire: async (...args) => (await get()).acquire(...args),
@@ -106,18 +120,20 @@ export class PlanSlotPools {
         releaseListeners.add(listener);
         return () => { releaseListeners.delete(listener); };
       },
-      get: async (...args) => entry.closed ? null : (await get()).get(...args),
-      list: async (...args) => entry.closed ? [] : (await get()).list(...args),
-      gc: async (finished) => {
+      get: (...args) => inspect((pool) => pool.get(...args), null),
+      list: (...args) => inspect((pool) => pool.list(...args), []),
+      gc: async (finished, opts) => {
         if (entry.closed) {
           // QA-5.1-22: the gc-only handle creates no directory.
           const pool = this.deps.makePool(await this.deps.store.read(planId));
-          try { await pool.open({ create: false }); return await pool.gc(finished); }
+          try { await pool.open({ create: false }); return await pool.gc(finished, opts); }
           finally { pool.close(); }
         }
         const pool = await get();
-        const result = await pool.gc(finished);
-        if (await finished(planId)) { entry.closed = true; pool.close(); }
+        const result = await pool.gc(finished, opts);
+        // A partial collection must keep its markers readable for the next save preflight, even though the pool
+        // itself already fences writes. A successful collection has nothing left to inspect.
+        if (await finished(planId) && result.reported.length === 0) { entry.closed = true; pool.close(); }
         return result;
       },
     };
@@ -127,13 +143,13 @@ export class PlanSlotPools {
     return view;
   }
 
-  async gc(finished: Parameters<SlotPool["gc"]>[0]): ReturnType<SlotPool["gc"]> {
+  async gc(finished: Parameters<SlotPool["gc"]>[0], opts?: Parameters<SlotPool["gc"]>[1]): ReturnType<SlotPool["gc"]> {
     const removed: string[] = [], reported: string[] = [];
     for (const plan of await this.deps.store.list()) {
       if (!sameToplevel(plan.toplevel, this.deps.toplevel)) continue;
       if (plan.status !== "completed" && plan.status !== "aborted" && this.entries.get(plan.planId)?.pool == null) continue;
       try {
-        const result = await this.of(plan.planId).gc(finished);
+        const result = await this.of(plan.planId).gc(finished, opts);
         removed.push(...result.removed); reported.push(...result.reported);
       } catch (error) {
         this.deps.log?.("warn", "slot gc failed", { planId: plan.planId, error: error instanceof Error ? error.message : String(error) });
@@ -205,6 +221,17 @@ export function slotsDirOf(planId: PlanId, toplevel: string, root: string | null
 function checkSlotsDir(slotsDir: string, toplevel: string): void {
   const result = validateSlotsDir(slotsDir, toplevel);
   if (!result.ok) throw new ExecutorError("E_INVALID_INPUT", result.reason);
+}
+
+/** Approval must still target the branch tip captured by compile, before any integration worktree is created. */
+async function checkBase(git: RuntimeDeps["git"], repo: LedgerV1["repo"]): Promise<void> {
+  const result = await git.run(["rev-parse", "--verify", `refs/heads/${repo.baseBranch}^{commit}`], { cwd: repo.toplevel, timeoutMs: 5_000 });
+  if (result.code !== 0) throw new ExecutorError("E_GIT", `could not read base branch ${repo.baseBranch}`);
+  const head = result.stdout.trim();
+  if (head !== repo.baseCommit) {
+    throw new ExecutorError("E_STALE_BASE", `base branch ${repo.baseBranch} moved ${repo.baseCommit}→${head} since compile; recompile`,
+      { baseBranch: repo.baseBranch, old: repo.baseCommit, new: head });
+  }
 }
 
 const processClaimKey = Symbol.for("omr.executor.claim.v1");
@@ -368,6 +395,7 @@ function assembleExecutor(context: { directory: string }, options: CreateExecuto
         return createSlotPool({ planId: ledger.planId, repoKey: ledger.repo.key, toplevel, slotsDir,
           markersDir: join(home, "slots"), executorHome: home, maxParallel: ledger.config.maxParallel,
           git: opsOf(ledger.planId), fs, clock,
+          integrationHead: async () => (await store.read(ledger.planId)).integration.head,
           provisioner: createProvisioner({ spawner, fs, clock, config: ledger.config,
             host: { platform: process.platform, env: process.env, guards: workRootGuards(slotsDir) } }),
           logger: { warn: (message) => log("warn", message) },
@@ -389,8 +417,8 @@ function assembleExecutor(context: { directory: string }, options: CreateExecuto
         const tier = names[Math.max(floor, Math.min(ceiling, requested))];
         const config = tier === undefined ? undefined : tiers[tier];
         const model = config === undefined ? undefined : parseModelRef(config.model);
-        if (model === undefined) throw new ExecutorError("E_INVALID_INPUT", "the task model is unavailable");
-        return { agent: role.agent, model: { providerID: model.providerId, modelID: model.modelId, variant: config?.variant ?? null },
+        if (model === undefined || tier === undefined) throw new ExecutorError("E_INVALID_INPUT", "the task model is unavailable");
+        return { agent: role.agent, tier, model: { providerID: model.providerId, modelID: model.modelId, variant: config?.variant ?? null },
           provider: model.providerId, heavy: tier === "heavy" };
       },
     };
@@ -470,6 +498,8 @@ function assembleExecutor(context: { directory: string }, options: CreateExecuto
           };
           poll();
         },
+        // M1: the runtime saves a blocked dependent's slot before its release (it always supplies the hook).
+        releaseSlot: input.releaseSlot ?? ((_taskId, slot) => pool.release(slot)),
         locks: createRepoLockFactory({ stateRoot: join(home, "locks"), clock, pid: spawner.pid, hostname: spawner.hostname, isPidAlive: spawner.isAlive }),
         guard, clock, logger,
       });
@@ -479,7 +509,7 @@ function assembleExecutor(context: { directory: string }, options: CreateExecuto
         async resume() {
           const ledger = input.writer.ledger, ref = `refs/heads/${ledger.integration.branch}`;
           if (await igit.readRef(toplevel, ref) === null) {
-            const result = await git.run(["update-ref", ref, ledger.repo.baseCommit, "0".repeat(ledger.repo.baseCommit.length)], { cwd: toplevel, timeoutMs: 5_000 });
+            const result = await git.run(["update-ref", ref, ledger.integration.head, "0".repeat(ledger.integration.head.length)], { cwd: toplevel, timeoutMs: 5_000 });
             if (result.code !== 0 && await igit.readRef(toplevel, ref) === null) throw new ExecutorError("E_GIT", "could not create the integration branch");
           }
           await pool.acquireSpecial(planId, "integration");
@@ -493,7 +523,7 @@ function assembleExecutor(context: { directory: string }, options: CreateExecuto
       return { sessionID, pid: spawner.pid, hostname: spawner.hostname, startedAt: now, heartbeatAt: now };
     };
     const self = processIdentity();
-    runtime = createExecutorRuntime({ store, compiler, self,
+    runtime = createExecutorRuntime({ store, compiler, self, executorHome: home,
       observations: options.observations,
       slots: planPools.facade, slotsFor: (id) => planPools.of(id), purgeSlots: (id, finished) => planPools.purge(id, finished),
       scheduler: createScheduler(), launcher: taskLauncher, routes, verifier: host.verifier, git, hosts: host.hosts, bindings: host.bindings, clock,
@@ -515,7 +545,13 @@ function assembleExecutor(context: { directory: string }, options: CreateExecuto
         launcherLiveness: { self, isAlive: spawner.isAlive } }),
       holder, capacity: createCapacityController, collaborators: realCollaborators({ queue: buildQueue, clock, log }),
       pinOrchestrator: host.pinOrchestrator, log,
-      config: () => ({ ...resolveRouting(loadConfig(directory), "v2").executor, slotsDir: null }), toplevel, checkSlotsDir,
+      config: () => ({ ...resolveRouting(loadConfig(directory), "v2").executor, slotsDir: null }), toplevel,
+      async checkSlotsDir(slotsDir, repoToplevel, planId?: PlanId) {
+        checkSlotsDir(slotsDir, repoToplevel);
+        if (planId === undefined) throw new ExecutorError("E_PLAN_STATE", "approval validation requires the plan id");
+        const ledger = await store.read(planId);
+        await checkBase(git, ledger.repo);
+      },
     });
     const innerRuntime = runtime;
     let disposal: Promise<void> | null = null;

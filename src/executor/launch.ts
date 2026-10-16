@@ -3,6 +3,7 @@
  * orchestrator's latest router tool call. Memo 3.1.1 §4-§5, ADR 0007 D14.
  */
 
+import { ResumeRejectedError } from "../compat/child-session";
 import {
   ABSOLUTE_PATH_PATTERN,
   CHILD_END_GRACE_MS,
@@ -10,7 +11,9 @@ import {
   LAUNCH_CONFIRM_TIMEOUT_MS,
   LAUNCH_HEADER_PATTERN,
   executionFailureOutcome,
+  formatLaunchHeader,
   isContextSupersededError,
+  isTaskId,
   type CancelReason,
   type ChildEnd,
   type ChildRunner,
@@ -33,9 +36,22 @@ import {
   type TaskLauncher,
 } from "./types";
 
-export type PlanBindInput = Parameters<RoleBindings["bind"]>[0] & { planId: PlanId; taskId: TaskId; attempt: number };
+/**
+ * QA-PDF21-2-20: `budget` is the route's `budget=` (the guard's per-dispatch budget of the child, as a routed dispatch's;
+ * absent: none named); `prompt` is the launch prompt, whose cap line sets the child's read cap (a resume's names none).
+ */
+export type PlanBindInput = Parameters<RoleBindings["bind"]>[0] & {
+  planId: PlanId; taskId: TaskId; attempt: number; budget?: number | null; prompt?: string; tier?: string;
+};
 
-/** Binding of a plan child; the production adapter maps `bind` to `bindPlanChild` and `evict` to binding.ts `evict`. */
+/**
+ * Binding of a plan child; the production adapter maps `bind` to `bindPlanChild` and `evict` to binding.ts `evict`
+ * (which tombstones the id: nothing binds it again). pdf2-1 (a): a completed child whose launch holds its binding
+ * (`LaunchHooks.holdCompletedBinding`) is evicted only once the runtime decided not to resume it; a budget resume of the
+ * same child under the same plan, task and attempt takes the live binding over instead of binding it again.
+ * QA-PDF21-2-20: `bind` also carries the launch prompt (the adapter registers the child's read cap from the executor's cap
+ * line) and the route `budget=` (the binding's call budget); QA-PDF21-2-11: a resume's new guard round is the bookkeeping's.
+ */
 export interface PlanRoleBindings {
   bind(i: PlanBindInput): void;
   evict(childSessionID: string): void;
@@ -91,6 +107,9 @@ export const MAX_TRACKED_SESSIONS = 256;
 const CONTEXT_ERROR_TEXT =
   /session[ _-]?not[ _-]?found|(?:context|capture)[ _-]?(?:superseded|expired|aborted|stale|invalid|gone|missing|not[ _-]?found)|(?:expired|aborted|stale|superseded)[ _-]?(?:context|capture)/i;
 
+/** Must match runtime.ts RESUME_PROMPT; resumes continue the existing child without a fresh plan header. */
+const RESUME_PROMPT = "continue and finish";
+
 /**
  * QA-3.1-4: whether a runner error before confirmation says the retained context itself is unusable (so the capture is
  * marked stale), as opposed to a deterministic runner failure that a fresh capture would not change (native subagent tool
@@ -118,7 +137,7 @@ interface Launch {
   readonly startedAt: IsoTime;
   childId: string | null;
   cancelReason: CancelReason | null;
-  /** `onCreated` was entered before the confirmation deadline. */
+  /** `onCreated` (fresh child) or the first step (resume) entered before the confirmation deadline. */
   hookEntered: boolean;
   timedOut: boolean;
   confirmSettled: boolean;
@@ -135,6 +154,7 @@ interface Launch {
   confirmTimer: { readonly id: number } | null;
   graceTimer: { readonly id: number } | null;
   resolveConfirmation(c: LaunchConfirmation): void;
+  rejectConfirmation(error: unknown): void;
   resolveCompletion(e: ChildEnd): void;
 }
 
@@ -149,6 +169,12 @@ export function createTaskLauncher(d: TaskLauncherDeps): TaskLauncher {
   const lastEpoch = new Map<string, number>();
   /** Captures of a session up to this epoch no longer launch anything (D14 guard 2). */
   const staleEpoch = new Map<string, number>();
+  /**
+   * pdf2-1 (a): live bindings of completed children kept for a budget resume (`LaunchHooks.holdCompletedBinding`), by
+   * child session, with the plan, task and attempt they were bound for. Dropped by `releaseBinding`, taken over by a
+   * resume of the same child under the same plan, task and attempt, evicted on dispose.
+   */
+  const held = new Map<string, { planId: PlanId; taskId: TaskId; attempt: number }>();
 
   const launchKey = (taskId: TaskId, attempt: number): string => `${taskId}#${attempt}`;
 
@@ -156,6 +182,17 @@ export function createTaskLauncher(d: TaskLauncherDeps): TaskLauncher {
     setBounded(lastEpoch, c.sessionID, Math.max(lastEpoch.get(c.sessionID) ?? 0, c.epoch));
   });
   const offEvents = d.hosts.onEvent((e) => {
+    if (e.type === "step.started") {
+      const l = byChild.get(e.sessionID);
+      if (l !== undefined && l.req.resume !== undefined && !l.confirmSettled && l.cancelReason === null && !disposed) {
+        l.hookEntered = true;
+        if (l.confirmTimer !== null) d.clock.clearTimer(l.confirmTimer);
+        l.confirmTimer = null;
+        settleConfirmation(l, {
+          kind: "confirmed", childSessionID: e.sessionID, latencyMs: Math.max(0, d.clock.now() - Date.parse(l.startedAt)),
+        }, "confirmed");
+      }
+    }
     if (isTerminal(e)) onTerminal(e);
   });
 
@@ -209,6 +246,10 @@ export function createTaskLauncher(d: TaskLauncherDeps): TaskLauncher {
     l.graceTimer = null;
   };
 
+  const evictBinding = (childId: string): void => {
+    try { d.bindings.evict(childId); } catch { /* the binding is dropped with the session anyway */ }
+  };
+
   const release = (l: Launch, status?: ChildEnd["kind"]): void => {
     if (l.inFlightRegistered) {
       l.inFlightRegistered = false;
@@ -217,7 +258,13 @@ export function createTaskLauncher(d: TaskLauncherDeps): TaskLauncher {
     }
     if (l.bound && l.childId !== null) {
       l.bound = false;
-      try { d.bindings.evict(l.childId); } catch { /* the binding is dropped with the session anyway */ }
+      // pdf2-1 (a): a completed child may be resumed for its budget; its binding waits for the caller's decision
+      // (`releaseBinding`, or a resume of the same child under the same task and attempt). Every other end evicts here.
+      if (status === "completed" && l.hooks.holdCompletedBinding === true && !disposed) {
+        held.set(l.childId, { planId: l.req.planId, taskId: l.req.taskId, attempt: l.req.attempt });
+        return;
+      }
+      evictBinding(l.childId);
     }
   };
 
@@ -236,7 +283,7 @@ export function createTaskLauncher(d: TaskLauncherDeps): TaskLauncher {
     forget(l);
   };
 
-  const settleConfirmation = (l: Launch, c: LaunchConfirmation, result: ContextAgeResult): void => {
+  const settleConfirmation = (l: Launch, c: LaunchConfirmation, result: ContextAgeResult, rejection?: unknown): void => {
     if (l.confirmSettled) return;
     l.confirmSettled = true;
     if (c.kind === "confirmed") l.confirmed = true;
@@ -249,7 +296,8 @@ export function createTaskLauncher(d: TaskLauncherDeps): TaskLauncher {
         capturedAt: l.contextInfo.capturedAt, ageMs: l.ageMs, result,
       });
     } catch { /* a metric sink never fails a launch */ }
-    l.resolveConfirmation(c);
+    if (rejection !== undefined) l.rejectConfirmation(rejection);
+    else l.resolveConfirmation(c);
   };
 
   const unconfirm = (
@@ -312,7 +360,9 @@ export function createTaskLauncher(d: TaskLauncherDeps): TaskLauncher {
       if (!l.confirmSettled) {
         // No error to classify: a runner that returns without ever creating the child leaves the context in doubt.
         markStale(l.req.orchestratorSessionID, l.req.context.epoch);
-        unconfirm(l, "threw", "the runner returned without creating a confirmed child");
+        unconfirm(l, "threw", l.req.resume !== undefined
+          ? "the runner returned without a first step from the resumed child"
+          : "the runner returned without creating a confirmed child");
       }
       settleCompletion(l, { kind: "lost", childSessionID: l.childId, reason: "runner-error", endedAt: d.clock.iso() });
       release(l);
@@ -324,6 +374,9 @@ export function createTaskLauncher(d: TaskLauncherDeps): TaskLauncher {
   };
 
   const onRunnerError = (l: Launch, error: unknown): void => {
+    if (l.req.resume !== undefined && error instanceof ResumeRejectedError) {
+      error = new ExecutorError("E_NO_CONTEXT", error.message, { childSessionID: error.sessionID });
+    }
     l.runnerDone = true;
     if (l.completionSettled) {
       // Already settled (a confirmation timeout or an event): only the leftovers of a late-adopted child remain.
@@ -333,9 +386,17 @@ export function createTaskLauncher(d: TaskLauncherDeps): TaskLauncher {
     }
     const at = d.clock.iso();
     if (!l.confirmed) {
-      if (l.cancelReason !== null && l.childId === null) {
+      if (l.req.resume !== undefined && !l.confirmSettled && l.cancelReason === null
+        && typeof error === "object" && error !== null && "code" in error && error.code === "E_NO_CONTEXT") {
+        // A missing resume session is not a stale orchestrator capture. Keep the typed error for Rt to park this attempt.
+        settleConfirmation(l, { kind: "unconfirmed", reason: "threw", error: messageOf(error) }, "threw", error);
+        settleCompletion(l, { kind: "lost", childSessionID: l.childId, reason: "runner-error", endedAt: at });
+        forget(l);
+        return;
+      }
+      if (l.cancelReason !== null && (l.childId === null || l.req.resume !== undefined)) {
         unconfirm(l, "threw", error);
-        settleCompletion(l, { kind: "interrupted", childSessionID: null, reason: l.cancelReason, endedAt: at });
+        settleCompletion(l, { kind: "interrupted", childSessionID: l.childId, reason: l.cancelReason, endedAt: at });
       } else if (isContextSupersededError(error)) {
         unconfirm(l, "superseded", error);
         settleCompletion(l, { kind: "lost", childSessionID: null, reason: "context-superseded", endedAt: at });
@@ -370,7 +431,10 @@ export function createTaskLauncher(d: TaskLauncherDeps): TaskLauncher {
     const { req } = l;
     d.bindings.bind({
       childSessionID: child, role: req.role, agent: req.route.agent, workRoot: req.workRoot, grant: [...req.grant],
-      planId: req.planId, taskId: req.taskId, attempt: req.attempt,
+      planId: req.planId, taskId: req.taskId, attempt: req.attempt, prompt: req.prompt,
+      ...(req.route.tier === undefined ? {} : { tier: req.route.tier }),
+      // QA-PDF21-2-20: the route `budget=` guards the plan child as it guards a routed role child (absent: kept on a re-bind).
+      ...(req.routeBudget !== undefined ? { budget: req.routeBudget } : {}),
     });
     l.bound = true;
   };
@@ -383,6 +447,12 @@ export function createTaskLauncher(d: TaskLauncherDeps): TaskLauncher {
   /** The runner's hook: awaited before the child is moved and prompted. */
   const onCreated = async (l: Launch, child: string): Promise<void> => {
     if (disposed || l.cancelReason !== null) throw new Error("[model-router] launch cancelled before the child was prompted");
+    if (l.req.resume !== undefined) {
+      // The runner registers a resumed session through this hook too, but it creates no child and journals no AC/AA.
+      if (child !== l.req.resume.childSessionID) throw new ExecutorError("E_NO_CONTEXT", "the runner did not resume the requested child");
+      if (l.confirmSettled && !l.confirmed) throw new Error("[model-router] resume was not confirmed in time");
+      return;
+    }
     if (!l.timedOut) {
       // In time (guard 1): from here the confirmation waits for this hook, however long it takes.
       l.hookEntered = true;
@@ -431,25 +501,48 @@ export function createTaskLauncher(d: TaskLauncherDeps): TaskLauncher {
         reason: g.ok ? "superseded" : g.reason,
       });
     }
-    const header = LAUNCH_HEADER_PATTERN.exec(req.prompt);
     const bad = (message: string): never => {
       throw new ExecutorError("E_LAUNCH_TASK", message, { taskId: req.taskId, attempt: req.attempt });
     };
-    if (!req.prompt.startsWith("PLAN CONTEXT\n")) bad("the prompt does not start with PLAN CONTEXT");
-    if (header === null || header[1] !== req.planId || header[2] !== req.taskId || header[3] !== String(req.attempt)
-      || header[4] !== req.nonce) bad("the prompt header does not match the launch request");
+    if (req.resume !== undefined) {
+      if (req.prompt !== RESUME_PROMPT) bad("the resume prompt does not match the runtime resume prompt");
+      if (typeof req.planId !== "string" || typeof req.nonce !== "string" || !isTaskId(req.taskId)) {
+        bad("the resume plan, task or nonce is invalid");
+      }
+      formatLaunchHeader(req); // Validate the plan, task, attempt and nonce even though no header is sent.
+      if (typeof req.resume.childSessionID !== "string" || req.resume.childSessionID.trim() === "") {
+        bad("the resume child session id is empty");
+      }
+      // pdf2-1 (a): a held binding is taken over only by the identical plan child; never re-bound to another identity.
+      const kept = held.get(req.resume.childSessionID);
+      if (kept !== undefined && (kept.planId !== req.planId || kept.taskId !== req.taskId || kept.attempt !== req.attempt)) {
+        bad("the resume child is bound to another plan, task or attempt");
+      }
+    } else {
+      const header = LAUNCH_HEADER_PATTERN.exec(req.prompt);
+      // An editing task's read-cap line follows this opening line (DF-2-9), so the opening check holds for every prompt.
+      if (!req.prompt.startsWith("PLAN CONTEXT\n")) bad("the prompt does not start with PLAN CONTEXT");
+      if (header === null || header[1] !== req.planId || header[2] !== req.taskId || header[3] !== String(req.attempt)
+        || header[4] !== req.nonce) bad("the prompt header does not match the launch request");
+    }
     if (!d.knownAgent(req.route.agent)) bad(`unknown agent ${req.route.agent}`);
     if (!ABSOLUTE_PATH_PATTERN.test(req.workRoot)) bad("the work root is not an absolute path");
     const key = launchKey(req.taskId, req.attempt);
     for (const other of launches.values()) {
+      // QA-PDF21-2-17: a resume may follow its own attempt's run whose completion already settled (the child's terminal event
+      // after the grace) while that run's runner has not returned yet: the same plan, task, attempt and child. That record is
+      // no launch in flight; the identity checks of `forget` keep its late runner result from touching the resume's records.
+      if (req.resume !== undefined && other.key === key && other.completionSettled && other.req.planId === req.planId
+        && other.childId === req.resume.childSessionID) continue;
       if (other.key === key || (other.req.taskId === req.taskId && !other.completionSettled)) {
         bad("the task already has a launch in flight");
       }
     }
 
     let resolveConfirmation: (c: LaunchConfirmation) => void = () => undefined;
+    let rejectConfirmation: (error: unknown) => void = () => undefined;
     let resolveCompletion: (e: ChildEnd) => void = () => undefined;
-    const confirmation = new Promise<LaunchConfirmation>((resolve) => { resolveConfirmation = resolve; });
+    const confirmation = new Promise<LaunchConfirmation>((resolve, reject) => { resolveConfirmation = resolve; rejectConfirmation = reject; });
     const completion = new Promise<ChildEnd>((resolve) => { resolveCompletion = resolve; });
     const startedAt = d.clock.iso();
     const l: Launch = {
@@ -457,30 +550,47 @@ export function createTaskLauncher(d: TaskLauncherDeps): TaskLauncher {
       childId: null, cancelReason: null, hookEntered: false, timedOut: false, confirmSettled: false, confirmed: false,
       unconfirmed: null, completionSettled: false, runnerDone: false, runnerFailed: false, terminal: null,
       inFlightRegistered: false, bound: false, confirmTimer: null, graceTimer: null,
-      resolveConfirmation, resolveCompletion,
+      resolveConfirmation, rejectConfirmation, resolveCompletion,
     };
 
     // A retained launch fires no `subagent` hook, so the executor writes the dispatch-time rows itself.
     d.bookkeeping.decisionRow(req);
     d.bookkeeping.recordDispatchStart(req, startedAt);
-    d.bookkeeping.registerInFlight(req.taskId, req.attempt, null);
+    d.bookkeeping.registerInFlight(req.taskId, req.attempt, req.resume?.childSessionID ?? null);
     l.inFlightRegistered = true;
     launches.set(key, l);
 
     l.confirmTimer = d.clock.setTimer(confirmTimeoutMs, () => {
       l.confirmTimer = null;
-      if (l.hookEntered || l.confirmSettled) return; // 30 s bounds the host's creation of the child, not our own hook
+      if (l.hookEntered || l.confirmSettled) return; // 30 s bounds child creation / the resumed child's first step, not our own hook
       l.timedOut = true;
       markStale(req.orchestratorSessionID, req.context.epoch);
       unconfirm(l, "timeout", null);
-      settleCompletion(l, { kind: "lost", childSessionID: null, reason: "unconfirmed", endedAt: d.clock.iso() });
+      settleCompletion(l, { kind: "lost", childSessionID: req.resume?.childSessionID ?? null, reason: "unconfirmed", endedAt: d.clock.iso() });
+      if (req.resume !== undefined) l.controller.abort(); // There is no late child to adopt on a resume.
     });
 
     const signal = AbortSignal.any([l.controller.signal, d.lifetime]);
     let running: Promise<{ sessionID: string; text: string }>;
     try {
+      if (req.resume !== undefined) {
+        const child = req.resume.childSessionID;
+        adopt(l, child);
+        const kept = held.get(child);
+        if (kept !== undefined && kept.planId === req.planId && kept.taskId === req.taskId && kept.attempt === req.attempt) {
+          // pdf2-1 (a): the binding of the budget end is still live for this very attempt: the resume takes it over.
+          held.delete(child);
+          l.bound = true;
+        } else {
+          bindChild(l, child);
+        }
+        // QA-PDF21-2-11: the resume is a NEW guard round and read-cap round for its child, as a routed resume is; without it the
+        // child keeps the exhausted per-dispatch budget of the round that ended NEED MORE: budget (the cumulative ceiling stays).
+        try { d.bookkeeping.beginResumeRound?.(child, req.route.agent, req.prompt); } catch { /* bookkeeping never fails a launch */ }
+      }
       running = d.runner.run({
         parentSessionID: req.orchestratorSessionID,
+        ...(req.resume !== undefined ? { resumeSessionID: req.resume.childSessionID } : {}),
         prompt: req.prompt,
         agent: req.route.agent,
         model: req.route.model,
@@ -520,11 +630,19 @@ export function createTaskLauncher(d: TaskLauncherDeps): TaskLauncher {
         taskId: l.req.taskId, attempt: l.req.attempt, childSessionID: l.childId, startedAt: l.startedAt,
       }));
     },
+    releaseBinding(childSessionID) {
+      if (!held.delete(childSessionID)) return;
+      evictBinding(childSessionID);
+    },
     async dispose() {
       if (disposed) return;
       disposed = true;
       offCapture();
       offEvents();
+      for (const child of [...held.keys()]) {
+        held.delete(child);
+        evictBinding(child);
+      }
       for (const l of launches.values()) {
         if (l.cancelReason === null) l.cancelReason = "dispose";
         l.controller.abort();

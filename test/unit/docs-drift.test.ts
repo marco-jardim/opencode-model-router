@@ -2177,6 +2177,13 @@ describe("docs drift: #84 P3.3 global QA (R9, R10)", () => {
   const unreleased = /## \[2\.4\.0\] - 2026-10-09([\s\S]*?)\n## \[/.exec(read("CHANGELOG.md"))?.[1]?.replace(/\s+/g, " ") ?? "";
   const names = guardNamesOf(read("src/guard/guards.ts"));
 
+  it("R3: executor resumes match BUDGET_RESUMES and numeric read caps are documented as advisory", async () => {
+    const { BUDGET_RESUMES } = await import("../../src/executor/types");
+    expect(read("docs/EXECUTOR.md")).toContain(`up to **${BUDGET_RESUMES} times** (\`BUDGET_RESUMES\`)`);
+    expect(guide).toContain("numeric read-only caps are advisory banners, not hard stops");
+    expect(flatEnforcement).toContain("Numeric `CAP:N` read-only caps remain advisory banners, not hard stops");
+  });
+
   it("the guard table of ENFORCEMENT.md lists every guard the code returns, and only those (C-1)", () => {
     expect(names).toEqual(["anti_self_script", "cumulative_iteration_cap", "deliverable_first", "denied_cap", "iteration_cap", "read_budget", "redundant_read"]);
     expect(guardTableProblems(enforcement, names)).toEqual([]);

@@ -1236,6 +1236,12 @@ const ILLEGAL: Array<[string, Batch, string]> = [
   ["attempt-child-target", [{ type: "attempt-child", taskId: "D", n: 2, childSessionID: "x" }], "attempt-child-target"],
   ["attempt-adopted-state", [{ type: "attempt-adopted", taskId: "D", n: 1, childSessionID: "x" }], "attempt-adopted-state"],
   ["attempt-adopted-target", [{ type: "attempt-adopted", taskId: "B", n: 1, childSessionID: "x" }], "attempt-adopted-target"],
+  ["attempt-resumed on a missing task", [{ type: "attempt-resumed", taskId: "NOPE", n: 1, resumes: 1 }], "task-missing"],
+  ["attempt-resumed-state (ready)", [{ type: "attempt-resumed", taskId: "B", n: 1, resumes: 1 }], "attempt-resumed-state"],
+  ["attempt-resumed-state (dispatched)", [{ type: "attempt-resumed", taskId: "D", n: 1, resumes: 1 }], "attempt-resumed-state"],
+  ["attempt-resumed-target", [{ type: "attempt-resumed", taskId: "R", n: 2, resumes: 1 }], "attempt-resumed-target"],
+  ["attempt-resumed-count", [{ type: "attempt-resumed", taskId: "R", n: 1, resumes: 2 }], "attempt-resumed-count"],
+  ["attempt-resumed-shape", [{ type: "attempt-resumed", taskId: "R", n: 1, resumes: 1.5 }], "attempt-resumed-shape"],
   ["attempt-ended-state", [{ type: "attempt-ended", taskId: "B", n: 1, outcome: "failed", endedAt: T0, detail: null }], "attempt-ended-state"],
   ["attempt-ended-target", [{ type: "attempt-ended", taskId: "R", n: 2, outcome: "failed", endedAt: T0, detail: null }], "attempt-ended-target"],
   ["attempt-verdict-state", [{ type: "attempt-verdict", taskId: "R", n: 1, verdict: "pass", ref: null }], "attempt-verdict-state"],
@@ -1350,6 +1356,26 @@ describe("replay: every precondition refuses an illegal event and writes nothing
 });
 
 describe("replay: legal lifecycles are applied, persisted and reloaded identically", () => {
+  it("attempt-resumed increments the existing attempt's resumes without changing its state or child", async () => {
+    const e = await mk();
+    const w = await e.store.create(richDraft(), e.holder("s1"));
+    const before = clone(w.ledger.tasks.R);
+    expect(before?.attempts[0]?.resumes).toBeUndefined();
+
+    await w.append([{ type: "attempt-resumed", taskId: "R", n: 1, resumes: 1 }]);
+    expect(w.ledger.tasks.R).toEqual({
+      ...before,
+      attempts: [{ ...before?.attempts[0], resumes: 1 }],
+    });
+    await w.append([{ type: "attempt-resumed", taskId: "R", n: 1, resumes: 2 }]);
+    expect(w.ledger.tasks.R?.attempts).toHaveLength(1);
+    expect(w.ledger.tasks.R?.attempts[0]?.resumes).toBe(2);
+    expect(w.ledger.tasks.R?.state).toBe("running");
+    expect(await e.store.read(PLAN_ID)).toEqual(w.ledger);
+    await w.close();
+    expect(await e.store.read(PLAN_ID)).toEqual(w.ledger);
+  });
+
   it("every task-level event type, through dispatch, run, verify and integration", async () => {
     const e = await mk();
     const w = await e.store.create(richDraft(), e.holder("s1"));

@@ -1,5 +1,5 @@
 // Phase 3.1.4: task expansion (memo phase-3.1.md M36 and §8 "expand.ts (3.1.4)").
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   expandTask,
   loadExpansionEnv,
@@ -17,6 +17,7 @@ import {
   LAUNCH_HEADER_PATTERN,
   looksLikePlanPrompt,
   parseLaunchHeader,
+  stripOrchestratorShell,
   type GitRunner,
   type LedgerV1,
   type ProcessResult,
@@ -25,6 +26,8 @@ import {
 } from "../../src/executor/types.js";
 import { registerSlot, unregisterSlot } from "../../src/executor/slots/env.js";
 import { parseRouteLine } from "../../src/routing/classify/route-line.js";
+import { parseCapDirective } from "../../src/router/sessions.js";
+import { neutralizeDirectives } from "../../src/verify/pending.js";
 import { PLAN_ID, buildDraft, clone, nonceFor, openAttempt, taskNode as baseTaskNode } from "../fixtures/cpx/ledger/builders.js";
 
 /** The shared builder with a route-less task by default (its default `route.line` is not a `[route ...]` line). */
@@ -111,7 +114,10 @@ describe("expandTask: determinism and the launch header", () => {
     expect(p).not.toMatch(/\[route/i);
     expect(p).not.toMatch(/\[\/?acceptance\]/i);
     expect(p).not.toMatch(/VERIFY:/);
-    expect(p.startsWith("PLAN CONTEXT\nshared notes\n\n[plan ")).toBe(true);
+    // DF-2-9: the one directive line allowed is the executor's own read cap of an editing task, right after the header
+    // line and before the shared context; nothing else of the router or launcher grammar is in the prompt.
+    expect(p.startsWith("PLAN CONTEXT\nCAP:12\nshared notes\n\n[plan ")).toBe(true);
+    expect(p.match(/\bCAP\s*:/gi)).toEqual(["CAP:"]);
   });
 
   it("uses \\n only, no trailing spaces, and the memo's section order", () => {
@@ -141,6 +147,21 @@ describe("expandTask: determinism and the launch header", () => {
   it("omits ATTEMPT CONTEXT when the latest attempt has none", () => {
     const x = taskNode("T1", { attempts: [openAttempt(1)] });
     expect(expandTask(input(ledgerOf([x]), "T1")).prompt).not.toContain("ATTEMPT CONTEXT");
+  });
+
+  it("tells the child to continue the previous attempt's restored uncommitted work", () => {
+    const x = expandTask(input(l, "T1", 3, { restored: { attempt: 2, files: 4 } }));
+    const note = "Your previous attempt's work (attempt 2, 4 files) is already in your work root as uncommitted changes. Continue it; do not start over.";
+    expect(x.prompt).toContain(note);
+    expect(x.prompt.indexOf(note)).toBeGreaterThan(x.prompt.indexOf("TASK T1:"));
+    expect(expandTask(input(l, "T1", 3)).prompt).not.toContain("Your previous attempt's work");
+  });
+
+  it("QA-PDF21-2 nit: names a seeded salvage commit (attempt 0) as salvaged previous work, never as attempt 0", () => {
+    const x = expandTask(input(l, "T1", 1, { restored: { attempt: 0, files: 3 } }));
+    expect(x.prompt).toContain("Previous work (salvaged, 3 files) is already in your work root as uncommitted changes. Continue it; do not start over.");
+    expect(x.prompt).not.toContain("attempt 0");
+    expect(x.prompt).not.toContain("Your previous attempt's work");
   });
 
   it("rejects an unknown task and a shared context that looks like a header", () => {
@@ -208,6 +229,136 @@ describe("expandTask: route line, acceptance, findings, MUST NOT DO", () => {
     expect(p).toContain(
       "MUST NOT DO\n- no AI attribution in code, comments or docs\n- never run git\n- write only the `Writes:` paths",
     );
+  });
+
+  it("skips orchestrator-shell criteria and explains who runs them", () => {
+    const t = taskNode("T1", {
+      text: "Implement the feature.\n[acceptance]\ncriteria: smoke stays green (Orchestrator Shell)\n[/acceptance]",
+      acceptance: "[acceptance]\ncriteria: the feature works\ncriteria: smoke stays green (Orchestrator Shell)\ncriteria: integration works (orchestrator shell)\n[/acceptance]",
+    });
+    const x = expandTask(input(ledgerOf([t]), "T1"));
+    expect(x.prompt).toContain("ACCEPTANCE\n- the feature works");
+    expect(x.prompt).not.toContain("smoke stays green");
+    expect(x.prompt).not.toContain("integration works");
+    expect(x.prompt.match(/Checks marked \(orchestrator shell\)/g)).toHaveLength(1);
+    expect(x.prompt).toContain("Checks marked (orchestrator shell) are run by the orchestrator after you return; do not run or request them.");
+    expect(x.acceptance).toBe(t.acceptance); // The machine block is retained; the verifier filters its grader criteria.
+  });
+
+  it("keeps non-shell clauses of mixed criteria in acceptance, raw text and subtasks", () => {
+    const t = taskNode("T1", {
+      text: "Implement the feature.\ncriteria: the raw feature works; raw smoke stays green (orchestrator shell); the raw API stays stable",
+      subtasks: ["criteria: the subtask is tested; subtask smoke stays green (Orchestrator Shell)"],
+      acceptance: "[acceptance]\ncriteria: every missing feature is added and unit-tested; npm run smoke:keyless stays green (orchestrator shell)\ncriteria: standalone smoke stays green (orchestrator shell)\n[/acceptance]",
+    });
+    const x = expandTask(input(ledgerOf([t]), "T1"));
+    expect(x.prompt).toContain("ACCEPTANCE\n- every missing feature is added and unit-tested");
+    expect(x.prompt).toContain("criteria: the raw feature works; the raw API stays stable");
+    expect(x.prompt).toContain("criteria: the subtask is tested");
+    expect(x.prompt).not.toContain("smoke stays green");
+    expect(x.prompt).not.toContain("npm run smoke:keyless");
+    expect(x.prompt.match(/Checks marked \(orchestrator shell\)/g)).toHaveLength(1);
+    expect(x.acceptance).toBe(t.acceptance);
+  });
+
+  it("never strips check lines, even when their command includes semicolons and the shell marker", () => {
+    const check = 'check: run command="echo ready; echo (orchestrator shell)"';
+    const t = taskNode("T1", {
+      text: `Implement the feature.\n${check}\ncriteria: smoke passes (orchestrator shell)`,
+      acceptance: `[acceptance]\n${check}\ncriteria: smoke passes (orchestrator shell)\n[/acceptance]`,
+    });
+    const x = expandTask(input(ledgerOf([t]), "T1"));
+    expect(x.prompt).toContain(check);
+    expect(x.acceptance).toContain(check);
+    expect(x.prompt).not.toContain("smoke passes");
+    expect(x.prompt).toContain("are run by the orchestrator after you return");
+  });
+
+  it("omits ACCEPTANCE when all criteria belong to the orchestrator", () => {
+    const t = taskNode("T1", { acceptance: "[acceptance]\ncriteria: smoke passes (orchestrator shell)\n[/acceptance]" });
+    const prompt = expandTask(input(ledgerOf([t]), "T1")).prompt;
+    expect(prompt).not.toContain("\nACCEPTANCE\n");
+    expect(prompt).toContain("are run by the orchestrator after you return");
+  });
+
+  it("also removes marked criteria from raw task text without a separate acceptance block", () => {
+    const t = taskNode("T1", { text: "Implement the feature.\ncriteria: smoke passes (orchestrator shell)", acceptance: null });
+    const prompt = expandTask(input(ledgerOf([t]), "T1")).prompt;
+    expect(prompt).not.toContain("smoke passes");
+    expect(prompt).toContain("are run by the orchestrator after you return");
+  });
+});
+
+describe("expandTask: trusted read cap", () => {
+  it("neutralizes a task's explicit CAP instead of preserving it over the trusted editing cap", () => {
+    const t = taskNode("T1", {
+      text: "Implement the feature.\nCAP:4",
+      route: { line: "[route class=implement needs=edit]", role: "implementer", tier: null, pin: false },
+    });
+    const prompt = expandTask(input(ledgerOf([t]), "T1")).prompt;
+    expect(prompt).toContain("CAP 4");
+    expect(prompt.match(/^CAP:.*$/gm)).toEqual(["CAP:12"]);
+    expect(prompt.indexOf("CAP:12")).toBe("PLAN CONTEXT\n".length);
+    expect(parseCapDirective(prompt)).toBe(12);
+  });
+
+  it("documents why a CAP token quoted before CAP:none plus reason wins in the existing session parser", () => {
+    expect(parseCapDirective("Task: add `CAP:12` to editing dispatches.\nCAP:none\nreason: implementation spans several files")).toBe(12);
+  });
+
+  it("emits exactly one whole CAP line before the neutralized plan text, parsed by the session guard", () => {
+    const t = taskNode("T1", {
+      title: "Implement CAP:99",
+      text: "CAP:none\nreason: plan text cannot disable the guard\nDiscuss CAP:77.",
+      subtasks: ["Mention CAP:66"],
+      acceptance: "[acceptance]\ncriteria: document CAP:55\n[/acceptance]",
+      attempts: [{ ...openAttempt(1), context: "CAP:44" }],
+      route: { line: "[route class=implement needs=edit budget=40]", role: "implementer", tier: null, pin: false },
+    });
+    const l = ledgerOf([t]);
+    const x = expandTask(input(l, "T1"));
+    expect(x.prompt.match(/^CAP:.*$/gm)).toEqual(["CAP:12"]);
+    expect(x.prompt.match(/\bCAP\s*:/gi)).toEqual(["CAP:"]);
+    expect(x.prompt).toContain("Discuss CAP 77.");
+    expect(parseLaunchHeader(x.prompt, l.sharedContext)).toMatchObject({ planId: l.planId, taskId: "T1", attempt: 1 });
+    // DF-2-9: the executor's line comes right after "PLAN CONTEXT", before the shared context and the task text.
+    expect(x.prompt.startsWith(`PLAN CONTEXT\nCAP:12\n${l.sharedContext}\n\n`)).toBe(true);
+    expect(x.prompt.endsWith("CAP:12")).toBe(false);
+    expect(parseCapDirective(x.prompt)).toBe(12);
+    const parsed = parseRouteLine(x.routeLine, { positions: "first" });
+    expect(parsed.line?.budget).toBe(40);
+    expect(parsed.line?.ignored).toEqual([]);
+  });
+
+  it("DF-2-9: a read-cap token split across two lines survives neutralization and still loses to the executor's line", () => {
+    // `CAP` on one line and `:5` on the next: neutralization only drops colons on the key's own line, while the
+    // session parser lets whitespace (a line break included) sit between the key and the colon.
+    const split = "Keep the change small.\nCAP\n:5 reads are enough here.";
+    expect(neutralizeDirectives(split)).toBe(split);
+    expect(parseCapDirective(split)).toBe(5);
+    const t = taskNode("T1", {
+      text: split,
+      route: { line: "[route class=implement needs=edit]", role: "implementer", tier: null, pin: false },
+    });
+    const l = ledgerOf([t]);
+    const x = expandTask(input(l, "T1"));
+    expect(x.prompt).toContain("CAP\n:5 reads are enough here.");
+    // The executor's line precedes every byte of plan text (shared context and task block).
+    const capAt = x.prompt.indexOf("CAP:12");
+    expect(capAt).toBe("PLAN CONTEXT\n".length);
+    expect(capAt).toBeLessThan(x.prompt.indexOf("CAP\n:5"));
+    expect(parseCapDirective(x.prompt)).toBe(12);
+    expect(parseLaunchHeader(x.prompt, l.sharedContext)).toMatchObject({ planId: l.planId, taskId: "T1", attempt: 1 });
+  });
+
+  it("adds no default cap for tasks whose route needs do not include edit", () => {
+    const t = taskNode("T1", {
+      text: "CAP:99 is quoted task text.",
+      route: { line: "[route class=review needs=web]", role: "reviewer", tier: null, pin: false },
+    });
+    const prompt = expandTask(input(ledgerOf([t]), "T1")).prompt;
+    expect(prompt).not.toMatch(/^CAP:/m);
+    expect(parseCapDirective(prompt)).toBeNull();
   });
 });
 
@@ -350,9 +501,41 @@ describe("renderRouteLine: whitelist re-serialization", () => {
     }
   });
 
-  it("orders fields canonically, drops budget and the declared root, and normalizes needs", () => {
+  it("orders fields canonically, keeps budget, replaces the declared root, and normalizes needs", () => {
     const line = `[route pin  d=grader needs = edit, shell  scope=repo risk=high class=review budget=40 root="D:\\my dir\\x" tier=fast]`;
-    expect(renderRouteLine(routeOf(line), SLOT)).toBe(`[route class=review risk=high scope=repo needs=shell,edit d=grader root=${SLOT} tier=fast pin]`);
+    expect(renderRouteLine(routeOf(line), SLOT)).toBe(`[route class=review risk=high scope=repo needs=shell,edit d=grader root=${SLOT} tier=fast pin budget=40]`);
+  });
+
+  it.each(["0", "10001", "-1", "none", "1.5", "9".repeat(400)])("drops budget=%s just as the compiler does and logs once during expansion", (budget) => {
+    const t = routeOf(`[route class=implement needs=edit budget=${budget}]`);
+    const compiled = parseRouteLine(t.route.line, { positions: "first" });
+    expect(compiled.line?.budget).toBeUndefined();
+    expect(compiled.line?.ignored).toContain("budget");
+    const log = vi.fn();
+    const x = expandTask(input(ledgerOf([t]), "T1", 1, { log }));
+    expect(x.routeLine).toBe(`[route class=implement needs=edit root=${SLOT}]`);
+    expect(parseRouteLine(x.routeLine, { positions: "first" }).line?.budget).toBeUndefined();
+    expect(x.prompt).toContain("TASK T1:");
+    expect(x.prompt).toMatch(/^CAP:12$/m);
+    expect(log).toHaveBeenCalledExactlyOnceWith("route expansion ignored invalid or out-of-range budget", { value: budget.slice(0, 40) });
+  });
+
+  it("logs an ignored budget by default, and a failing diagnostic sink never fails expansion", () => {
+    const t = routeOf("[route class=implement budget=0]");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect(renderRouteLine(t, SLOT)).toBe(`[route class=implement root=${SLOT}]`);
+      expect(warn).toHaveBeenCalledExactlyOnceWith("route expansion ignored invalid or out-of-range budget", { value: "0" });
+    } finally {
+      warn.mockRestore();
+    }
+    expect(renderRouteLine(t, SLOT, () => { throw new Error("log sink down"); })).toBe(`[route class=implement root=${SLOT}]`);
+  });
+
+  it.each([1, 10000])("keeps valid budget boundary %s", (budget) => {
+    const log = vi.fn();
+    expect(renderRouteLine(routeOf(`[route budget=${budget}]`), SLOT, log)).toBe(`[route root=${SLOT} budget=${budget}]`);
+    expect(log).not.toHaveBeenCalled();
   });
 
   it("task.route.tier and pin win over the line's own", () => {
@@ -453,6 +636,18 @@ describe("renderRouteLine: whitelist re-serialization", () => {
     expect(x.routeLine).not.toMatch(/[\r\n]/);
     expect(x.routeLine).not.toContain("evil");
     expect(clone(x).routeLine).toBe(x.routeLine);
+  });
+});
+
+describe("stripOrchestratorShell", () => {
+  it.each([
+    ["feature works; smoke passes (orchestrator shell); API is tested", { kept: "feature works; API is tested", dropped: true }],
+    ["smoke passes (Orchestrator Shell)", { kept: null, dropped: true }],
+    ["smoke passes (orchestrator shell); integration passes (orchestrator shell)", { kept: null, dropped: true }],
+    ["feature works ; API is tested", { kept: "feature works; API is tested", dropped: false }],
+    ["", { kept: null, dropped: false }],
+  ])("strips only marked semicolon-delimited clauses: %s", (criterion, expected) => {
+    expect(stripOrchestratorShell(criterion)).toEqual(expected);
   });
 });
 

@@ -289,6 +289,27 @@ describe("reconcile: launcher liveness (v2)", () => {
     expect(r.logs).toEqual([]);
   });
 
+  it.each([false, true])("budget resumes use only their current round's launcher evidence (current launcher dead=%s)", async (dead) => {
+    const r = setup([
+      record(),
+      record({ resumes: "1", pid: String(self.pid), token: dead ? "previous-process-at-this-pid" : self.token }, 2),
+    ]);
+    const t = running(r);
+    t.attempts[0]!.resumes = 1;
+    expect(await feedOf(r, t)).toMatchObject(dead
+      ? { evidence: "lost", action: "requeue-lost", probation: null }
+      : { evidence: "alive", action: "adopt", probation: PROBATION });
+    expect(r.isAlive).not.toHaveBeenCalled();
+  });
+
+  it("a resumed attempt without evidence of its new launcher keeps probation, never reuses the dead original launcher", async () => {
+    const r = setup();
+    const t = running(r);
+    t.attempts[0]!.resumes = 1;
+    expect(await feedOf(r, t)).toMatchObject({ evidence: "alive", action: "adopt", probation: PROBATION });
+    expect(r.isAlive).not.toHaveBeenCalled();
+  });
+
   it.each([true, undefined])("dead launcher + toolInFlight=%s keeps probation without exporting history or probing the process", async (toolInFlight) => {
     const r = setup();
     const t = running(r, "T1", "unknown-tool");

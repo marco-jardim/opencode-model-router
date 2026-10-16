@@ -5,11 +5,13 @@ import type { RoleSpec } from "../../router/roles";
 import { NEEDS, type RouteLine } from "../../routing/classify/types";
 import type { AnnotatedPlan, PlanStep } from "../../routing/engine";
 import type { DurationModel } from "../../routing/outcomes/durations";
+import { neutralizeDirectives } from "../../verify/pending";
 import { grantFor } from "../../routing/roles/policy";
 import {
   EXECUTOR_LIMITS,
   ExecutorError,
   LAUNCH_HEADER_PATTERN,
+  ORCHESTRATOR_SHELL_RE,
   PLAN_ID_PATTERN,
   ledgerViolations,
   type CompileSummary,
@@ -170,7 +172,7 @@ function checkInputs(
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// Shared context (D2): worktree paths -> <worktree>, header-shaped lines removed, cap at the last newline.
+// Shared context (D2): paths -> <worktree>, headers removed, directives neutralised, cap at the last newline.
 
 const HEADER_REPLACEMENT = "[header-shaped line removed]";
 
@@ -220,7 +222,7 @@ function sharedContextOf(
   if (removed > 0) {
     warnings.push({ code: "shared-context-header", line: 0, message: `${removed} header-shaped line(s) in the shared context were removed` });
   }
-  text = kept.join("\n");
+  text = neutralizeDirectives(kept.join("\n"));
   const cut = cutAtNewline(text, cap);
   if (cut.length < text.length) {
     warnings.push({ code: "shared-context-truncated", line: 0, message: `shared context cut to ${cut.length} of ${text.length} chars` });
@@ -342,12 +344,18 @@ async function gitText(git: RepoGit, args: readonly string[], cwd: string): Prom
   return r.stdout.trim();
 }
 
-async function readRepo(deps: CompilerDeps, cwd: string, toplevel: string): Promise<LedgerV1["repo"]> {
+async function readRepo(deps: CompilerDeps, toplevel: string): Promise<LedgerV1["repo"]> {
   const git = deps.git;
-  const common = await gitText(git, ["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd);
-  const baseCommit = await gitText(git, ["rev-parse", "HEAD"], cwd);
-  const baseBranch = await gitText(git, ["rev-parse", "--abbrev-ref", "HEAD"], cwd);
-  const abs = /^(?:[A-Za-z]:[\\/]|\\\\|\/)/.test(common) ? common : (/^[A-Za-z]:/.test(cwd) ? win32.resolve(cwd, common) : posix.resolve(cwd, common));
+  const common = await gitText(git, ["rev-parse", "--path-format=absolute", "--git-common-dir"], toplevel);
+  const branch = await git.run(["symbolic-ref", "HEAD"], toplevel);
+  const branchRef = branch.stdout.trim();
+  if (branch.code !== 0 || !branchRef.startsWith("refs/heads/") || branchRef === "refs/heads/") {
+    throw new ExecutorError("E_INVALID_INPUT", "check out the base branch before compiling a plan (detached HEAD)", null);
+  }
+  const baseBranch = branchRef.slice("refs/heads/".length);
+  // Resolve the branch ref afresh on every compile, never the plan directory's HEAD or a cached base.
+  const baseCommit = await gitText(git, ["rev-parse", "--verify", `refs/heads/${baseBranch}^{commit}`], toplevel);
+  const abs = /^(?:[A-Za-z]:[\\/]|\\\\|\/)/.test(common) ? common : (/^[A-Za-z]:/.test(toplevel) ? win32.resolve(toplevel, common) : posix.resolve(toplevel, common));
   // QA-2.3-17: the key is the real path of the common git dir, so two spellings of one repository get one key.
   const key = deps.fs.realpath === undefined ? abs : await deps.fs.realpath(abs);
   return { key, toplevel, baseBranch, baseCommit };
@@ -698,6 +706,14 @@ export function createPlanCompiler(deps: CompilerDeps): PlanCompiler {
     const issues: CompileIssue[] = [];
     const parsed = await annotateUnrouted(parsePlan(text), deps.annotate);
     issues.push(...parsed.warnings);
+    text.split(/\r\n|\n|\r/).forEach((line, i) => {
+      const criteria = /^[ \t]*criteria[ \t]*:(.*)$/i.exec(line)?.[1];
+      if (criteria === undefined) return;
+      const clauses = criteria.split(";").map((clause) => clause.trim()).filter((clause) => clause !== "");
+      if (clauses.some((clause) => ORCHESTRATOR_SHELL_RE.test(clause)) && clauses.some((clause) => !ORCHESTRATOR_SHELL_RE.test(clause))) {
+        issues.push({ code: "orchestrator-shell-mixed", line: i + 1, message: "only the marked clause is skipped" });
+      }
+    });
 
     const sel = selectPhases(parsed, opts, issues);
     const includedIds = new Set(sel.included.map((p) => p.id));
@@ -799,7 +815,7 @@ export function createPlanCompiler(deps: CompilerDeps): PlanCompiler {
     }
 
     const planId = planIdOf(planPath, opts.phases, opts.doneBefore);
-    const repo = await readRepo(deps, cwd, view.toplevel);
+    const repo = await readRepo(deps, view.toplevel);
     // QA-2.3-13 / QA-2.3-3: remember the case flag and the tracked files of this repository for the later calls.
     ciByRepo.set(repo.key, ci);
     filesByRepo.set(repo.key, [...view.files]);

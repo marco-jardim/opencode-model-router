@@ -4,6 +4,9 @@
 // grammar, the findings format and every interface other executor modules are built against. No I/O: the only
 // runtime code is small, pure and dependency-free (canTransition, counting, guards, header, classification).
 
+// QA-PDF21-2-18: the guard's cumulative multiplier (a pure constant) bounds BUDGET_RESUMES.
+import { GUARD_CUMULATIVE_MULTIPLIER } from "../router/guard-profile";
+
 // ---------------------------------------------------------------------------------------------------------------
 // §5 Ledger data
 // ---------------------------------------------------------------------------------------------------------------
@@ -145,6 +148,8 @@ export interface Attempt {
   /** Retained router-call id used for the launch. */
   callID: string | null;
   childSessionID: string | null;
+  /** Budget resumes of this attempt (BUDGET_RESUMES cap). */
+  resumes?: number;
   startedAt: IsoTime;
   endedAt: IsoTime | null;
   outcome: AttemptOutcome | null;
@@ -327,7 +332,7 @@ export const TERMINAL_TASK_STATES = ["done", "cancelled"] as const;
 export type TransitionTrigger =
   | "deps-satisfied" | "dep-parked" | "dep-blocked" | "abort" | "launch" | "dep-reverted" | "adopt"
   | "reported-done" | "dep-added" | "child-created" | "launch-lost" | "launch-task-error" | "child-ended" | "child-failed"
-  | "lease-unresolvable" | "qa-unparsable" | "escalate" | "ambiguity" | "child-lost" | "capacity-stop" | "lease-needed"
+  | "lease-unresolvable" | "qa-unparsable" | "escalate" | "ambiguity" | "budget-cap" | "child-lost" | "capacity-stop" | "lease-needed"
   | "committed" | "no-changes" | "commit-failed" | "verify-pass" | "verify-fail" | "dequeued" | "fast-forwarded"
   | "rebase-conflict" | "checks-failed" | "suite-culprit" | "retry" | "exhausted" | "answered" | "dep-recovered";
 
@@ -375,7 +380,7 @@ export const TRANSITION_TRIGGERS: Readonly<Partial<Record<TransitionKey, readonl
   "dispatched>cancelled": ["abort"],
   "running>completed": ["child-ended"],
   "running>failed": ["child-failed", "lease-unresolvable", "qa-unparsable"],
-  "running>parked": ["escalate", "ambiguity", "qa-unparsable"],
+  "running>parked": ["escalate", "ambiguity", "qa-unparsable", "budget-cap"],
   "running>ready": ["child-lost", "capacity-stop", "lease-needed"],
   "running>blocked": ["dep-reverted"],
   "running>cancelled": ["abort"],
@@ -617,6 +622,7 @@ export type ExecutorEvent =
   | E<"attempt-started", { taskId: TaskId; attempt: Attempt }>
   | E<"attempt-child", { taskId: TaskId; n: number; childSessionID: string }>
   | E<"attempt-adopted", { taskId: TaskId; n: number; childSessionID: string }>
+  | E<"attempt-resumed", { taskId: TaskId; n: number; resumes: number }>
   | E<"attempt-ended", { taskId: TaskId; n: number; outcome: AttemptOutcome; endedAt: IsoTime; detail: string | null }>
   | E<"attempt-verdict", { taskId: TaskId; n: number; verdict: Verdict; ref: string | null }>
   | E<"attempt-context", { taskId: TaskId; n: number; context: string }>
@@ -670,13 +676,34 @@ export const LAUNCH_CONFIRM_TIMEOUT_MS = 30_000;
 export const CHILD_END_GRACE_MS = 5_000;
 /** Concurrent heavy-tier children per provider (3.1.3.a). */
 export const HEAVY_CAP_PER_PROVIDER = 2;
+/**
+ * Maximum budget resumes of the same attempt. QA-PDF21-2-18: derived from the guard's cumulative ceiling (the role budget ×
+ * {@link GUARD_CUMULATIVE_MULTIPLIER}), so every round the attempt may take — the first launch plus each resume — still has a
+ * full per-dispatch budget under that ceiling; one more resume would be refused at its first call.
+ */
+export const BUDGET_RESUMES = GUARD_CUMULATIVE_MULTIPLIER - 1;
+/** Trailer identifying a saved work-in-progress commit. */
+export const WIP_TRAILER = "Omr-Wip";
+/** Marker identifying an orchestrator shell session. */
+export const ORCHESTRATOR_SHELL_RE = /\(orchestrator shell\)/i;
+
+/** Remove only semicolon-delimited criteria clauses assigned to the orchestrator's shell. */
+export function stripOrchestratorShell(criterion: string): { kept: string | null; dropped: boolean } {
+  const kept: string[] = [];
+  let dropped = false;
+  for (const clause of criterion.split(";")) {
+    if (ORCHESTRATOR_SHELL_RE.test(clause)) dropped = true;
+    else if (clause.trim() !== "") kept.push(clause.trim());
+  }
+  return { kept: kept.length === 0 ? null : kept.join("; "), dropped };
+}
 
 /** Codes of `ExecutorError` (§8). */
 export type ExecutorErrorCode =
   | "E_INVALID_INPUT" | "E_PLAN_STATE" | "E_NOT_OWNER" | "E_LEDGER_NOT_FOUND" | "E_EXISTS" | "E_SCHEMA_NEWER"
   | "E_SCHEMA_INVALID" | "E_SEQ_GAP" | "E_ILLEGAL_TRANSITION" | "E_LOCK_HELD" | "E_LOCK_LOST" | "E_COMPILE"
   | "E_CYCLE" | "E_RESIDUE" | "E_SLOT_UNAVAILABLE" | "E_SLOT_BROKEN" | "E_PROVISION" | "E_GIT" | "E_IDENTITY"
-  | "E_CAPACITY" | "E_NO_CONTEXT" | "E_LAUNCH_TASK" | "E_DISPOSED";
+  | "E_CAPACITY" | "E_NO_CONTEXT" | "E_LAUNCH_TASK" | "E_DISPOSED" | "E_STALE_BASE";
 
 /** Error every executor interface method throws; not ledger data (§8). A failing `append` leaves memory and disk unchanged. */
 export class ExecutorError extends Error {
@@ -788,12 +815,23 @@ function isAttempt(v: unknown): v is Attempt {
     (v.verdict === null || isOneOf(VERDICTS, v.verdict)) && isStr(v.context);
 }
 
+/** Shape guard for an `attempt-resumed` journal event; replay checks the target, state and count increment. */
+export function isAttemptResumedEvent(v: unknown): v is Extract<ExecutorEvent, { type: "attempt-resumed" }> {
+  return isRec(v) && v.type === "attempt-resumed" && isInt(v.seq) && v.seq >= 1 && isIso(v.at) &&
+    isInt(v.batch) && v.batch >= 1 && isBool(v.last) && isTaskId(v.taskId) &&
+    isInt(v.n) && v.n >= 1 && isInt(v.resumes) && v.resumes >= 1;
+}
+
 const SLOT_REQUIRED_STATES: readonly TaskState[] = ["dispatched", "running", "completed", "verifying", "verified", "integrating"];
 const BRANCH_REQUIRED_STATES: readonly TaskState[] = ["verifying", "verified", "integrating"];
 
-/** Task states that hold no slot (A1-7 `slot-forbidden`): the slot is released on entering them. */
+/**
+ * Task states that hold no slot (A1-7 `slot-forbidden`): the slot is released on entering them. QA-PDF21-3 amends A1-7 for
+ * `parked`: a park whose slot's work could not be saved keeps the slot on the task (never reset or released while that
+ * work is unsaved), so a parked task may hold a slot; every other park clears it as before.
+ */
 const SLOT_FORBIDDEN_STATES: readonly TaskState[] =
-  ["pending", "blocked", "parked", "done", "cancelled", "integrated", "reverted"];
+  ["pending", "blocked", "done", "cancelled", "integrated", "reverted"];
 
 /** One violated invariant: a stable `code` and the JSON path `at` of the offending value (A1-7). */
 export interface LedgerViolation {
@@ -1061,7 +1099,8 @@ export function isLedgerV1(v: unknown): v is LedgerV1 {
 
 /**
  * Prompt grammar (QA-0.1-21): `prompt = planContext "\n\n" headerLine "\n\n" taskBlock`,
- * `planContext = "PLAN CONTEXT\n" ledger.sharedContext`, `headerLine = header " nonce=" nonce`,
+ * `planContext = "PLAN CONTEXT\n" [EXECUTOR_READ_CAP_LINE "\n"] ledger.sharedContext` (the read-cap line for editing
+ * tasks only, DF-2-9), `headerLine = header " nonce=" nonce`,
  * `header = "[plan " planId ":" taskId "#" attempt "]"` with attempt = `Attempt.n` (D-b). `taskBlock` belongs to 3.1.4.
  * The child's first-context fail-closed check (3.1.7.a) refuses every tool call of an unbound child whose prompt matches.
  * Consumers must import this pattern; never re-derive it (the memo's old task-id lookahead was wrong, QA-1.4-12).
@@ -1095,14 +1134,27 @@ function hasHeaderShapedLine(text: string): boolean {
 }
 
 /**
- * Strict, at the fixed position (A1-7): the prompt starts with `"PLAN CONTEXT\n" + sharedContext + "\n\n"`, the next line matches
- * `LAUNCH_HEADER_PATTERN` in full and is followed by `"\n\n"`. Anything else is null, including a `sharedContext` that itself has a
- * header-shaped line. Recovery (C7) uses this with `ledger.sharedContext`.
+ * The executor's own read-cap line for an editing task (DF-2-9). The router honours the first read-cap token of a prompt,
+ * so this line sits right after the `"PLAN CONTEXT"` line, before the shared context and the task text (both neutralized).
+ */
+export const EXECUTOR_READ_CAP_LINE = "CAP:12";
+
+/** The fixed opening of every launch prompt: `"PLAN CONTEXT\n"`, then the executor's read-cap line when `readCap`. */
+function launchOpening(readCap: boolean): string {
+  return readCap ? `PLAN CONTEXT\n${EXECUTOR_READ_CAP_LINE}\n` : "PLAN CONTEXT\n";
+}
+
+/**
+ * Strict, at the fixed position (A1-7): the prompt starts with `"PLAN CONTEXT\n"`, optionally the executor's read-cap line
+ * (`EXECUTOR_READ_CAP_LINE + "\n"`), then `sharedContext + "\n\n"`; the next line matches `LAUNCH_HEADER_PATTERN` in full and is
+ * followed by `"\n\n"`. Anything else is null, including a `sharedContext` that itself has a header-shaped line. Recovery (C7)
+ * uses this with `ledger.sharedContext`.
  */
 export function parseLaunchHeader(prompt: string, sharedContext: string): LaunchHeaderFields | null {
   if (hasHeaderShapedLine(sharedContext)) return null;
-  const prefix = `PLAN CONTEXT\n${sharedContext}\n\n`;
-  if (!prompt.startsWith(prefix)) return null;
+  // An editing task's prompt carries the executor's read-cap line; every other prompt goes straight to the shared context.
+  const prefix = [launchOpening(true), launchOpening(false)].map(open => `${open}${sharedContext}\n\n`).find(p => prompt.startsWith(p));
+  if (prefix === undefined) return null;
   const rest = prompt.slice(prefix.length);
   const end = rest.indexOf("\n\n");
   if (end < 0) return null;
@@ -1120,17 +1172,18 @@ export function looksLikePlanPrompt(prompt: string): boolean {
 }
 
 /**
- * §7 grammar: `"PLAN CONTEXT\n" + sharedContext + "\n\n" + headerLine + "\n\n" + taskBlock`.
+ * §7 grammar: `"PLAN CONTEXT\n" + [EXECUTOR_READ_CAP_LINE "\n"] + sharedContext + "\n\n" + headerLine + "\n\n" + taskBlock`.
+ * The read-cap line is present only when `readCap` (an editing task); it is then the prompt's first read-cap token (DF-2-9).
  * Throws E_LAUNCH_TASK when `sharedContext` has a header-shaped line, the header fields are invalid, or `taskBlock` does not start with "TASK".
  */
-export function formatLaunchPrompt(sharedContext: string, header: LaunchHeaderFields, taskBlock: string): string {
+export function formatLaunchPrompt(sharedContext: string, header: LaunchHeaderFields, taskBlock: string, readCap = false): string {
   if (hasHeaderShapedLine(sharedContext)) {
     throw new ExecutorError("E_LAUNCH_TASK", "shared context contains a launch-header-shaped line");
   }
   if (!taskBlock.startsWith("TASK")) {
     throw new ExecutorError("E_LAUNCH_TASK", 'task block must start with "TASK"');
   }
-  return `PLAN CONTEXT\n${sharedContext}\n\n${formatLaunchHeader(header)}\n\n${taskBlock}`;
+  return `${launchOpening(readCap)}${sharedContext}\n\n${formatLaunchHeader(header)}\n\n${taskBlock}`;
 }
 
 export type FindingSeverity = "blocking" | "critical" | "major" | "minor" | "nit";
@@ -1298,6 +1351,16 @@ export const EXECUTOR_DEFAULTS: ReadonlyExecutorConfig = Object.freeze({
 // §8 Interfaces. Every method throws `ExecutorError`.
 // ---------------------------------------------------------------------------------------------------------------
 
+export type { ExpandInput } from "./expand";
+
+// Type-only extension of the existing expansion input; expansion behaviour is unchanged.
+declare module "./expand" {
+  interface ExpandInput {
+    /** The previous attempt's work restored as uncommitted changes. */
+    restored?: { attempt: number; files: number };
+  }
+}
+
 /** Ledger persistence (2.2): snapshot plus journal under one writer lock. */
 export interface LedgerStore {
   /** pre: no plan dir; isLedgerV1(draft) and `draft.seq === 1`; post: dir, snapshot, journal (ledger-init `{seq: 1, batch: 1, last: true}`), lock held.
@@ -1407,7 +1470,7 @@ export interface SlotPool {
   get(slot: string): Promise<SlotRecord | null>;
   list(planId?: PlanId): Promise<SlotRecord[]>;
   /** Removes only marked slots of completed/aborted plans, or unknown plans after 7 d; never follows links; reports unmarked dirs */
-  gc(isFinished: (planId: PlanId) => Promise<boolean | null>): Promise<{ removed: string[]; reported: string[] }>;
+  gc(isFinished: (planId: PlanId) => Promise<boolean | null>, opts?: { savedSlots?: ReadonlySet<string> }): Promise<{ removed: string[]; reported: string[] }>;
 }
 
 /** Called after the fsync of the corresponding journal batch. */
@@ -1505,6 +1568,8 @@ export interface LeaseService extends LeaseView {
 }
 export interface TaskRoute {
   agent: string;
+  /** Resolved (role-range-clamped) tier, not the role's floor or the task's unvalidated request. */
+  tier?: string;
   model: { providerID: string; modelID: string; variant: string | null };
   provider: string;
   heavy: boolean;
@@ -1625,12 +1690,23 @@ export interface LaunchRequest {
   attempt: number;
   nonce: string;
   orchestratorSessionID: string;
+  /**
+   * Resume of the same attempt; no new child, confirmed on the first step. It opens a new guard round and read-cap round for the
+   * child (`DispatchBookkeeping.beginResumeRound`, QA-PDF21-2-11), and may follow its own attempt's run whose completion settled
+   * before that run's runner returned (QA-PDF21-2-17).
+   */
+  resume?: { childSessionID: string };
   /** The gated capture; `attempt-started.attempt.callID === context.callID` (A1-4). */
   context: ContextRef;
   route: TaskRoute;
   role: string;
   /** Route `needs`. */
   grant: string[];
+  /**
+   * QA-PDF21-2-20 (optional, additive): the route's `budget=` (`routeBudgetOf(expanded.routeLine)`), bound with the child as a
+   * routed dispatch's binding carries it, so the guard raises the child's per-dispatch budget by it. Absent or null: none named.
+   */
+  routeBudget?: number | null;
   /** Slot path. */
   workRoot: string;
   /** §7 grammar; the header must match (planId, taskId, attempt, nonce). */
@@ -1644,6 +1720,12 @@ export interface LaunchHooks {
    *  child is prompted. Rt appends with a builder: dispatched with this attempt open -> [AC, TT child-created]; ready with this attempt
    *  latest and lost -> [AA, TT adopt, G1] + forced token; anything else -> throw (refuse). A throw makes the runner interrupt the child. */
   onChildCreated(childSessionID: string): Promise<void>;
+  /**
+   * pdf2-1 (a): a `completed` end keeps the child's role binding (the caller may resume the child for its budget) until
+   * `TaskLauncher.releaseBinding` drops it or a resume of the same child under the same task and attempt takes it over.
+   * Absent or false: every end evicts the binding when the completion settles.
+   */
+  holdCompletedBinding?: boolean;
 }
 
 /** Why a launch was not confirmed (A1-5): "timeout" and "threw" mark the context stale; "task-error" is R1 (counts). */
@@ -1699,6 +1781,11 @@ export interface TaskLauncher {
   /** Requested interrupt: records the request, aborts the executor-owned signal, HostSessions.interrupt(child) if known. Idempotent. */
   cancel(taskId: TaskId, attempt: number, reason: CancelReason): Promise<void>;
   inFlight(): ReadonlyArray<{ taskId: TaskId; attempt: number; childSessionID: string | null; startedAt: IsoTime }>;
+  /**
+   * pdf2-1 (a): evicts the binding a `completed` end held (`LaunchHooks.holdCompletedBinding`) once the caller decided not
+   * to resume `childSessionID`. A no-op when nothing is held for it (a resume took it over, or it was never held).
+   */
+  releaseBinding?(childSessionID: string): void;
   /** Aborts every owned signal; journals nothing (recovery closes those attempts as lost). */
   dispose(): Promise<void>;
 }
@@ -1783,11 +1870,11 @@ export interface RecoveryService {
 export interface UnattendedPolicy {
   /** Dedupe: an open item with the same kind+taskId+text is returned instead. Journals inbox-added (durable); wakes ("inbox", "inbox:<id>") unless closed at creation. */
   raise(i: Omit<InboxItem, "id" | "createdAt" | "answer"> & { answer?: string }): Promise<InboxItem>;
-  /** From running (escalate|ambiguity|qa-unparsable) or conflict|failed|reverted (exhausted). post: parked; transitive **pending** dependents
+  /** From running (escalate|ambiguity|qa-unparsable|budget-cap) or conflict|failed|reverted (exhausted). post: parked; transitive **pending** dependents
    *  -> blocked (a dependent of an un-integrated task cannot be ready or in flight, R9/R10); one inbox item.
    *  Leases are held exactly while `slot !== null` (A1-2.4): parking releases the slot and so calls `LeaseService.releaseTask` after the fsync of the park batch (P rows 17, 36); the answered
    *  task re-acquires through `LeaseService.acquireTask` when it is launched again (A2, QA-1.4-22). */
-  park(taskId: TaskId, cause: "escalate" | "ambiguity" | "qa-unparsable" | "exhausted", text: string): Promise<InboxItem>;
+  park(taskId: TaskId, cause: "escalate" | "ambiguity" | "qa-unparsable" | "exhausted" | "budget-cap", text: string): Promise<InboxItem>;
   /** pre: item open. post: inbox-answered; attempt-context on the latest attempt; parked -> ready. A critical `qa-cap` item goes to
    *  `QaLoop.onCapAnswer` instead (the answer must be one of its options). err E_INVALID_INPUT */
   answer(inboxId: string, text: string): Promise<{ resumed: TaskId | null }>;
@@ -1832,6 +1919,22 @@ export interface DispatchBookkeeping {
    * back to a guess when the runner result settles before the child's own end event.
    */
   unregisterInFlight(taskId: TaskId, attempt: number, status?: ChildEnd["kind"]): void;
+  /**
+   * QA-PDF21-2-11 (optional, additive): a launch that resumes its child (`req.resume`) opens a NEW guard round and a new read-cap
+   * round for that child session before the runner call, exactly as a routed resume does: the per-dispatch budget and the read
+   * counter restart, the cumulative ceiling stays. `prompt`: the launch prompt, whose cap line (if any) sets the new round's cap.
+   */
+  beginResumeRound?(childSessionID: string, agent: string, prompt: string): void;
+}
+/**
+ * QA-PDF21-2-11/-20: the plugin's guard state of an executor child, as the v2 adapter's bookkeeping drives it (index.ts hands
+ * it over through `routerOnExecutorChildGuard`). `beginResumeRound`: a resume's new guard round and read-cap round (a routed
+ * resume's `guardStore.beginDispatch` and `resumeRoleSession`). `applyCap`: a freshly bound child's read cap, parsed from its
+ * launch prompt's cap line as a routed role dispatch's is.
+ */
+export interface ExecutorChildGuardPort {
+  beginResumeRound(childSessionID: string, agent: string, prompt: string): void;
+  applyCap(childSessionID: string, agent: string, prompt: string): void;
 }
 /** Deterministic verification of a task in its slot. */
 export interface SlotVerifier {
@@ -1931,6 +2034,8 @@ export interface HostSessions {
 
 export interface ChildRunRequest {
   parentSessionID: string;
+  /** Resume this child session instead of creating one (the runner honours it). */
+  resumeSessionID?: string;
   prompt: string;
   agent: string;
   model: { providerID: string; modelID: string; variant: string | null };

@@ -3,6 +3,8 @@ import { createPlanCompiler, planIdOf, type CompilerDeps } from "../../src/execu
 import { residueDigestOf } from "../../src/executor/compile/residue";
 import { ExecutorError, PLAN_ID_PATTERN, executorDefaults, type ExecutorConfig, type TaskNode } from "../../src/executor/types";
 import { NOW, ROUTE_LINE, compileOpts, makeHarness, planPathOf, stubAnnotate } from "../fixtures/cpx/plans/harness";
+import { parseCapDirective } from "../../src/router/sessions";
+import { neutralizeDirectives } from "../../src/verify/pending";
 
 async function rejection(p: Promise<unknown>): Promise<ExecutorError> {
   try {
@@ -29,6 +31,21 @@ const SIMPLE_PLAN = [
 ].join("\n");
 
 describe("compile happy path", () => {
+  it("QA-PDF21-2: warns only when a criteria line mixes orchestrator-shell and child clauses", async () => {
+    const plan = [
+      "# Plan", "", "### Phase 1.1: First", "", "**Tasks**", "- **1.1.1** Add widget", "  Writes: `src/a.ts`",
+      "  [acceptance]",
+      "  criteria: child unit tests pass; smoke test (orchestrator shell); child preserves the API",
+      "  criteria: build (ORCHESTRATOR SHELL); smoke (orchestrator shell);",
+      "  criteria: child tests pass; child typecheck passes",
+      "  [/acceptance]", "",
+    ].join("\n");
+    const h = makeHarness({ inline: { "mixed.md": plan } });
+    const { draft, summary } = await h.compiler.compile(planPathOf("mixed.md"), compileOpts(h));
+    expect(summary.warnings.filter((warning) => warning.startsWith("orchestrator-shell-mixed")))
+      .toEqual(["orchestrator-shell-mixed L9: only the marked clause is skipped"]);
+    expect(draft.tasks["1.1.1"]?.acceptance).toContain("child preserves the API");
+  });
   it("compiles a small plan into a valid draft", async () => {
     const h = makeHarness({ inline: { "simple.md": SIMPLE_PLAN } });
     const r = await h.compiler.compile(planPathOf("simple.md"), compileOpts(h));
@@ -112,7 +129,7 @@ describe("compile selection", () => {
 describe("compile git and repo seams", () => {
   it("fails with E_GIT when a git command fails", async () => {
     const h = makeHarness({ inline: { "twophase.md": TWO_PHASES } });
-    const git = { run: async (args: readonly string[], cwd: string): Promise<{ code: number; stdout: string }> => (args.join(" ") === "rev-parse HEAD" ? { code: 128, stdout: "" } : h.deps.git.run(args, cwd)) };
+    const git = { run: async (args: readonly string[], cwd: string): Promise<{ code: number; stdout: string }> => (args.join(" ") === `rev-parse --verify refs/heads/${h.view.branch}^{commit}` ? { code: 128, stdout: "" } : h.deps.git.run(args, cwd)) };
     const c = createPlanCompiler({ ...h.deps, git });
     const e = await rejection(c.compile(planPathOf("twophase.md"), compileOpts(h)));
     expect(e.code).toBe("E_GIT");
@@ -127,18 +144,18 @@ describe("compile git and repo seams", () => {
     expect(seen).toHaveLength(1);
   });
 
-  it("resolves a relative common git dir against the plan directory", async () => {
+  it("resolves a relative common git dir against the repository toplevel", async () => {
     const h = makeHarness({ inline: { "twophase.md": TWO_PHASES }, view: { commonDir: ".git" } });
     const r = await h.compiler.compile(planPathOf("twophase.md"), compileOpts(h));
-    expect(r.draft.repo.key.endsWith(".git")).toBe(true);
-    expect(r.draft.repo.key).not.toBe(".git");
+    expect(r.draft.repo.key.replace(/\\/g, "/")).toBe(`${h.view.toplevel.replace(/\\/g, "/")}/.git`);
   });
 
   it("resolves a relative common git dir on a posix cwd", async () => {
-    const h = makeHarness({ view: { commonDir: ".git" } });
+    const h = makeHarness({ view: { commonDir: ".git", toplevel: "/repo" } });
     const c = createPlanCompiler({ ...h.deps, fs: { readText: async () => TWO_PHASES } });
     const r = await c.compile("/plans/twophase.md", compileOpts(h));
-    expect(r.draft.repo.key.replace(/\\/g, "/")).toMatch(/\/plans\/\.git$/);
+    expect(r.draft.repo.toplevel).toBe("/repo");
+    expect(r.draft.repo.key).toBe("/repo/.git");
   });
 });
 
@@ -469,6 +486,15 @@ describe("mergeResidue", () => {
 });
 
 describe("shared context", () => {
+  it("QA-PDF21-9: neutralizes shared directives in the compiled ledger", async () => {
+    const context = "CAP:3\nreason: quoted example\nVERIFY:deferred\nVERIFY_WAIT:1s\nKeep the rest byte-identical.";
+    const plan = `<!-- plan-context -->\n${context}\n<!-- /plan-context -->\n${SIMPLE_PLAN}`;
+    const h = makeHarness({ inline: { "directives.md": plan } });
+    const { draft } = await h.compiler.compile(planPathOf("directives.md"), compileOpts(h));
+    expect(draft.sharedContext).toBe(neutralizeDirectives(context));
+    expect(neutralizeDirectives(draft.sharedContext)).toBe(draft.sharedContext);
+    expect(parseCapDirective(`${draft.sharedContext}\nCAP:12`)).toBe(12);
+  });
   it("replaces worktree paths, strips header-shaped lines and cuts at the cap", async () => {
     const header = "[plan demo-plan:1.1.1#1] nonce=" + "a".repeat(32);
     const plan = [
@@ -525,7 +551,7 @@ describe("compile routing fields", () => {
 describe("compile self-check", () => {
   it("refuses a draft that breaks the ledger schema and names the ledger violation", async () => {
     const h = makeHarness({ inline: { "twophase.md": TWO_PHASES } });
-    const git = { run: async (args: readonly string[], cwd: string): Promise<{ code: number; stdout: string }> => (args.join(" ") === "rev-parse HEAD" ? { code: 0, stdout: "not-a-commit\n" } : h.deps.git.run(args, cwd)) };
+    const git = { run: async (args: readonly string[], cwd: string): Promise<{ code: number; stdout: string }> => (args.join(" ") === `rev-parse --verify refs/heads/${h.view.branch}^{commit}` ? { code: 0, stdout: "not-a-commit\n" } : h.deps.git.run(args, cwd)) };
     const c = createPlanCompiler({ ...h.deps, git });
     const e = await rejection(c.compile(planPathOf("twophase.md"), compileOpts(h)));
     expect(e.code).toBe("E_COMPILE");
