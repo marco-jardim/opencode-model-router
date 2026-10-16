@@ -1956,12 +1956,20 @@ describe("cost doctor in the plugin", { timeout: 60_000 }, () => {
   it("G-2: v2 with executor-capable routing lists every plan help line", async () => {
     // G-16: the executor (and its help) is Windows-only; drive the platform seam to Windows on every CI runner.
     const platform = vi.spyOn(platformModule, "executorPlatformSupported").mockReturnValue(true);
+    // QA-62C-6: a supported platform logs no executor platform notice (reset first, so an earlier notice cannot hide one).
+    platformModule.resetExecutorPlatformNotice();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
-      const { hooks } = await plugin({ routing: { delegation: "roles", leases: { mode: "enforce" }, outcomes: { path: store } } });
+      const { hooks, host } = await plugin({ routing: { delegation: "roles", leases: { mode: "enforce" }, outcomes: { path: store } } });
       const text = await ask(hooks);
       for (const line of PLAN_HELP_LINES) expect(text).toContain(line);
+      const notice = (message: unknown): boolean => JSON.stringify(message).includes(platformModule.EXECUTOR_PLATFORM_NOTICE);
+      expect(warn.mock.calls.filter(notice)).toEqual([]);
+      expect(host.logs.filter(notice)).toEqual([]);
     } finally {
+      warn.mockRestore();
       platform.mockRestore();
+      platformModule.resetExecutorPlatformNotice();
     }
   });
 

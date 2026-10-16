@@ -65,10 +65,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rewritten from memory. OpenCode v1 ignores every `routing.background.*` and `routing.leases.*` key and logs one
   notice per process that names them.
 - **OpenCode v2: the plan executor is Windows only in this release.** Its execution slots need a drive-letter path
-  (`routing.executor.slotsDir`, default `<drive>:\.omr-slots\<planId>`). On Linux and macOS it is inert: `router_plan`
-  and `/plan` are not registered, `/router` does not list `/plan`, role agents get no executor-home or slots rule, no
-  executor discovery runs at start, and when roles mode with enforced leases would assemble it the router logs one
-  notice per process, `plan executor requires Windows; router_plan and /plan are not registered`.
+  (`routing.executor.slotsDir`, default `<drive>:\.omr-slots\<planId>`). On platforms other than Windows it is inert:
+  `router_plan` and `/plan` are not registered, `/router` does not list `/plan`, role agents get no slots rule and no
+  executor-home lookup runs (an existing `<git common dir>/omr-executor`, found on disk without running git, is still
+  denied to them), invalid `routing.executor.*` values are not reported, no executor discovery runs at start, and when
+  roles mode at start with enforced leases and verification not `never` would assemble it the router logs one notice
+  per process, `plan executor requires Windows; router_plan and /plan are not registered`.
 - **OpenCode v2: plan executor registration.** `router_plan` and `/plan` are registered only in roles mode selected at
   start, and `router_plan` resolves the executor at call time; `/router` lists `/plan` only when it is registered, not
   user-defined, and the executor prerequisites hold (roles delegation, enforced leases, verification not `never`, a

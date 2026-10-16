@@ -104,7 +104,7 @@ type Surface = {
   "command.execute.before"(input: { command: string; arguments: string; sessionID: string }, output: { parts: { type: string; text: string }[] }): Promise<void>;
 };
 
-async function configure(root: string, slotsRoot: string, delegation = "roles", leases = "enforce") {
+async function configure(root: string, slotsRoot: string, delegation = "roles", leases = "enforce", verifyRequire = "always") {
   for (const key of ["HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME"]) vi.stubEnv(key, root);
   vi.stubEnv("MODEL_ROUTER_ENFORCE", "1");
   const bundled = JSON.parse(await readFile(new URL("../../tiers.json", import.meta.url), "utf8")) as Record<string, unknown>;
@@ -114,7 +114,7 @@ async function configure(root: string, slotsRoot: string, delegation = "roles", 
     heavy: { model: "fixture/heavy", description: "fixture heavy", costRatio: 3 },
   } }, routing: { delegation, leases: { mode: leases },
     executor: { slotsDir: slotsRoot, land: "manual", phaseSuite: "off", batchMax: 1, wakeDebounceMs: 1000 } },
-    enforcement: { verify: { require: "always" } } });
+    enforcement: { verify: { require: verifyRequire } } });
   vi.spyOn(configModule, "loadConfig").mockReturnValue(config);
   if (delegation === "roles") {
     const table = resolveRoleTable(config, "v2");
@@ -302,14 +302,15 @@ async function waitForChild(child: ReturnType<typeof scriptedRunner>, executor: 
   }, { timeout: 10_000 });
 }
 
+// QA-62C-5: pure string rendering, no assembly: runs on every platform.
+it("launch fixtures have renderable routes, unlike the persistence builder's prose placeholder", () => {
+  expect(() => renderRouteLine(taskNode("T1"), "C:/fixture/slot-1")).toThrow("not one well-formed [route");
+  expect(renderRouteLine(assemblyTask("T1"), "C:/fixture/slot-1"))
+    .toBe("[route class=implement needs=edit root=C:/fixture/slot-1 tier=fast]");
+}, 5_000);
+
 // executor is Windows-only (G-16): the real assembly needs drive-letter slots; the suite below drives the seam off Windows.
 describe.runIf(process.platform === "win32")("assembled executor through v2 registration", () => {
-  it("launch fixtures have renderable routes, unlike the persistence builder's prose placeholder", () => {
-    expect(() => renderRouteLine(taskNode("T1"), "C:/fixture/slot-1")).toThrow("not one well-formed [route");
-    expect(renderRouteLine(assemblyTask("T1"), "C:/fixture/slot-1"))
-      .toBe("[route class=implement needs=edit root=C:/fixture/slot-1 tier=fast]");
-  }, 5_000);
-
   it("A1: registers both surfaces and renders executor instructions immediately after plan (order 61)", async () => {
     const fixture = await repository();
     await configure(fixture.root, fixture.slotsRoot);
@@ -887,7 +888,8 @@ describe("G-16: the plan executor off Windows (platform seam)", () => {
     const help = await first.router();
     expect(help).not.toBe("");
     expect(help).not.toContain("/plan");
-    // Role registration ran with the executor treated as disabled: no executor-home lookup, no slots root.
+    // Role registration ran with the executor treated as disabled: no executor-home lookup, no slots root. The fixture
+    // has no `.git/omr-executor`, so the on-disk executor-home deny (QA-62C-1) has nothing to deny either.
     expect(roles).toHaveBeenCalledWith(expect.anything(), expect.anything(), expect.objectContaining({ executorPlatform: false }));
     const registration = await roles.mock.results[0]?.value as Awaited<ReturnType<typeof roleAgentsModule.registerRoleAgents>>;
     expect(registration.registered).toContain("implementer");
@@ -908,12 +910,13 @@ describe("G-16: the plan executor off Windows (platform seam)", () => {
   }, 30_000);
 
   it.each([
-    ["tiers", "enforce"],
-    ["roles", "off"],
-  ])("logs no notice when the config does not ask for the executor (delegation %s, leases %s)", async (delegation, leases) => {
+    ["tiers", "enforce", "always"],
+    ["roles", "off", "always"],
+    ["roles", "enforce", "never"],
+  ])("logs no notice when the config does not ask for the executor (delegation %s, leases %s, verify.require %s)", async (delegation, leases, verifyRequire) => {
     platformModule.resetExecutorPlatformNotice();
     const fixture = await repository();
-    await configure(fixture.root, fixture.slotsRoot, delegation, leases);
+    await configure(fixture.root, fixture.slotsRoot, delegation, leases, verifyRequire);
     vi.spyOn(platformModule, "executorPlatformSupported").mockReturnValue(false);
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const plugin = await bootSetup(fixture.repo);
@@ -921,6 +924,25 @@ describe("G-16: the plan executor off Windows (platform seam)", () => {
     expect(plugin.commands.has("plan")).toBe(false);
     expect(warn.mock.calls.filter(call => JSON.stringify(call).includes(platformModule.EXECUTOR_PLATFORM_NOTICE))).toEqual([]);
   }, 30_000);
+
+  it("QA-62C-3 the once-per-process notice flag is process-global (globalThis registry symbol) and the reset clears it", () => {
+    const key = Symbol.for("omr.executor.platformNotice.v1");
+    const registry = globalThis as typeof globalThis & Record<symbol, unknown>;
+    platformModule.resetExecutorPlatformNotice();
+    expect(Object.hasOwn(registry, key)).toBe(false);
+    const logger = { warn: vi.fn() };
+    platformModule.warnExecutorPlatformOnce(logger);
+    expect(registry[key]).toBe(true);
+    platformModule.warnExecutorPlatformOnce(logger);
+    expect(logger.warn).toHaveBeenCalledExactlyOnceWith(`[router] ${platformModule.EXECUTOR_PLATFORM_NOTICE}`);
+    // Another module copy reads the same flag: set by it, this copy logs nothing.
+    platformModule.resetExecutorPlatformNotice();
+    registry[key] = true;
+    platformModule.warnExecutorPlatformOnce(logger);
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    platformModule.resetExecutorPlatformNotice();
+    expect(Object.hasOwn(registry, key)).toBe(false);
+  });
 
   it("the seam's default is this process's platform, and only win32 supports the executor", () => {
     expect(platformModule.executorPlatformSupported()).toBe(process.platform === "win32");

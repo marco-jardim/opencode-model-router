@@ -19,16 +19,21 @@ export function executorPlatformSupported(platform: NodeJS.Platform = process.pl
   return platform === "win32";
 }
 
-let warnedExecutorPlatform = false;
+/**
+ * QA-62C-3: the "notice logged" flag lives on `globalThis` under a registry symbol, so every loaded copy of this module
+ * (a hot reload, a second bundle) shares it and the process still logs one notice.
+ */
+const platformNoticeKey = Symbol.for("omr.executor.platformNotice.v1");
+const platformNotice = globalThis as typeof globalThis & { [platformNoticeKey]?: boolean };
 
 /** Logs {@link EXECUTOR_PLATFORM_NOTICE} once per process (AGENTS.md: at most one notice per process for an inert feature). */
 export function warnExecutorPlatformOnce(logger: { warn(message: string): void }): void {
-  if (warnedExecutorPlatform) return;
-  warnedExecutorPlatform = true;
+  if (platformNotice[platformNoticeKey] === true) return;
+  platformNotice[platformNoticeKey] = true;
   logger.warn(`[router] ${EXECUTOR_PLATFORM_NOTICE}`);
 }
 
 /** Tests only: forget that the notice was logged. */
 export function resetExecutorPlatformNotice(): void {
-  warnedExecutorPlatform = false;
+  delete platformNotice[platformNoticeKey];
 }

@@ -208,7 +208,9 @@ parent's directory.
   started in lies outside every `routing.workRoots` entry, the worktrees are still listed and the executor home is still
   denied, but there is no executor slots-root allowance. See [Assembly and lifecycle](./EXECUTOR.md#assembly-and-lifecycle).
   The plan executor is Windows only in this release: on other platforms it is inert, so role agents get no
-  executor-home deny and no slots-root allowance.
+  slots-root allowance and no executor-home lookup runs. An executor home that already exists there (a Windows host runs
+  the executor on a repository shared with, for example, WSL) is still denied: the router reads the listed worktree's
+  `.git` (and its `commondir`) to find `<git common dir>/omr-executor` on disk, without running git.
 - **Canonical long form.** Write `routing.workRoots` entries in their canonical long spelling: an 8.3 short segment
   (`PROGRA~1`) is refused, because the host compares spellings and a short name can alias another directory.
 - **Over-match.** `*` crosses separators: `D:/git/omr-rta-*` allows every directory starting with `omr-rta-`, nested
@@ -825,8 +827,9 @@ For execution of a written plan, see [the plan executor guide](EXECUTOR.md): `/p
 isolated slots, [leases and safety invariants](EXECUTOR.md#safety-model), recovery and the
 [owner checklist](EXECUTOR.md#owner-checklist-for-the-next-real-plan). It requires roles mode at start and enforced
 leases; plain role dispatches do not become plan tasks merely by running in the background. The plan executor is
-Windows only in this release: on Linux and macOS `router_plan` and `/plan` are not registered and the router logs one
-notice per process, `plan executor requires Windows; router_plan and /plan are not registered`.
+Windows only in this release: on platforms other than Windows `router_plan` and `/plan` are not registered, and when
+roles mode at start with enforced leases and verification not `never` would assemble it the router logs one notice per
+process, `plan executor requires Windows; router_plan and /plan are not registered`.
 
 ## File leases
 

@@ -15,9 +15,9 @@
  * anything (I1/I8). A failure while resolving or building the roles registers no role agent at
  * all (fail closed); tier agents are never touched.
  */
-import { lstatSync, realpathSync, statSync } from "node:fs";
-import { join, posix, win32 } from "node:path";
-import { resolveExecutorHome } from "../executor/paths";
+import { lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { dirname, join, posix, resolve as resolvePath, win32 } from "node:path";
+import { EXECUTOR_HOME_DIRNAME, resolveExecutorHome } from "../executor/paths";
 import { resolveActiveTiers, resolveRolesRouting, resolveRouting, slotsDirProblem, type RouterConfig, type TierConfig } from "./config";
 import { GIT_TOOL_NAMES, gitEnvironment, gitExecutable, hardeningArgs, inheritedSafeDirectoryArgs, spawnBounded, workRootGuards } from "./git-tools";
 import { positiveBudget, REFUSAL_CAP, ROUTE_BUDGET_RAISE_MAX, TIER_GUARD_BUDGET } from "./guard-profile";
@@ -238,6 +238,44 @@ export function approvedRootPattern(path: string, realpath: Realpath = nativeRea
   if (!same) return { problem: `resolves to ${canonical}, not the approved path` };
   const after = workRootProblem(canonical);
   return after === undefined ? { pattern: join(canonical, "*") } : { problem: `canonical form ${canonical} ${after}` };
+}
+
+/**
+ * QA-62C-1: the git common directory of `directory` read from disk, without running git (used off Windows, where the
+ * executor never runs but a Windows host sharing the repository may). Walks up from `directory` to the first `.git`:
+ * a directory is the common directory itself; a file `gitdir: <path>` names the private git directory (relative to the
+ * file's folder), whose `commondir` file, when present, names the common directory (relative to that git directory).
+ * Undefined when no `.git` is found or it cannot be read.
+ */
+export function gitCommonDirFromDisk(directory: string): string | undefined {
+  let current = resolvePath(directory);
+  for (;;) {
+    const dotGit = join(current, ".git");
+    let isDirectory: boolean | undefined;
+    try {
+      isDirectory = statSync(dotGit).isDirectory();
+    } catch { /* No `.git` here: try the parent. */ }
+    if (isDirectory === true) return dotGit;
+    if (isDirectory === false) {
+      try {
+        const match = /^gitdir:[ \t]*(.+?)[ \t]*$/m.exec(readFileSync(dotGit, "utf8"));
+        if (match === null) return undefined;
+        const gitDir = resolvePath(current, match[1] as string);
+        let commonDir: string;
+        try {
+          commonDir = readFileSync(join(gitDir, "commondir"), "utf8").replace(/\r?\n$/, "");
+        } catch {
+          return gitDir;
+        }
+        return commonDir.trim() === "" ? gitDir : resolvePath(gitDir, commonDir);
+      } catch {
+        return undefined;
+      }
+    }
+    const parent = dirname(current);
+    if (parent === current) return undefined;
+    current = parent;
+  }
 }
 
 /** Executor directories may not exist yet; only ENOENT permits using a canonical parent and the literal basename. */
@@ -485,7 +523,9 @@ export interface RoleRegistrationOptions {
   executorHome?: (directory: string) => Promise<string>;
   /**
    * G-16: false when the plan executor cannot run on this platform (the caller asks `executorPlatformSupported`): the
-   * executor is treated as disabled, so no executor-home lookup runs and no slots root is granted. Absent: true.
+   * executor is treated as disabled, so no executor-home lookup runs and no slots root is granted. An executor home that
+   * already exists in the git common directory (found on disk by {@link gitCommonDirFromDisk}, no git) is still denied
+   * (QA-62C-1: a Windows host may run the executor on a repository shared with WSL). Absent: true.
    */
   executorPlatform?: boolean;
   /** Clock in epoch ms for the approval expiry; default `Date.now`. */
@@ -612,6 +652,26 @@ export async function registerRoleAgents(
           executorProblems.push(["roles:executor-slots", `${PREFIX}executor slots root ${root ?? "(default)"} ${slots.problem ?? "is not usable"}; not granted`]);
         } else if (!externalDirectory.includes(slots.pattern)) {
           externalDirectory.push(slots.pattern);
+        }
+      }
+    } else if (opts.executorPlatform === false && table.roles.size > 0
+      && (!outside || worktrees.length > 0 || worktreeListingProblem !== undefined)) {
+      // QA-62C-1: the executor does not run on this platform, but a Windows host sharing the repository (WSL) may run it.
+      // Deny an existing executor home, found on disk without running git; never grant the slots root here.
+      const common = gitCommonDirFromDisk(worktrees[0] ?? opts.directory);
+      if (common !== undefined) {
+        const home = join(common, EXECUTOR_HOME_DIRNAME);
+        let exists = false;
+        try {
+          exists = statSync(home).isDirectory();
+        } catch { /* No executor home: nothing to deny. */ }
+        if (exists) {
+          const canonical = executorDirectoryRoot(home, opts.realpath ?? nativeRealpath, false);
+          if (canonical.root !== undefined) {
+            externalDirectoryDenied = [join(canonical.root, "*")];
+          } else {
+            executorProblems.push(["roles:executor-home", `${PREFIX}the executor home ${home} ${canonical.problem ?? "has no canonical long form"}; the executor home is not denied`]);
+          }
         }
       }
     }

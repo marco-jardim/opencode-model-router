@@ -8,10 +8,12 @@
 > [OpenCode v1 fallback](ROLES.md#opencode-v1-fallback) for how v2-only features behave there).
 >
 > **Windows only in this release.** Execution slots need a drive-letter path (`routing.executor.slotsDir`, default
-> `<drive>:\.omr-slots\<planId>`), so on Linux and macOS the executor is inert on OpenCode v2:
-> `router_plan` and `/plan` are not registered, `/router` does not list `/plan`, role agents get no executor-home or
-> slots rule, and no executor discovery runs at start. When roles mode with enforced leases would assemble it, the
-> router logs one notice per process:
+> `<drive>:\.omr-slots\<planId>`), so on platforms other than Windows the executor is inert on OpenCode v2:
+> `router_plan` and `/plan` are not registered, `/router` does not list `/plan`, role agents get no slots rule and no
+> executor-home lookup runs, and no executor discovery runs at start. An executor home that already exists (a Windows
+> host runs the executor on a repository shared with, for example, WSL) is still denied to role agents: the router
+> finds `<git common dir>/omr-executor` on disk, without running git. When roles mode at start with enforced leases and
+> verification not `never` would assemble it, the router logs one notice per process:
 > `plan executor requires Windows; router_plan and /plan are not registered`.
 
 The plan executor runs a written plan (a Markdown file of phases and tasks) with several subagents at once, without

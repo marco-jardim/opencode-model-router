@@ -11,6 +11,7 @@
  */
 import { realpathSync } from "node:fs";
 import { posix, win32 } from "node:path";
+import { isSlash, trimEndWhile } from "../util/linear-trim";
 import { permissionMatches } from "./read-only";
 import { workRootGlobIndex } from "./roles-config";
 
@@ -19,11 +20,7 @@ const nativeRealpath: Realpath = (path) => realpathSync.native(path);
 
 function normalize(path: string, platform: NodeJS.Platform): string {
   const forward = path.replace(/\\/g, "/");
-  let end = forward.length;
-  if (!/^[A-Za-z]:\/$|^\/$/.test(forward)) {
-    while (end > 0 && forward[end - 1] === "/") end--;
-  }
-  const trimmed = forward.slice(0, end);
+  const trimmed = /^[A-Za-z]:\/$|^\/$/.test(forward) ? forward : trimEndWhile(forward, isSlash);
   return platform === "win32" ? trimmed.toLowerCase() : trimmed;
 }
 
