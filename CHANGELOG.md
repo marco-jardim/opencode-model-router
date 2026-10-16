@@ -132,6 +132,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **CI: pull requests are Linux-only; one Windows Node 22 typecheck + full-suite coverage job runs on master pushes
+  and manual runs.** Linux e2e and Bun smoke stay blocking. Without Windows coverage, only `src/verify/exec.ts`
+  and the `src/executor/` prefix are warn-only; with it, all coverage gates block (G-21).
 - **OpenCode v2: register `router_plan` and `/plan` only in roles mode selected at start, like `router_run`.** Tiers
   mode no longer carries the unusable plan-tool schema; switching to roles needs a restart. `/router` help never
   advertises an unregistered or user-defined `/plan`. OpenCode v1's tool, command and help maps are unchanged.

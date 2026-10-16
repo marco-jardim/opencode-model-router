@@ -521,6 +521,11 @@ a plan awaiting approval. Recovery and adoption do not turn a compile/run reques
 
 ## Windows notes
 
+CI exercises the Windows executor in `test + coverage (node 22, windows-latest)`: typecheck and the full
+default suite with coverage on master pushes and manual runs, without Windows e2e. Pull requests are
+Linux-only; without the Windows coverage input, the `src/executor/` prefix and `src/verify/exec.ts` are
+warn-only in the coverage gate. With that input, all gates block.
+
 - **Same drive, short root.** Keep slots on the repository's drive, outside every non-slot worktree; the default
   `<repo drive>:\.omr-slots\<planId>` is intentionally short. Configure a different root only in the global override.
   Moving slots to another drive is refused, not a way around checkout isolation.

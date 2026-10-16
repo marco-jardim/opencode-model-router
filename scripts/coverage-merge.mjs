@@ -3,15 +3,17 @@
 // (Windows + Linux CI runners) and enforce the per-file gate declared in
 // vitest.config.ts: MERGED_PER_FILE_GATED / MERGED_PER_FILE_MIN (exact files, lines + branches) and
 // MERGED_PREFIX_GATED (directory prefixes ending in "/": every merged file under one is gated on the
-// metrics the entry declares, functions included; a prefix matching no file fails). The decision
+// metrics the entry declares, functions included; a prefix matching no file fails unless warn-only). The decision
 // itself is the pure evaluateGates in scripts/coverage-gate.ts.
 //
-// Usage: node scripts/coverage-merge.mjs [--warn-only <src/...>]... <out-dir> <coverage-final.json>...
+// Usage: node scripts/coverage-merge.mjs [--warn-only <src/...>]... [--warn-only-prefix <prefix>]... <out-dir> <coverage-final.json>...
 //
 // --warn-only <rel>: that gated file is still measured and printed, but a miss prints a GitHub
-// `::warning::` instead of failing the gate. CI passes `--warn-only src/verify/exec.ts` when the
-// Windows unit input is missing: Linux-only data leaves exec.ts's win32 branches uncovered. Every
-// other gated file stays blocking. The path must be one of MERGED_PER_FILE_GATED.
+// `::warning::` instead of failing the gate. The path must be one of MERGED_PER_FILE_GATED.
+// --warn-only-prefix <prefix>: the same for every file under a MERGED_PREFIX_GATED prefix,
+// including when that prefix matches no file. CI softens src/verify/exec.ts and src/executor/
+// when Windows unit coverage is missing (PRs are Linux-only). Every other gate stays blocking;
+// with the Windows input from a master push or manual run, all gates block.
 //
 // Why not `vitest --merge-reports`: blob reports store absolute source paths
 // (e.g. D:\a\...\src\verify\exec.ts vs /home/runner/work/.../src/verify/exec.ts),
@@ -19,7 +21,7 @@
 // key is rewritten to its repo-relative `src/...` path before merging, then
 // resolved against the current checkout. See docs/qa/verification-resource-budget/phase-3.1.md.
 //
-// Exit code: 0 when every gated file meets the minimum, 1 otherwise, 2 on bad input.
+// Exit code: 0 when all blocking gates pass, 1 on a blocking coverage miss, 2 on bad input.
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import libCoverage from "istanbul-lib-coverage";
@@ -28,8 +30,9 @@ process.env.OMR_COVERAGE_MERGED = "1";
 const { MERGED_PER_FILE_GATED, MERGED_PER_FILE_MIN, MERGED_PREFIX_GATED } = await import("../vitest.config.ts");
 const { evaluateGates } = await import("./coverage-gate.ts");
 
-const USAGE = "usage: node scripts/coverage-merge.mjs [--warn-only <src/...>]... <out-dir> <coverage-final.json>...";
+const USAGE = "usage: node scripts/coverage-merge.mjs [--warn-only <src/...>]... [--warn-only-prefix <prefix>]... <out-dir> <coverage-final.json>...";
 const warnOnly = new Set();
+const warnOnlyPrefixes = new Set();
 const positional = [];
 const argv = process.argv.slice(2);
 for (let i = 0; i < argv.length; i++) {
@@ -40,6 +43,13 @@ for (let i = 0; i < argv.length; i++) {
       process.exit(2);
     }
     warnOnly.add(rel);
+  } else if (argv[i] === "--warn-only-prefix") {
+    const prefix = argv[++i];
+    if (!prefix || !MERGED_PREFIX_GATED.some((entry) => entry.prefix === prefix)) {
+      console.error(`--warn-only-prefix needs one of: ${MERGED_PREFIX_GATED.map((entry) => entry.prefix).join(", ")} (got ${prefix ?? "nothing"})\n${USAGE}`);
+      process.exit(2);
+    }
+    warnOnlyPrefixes.add(prefix);
   } else if (argv[i].startsWith("--")) {
     console.error(`unknown option ${argv[i]}\n${USAGE}`);
     process.exit(2);
@@ -107,6 +117,7 @@ const outcome = evaluateGates({
   prefixes: MERGED_PREFIX_GATED,
   files: stats,
   warnOnly,
+  warnOnlyPrefixes,
 });
 const { failed, warnings } = outcome;
 
@@ -127,9 +138,11 @@ for (const p of MERGED_PREFIX_GATED) {
   console.log(`prefix gate ${p.prefix}: every merged file, ${mins.join(", ")}`);
 }
 if (warnOnly.size > 0) console.log(`warn-only (not blocking): ${[...warnOnly].join(", ")}`);
+if (warnOnlyPrefixes.size > 0) console.log(`warn-only prefixes (not blocking): ${[...warnOnlyPrefixes].join(", ")}`);
 for (const row of rows) console.log(row);
 for (const prefix of outcome.emptyPrefixes) {
-  console.log(`${prefix.padEnd(28)} FAIL: prefix gate matched no file of the merged report`);
+  const label = warnOnlyPrefixes.has(prefix) ? "WARN (warn-only)" : "FAIL";
+  console.log(`${prefix.padEnd(28)} ${label}: prefix gate matched no file of the merged report`);
 }
 for (const w of warnings) console.log(`::warning::${w}`);
 if (failed) {
