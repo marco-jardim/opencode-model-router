@@ -275,6 +275,34 @@ pending 6.2.QA
   to be refreshed against the host in a separate change. The routing-engine smoke `5-advisor` failure is the known
   pre-existing PF-4 (fails at `7181165` too).
 
+### Focused QA of G-11..G-14 (heavy, round 1, 2026-10-16) and fixes
+
+Reviewer session `ses_ebb4fd859ffeqg4Z0Urjl0Ewwr` at `25fd915`: 1 major, 2 minor, 3 nits.
+- **QA-62F-1 (major, security) — fixed.** With G-12 the worktree allows came back outside every work root, but the
+  executor-home lookup (and its deny) stayed gated by `!outside`, so `<main>\*` covered `<git common dir>\omr-executor`.
+  The lookup now runs when `!outside || worktrees.length > 0`; the slots-root grant alone stays inside the work roots.
+  Tests in `test/unit/role-agents-work-roots.test.ts`: the outside and G-12 cases assert `externalDirectoryDenied` and
+  a `deny` for `<wt>\.git\omr-executor\ledger.json`; new "QA-62F-1 …" cases for no slots root outside, no lookup
+  without a listed worktree, and fail-closed on an unresolved home.
+- **QA-62F-2 (minor, docs) — fixed.** `docs/ROLES.md` and `docs/CONFIG_REFERENCE.md` state the outside-work-roots
+  behaviour (worktrees listed, home denied, no slots-root allowance); docs-drift pins added.
+- **QA-62F-3 (minor, coverage) — fixed.** S6 has a third run (`routing.background.mode: "auto"`, verification
+  enforced): the call reaches the host with `background: true`, returns in < 3 s with a `running` acknowledgement
+  whose parts are the host ack, `[router] Running in the background (…). Its result is held until verification
+  finishes.`, then the probe's note; one `execute.after` record; no host errors.
+- **QA-62F-4 (nit) — fixed.** The start-up `git worktree list` picks its executable with `workRootGuards(directory)`,
+  as the executor-home lookup does; unit test "QA-62F-4 …".
+- **QA-62F-5 (nit) — fixed.** `v2-provider-e2e` flattens string or text-part system content (`contentText`).
+- **QA-62F-6 (nit) — accepted:** G-14's deferral stands on the identical failure at `6ec3faa`; the root-cause
+  sentence is reworded as unverified below.
+
+G-14 wording correction: the cause (host default for `external_directory` on 2.0.26 versus the spike's expectation)
+is not proven; only "identical failure at `origin/master` `6ec3faa`" is.
+
+Orchestrator validation: `npm run typecheck` exit 0; `role-agents-work-roots`, `roles.registration`, `work-roots`,
+`docs-drift`, `routing-advisor` integration: 326 passed, 1 skipped; on 2.0.26: role-spikes S2+S6 4/4 (with the
+auto run), roles + role-spikes 22/24 before the S6 matcher fix (S6 matcher, S11 = G-14), `smoke:v2:e2e` 4/4.
+
 ## Deferred findings
 
 pending 6.2.QA
