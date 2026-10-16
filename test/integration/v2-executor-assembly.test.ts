@@ -26,6 +26,12 @@ import { resolveRoleTable } from "../../src/router/roles";
 import { buildDraft, holderOf, openAttempt, taskNode } from "../fixtures/cpx/ledger/builders";
 import { removeDirWhenReleased } from "../helpers/remove-dir";
 import type { RouterPlanArgs } from "../../src/executor/tool";
+import type { Plugin } from "@opencode/plugin";
+import v2Plugin from "../../src/v2";
+import * as createModule from "../../src/executor/create";
+import * as pathsModule from "../../src/executor/paths";
+import * as platformModule from "../../src/executor/platform";
+import * as roleAgentsModule from "../../src/router/role-agents";
 
 // Every assembled instance must release the process-wide executor claim.
 const executors: V2Executor[] = [];
@@ -296,7 +302,8 @@ async function waitForChild(child: ReturnType<typeof scriptedRunner>, executor: 
   }, { timeout: 10_000 });
 }
 
-describe("assembled executor through v2 registration", () => {
+// executor is Windows-only (G-16): the real assembly needs drive-letter slots; the suite below drives the seam off Windows.
+describe.runIf(process.platform === "win32")("assembled executor through v2 registration", () => {
   it("launch fixtures have renderable routes, unlike the persistence builder's prose placeholder", () => {
     expect(() => renderRouteLine(taskNode("T1"), "C:/fixture/slot-1")).toThrow("not one well-formed [route");
     expect(renderRouteLine(assemblyTask("T1"), "C:/fixture/slot-1"))
@@ -816,4 +823,108 @@ describe("assembled executor through v2 registration", () => {
     // Completion may already have collected the worktree; the integration ref is the durable result.
     expect(git(fixture.repo, "show", `${value.integration.branch}:result.txt`)).toBe("verified work");
   }, 45_000);
+});
+
+/** The real `src/v2.ts` setup over a recording host: the tools and commands it registers, and what `/router` prompts. */
+async function bootSetup(repo: string) {
+  const tools = new Set<string>();
+  const commands = new Map<string, { execute(invocation: unknown): Promise<void> }>();
+  const prompts: string[] = [];
+  const reg = async () => ({ dispose: async () => {} });
+  const editors = {
+    agent: { update() {} },
+    command: { add(command: { name: string; execute(invocation: unknown): Promise<void> }) { commands.set(command.name, command); } },
+    tool: { add(tool: { name: string }) { tools.add(tool.name); }, update() {} },
+  };
+  const ctx = {
+    location: { directory: repo, project: { directory: repo } },
+    agent: { reload: async () => {}, list: async () => ({ data: [] }), transform: async (cb: (editor: unknown) => void) => { cb(editors.agent); return reg(); } },
+    command: { reload: async () => {}, transform: async (cb: (editor: unknown) => void) => { cb(editors.command); return reg(); } },
+    tool: { transform: async (cb: (editor: unknown) => void) => { cb(editors.tool); return reg(); }, hook: reg, list: async () => [] },
+    model: { list: async () => ({ data: [] }) },
+    session: {
+      get: async ({ sessionID }: { sessionID: string }) => ({ id: sessionID, ...(sessionID === "root" ? {} : { parentID: "root" }) }),
+      update: async () => {}, context: async () => [], synthetic: async () => {}, interrupt: async () => {}, move: async () => {},
+      prompt: async (input: { text: string }) => { prompts.push(input.text); },
+      hook: async () => reg(),
+    },
+    permission: { hook: reg },
+    event: { subscribe: async function* ({ signal }: { signal: AbortSignal }) {
+      while (!signal.aborted) await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+    } },
+  };
+  const dispose = await v2Plugin.setup(ctx as unknown as Plugin.Context);
+  let disposal: Promise<void> | null = null;
+  plugins.push(() => disposal ??= Promise.resolve(dispose?.()).then(() => undefined));
+  return { tools, commands, async router(): Promise<string> {
+    const router = commands.get("router");
+    if (router === undefined) throw new Error("/router is not registered");
+    prompts.length = 0;
+    await router.execute({ sessionID: "root", prompt: { text: "" }, delivery: undefined });
+    return prompts.join("\n");
+  } };
+}
+
+// G-16: runs on every platform, driving the one platform seam off Windows (where the executor is inert).
+describe("G-16: the plan executor off Windows (platform seam)", () => {
+  afterEach(() => { platformModule.resetExecutorPlatformNotice(); });
+
+  it("registers neither router_plan nor /plan, drops /plan from /router, looks no executor home up and logs one notice per process", async () => {
+    platformModule.resetExecutorPlatformNotice();
+    const fixture = await repository();
+    await configure(fixture.root, fixture.slotsRoot);
+    vi.spyOn(platformModule, "executorPlatformSupported").mockReturnValue(false);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const prepare = vi.spyOn(createModule, "prepareExecutor");
+    const home = vi.spyOn(pathsModule, "resolveExecutorHome");
+    const roles = vi.spyOn(roleAgentsModule, "registerRoleAgents");
+    const first = await bootSetup(fixture.repo);
+    // Roles mode is on at start (router_run is registered); only the executor surface is missing.
+    expect(first.tools.has("router_run")).toBe(true);
+    expect(first.tools.has("router_plan")).toBe(false);
+    expect(first.commands.has("router")).toBe(true);
+    expect(first.commands.has("plan")).toBe(false);
+    const help = await first.router();
+    expect(help).not.toBe("");
+    expect(help).not.toContain("/plan");
+    // Role registration ran with the executor treated as disabled: no executor-home lookup, no slots root.
+    expect(roles).toHaveBeenCalledWith(expect.anything(), expect.anything(), expect.objectContaining({ executorPlatform: false }));
+    const registration = await roles.mock.results[0]?.value as Awaited<ReturnType<typeof roleAgentsModule.registerRoleAgents>>;
+    expect(registration.registered).toContain("implementer");
+    expect(registration.externalDirectoryDenied).toEqual([]);
+    expect(registration.externalDirectory.some(pattern => pattern.includes(fixture.slotsRoot) || pattern.toLowerCase().includes(".omr-slots"))).toBe(false);
+    expect(home).not.toHaveBeenCalled();
+    // Start-up executor discovery did nothing.
+    expect(prepare).not.toHaveBeenCalled();
+    expect(runtimeModule.createExecutorRuntime).not.toHaveBeenCalled();
+    expect(poolModule.createSlotPool).not.toHaveBeenCalled();
+    expect(await readdir(join(fixture.repo, ".git"))).not.toContain("omr-executor");
+    // A second instance in the same process logs no second notice.
+    const second = await bootSetup(fixture.repo);
+    expect(second.tools.has("router_plan")).toBe(false);
+    const notices = warn.mock.calls.filter(call => JSON.stringify(call).includes(platformModule.EXECUTOR_PLATFORM_NOTICE));
+    expect(notices).toHaveLength(1);
+    expect(String(notices[0]?.[0])).toContain(`[router] ${platformModule.EXECUTOR_PLATFORM_NOTICE}`);
+  }, 30_000);
+
+  it.each([
+    ["tiers", "enforce"],
+    ["roles", "off"],
+  ])("logs no notice when the config does not ask for the executor (delegation %s, leases %s)", async (delegation, leases) => {
+    platformModule.resetExecutorPlatformNotice();
+    const fixture = await repository();
+    await configure(fixture.root, fixture.slotsRoot, delegation, leases);
+    vi.spyOn(platformModule, "executorPlatformSupported").mockReturnValue(false);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const plugin = await bootSetup(fixture.repo);
+    expect(plugin.tools.has("router_plan")).toBe(false);
+    expect(plugin.commands.has("plan")).toBe(false);
+    expect(warn.mock.calls.filter(call => JSON.stringify(call).includes(platformModule.EXECUTOR_PLATFORM_NOTICE))).toEqual([]);
+  }, 30_000);
+
+  it("the seam's default is this process's platform, and only win32 supports the executor", () => {
+    expect(platformModule.executorPlatformSupported()).toBe(process.platform === "win32");
+    expect(platformModule.executorPlatformSupported("win32")).toBe(true);
+    for (const platform of ["linux", "darwin", "freebsd"] as const) expect(platformModule.executorPlatformSupported(platform)).toBe(false);
+  });
 });

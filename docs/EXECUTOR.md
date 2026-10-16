@@ -6,6 +6,13 @@
 > OpenCode v1 is unchanged: no executor tool, command or instructions are registered there, and the
 > `routing.executor.*` keys are ignored with one notice per process (see
 > [OpenCode v1 fallback](ROLES.md#opencode-v1-fallback) for how v2-only features behave there).
+>
+> **Windows only in this release.** Execution slots need a drive-letter path (`routing.executor.slotsDir`, default
+> `<drive>:\.omr-slots\<planId>`), so on Linux and macOS the executor is inert on OpenCode v2:
+> `router_plan` and `/plan` are not registered, `/router` does not list `/plan`, role agents get no executor-home or
+> slots rule, and no executor discovery runs at start. When roles mode with enforced leases would assemble it, the
+> router logs one notice per process:
+> `plan executor requires Windows; router_plan and /plan are not registered`.
 
 The plan executor runs a written plan (a Markdown file of phases and tasks) with several subagents at once, without
 letting a half-finished task touch your checkout. This page describes what it does, the `/plan` command, the

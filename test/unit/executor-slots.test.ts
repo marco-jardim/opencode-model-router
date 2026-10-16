@@ -42,7 +42,8 @@ describe("slot environment: platform variants", () => {
     expect(slotEnvFor(ENV_ROOT, "linux")).toMatchObject({ set: {}, prependPath: [] });
   });
 
-  it("uses the Windows layout for the same slot when asked for win32", () => {
+  // executor is Windows-only (G-16): registerSlot keys `D:\…` roots with the host's path functions, so only win32 matches them.
+  it.runIf(process.platform === "win32")("uses the Windows layout for the same slot when asked for win32", () => {
     registerSlot({ root: ENV_ROOT, managers: ["pip"] });
     const env = slotEnvFor(ENV_ROOT, "win32");
     expect(env?.prependPath).toEqual([win32.join(ENV_ROOT, ".venv", "Scripts")]);
@@ -405,7 +406,8 @@ describe("SlotPool lifecycle", () => {
     expect(await h.fs.lstat(SLOTS)).not.toBeNull();
   });
 
-  it("registers the slot environment once it is usable and drops it when released slots are retired", async () => {
+  // executor is Windows-only (G-16): registerSlot keys `D:\…` roots with the host's path functions, so only win32 matches them.
+  it.runIf(process.platform === "win32")("registers the slot environment once it is usable and drops it when released slots are retired", async () => {
     const h = harness();
     await h.pool.open();
     const lease = await h.pool.acquire(PLAN, "task-1", C1);
@@ -1284,7 +1286,8 @@ describe("SlotPool repair", () => {
     expect(h.marker("slot-1").state).toBe("leased");
   });
 
-  it("leased and ready markers survive a restart: the same owner gets its slot, a new owner resets a ready one", async () => {
+  // executor is Windows-only (G-16): registerSlot keys `D:\…` roots with the host's path functions, so only win32 matches them.
+  it.runIf(process.platform === "win32")("leased and ready markers survive a restart: the same owner gets its slot, a new owner resets a ready one", async () => {
     const h = seeded([
       record("slot-1", { state: "leased", owner: "t1", managers: ["pip"] }),
       record("slot-2", { state: "ready", owner: null, commit: C1 }),
@@ -1356,7 +1359,8 @@ describe("SlotPool sidecars, stages and gc locking (QA-2.4-25 to QA-2.4-29)", ()
     expect(bare.git.resetKeeps[0]).not.toContain("/stale");
   });
 
-  it("QA-2.4-27: the executables found after provisioning are recorded, written beside the marker and restored", async () => {
+  // executor is Windows-only (G-16): registerSlot keys `D:\…` roots with the host's path functions, so only win32 matches them.
+  it.runIf(process.platform === "win32")("QA-2.4-27: the executables found after provisioning are recorded, written beside the marker and restored", async () => {
     const h = harness();
     const original = h.prov.provision.bind(h.prov);
     h.prov.provision = async (slot, detection, o) => {
@@ -1376,7 +1380,8 @@ describe("SlotPool sidecars, stages and gc locking (QA-2.4-25 to QA-2.4-29)", ()
     expect(slotEnvFor(lease.path, "win32")?.bins).toEqual([exe]);
   });
 
-  it("QA-2.4-27: a slot without a usable .bins file registers no executables and warns", async () => {
+  // executor is Windows-only (G-16): registerSlot keys `D:\…` roots with the host's path functions, so only win32 matches them.
+  it.runIf(process.platform === "win32")("QA-2.4-27: a slot without a usable .bins file registers no executables and warns", async () => {
     const h = seeded([record("slot-1", { state: "ready", owner: null, managers: ["pip"] })], [slotPath("slot-1")]);
     h.fs.put(sidecar("slot-1", "bins"), "{ not json");
     await h.pool.open();
@@ -1384,7 +1389,8 @@ describe("SlotPool sidecars, stages and gc locking (QA-2.4-25 to QA-2.4-29)", ()
     expect(h.warnings.some(w => w.includes(".bins"))).toBe(true);
   });
 
-  it("QA-2.4-31: on win32 only .exe and .com files are recorded", async () => {
+  // executor is Windows-only (G-16): registerSlot keys `D:\…` roots with the host's path functions, so only win32 matches them.
+  it.runIf(process.platform === "win32")("QA-2.4-31: on win32 only .exe and .com files are recorded", async () => {
     const h = harness();
     const original = h.prov.provision.bind(h.prov);
     h.prov.provision = async (slot, detection, o) => {
@@ -1397,7 +1403,8 @@ describe("SlotPool sidecars, stages and gc locking (QA-2.4-25 to QA-2.4-29)", ()
     expect(paths).toEqual(["python.exe", "tool.com"]);
   });
 
-  it("QA-2.4-31: on win32 node_modules\\.bin is not recorded, however many shims it holds", async () => {
+  // executor is Windows-only (G-16): registerSlot keys `D:\…` roots with the host's path functions, so only win32 matches them.
+  it.runIf(process.platform === "win32")("QA-2.4-31: on win32 node_modules\\.bin is not recorded, however many shims it holds", async () => {
     const h = harness();
     h.git.files = { "package.json": "{}\n", "package-lock.json": "{}\n" };
     const original = h.prov.provision.bind(h.prov);
@@ -1412,7 +1419,8 @@ describe("SlotPool sidecars, stages and gc locking (QA-2.4-25 to QA-2.4-29)", ()
     expect(JSON.parse(h.fs.text(sidecar(lease.slot, "bins")) ?? "null")).toEqual([]);
   });
 
-  it("QA-2.4-31: a large .bins list is not written, the slot still leases and router_run falls back to PATH", async () => {
+  // executor is Windows-only (G-16): registerSlot keys `D:\…` roots with the host's path functions, so only win32 matches them.
+  it.runIf(process.platform === "win32")("QA-2.4-31: a large .bins list is not written, the slot still leases and router_run falls back to PATH", async () => {
     const h = harness();
     const original = h.prov.provision.bind(h.prov);
     h.prov.provision = async (slot, detection, o) => {
@@ -2028,7 +2036,8 @@ describe("slot name, marker path, lock reason and safe dir", () => {
 // ---------------------------------------------------------------------------------------------------------------
 
 describe("SlotPool check-cleanup failures", () => {
-  it.each([
+  // executor is Windows-only (G-16): registerSlot keys `D:\…` roots with the host's path functions, so only win32 matches them.
+  it.runIf(process.platform === "win32").each([
     ["git clean", "cleanForChecks", new ExecutorError("E_GIT", "clean failed", { op: "clean", code: 1, stderr: "" })],
     ["pointer verification", "verifySlotPointers", new ExecutorError("E_SLOT_BROKEN", "slot .git is missing", {})],
   ] as Array<[string, string, ExecutorError]>)("a failing %s is reported as E_SLOT_BROKEN and leaves the leased slot with its owner", async (_name, op, error) => {
@@ -2091,7 +2100,8 @@ describe("slot environment", () => {
     expect(applySlotEnv(env, null, P)).toBe(env);
   });
 
-  it("applies inside a registered slot, in nested paths, and not outside or in a sibling with the same prefix", () => {
+  // executor is Windows-only (G-16): the missing nested path's null depends on the Windows temp-path canonical form.
+  it.runIf(process.platform === "win32")("applies inside a registered slot, in nested paths, and not outside or in a sibling with the same prefix", () => {
     registerSlot({ root: slotA, managers: ["pip", "pnpm"] });
     const venv = join(real(slotA), ".venv");
     const env = slotEnvFor(slotA, P);

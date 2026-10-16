@@ -220,9 +220,11 @@ describe("background dispatch: acknowledgement, in-flight list, completion annot
     // A unique event id: the adapter drops an end event id it has already seen in this process.
     h.emit({ type: "session.execution.succeeded", id: "ev-end-typed-assistant", created: 2, data: { sessionID: CHILD } });
     await h.drain();
-    // The end handler awaits the timing store before it starts the processor: poll the tail until the attempt left the in-flight list.
+    // The end handler awaits the timing store before it starts the processor: poll until the attempt left the in-flight list.
+    // G-16: the whole context is checked, as in QA-2.1-21: once the processing settled there may be no turn-state tail at all
+    // (`tail()` threw then, so the poll only passed when it caught a tail before that; on Linux CI it never did).
     await vi.waitFor(async () => {
-      const state = tail(await request(h, [user("continue")]));
+      const state = allText(await request(h, [user("continue")]));
       expect(state).not.toContain("In flight (background)");
       expect(state).not.toContain("router guarantees pending");
     }, { timeout: 5000, interval: 50 });

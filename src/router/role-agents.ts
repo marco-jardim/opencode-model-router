@@ -483,6 +483,11 @@ export interface RoleRegistrationOptions {
   realpath?: Realpath;
   /** Replaces the executor-home lookup; its result is still canonicalized before granting slots access. */
   executorHome?: (directory: string) => Promise<string>;
+  /**
+   * G-16: false when the plan executor cannot run on this platform (the caller asks `executorPlatformSupported`): the
+   * executor is treated as disabled, so no executor-home lookup runs and no slots root is granted. Absent: true.
+   */
+  executorPlatform?: boolean;
   /** Clock in epoch ms for the approval expiry; default `Date.now`. */
   now?: () => number;
 }
@@ -548,7 +553,8 @@ export async function registerRoleAgents(
     // slotsDir is trusted here: the project-controlled value was stripped before the config merge (D18).
     const executorRouting = resolveRouting(cfg, "v2");
     const slotsDir = executorRouting.executor.slotsDir;
-    const executorEnabled = executorRouting.leases.mode === "enforce" && cfg.enforcement?.verify?.require !== "never";
+    const executorEnabled = opts.executorPlatform !== false
+      && executorRouting.leases.mode === "enforce" && cfg.enforcement?.verify?.require !== "never";
     const executorProblems: Array<readonly [key: string, message: string]> = [];
     // QA-62F-1, QA-62F-9: outside every work root, listed worktrees or configured roots can still cover the executor
     // home in the git common directory, even when listing failed. Resolve the home (one read-only, guarded rev-parse)

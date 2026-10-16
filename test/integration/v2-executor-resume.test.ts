@@ -293,7 +293,8 @@ async function waitForState(executor: ReturnType<typeof built>, state: TaskNode[
   }, { timeout: WAIT_MS });
 }
 
-describe("v2 assembled executor resume and restored work (real launcher, pool and runtime)", () => {
+// executor is Windows-only (G-16): the real pool needs drive-letter slots; v2-executor-assembly.test.ts covers the inert POSIX path.
+describe.runIf(process.platform === "win32")("v2 assembled executor resume and restored work (real launcher, pool and runtime)", () => {
   it("A13: budget resumes the same session, slot, attempt and nonce, then commits/verifies/integrates once", async () => {
     const fixture = await repository();
     const tracked = await configure(fixture.root, fixture.slotsRoot);

@@ -130,7 +130,8 @@ async function fixture(setting: "auto" | "configured" = "configured") {
 }
 
 describe("prepared execution-slot command resolution", () => {
-  it.each(["auto", "configured"] as const)("uses the registered %s suite/base/bisect/revert binary and environment, not integration's install", async setting => {
+  // executor is Windows-only (G-16): with PATH="" a POSIX background check cannot find its `nice` wrapper (spawn nice ENOENT).
+  it.runIf(process.platform === "win32").each(["auto", "configured"] as const)("uses the registered %s suite/base/bisect/revert binary and environment, not integration's install", async setting => {
     const f = await fixture(setting);
     const original = JSON.stringify(f.commands);
     expect(f.commands[0]).toMatchObject({ file: f.binary(f.integration), resolution: { cwd: f.integration, env: { VIRTUAL_ENV: join(f.integration, ".venv") } } });
@@ -178,7 +179,8 @@ describe("prepared execution-slot command resolution", () => {
     expect(f.executed).toEqual([]);
   }, 30_000);
 
-  it.each([false, true])("preserves explicit environment overrides and explicit cwd=%s, even equal to inherited defaults", async overrideCwd => {
+  // executor is Windows-only (G-16): with PATH="" a POSIX background check cannot find its `nice` wrapper (spawn nice ENOENT).
+  it.runIf(process.platform === "win32").each([false, true])("preserves explicit environment overrides and explicit cwd=%s, even equal to inherited defaults", async overrideCwd => {
     const f = await fixture();
     const original = f.commands[0]!;
     const inheritedPath = Object.entries(original.resolution!.env).find(([key]) => key.toUpperCase() === "PATH")![1];
