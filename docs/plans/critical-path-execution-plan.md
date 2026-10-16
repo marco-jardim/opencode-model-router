@@ -4150,6 +4150,9 @@ Edge cases are those listed in 6.1.2.
   - `npx cross-env RUN_OC_SMOKE_ROLES=1 RUN_OC_SMOKE_ROLE_SPIKES=1 vitest run --config vitest.smoke.config.ts test/smoke/roles.smoke.test.ts test/smoke/role-spikes.smoke.test.ts`;
   - `npm run smoke:v1`, when an OpenCode 1.x executable is available. Otherwise record it as not run; the v1 goldens are
     then the evidence.
+- *Amended by A-6.2-1 (owner decision 2026-10-15):* the pre-flight runs typecheck and the full suite with coverage
+  only; every smoke lane runs once at a single final gate before the pull request, and CI covers the coverage gate and
+  `smoke:keyless`. *Amended by A-6.2-2:* findings deferred with a recorded reason count as closed for the first item.
 
 **Order:** 6.2.0 → 6.2.QA → 6.2.FIX (loop) → 6.2.4 → 6.2.3 → 6.2.5.
 
@@ -4734,5 +4737,29 @@ Node ≥ 22.18; DF-2 switch procedure and the 24 h pending TTL from DF-1; QA tas
   Related owner disposition (**2026-10-15**): `smoke:v1` is a **declared gap for 6.1**. This machine has only Claude
   Code v2.0.29 (`opencode --version`), not the 1.x executable required by `scripts/smoke-v1-preflight.mjs`.
   It remains a **6.2 full-matrix obligation**, not a pass; see the report's m-C row and Handoffs.
+
+- **A-6.2-1** (Phase 6.2, owner decision **2026-10-15**) — **One smoke run per lane, on the final code.** Applies to the
+  6.2 pre-flight and 6.2.4.
+
+  > Smoke evidence is valid for every commit whose tree is identical to the evidenced one, or whose diff touches nothing
+  > the smoke loads (docs-only). The 6.2 pre-flight runs `npm run typecheck` and the full suite with coverage once, and
+  > no real-host smoke: `smoke:cpx` and `smoke:cpx:e2e` are carried from Phase 6.1 (runs 24-26 and the final
+  > `smoke:cpx`, code `2b2cb58`; `cpx/main` `00c45a0` has the same tree as `cpx/p61` `7181165`). 6.2.QA and 6.2.FIX use
+  > scoped unit tests only. Before the pull request, a single final gate runs each local smoke lane **once** on the
+  > final code: `smoke:cpx`, `smoke:cpx:provision`, `smoke:cpx:e2e` (one run; the three-run repeatability gate was
+  > Phase 6.1's), `smoke:v2`, `smoke:routing`, `smoke:v2:e2e`, and the roles + role-spikes smokes. A red lane is fixed
+  > and only the affected lanes are rerun; the 6.2.4 "rerun every pre-flight command" is satisfied by this gate.
+  > The full suite with coverage, `typecheck` and `smoke:keyless` (OpenCode 1.18.19, a v1 host) are run by the PR's
+  > CI (`.github/workflows/test.yml`, `smoke-keyless.yml`) and are not repeated locally at the gate. `smoke:v1` stays a
+  > declared gap locally (no 1.x executable on this machine); CI's keyless lane on 1.x plus the v1 goldens are its
+  > evidence.
+
+  Accepted risk: lanes not run since earlier phases may already be red; they are found at the final gate rather than
+  before 6.2.QA, at the cost of one more fix round.
+
+- **A-6.2-2** (Phase 6.2, owner decision **2026-10-15**) — **Deferred findings with a recorded reason are accepted.**
+  Amends the 6.2 pre-flight item "every phase report shows zero open findings": findings deferred with a recorded reason
+  under the ratified bounded-QA rule (A-6.1-7) count as closed for the pre-flight and are disclosed in the Phase 6.2 PR.
+  Deferred findings without a recorded reason are queued for 6.2.QA, which decides whether 6.2.FIX fixes them.
 
 **Owner execution rules for the implementation session** — §0.14 (continuous iteration, momentary takeover, atomic delegation with [tier:heavy] for complex coding and lighter test runs, bounded QA rounds, pre-flight fix-or-document, Linear not used, worktree reporting), the testing policy (§0.6-9: scoped, accelerated, full suite only in 6.2), the bounded executor QA loop (default 3 rounds), and the handover's kickoff prompt.
