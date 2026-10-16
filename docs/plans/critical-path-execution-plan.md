@@ -4665,7 +4665,7 @@ Node ≥ 22.18; DF-2 switch procedure and the 24 h pending TTL from DF-1; QA tas
 
 - **A-6.1-3** (Phase 6.1, owner decision **2026-10-15**) — **One clean-checkout smoke and real-use soak.** Applies to
   6.1.3's remaining `unmeasured` subcases and 6.1.4; does not replace the green working-worktree runs or assert phase
-  acceptance.
+  acceptance. **Narrowed by A-6.1-6** (observable soak subcases only).
 
   > 6.1.4 runs `npm run smoke:cpx:e2e` **once**, not three times, in the detached worktree after `npm ci`. Its purpose
   > is to catch environment leakage (dependencies outside the lockfile, untracked files) on a clean checkout, since
@@ -4701,8 +4701,38 @@ Node ≥ 22.18; DF-2 switch procedure and the 24 h pending TTL from DF-1; QA tas
   its A-6.1-3 purpose (environment leakage on a clean checkout). Recorded in
   `docs\qa\critical-path-execution\phase-6.1.md`, "Owner amendment A-6.1-4 — 2026-10-15".
 
+  Result: **runs 24, 25 and 26 are green on code `2b2cb58`**; run 26 is the detached clean-checkout run at `9b8593f`.
+  Between run 25 and run 26's evaluation, `6e643fd` (soak analyzer: `scripts/`, `test/unit/`, CHANGELOG) and `532f209`
+  (docs) landed, both after run 26 started from `9b8593f`. Neither touches `src/` or anything the smoke loads;
+  run 26 itself ran at `9b8593f`, not either later head.
+
 - **A-6.1-5 (record only)** (Phase 6.1) — Owner-approved out-of-plan additions: opt-in
   `routing.roleFloor: "gated"` (`541a0cb`, `d1983e6`) and recording risk origin in `trace.riskSources` (`3df0230`).
   Both are v2-only, inert on v1; no acceptance criterion changes. Recorded in the Phase 6.1 report.
+
+- **A-6.1-6** (Phase 6.1, owner decision **2026-10-15**) — **Soak restricted to observable subcases.** Narrows A-6.1-3:
+  with current log formats its soak could never pass for G6 shared-tree read/search/run and deferred plugin verification,
+  or G9 non-held deferred pending verification across restart. The analyzer in `6e643fd` reports these structurally
+  unobservable subcases as `not-observable`.
+
+  > Only observable subcases are in soak scope. The not-observable G6/G9 subcases are **DECLARED GAPS**, disclosed in
+  > the Phase 6.2 PR alongside G3, G11, G13 and G8's bound. They are never reported as passing. Instrumenting `src/`
+  > to observe them is a possible follow-up, not a Phase 6.1/6.2 obligation.
+
+  The ≥5-working-day window and ≥3 occurrences with zero violations per observable criterion remain unchanged;
+  missing evidence is not a pass. Recorded in the Phase 6.1 report and its Handoffs.
+
+- **A-6.1-7** (Phase 6.1, owner ratification **2026-10-15**) — **Bounded-QA deferral rule ratified.** Supersedes §0.7
+  fix-loop rules 1–2 for Phase 6.1 (`docs\plans\critical-path-execution-plan.md:322–323`):
+
+  > After heavy QA round 2, only critical/major/blocking findings are fixed; minors and nits are deferred with a
+  > recorded reason. Round-1 deferrals already recorded with a reason stand.
+
+  Items whose reason is "no reason recorded; for owner decision in 6.2" remain unchanged in the deferred table and
+  go to 6.2; ratification does not invent a rationale. Recorded in the Phase 6.1 report's Deferred findings.
+
+  Related owner disposition (**2026-10-15**): `smoke:v1` is a **declared gap for 6.1**. This machine has only Claude
+  Code v2.0.29 (`opencode --version`), not the 1.x executable required by `scripts/smoke-v1-preflight.mjs`.
+  It remains a **6.2 full-matrix obligation**, not a pass; see the report's m-C row and Handoffs.
 
 **Owner execution rules for the implementation session** — §0.14 (continuous iteration, momentary takeover, atomic delegation with [tier:heavy] for complex coding and lighter test runs, bounded QA rounds, pre-flight fix-or-document, Linear not used, worktree reporting), the testing policy (§0.6-9: scoped, accelerated, full suite only in 6.2), the bounded executor QA loop (default 3 rounds), and the handover's kickoff prompt.

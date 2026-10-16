@@ -443,7 +443,7 @@ was not run for this change.
 ### Real-host smoke results (`npm run smoke:cpx:e2e`)
 
 Runs 22–26 are appended at final QA, using the orchestrator shell and the real Claude Code host.
-For runs 24–25, fixture triples are **makespan / g8Ratio / max idle-with-ready**.
+For runs 24–26, fixture triples are **makespan / g8Ratio / max idle-with-ready**.
 
 | Run | Head | Result | Notes |
 |---|---|---|---|
@@ -458,11 +458,17 @@ For runs 24–25, fixture triples are **makespan / g8Ratio / max idle-with-ready
 | 23 | `66efe47` | **green** (32 passed, 9 documented `unmeasured` skips) | Reported throughput: makespan 130.2 s, g8Ratio 1.51, max idle-with-ready 5.6 s. |
 | 24 | `2b2cb58` | **green** (32 passed, 9 documented `unmeasured` skips) | Recovered-verification admission; ~1839 s. node-npm: 134.2 s / 1.47 / 6.6 s; node-pnpm: 141.3 s / 1.49 / 7.6 s; py-pip: 130.4 s / 1.52 / 6.3 s. |
 | 25 | `2b2cb58` code (HEAD `9b8593f`, docs-only on top) | **green** (32 passed, 9 documented `unmeasured` skips) | ~1738 s. node-npm: 118.5 s / 1.35 / 6.5 s; node-pnpm: 128.6 s / 1.40 / 7.0 s; py-pip: 128.5 s / 1.50 / 8.8 s. |
-| 26 | `2b2cb58` code; final docs head to be recorded | in progress — orchestrator fills in | 6.1.4 clean checkout after `npm ci`; counts as the third green under A-6.1-4 only if successful. |
+| 26 | `2b2cb58` code (detached HEAD `9b8593f`) | **green** (32 passed, 9 documented `unmeasured` skips) | 6.1.4 clean checkout after `npm ci`; ~1854 s. node-npm: 125.9 s / 1.41 / 6.3 s; node-pnpm: 146.1 s / 1.53 / 8.0 s; py-pip: 132.4 s / 1.54 / 9.4 s. Third green under A-6.1-4. |
 
-Evidence: `.cpx-logs\e2e-runNN.log`, `.cpx-logs\run23-evidence\`, `.cpx-logs\run24-evidence\` and
-`.cpx-logs\run25-evidence\` are **untracked local scratch, not committed**. The run-26 result and evidence are for the
-orchestrator to fill in.
+Evidence: `.cpx-logs\e2e-runNN.log`, `.cpx-logs\run23-evidence\`, `.cpx-logs\run24-evidence\`,
+`.cpx-logs\run25-evidence\` and `.cpx-logs\run26-evidence\` are **untracked local scratch, not committed**.
+
+Run 26 used the detached worktree `D:\git\omr-cpx-e2e` at `9b8593f`, after `npm ci` installed 357 packages.
+npm blocked the optional `msgpackr-extract` install script (native acceleration with a JS fallback); the run was green
+regardless. The worktree status was clean after the run, and the worktree was removed.
+
+**Risk for the soak and 6.2:** run 26's py-pip max idle-with-ready reached **9.4 s** against the **10 s ceiling**,
+up from the previous maximum of **8.8 s**. The margin is shrinking; the ceiling is unchanged.
 
 Throughput (A-6.1-2, recorded): makespan 115-132 s in runs 19-21 versus 166 s in run 14; `g8Ratio` 1.32-1.47 (target ≤ 1.0, not met);
 longest idle-with-ready episode ≤ 7.1 s (ceiling 10 s).
@@ -474,12 +480,14 @@ the bound is met iff **`g8Ratio <= 1.0`** (`g8BoundMet = makespan <= bound`). Th
 
 **Phase 6.1 is not accepted.** Outstanding: two more consecutive green runs at the final head; the mandatory subcases still listed as
 `unmeasured` in the smoke; 6.1.4 (detached worktree, three green runs); 6.1.5 documentation; final heavy phase QA. G13 remains unmet.
+(superseded by the Verdict section)
 
 ## Owner amendment A-6.1-3 — 2026-10-15
 
 The owner amended the remaining evidence obligations on **2026-10-15**. This supersedes the earlier requirements for
 three detached-worktree runs and new synthetic coverage of the `unmeasured` subcases; earlier sections remain dated
 historical evidence. The plan's 6.1.3, 6.1.4 and amendment log record the decision. This is not phase acceptance.
+**Narrowed by A-6.1-6:** only observable soak subcases remain in scope; see the owner amendments and Handoffs below.
 
 - **6.1.4:** after `npm ci`, run `npm run smoke:cpx:e2e` **once**, not three times, in the detached worktree at the
   committed integration head (under the fallback, `cpx/p61`). This catches environment leakage on a clean checkout —
@@ -561,18 +569,35 @@ touch only docs); any red resets the count.
 The change touches only the executor recovery path and the plan-task verifier's attachment cut; runs 19–23 covered the
 rest of the code. Recorded in the plan's amendment log.
 
+**Count closed: runs 24, 25 and 26 are green on code `2b2cb58`.** Run 26 itself ran at detached HEAD `9b8593f`.
+Between run 25 and run 26's evaluation, `6e643fd` (soak analyzer: `scripts/`, `test/unit/`, CHANGELOG) and `532f209`
+(docs) landed, both after run 26 had started from `9b8593f`. Neither touches `src/` or anything the smoke loads;
+run 26 did not run at either later head. This is the actual run attribution, not a claim that all intervening commits
+were docs-only.
+
 **A-6.1-5 (record only):** owner-approved out-of-plan additions are opt-in `routing.roleFloor: "gated"`
 (`541a0cb`, `d1983e6`) and risk-origin recording in `trace.riskSources` (`3df0230`); v2-only, inert on v1;
 no acceptance criterion changes. Mirrored in the plan's amendment log.
 
+## Owner amendments A-6.1-6 and A-6.1-7 — 2026-10-15
+
+- **A-6.1-6 (soak scope):** A-6.1-3 as written could never pass with current log formats. G6 shared-tree
+  read/search/run and deferred plugin verification, and G9 non-held deferred pending verification across restart, are
+  structurally unobservable; the analyzer in `6e643fd` reports them `not-observable`. The owner restricts the soak to
+  observable subcases. These G6/G9 subcases are **DECLARED GAPS**, never passing, disclosed in the 6.2 PR alongside
+  G3, G11, G13 and G8's bound. Instrumenting `src/` is a possible follow-up, not a 6.1/6.2 obligation.
+- **A-6.1-7 (deferral rule):** owner-ratified on **2026-10-15**, superseding the plan's §0.7 fix-loop rules 1–2
+  (`docs\plans\critical-path-execution-plan.md:322–323`) for Phase 6.1. The ratified wording and dispositions are
+  recorded under Deferred findings. Both amendments are in the plan's amendment log.
+
 ## Findings
 
-Final Phase 6.1 heavy QA: **accept after fixes (MA-1, MA-2)**, not unconditional phase acceptance.
+Final Phase 6.1 heavy QA: **accept after fixes (MA-1, MA-2)**; both are now closed below. Acceptance retains the
+disclosures in Handoffs and Verdict.
 
 - **MA-1 (major):** the report lacked §0.7's final findings/fixes/deferred/handoff/verdict structure and a consolidated
   disposition of open findings. These final sections supply it; dated progress sections above remain historical.
-- **MA-2 (major):** soak-analyzer subcase statuses require correction by the parallel analyzer fix. Confirmation remains
-  with the orchestrator; this documentation change does not establish that fix's result.
+- **MA-2 (major):** soak-analyzer subcase statuses required correction; **fixed in `6e643fd`**.
 - Final-QA minors **m-A, m-B, m-C, m-E, m-G, m-H** and prior open findings are consolidated below. Smoke attribution,
   the ratio target, **m-F**'s stale three-working-worktree-runs wording and the wake/wrapping nits are corrected here.
 
@@ -584,21 +609,34 @@ Final Phase 6.1 heavy QA: **accept after fixes (MA-1, MA-2)**, not unconditional
 - Executor rounds 1–2 fixed the gated role floor, QA fix routes and **R2-1**'s unsafe dead-launcher fast path
   (`d1983e6`, `26d0a8b`, `66efe47`), with C16/O16 evidence. The recovery-cycle fix is `2b2cb58`, including recovery
   round-1 **M1, m3–m6, m8** and the fixed nits recorded above; round 2 verified those corrections.
-- This docs-only round fixes **MA-1**, records runs 22–25 and run 26's placeholder, corrects the same-code claim to
-  runs 21–23 (with a bracketed correction in the plan's owner quote), states the coded G8 formula/ratio threshold,
-  annotates acceptance with A-6.1-4, records A-6.1-5, and fixes wake wording and **N5**'s line wrap.
-- **MA-2:** “fixed in this round” is a **placeholder only**, pending orchestrator confirmation of the analyzer fix
-  and its checks. No checks were run by this documentation implementer; docs-drift remains for the orchestrator.
+- The prior docs-only round fixed **MA-1**, recorded runs 22–25, corrected the same-code claim to
+  runs 21–23 (with a bracketed correction in the plan's owner quote), stated the coded G8 formula/ratio threshold,
+  annotated acceptance with A-6.1-4, recorded A-6.1-5, and fixed wake wording and **N5**'s line wrap. This closing
+  update records run 26, A-6.1-6/A-6.1-7, final-code DoD evidence and the acceptance disclosures.
+- **MA-2: fixed in `6e643fd`.** Not-observable subcases are distinguished from missing evidence and never pass.
+
+### Final-code DoD evidence — 2026-10-15
+
+Orchestrator-reported results at final code **`2b2cb58`**, not checks run by this documentation implementer:
+
+- `npm run smoke:cpx`: **green, 5 files / 74 tests; 572 s**.
+- Goldens (`test/golden`): **green, 13 files / 113 tests**.
+- Scoped unit tests, docs-drift and `npm run typecheck`: **green**.
+- `router_verify pending:true`: **no unverified delegations**.
+- `smoke:v1`: **declared gap**, not a pass; the unavailable 1.x host is recorded in m-C and Handoffs.
+
+No checks were run by this documentation implementer; the orchestrator runs docs-drift again after these closing edits.
 
 ## Deferred findings
 
-The deferral rule was applied: **after QA round 2 fix only critical/major/blocking; defer the rest with reasons**.
-Its **dated owner ratification is PENDING**; the orchestrator fills the date only if the owner confirms. The earlier
-reports' references to an owner rule do not supply that ratification. No missing rationale is inferred below.
+**Owner-ratified on 2026-10-15 (A-6.1-7):** "After heavy QA round 2, only critical/major/blocking findings are fixed;
+minors and nits are deferred with a recorded reason. Round-1 deferrals already recorded with a reason stand."
+This supersedes the plan's §0.7 fix-loop rules 1–2 for Phase 6.1 (plan lines 322–323). Items marked
+"no reason recorded; for owner decision in 6.2" remain unchanged and go to 6.2; no missing rationale is inferred.
 
 This is the single consolidated disposition table for prior and final-QA open items. Local prefixes disambiguate
 reused ids; the four deferred recovery nits and three pre-existing items receive local ids. **N5** is retained as fixed
-in this round, and **MA-2** as a fix-confirmation placeholder, not as an approved major deferral.
+in the prior docs round, and **MA-2** as fixed in `6e643fd`, not as a major deferral.
 
 | ID | Origin round | Severity | Summary | Reason | Owner / next step |
 |---|---|---|---|---|---|
@@ -633,34 +671,43 @@ in this round, and **MA-2** as a fix-confirmation placeholder, not as an approve
 | N6 | Recovery fix R2 | nit | `registerRecoveredWork` keys by latest attempt rather than the end's `n`. | Safe under the ledger rule that the open attempt is latest. | 6.2 owner: make `if (a.n !== n) return` explicit. |
 | m-A | Final QA | minor | Lease-loss recovery can discard a finished end: `runtime.ts:3151/:3216` lack the `:3113–3117` guard, producing an uncounted lost attempt and relaunch. | no reason recorded; for owner decision in 6.2 | 6.2 owner: guard the lease-held requeue and regress a terminal end during interruption. |
 | m-B | Final QA | minor | `2b2cb58` restart-while-verifying path has unit coverage only; no smoke restart point. | no reason recorded; for owner decision in 6.2 | 6.2 owner: deterministic restart-while-verifying smoke point. |
-| m-C | Final QA | minor | Final-head `smoke:cpx`, `router_verify pending:true`, goldens and `smoke:v1` are not yet evidenced. | Final-head DoD checks pending; this is not a pass or waiver. | Orchestrator: run and record results before finalising; carry full matrix to 6.2. |
+| m-C | Final QA | minor | Final-code `smoke:cpx` (5 files / 74 tests, 572 s), goldens (13 files / 113 tests), scoped units, docs-drift and typecheck are green; `router_verify pending:true` reports no unverified delegations. `smoke:v1` remains a declared gap. | Owner decision 2026-10-15: this machine has only Claude Code v2.0.29 (`opencode --version`), no 1.x executable for `scripts/smoke-v1-preflight.mjs`; no v1 smoke pass claimed. | 6.2 owner: fulfil `smoke:v1` in the full validation matrix with a 1.x executable. |
 | m-E | Final QA | minor | Out-of-plan `routing.roleFloor: "gated"` and `trace.riskSources` need traceability/disclosure. | Owner-approved, v2-only and inert on v1; A-6.1-5 records them without changing acceptance. | Orchestrator / 6.2 owner: disclose both additions in the PR. |
 | m-G | Final QA | minor | Analyzer imports test helpers at runtime and needs Node ≥22.13 for `stripTypeScriptTypes`. | no reason recorded; for owner decision in 6.2 | 6.2 owner: decide runtime dependency packaging and document the Node requirement. |
 | m-H | Final QA | minor | Applicable executor fixes still need porting to `cpx/pdf2-1` and bounded re-check of `4070b22`. | no reason recorded; for owner decision in 6.2 | Orchestrator / 6.2 owner: fulfil `phase-6.1-handover.md`'s port obligation. |
-| MA-2 | Final QA | major | Soak-analyzer subcase statuses need correction. | “fixed in this round” — placeholder only; orchestrator confirmation pending, not deferred acceptance. | Analyzer implementer / orchestrator: confirm implementation and checks before closing. |
+| MA-2 | Final QA | major | Soak-analyzer subcase statuses needed correction. | Fixed in `6e643fd`; retained for traceability, not deferred. | Closed; preserve missing / not-observable distinctions in soak reporting. |
 
 ## Handoffs
 
-- **Orchestrator, before finalising 6.1:** fill run 26 (6.1.4 clean checkout), confirm MA-2, and record final-head DoD
-  evidence, including `smoke:cpx`, `router_verify pending:true`, goldens and `smoke:v1` (or an explicit unavailable-host
-  disposition). Run `npx vitest run test/unit/docs-drift.test.ts`; no docs-drift pass is claimed by this edit.
+- **Closing evidence:** run 26 completes 6.1.4 and A-6.1-4's three greens on code `2b2cb58`; MA-2 is fixed in
+  `6e643fd`. Final-code DoD results are recorded above. The orchestrator runs docs-drift after these closing edits;
+  this implementer claims no new check execution.
+- **`smoke:v1` declared gap (owner decision 2026-10-15):** only Claude Code v2.0.29 is available via
+  `opencode --version`; no 1.x executable meets `scripts/smoke-v1-preflight.mjs`. This is a **6.2 obligation** in the
+  full matrix, not a pass or permanent waiver (m-C).
 - **6.2 validation:** run the full suite with coverage, goldens, `smoke:v1`, all smokes and `router_verify pending:true`
   at the delivery head. Follow the plan's unavailable-v1-host rule if needed; absent evidence is not a pass. Add a
   deterministic restart-while-verifying smoke point for `2b2cb58`'s recovery path (m-B).
-- **Soak, A-6.1-3:** collect at least 5 working days of real plans with `MODEL_ROUTER_V2_OBSERVATIONS` enabled; analyse
-  offline with `scripts/soak-analyze.mjs`. Each observable criterion (G1/G2/G6/G8/G9) needs ≥3 occurrences and zero
-  violations. Preserve per-subcase statuses; missing/not-observable evidence is not a pass. G5 remains with 2.3 and
-  G12's full matrix with 6.2; only the owner may change the soak criteria.
-- **6.2 PR disclosures:** G13 remains unmet until the owner decides; disclose the G8 bound and ratio (bound met iff
-  `g8Ratio <= 1.0`, measured/disclosed only), soak gaps including unobserved G3/G11 and not-observable subcases, and
-  the owner-approved out-of-plan `roleFloor: "gated"` / `trace.riskSources` additions (v2-only, inert on v1).
+- **Soak pending, A-6.1-3 narrowed by A-6.1-6:** collect at least 5 working days of real plans with
+  `MODEL_ROUTER_V2_OBSERVATIONS` enabled; analyse offline with `scripts/soak-analyze.mjs`. Only observable subcases
+  of G1/G2/G6/G8/G9 are in scope; each observable criterion needs ≥3 occurrences and zero violations. G6 shared-tree
+  read/search/run and deferred plugin verification, and G9 non-held deferred pending verification across restart, are
+  `not-observable` **DECLARED GAPS**, disclosed alongside G3/G11, G13 and G8's bound, never reported as passing.
+  Instrumenting `src/` is optional follow-up, not a 6.1/6.2 obligation. Preserve per-subcase statuses; missing evidence is not a pass.
+  G5 remains with 2.3 and G12's full matrix with 6.2.
+- **Soak / 6.2 timing risk:** py-pip max idle-with-ready rose from 8.8 s to **9.4 s** in run 26, leaving only **0.6 s**
+  below the unchanged 10 s ceiling. Monitor the shrinking margin.
+- **6.2 PR disclosures:** G13 remains unmet until the owner decides; **G8's bound was not met** (`g8Ratio` 1.35–1.54
+  in runs 24–26, target `<= 1.0`; measured/disclosed under A-6.1-2). Disclose the pending soak and declared G3/G11
+  and not-observable G6/G9 gaps, the `smoke:v1` gap, deferred findings per the table, and the owner-approved out-of-plan
+  `roleFloor: "gated"` / `trace.riskSources` additions (v2-only, inert on v1).
 - **Cross-phase obligation:** port applicable executor fixes to `cpx/pdf2-1` and finish its bounded heavy QA re-check
   of `4070b22`, as required by `phase-6.1-handover.md`. The consolidated table supplies the 6.2 owner-decision queue;
-  ratification of the applied deferral rule still needs the owner's dated confirmation.
+  A-6.1-7 ratifies the deferral rule on 2026-10-15 without changing entries that have no recorded reason.
 
 ## Verdict
 
-Pending 6.1.4 (run 26) and DoD checks; final QA verdict: accept after fixes (MA-1, MA-2).
-
-The orchestrator finalises this verdict after recording those results and confirming MA-2. No completed soak or
-unconditional Phase 6.1 acceptance is claimed here.
+Phase 6.1 ACCEPTED on 2026-10-15 at code `2b2cb58` (report head: this commit), subject to the disclosures listed in
+Handoffs: G13 unmet; G8 bound not met (g8Ratio 1.35-1.54 in runs 24-26, target <= 1.0; A-6.1-2 measured/disclosed);
+soak pending (A-6.1-3 narrowed by A-6.1-6) with declared gaps G3, G11 and the not-observable G6/G9 subcases;
+smoke:v1 gap; deferred findings per the table.
