@@ -24,7 +24,7 @@ export interface ParsedTask {
   span: Span;
   subtasks: string[];
   tierTag: Tier | null;
-  route: { line: string; fields: RouteLine | null; conflict: boolean } | null;
+  route: { line: string; fields: RouteLine | null; conflict: boolean; inferred?: boolean } | null;
   verify: "required" | "deferred" | "none" | null;
   cap: number | "none" | null;
   acceptance: string | null;
@@ -1468,7 +1468,7 @@ export function parsePlan(text: string): ParsedPlan {
 // ---------------------------------------------------------------------------------------------------------------
 // annotateUnrouted (step 8)
 
-/** One `annotate` call over every routable task that carries no route line; existing tags and route lines are kept. */
+/** One `annotate` call over unrouted tasks; mark inferred routes so write footprints can reconcile them before role selection. */
 export async function annotateUnrouted(
   p: ParsedPlan,
   annotate: (s: readonly PlanStep[]) => Promise<AnnotatedPlan>,
@@ -1485,9 +1485,8 @@ export async function annotateUnrouted(
     return {
       ...t,
       tierTag: t.tierTag ?? (isTier(a.tier) ? a.tier : null),
-      route: { line: a.routeLine, fields, conflict: false },
+      route: { line: a.routeLine, fields, conflict: false, inferred: true },
     };
   });
   return { ...p, tasks };
 }
-

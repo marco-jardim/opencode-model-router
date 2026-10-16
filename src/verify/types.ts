@@ -64,6 +64,8 @@ export interface ExecResult {
 
 /** Options shared by every verification process seam (shell string or argv). */
 export interface ExecOptions {
+  /** Optional v2 diagnostics; process adapters split preparation from the actual spawn/child lifetime. */
+  service?: import("../executor/observations").ServiceExecution;
   cwd?: string;
   timeoutMs?: number;
   /** Aborting kills the whole process tree; an already-aborted signal never spawns. */
@@ -74,11 +76,12 @@ export interface ExecOptions {
   env?: Record<string, string>;
 }
 
+/** Execution-only seam; an adapter doing preparation must forward `service` to the instrumented process layer. */
 export interface ExecSeam {
   (command: string, opts?: ExecOptions): Promise<ExecResult>;
 }
 
-/** Spawn `file` with `args` and no shell: arguments reach the child byte-for-byte. */
+/** Spawn `file` with `args` and no shell: arguments reach the child byte-for-byte. Adapters preserve `service`. */
 export interface ArgvSeam {
   (file: string, args: readonly string[], opts?: ExecOptions): Promise<ExecResult>;
 }
@@ -93,6 +96,8 @@ export interface MutexRegistry {
 }
 
 export interface DeterministicDeps {
+  /** Read-only v2 intrinsic-execution diagnostics; absent on v1/off. */
+  service?: import("../executor/observations").ServiceObservation;
   /**
    * S5 (deterministic.ts header, T2 P2-P7): plans, runs and rechecks one testsPass request. Called
    * outside `mutex`. Absent -> testsPass is unverifiable, never a run (G5).

@@ -22,6 +22,7 @@ import ModelRouterPlugin from "../../src/index";
 import { invalidateConfigCache, overridePath } from "../../src/router/config";
 import { createPendingFileJournal, resolvePendingJournalDir, type PendingRecord } from "../../src/verify/pending";
 import { removeDirWhenReleased } from "./remove-dir";
+import type { V2Observations } from "../../src/compat/v2-observations";
 
 export interface SessionSpec {
   parentID?: string;
@@ -89,6 +90,7 @@ export interface BgHost {
 }
 
 export interface BootOptions {
+  observations?: V2Observations;
   /** Written to the global override file before anything reads the config. */
   overrides?: Record<string, unknown>;
   sessions?: Record<string, SessionSpec>;
@@ -278,6 +280,7 @@ export async function bootBgHost(options: BootOptions = {}): Promise<BgHost> {
     serverUrl: new URL("http://localhost"),
     $: () => undefined,
     ...(options.routerHost === "v1" ? {} : { routerHost: "v2" }),
+    routerObservations: options.observations,
     client: { session: { get: async ({ path }: { path: { id: string } }) => ({ data: { id: path.id } }) } },
     ...(runtime === undefined ? {} : { routerChildRunner: runtime.childRunner }),
   } as unknown as Parameters<typeof ModelRouterPlugin>[0]);
@@ -298,9 +301,9 @@ export async function bootBgHost(options: BootOptions = {}): Promise<BgHost> {
     });
   }
 
-  const cleanup = runtime === undefined
-    ? await registerV2Hooks(ctx as unknown as Context, seen)
-    : await registerV2Hooks(ctx as unknown as Context, seen, runtime);
+  const cleanup = await registerV2Hooks(ctx as unknown as Context, seen, runtime, {
+    observations: options.routerHost === "v1" ? undefined : options.observations,
+  });
 
   const turns = async (n = 40): Promise<void> => {
     for (let i = 0; i < n; i += 1) await Promise.resolve();

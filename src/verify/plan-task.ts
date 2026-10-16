@@ -310,17 +310,21 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
   const shutdown = new AbortController();
   const live = new Set<{ deadline: ReturnType<typeof createDeadline>; graders: ReadonlySet<string> }>();
   /** Races `work` against dispose: rejects with PlanTaskShutdownError once dispose is called (already called: at once). */
-  const untilShutdown = async <T>(work: Promise<T>): Promise<T> => {
+  const untilStopped = async <T>(work: Promise<T>, signal?: AbortSignal): Promise<T> => {
     let onAbort = (): void => {};
     const stop = new Promise<never>((_resolve, reject) => {
       onAbort = () => reject(new PlanTaskShutdownError());
-      if (shutdown.signal.aborted) onAbort();
-      else shutdown.signal.addEventListener("abort", onAbort, { once: true });
+      if (shutdown.signal.aborted || signal?.aborted) onAbort();
+      else {
+        shutdown.signal.addEventListener("abort", onAbort, { once: true });
+        signal?.addEventListener("abort", onAbort, { once: true });
+      }
     });
     try {
       return await Promise.race([work, stop]);
     } finally {
       shutdown.signal.removeEventListener("abort", onAbort);
+      signal?.removeEventListener("abort", onAbort);
     }
   };
   const unverifiable = (reason: string, dod?: DoD): { verdict: SlotVerdict; findings: string; ref: string } =>
@@ -339,18 +343,26 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
     }
   };
 
-  async function prepare(record: AttemptRecord, childID: string, restoredHead?: Parameters<VerificationWiring["prepareVerification"]>[6]): Promise<{ ok: true; prepared: PreparedVerification } | { ok: false; reason: string }> {
+  async function prepare(record: AttemptRecord, attempt: Attempt, restoredHead?: Parameters<VerificationWiring["prepareVerification"]>[6], signal?: AbortSignal): Promise<{ ok: true; prepared: PreparedVerification } | { ok: false; reason: string }> {
     const deadline = createDeadline(resolveVerifyBudget(deps.getConfig()).gateBudgetMs);
     const entry = { deadline, graders: new Set<string>() };
     live.add(entry);
-    if (disposing) deadline.abort(PLAN_TASK_SHUTDOWN_REASON);
+    const abort = (): void => deadline.abort(PLAN_TASK_SHUTDOWN_REASON);
+    signal?.addEventListener("abort", abort, { once: true });
+    if (disposing || signal?.aborted) abort();
     try {
-      const prepared = await deps.prepareVerification(deps.changedFileStore, record.id, childID, record.slotPath, deadline, record.startedAt, restoredHead);
+      const prepared = await untilStopped(deps.prepareVerification(
+        deps.changedFileStore, record.id, attempt.childSessionID ?? "", record.slotPath, deadline, record.startedAt, restoredHead,
+        record.orchestratorSessionID, () => ({ source: "plan-task-change", callID: attempt.callID ?? record.id }),
+        () => ({ planId: record.planId, taskId: record.taskId, attempt: record.n, phaseId: null, entryId: null,
+          taskIds: [record.taskId], component: "verify", candidate: restoredHead?.head ?? null }),
+      ), signal);
       return { ok: true, prepared };
     } catch (error) {
       return { ok: false, reason: `the change observation failed: ${scrubText(error instanceof Error ? error.message : String(error))}` };
     } finally {
       live.delete(entry);
+      signal?.removeEventListener("abort", abort);
       deadline.dispose();
     }
   }
@@ -379,16 +391,18 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
     }
   }
 
-  async function observe(task: TaskNode, slot: SlotLease, attempt: Attempt, finalText?: string, _ctx?: PlanTaskContext): Promise<void> {
+  async function observe(task: TaskNode, slot: SlotLease, attempt: Attempt, finalText?: string, ctx?: PlanTaskContext): Promise<void> {
     const key = keyOf(slot.planId, task.id, attempt.n);
     // The child's claim is kept even without a begin record: verify's restart fallback grades it too.
     if (finalText !== undefined && finalText.trim() !== "") finalTexts.set(key, finalText);
     const record = records.get(key);
     // No begin record (a restart): verify takes the fail-closed fallback.
     if (record === undefined || record.observed !== undefined) return;
-    record.observed = prepare(record, attempt.childSessionID ?? "");
+    // The cached observation is process-wide (it outlives an attachment): only its WAIT is bound to the attachment, never
+    // the observation itself, so an attachment cut cannot cache a failed observation that the next attachment would grade.
+    record.observed = prepare(record, attempt);
     // QA-5.1-4: dispose never waits for an observation (its deadline is aborted; verify then cuts).
-    try { await untilShutdown(record.observed); } catch { /* cut by dispose */ }
+    try { await untilStopped(record.observed, ctx?.signal); } catch { /* cut by dispose or attachment change */ }
   }
 
   async function forget(planId: string, taskId: string, n: number): Promise<void> {
@@ -420,7 +434,7 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
   }
 
   /** The restart fallback (no begin/observe record): fail closed, never a weaker gate. */
-  async function fallback(task: TaskNode, slot: SlotLease, attempt: Attempt, orchestratorSessionID: string): Promise<{ ok: true; record: AttemptRecord; prepared: PreparedVerification; trusted: false } | { ok: false; reason: string; dod: DoD }> {
+  async function fallback(task: TaskNode, slot: SlotLease, attempt: Attempt, orchestratorSessionID: string, signal?: AbortSignal): Promise<{ ok: true; record: AttemptRecord; prepared: PreparedVerification; trusted: false } | { ok: false; reason: string; dod: DoD }> {
     const dod = planTaskDoD(task);
     const id = planTaskVerificationID(orchestratorSessionID, slot.planId, task.id, attempt.n);
     const head = await revParse("HEAD", slot.path);
@@ -443,7 +457,7 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
     if (await (deps.perimeterPlanned ?? perimeterWouldBePlanned)(id, slot.path)) {
       return { ok: false, reason: "the attempt's observation was lost in a restart and its perimeter would be planned; the other repositories cannot be judged; unverifiable", dod };
     }
-    const observed = await prepare(record, attempt.childSessionID ?? "", restoredHead);
+    const observed = await prepare(record, attempt, restoredHead, signal);
     if (!observed.ok) return { ok: false, reason: observed.reason, dod };
     if (observed.prepared.perimeter !== undefined && observed.prepared.perimeter.roots.length > 0) {
       return { ok: false, reason: "the attempt's observation was lost in a restart and its perimeter would be planned; the other repositories cannot be judged; unverifiable", dod };
@@ -454,8 +468,10 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
 
   async function runPass(
     passDoD: DoD, budgetMs: number, record: AttemptRecord, task: TaskNode, slot: SlotLease, attempt: Attempt,
-    artefact: Artefact, prepared: PreparedVerification, parent: string,
+    artefact: Artefact, prepared: PreparedVerification, parent: string, signal?: AbortSignal,
   ): Promise<{ res: GateResult; cut: boolean }> {
+    // Bind this pass's wait to its attachment as well as plugin shutdown; the gate remains directly awaited.
+    const untilShutdown = <T>(work: Promise<T>): Promise<T> => untilStopped(work, signal);
     const cfg = deps.getConfig();
     const strict = cfg.enforcement?.verify?.strictUnverifiable;
     const scope = verificationScope(passDoD.cwd, slot.path);
@@ -464,6 +480,8 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
     const graders = new Set<string>();
     const entry = { deadline, graders };
     live.add(entry);
+    const abort = (): void => deadline.abort(PLAN_TASK_SHUTDOWN_REASON);
+    signal?.addEventListener("abort", abort, { once: true });
     const completedFailures: string[] = [];
     const child = attempt.childSessionID ?? "";
     const tree = prepared.snapshot?.root ?? slot.path;
@@ -471,6 +489,7 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
     try {
       // QA-5.1-14: the grader is parented to the plan's CURRENT orchestrator, as the runtime read it for this verify (an
       // adopt moves the plan; verify refused an unknown one before any gate ran).
+      // The verify service observer rides on `prepared.service`, bound to this attempt's checked candidate.
       const gateDeps = deps.buildGateDeps(parent, graders, prepared, deadline, false, parent);
       gateDeps.deterministic.onFailure = (reason) => completedFailures.push(reason);
       const delegation: Delegation = {
@@ -483,13 +502,15 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
         ...(placement.placements !== undefined ? { checkPlacements: placement.placements } : {}),
         ...(placement.refused !== undefined ? { refusedCheck: placement.refused } : {}),
       };
-      if (disposing) throw new PlanTaskShutdownError();
+      if (disposing || signal?.aborted) throw new PlanTaskShutdownError();
       const res = await untilShutdown(withTimeout(accept(delegation, artefact, gateDeps), deadline.remaining(), "verification gate"));
       return { res, cut: false };
     } catch (error) {
-      if (error instanceof PlanTaskShutdownError || disposing) {
+      if (error instanceof PlanTaskShutdownError || disposing || signal?.aborted) {
         // QA-5.1-4: dispose aborted the deadline and owns the grader aborts; the pass judged nothing and is never re-run.
         deadline.abort(PLAN_TASK_SHUTDOWN_REASON);
+        if (signal?.aborted && !disposing) await Promise.allSettled([...graders].map((sessionID) =>
+          withTimeout(deps.abortSession(sessionID), PLAN_TASK_ABORT_MS, "grader abort")));
         return { res: unverifiableGateResult(PLAN_TASK_SHUTDOWN_REASON, passDoD.source, strict), cut: false };
       }
       const timedOut = error instanceof RouterTimeoutError;
@@ -506,23 +527,25 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
       };
     } finally {
       live.delete(entry);
+      signal?.removeEventListener("abort", abort);
       deadline.dispose();
       for (const release of releases) release();
     }
   }
 
-  async function verifyNow(task: TaskNode, slot: SlotLease, attempt: Attempt, parent: string,
+  async function verifyWithAttachment(signal: AbortSignal | undefined, task: TaskNode, slot: SlotLease, attempt: Attempt, parent: string,
     onDecided: (decided: PlanTaskVerdict) => void): Promise<PlanTaskVerdict> {
+    const untilShutdown = <T>(work: Promise<T>): Promise<T> => untilStopped(work, signal);
     const key = keyOf(slot.planId, task.id, attempt.n);
     let record = records.get(key);
     let prepared: PreparedVerification;
     try {
       if (record?.observed !== undefined) {
-        const observed = await record.observed;
+        const observed = await untilShutdown(record.observed);
         if (!observed.ok) return unverifiable(observed.reason, record.dod);
         prepared = observed.prepared;
       } else {
-        const restored = await fallback(task, slot, attempt, parent);
+        const restored = await fallback(task, slot, attempt, parent, signal);
         if (!restored.ok) return unverifiable(restored.reason, restored.dod);
         record = restored.record;
         prepared = restored.prepared;
@@ -534,17 +557,29 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
       if (!checked.ok) return unverifiable(checked.reason, record.dod);
       const cfg = deps.getConfig();
       const budget = resolveVerifyBudget(cfg);
+      if (disposing || signal?.aborted) return cutVerdict(record.dod);
       // A fresh snapshot after cleanForChecks: the tree the checks run on (materialize's drift check, the lease wait's tree).
       const controller = new AbortController();
       let fresh: PreparedVerification["snapshot"];
+      let snapshotReason: string | undefined;
+      const preparation = prepared.service?.start("service-prep", "slot-snapshot", checked.candidate);
       try {
-        fresh = await withTimeout(snapshotTree(slot.path, controller.signal, { lowPriority: budget.lowPriority }), GIT_MS, "slot snapshot");
-      } catch {
+        fresh = await withTimeout(snapshotTree(slot.path, AbortSignal.any([controller.signal, ...(signal === undefined ? [] : [signal])]), {
+          lowPriority: budget.lowPriority,
+          onError: (reason) => { snapshotReason = reason; },
+        }), GIT_MS, "slot snapshot");
+        preparation?.end("completed");
+      } catch (error) {
+        snapshotReason = error instanceof Error ? error.message : String(error);
         fresh = undefined;
       } finally {
+        preparation?.end("error");
         controller.abort();
       }
-      if (fresh === undefined) return unverifiable(`the slot ${slot.path} could not be snapshotted after cleanForChecks; nothing ran`, record.dod);
+      if (fresh === undefined) {
+        const reason = snapshotReason === undefined ? "" : ` (${scrubText(snapshotReason).replace(/\s+/g, " ").trim().slice(0, 200)})`;
+        return unverifiable(`the slot ${slot.path} could not be snapshotted after cleanForChecks${reason}; nothing ran`, record.dod);
+      }
       const root = fresh.root ?? prepared.snapshot?.root ?? slot.path;
       const committed = await committedFiles(slot.path, root, record.base, checked.candidate);
       if (committed === undefined) return unverifiable(`the change between ${record.base} and ${checked.candidate} could not be read; nothing ran`, record.dod);
@@ -556,8 +591,15 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
         seen.add(k);
         changedFiles.push(file);
       }
+      const service = prepared.service;
+      const boundService: PreparedVerification["service"] = service === undefined ? undefined : {
+        start: (kind, stage, candidate = checked.candidate) => service.start(kind, stage, candidate),
+        execution: (stage, candidate = checked.candidate) => service.execution(stage, candidate),
+      };
       const gatePrepared: PreparedVerification = {
         ...prepared,
+        graderDispatchLabel: `${task.id}#${attempt.n}`,
+        ...(boundService === undefined ? {} : { service: boundService }),
         changedFiles,
         // The union is complete: the observed files and every path the candidate commits over the reset commit.
         changeBaseline: prepared.branchSwitch !== undefined ? "unavailable" : "available",
@@ -591,10 +633,20 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
       const current = record;
       const withReruns = async (passDoD: DoD, budgetMs: number): Promise<GateResult> => {
         for (;;) {
-          const { res, cut } = await runPass(passDoD, budgetMs, current, task, slot, attempt, artefact, gatePrepared, parent);
+          const { res, cut } = await runPass(passDoD, budgetMs, current, task, slot, attempt, artefact, gatePrepared, parent, signal);
+          if (signal?.aborted) return res;
           if (disposing || !isTransientPlanTaskResult(res, cut) || reruns >= PLAN_TASK_TRANSIENT_RERUNS) return res;
+          const reason = scrubText([...new Set([...res.verdict.reasons, ...(res.verdict.caveats ?? [])])].join("; "))
+            .replace(/\s+/g, " ").trim().slice(0, 200);
+          const label = scrubText(`${task.id}#${attempt.n}`).replace(/\s+/g, " ").trim().slice(0, 200);
+          warn(`plan-task verification retry ${reruns + 1} for ${label}: ${reason}`);
           // QA-5.1-4: dispose cancels the backoff (the transient result stands; verify already resolved as cut).
-          try { await untilShutdown(sleep(PLAN_TASK_RERUN_BACKOFF_MS[reruns])); } catch { return res; }
+          const backoff = prepared.service?.start("service-wait", "retry-backoff", checked.candidate);
+          let interrupted = true;
+          try {
+            try { await untilShutdown(sleep(PLAN_TASK_RERUN_BACKOFF_MS[reruns])); } catch { return res; }
+            interrupted = false;
+          } finally { backoff?.end(interrupted ? "interrupted" : "completed"); }
           reruns += 1;
         }
       };
@@ -613,7 +665,7 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
       }
       // QA-5.1-4: a gate cut by dispose judged nothing: no verdict reaches the outcome store.
       // QA-5.1-21: it is marked as a cut, which the runtime discards; nothing below runs for it (no `onVerdict`).
-      if (disposing) return cutVerdict(record.dod);
+      if (disposing || signal?.aborted) return cutVerdict(record.dod);
       // D10 (A-5.1-13): no R11 lineage. QA-3.1-2 / QA-3.1-3 caveats as on a dispatch.
       res = applyDispatchCaveats(res, gatePrepared);
       // QA-5.1-21: from here the verdict is decided: `verify` returns it even when dispose cuts its wait afterwards.
@@ -635,11 +687,15 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
   /** QA-5.1-6/-14: the orchestrator is the one the runtime read for THIS call (the grader's parent after an adopt too). */
   async function verify(task: TaskNode, slot: SlotLease, attempt: Attempt, ctx?: PlanTaskContext): Promise<PlanTaskVerdict> {
     const cut = (): PlanTaskVerdict => cutVerdict(records.get(keyOf(slot.planId, task.id, attempt.n))?.dod);
-    if (disposing) return cut();
+    if (disposing || ctx?.signal?.aborted) return cut();
     // QA-5.1-21: a verdict decided before dispose cut the wait (and already handed to `onVerdict`) is returned, never a cut.
     let decided: PlanTaskVerdict | null = null;
     try {
-      return await untilShutdown(verifyNow(task, slot, attempt, orchestrator(ctx), (v) => { decided = v; }));
+      // Attachment cuts are handled inside the pipeline, including bounded grader abort/cleanup, before a new
+      // attachment can verify this identity. Global dispose retains its prompt outer cut semantics.
+      const verifyNow = verifyWithAttachment.bind(undefined, ctx?.signal);
+      const result = await untilStopped(verifyNow(task, slot, attempt, orchestrator(ctx), (v) => { decided = v; }));
+      return ctx?.signal?.aborted && decided === null ? cut() : result;
     } catch (error) {
       if (error instanceof PlanTaskShutdownError) return decided ?? cut();
       throw error;

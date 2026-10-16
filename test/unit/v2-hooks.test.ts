@@ -4,13 +4,14 @@ import { Agent } from "@opencode/plugin";
 import type { Hooks } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import {
-  APPROVAL_RELOAD_APPLIES, executorRunnerStatus, registerV2Hooks, resumeTargetsOf, v2Instructions, V2_BACKGROUND_SETTLED,
+  APPROVAL_RELOAD_APPLIES, executorRunnerStatus, processToken, registerV2Hooks, resumeTargetsOf, v2Instructions, V2_BACKGROUND_SETTLED,
   type V2Executor, type V2ExecutorFactory, type V2ExecutorHost,
 } from "../../src/compat/v2-hooks";
 import { approvalReloadLine, markApprovalsChanged, type ApprovalsChange } from "../../src/commands/approvals";
 import { PLAN_PROVIDER_NAME, ROUTER_TURN_STATE_ATTACH } from "../../src/compat/turn-state";
 import { bindPlanChild, currentBinding, evict as evictBinding } from "../../src/routing/roles/binding";
 import type { HostSessionEvent } from "../../src/executor/types";
+import { processIdentity } from "../../src/executor/process-identity";
 import ModelRouterPlugin from "../../src/index";
 import { invalidateConfigCache, loadConfig, overridePath } from "../../src/router/config";
 import { getActiveTiers } from "../../src/router/protocol";
@@ -1362,6 +1363,21 @@ describe("plan executor wiring in the v2 adapter (3.1.7: W2, W4, W5, W6, M41)", 
     const tick = async (): Promise<void> => { for (let i = 0; i < 20; i += 1) await new Promise<void>((resolve) => setImmediate(resolve)); };
     return { f, listeners, providers, cleanup, messagesBySession, toolEvent, contextEvent, tick };
   }
+
+  it("the adapter preserves its process token and always reports unknown activity (launcher liveness belongs to recovery)", async () => {
+    expect(processToken()).toBe(processIdentity().token);
+    const x = fakeExecutor();
+    const w = await startWired({ executor: x.factory });
+    const host = x.state.host;
+    if (host === undefined) throw new Error("the factory was not called");
+    expect(await host.hosts.activity(PLAN_CHILD)).toBe("unknown");
+    w.messagesBySession.set(PLAN_CHILD, [{ type: "assistant", finish: "stop", time: { created: 1, completed: 2 } }]);
+    expect(await host.hosts.activity(PLAN_CHILD)).toBe("unknown");
+    expect(await host.hosts.activity("missing-child")).toBe("unknown");
+    w.f.emit({ id: "launcher-liveness-step", type: "session.step.started", data: { sessionID: PLAN_CHILD, model: { providerID: "p", id: "m" } } });
+    await w.tick();
+    expect(await host.hosts.activity(PLAN_CHILD)).toBe("unknown");
+  });
 
   it("a captured router tool call of the orchestrator feeds the executor (W2); disposing unsubscribes", async () => {
     const x = fakeExecutor();

@@ -10,6 +10,7 @@ import {
   overridePath,
   resetRolesWarnings,
   resolveRolesRouting,
+  sanitizeRoleFloor,
   setRoleTableResolverForTest,
   validateConfig,
   ROLE_NOTICE_PREFIX,
@@ -102,6 +103,47 @@ describe("routing.exploration", () => {
     expect(a.issues).toHaveLength(2);
     expect(sanitizeExploration({ rate: "x" }).value?.rate).toBeUndefined();
     expect(sanitizeExploration(5).value).toBeUndefined();
+  });
+});
+
+describe("routing.roleFloor", () => {
+  afterEach(() => resetRolesWarnings());
+
+  it.each(["strict", "gated"] as const)("accepts %s and resolves it on v2", (mode) => {
+    expect(sanitizeRoleFloor(mode)).toEqual({ value: mode, issues: [] });
+    const cfg = validateConfig(validRaw({ routing: { roleFloor: mode } }));
+    expect(cfg.routing?.roleFloor).toBe(mode);
+    expect(resolveRolesRouting(cfg, "v2").roleFloor).toBe(mode);
+  });
+
+  it.each(["other", "GATED", "", null, 1, false, {}, []].map((value) => ({ value })))("fails closed to strict with an issue for $value", ({ value }) => {
+    const sanitized = sanitizeRoleFloor(value);
+    expect(sanitized.value).toBe("strict");
+    expect(sanitized.issues).toHaveLength(1);
+    expect(sanitized.issues[0]).toContain("routing.roleFloor must be strict|gated");
+    expect(sanitized.issues[0]).toContain("using strict");
+    const cfg = validateConfig(validRaw({ routing: { roleFloor: value, margin: 0.1 } }));
+    expect(cfg.routing?.roleFloor).toBe("strict");
+    expect(cfg.routing?.margin).toBe(0.1);
+    expect(resolveRolesRouting(cfg, "v2").roleFloor).toBe("strict");
+  });
+
+  it("leaves an absent value unset and defaults to strict", () => {
+    expect(sanitizeRoleFloor(undefined)).toEqual({ value: undefined, issues: [] });
+    const cfg = validateConfig(validRaw());
+    expect(cfg.routing?.roleFloor).toBeUndefined();
+    expect(resolveRolesRouting(cfg, "v2").roleFloor).toBe("strict");
+  });
+
+  it.each(["strict", "gated"] as const)("is inert on v1 with only the existing single notice for %s", (roleFloor) => {
+    const warn = vi.fn();
+    const cfg = validateConfig(validRaw({ routing: { roleFloor } }));
+    const resolved = resolveRolesRouting(cfg, "v1", { warn });
+    resolveRolesRouting(cfg, "v1", { warn });
+    resolveRolesRouting(validateConfig(validRaw({ routing: { delegation: "roles", roleFloor } })), "v1", { warn });
+    expect(resolved).toMatchObject({ delegation: "tiers", roleFloor: "strict", inert: true });
+    expect(resolveRoles(cfg, "v1").size).toBe(0);
+    expect(warn).toHaveBeenCalledExactlyOnceWith("roles delegation requires OpenCode v2; using tiers");
   });
 });
 
@@ -297,6 +339,7 @@ describe("resolveRolesRouting", () => {
   it("applies defaults", () => {
     const r = resolveRolesRouting(validateConfig(validRaw()), "v2");
     expect(r.delegation).toBe("tiers");
+    expect(r.roleFloor).toBe("strict");
     expect(r.exploration).toEqual({ rate: 0, requireDetection: "deterministic" });
     expect(r.run.scripts).toEqual(["test", "typecheck", "lint", "build"]);
     expect(r.run.timeoutMs).toBe(600000);
@@ -374,6 +417,35 @@ describe("layers (loadConfig)", () => {
     }
     return project;
   }
+
+  it.each([
+    [undefined, "gated", "strict"],
+    ["strict", "gated", "strict"],
+    ["gated", "strict", "gated"],
+  ] as const)("strips project roleFloor (%s / %s), preserving the global policy", (global, projectFloor, expected) => {
+    const project = setup(
+      global === undefined ? undefined : { routing: { roleFloor: global } },
+      { routing: { roleFloor: projectFloor, margin: 0.2 } },
+    );
+    const cfg = loadConfig(project);
+    expect(cfg.routing?.roleFloor).toBe(global);
+    expect(resolveRolesRouting(cfg, "v2").roleFloor).toBe(expected);
+    expect(cfg.routing?.margin).toBe(0.2);
+    const text = getConfigNotices(project).map((notice) => notice.message).join("\n");
+    expect(text).toContain("routing.roleFloor");
+    expect(text).toContain("only tiers.json or the global override may set it");
+    expect(text).not.toContain("unknown routing key");
+  });
+
+  it("the global layer keeps valid roleFloor and reports invalid roleFloor with a v2-only notice", () => {
+    const good = setup({ routing: { roleFloor: "gated" } }, undefined);
+    expect(loadConfig(good).routing?.roleFloor).toBe("gated");
+    expect(getConfigNotices(good).map((notice) => notice.message).join("\n")).not.toContain("unknown routing key");
+    const bad = setup({ routing: { roleFloor: "other" } }, undefined);
+    expect(loadConfig(bad).routing?.roleFloor).toBe("strict");
+    const notices = getConfigNotices(bad).filter((notice) => notice.message.includes("routing.roleFloor"));
+    expect(notices).toEqual([{ message: 'routing.roleFloor must be strict|gated (got "other"); using strict', v2Only: true }]);
+  });
 
   it("reports role-table notices in /router when delegation is roles (QA-P11-1-1)", () => {
     const project = setup({

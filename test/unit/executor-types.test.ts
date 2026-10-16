@@ -2254,7 +2254,8 @@ describe("typed test doubles for every interface", () => {
       acquire: async () => hit("acquire", LEASE),
       acquireSpecial: async () => hit("acquireSpecial", LEASE),
       reset: async () => hit("reset", undefined),
-      cleanForChecks: async () => hit("cleanForChecks", undefined),
+      noteCommit: async () => hit("noteCommit", undefined),
+      cleanForChecks: async () => hit("cleanForChecks", { drifted: false }),
       release: async () => hit("release", undefined),
       get: async () => hit("get", SLOT_RECORD),
       list: async () => hit("list", [SLOT_RECORD]),
@@ -2263,12 +2264,13 @@ describe("typed test doubles for every interface", () => {
     expect(await pool.acquire("plan-one", "T1", "c0ffee")).toBe(LEASE);
     expect(await pool.acquireSpecial("plan-one", "ci")).toBe(LEASE);
     await pool.reset("slot-1", "c0ffee");
-    await pool.cleanForChecks("slot-1");
+    await pool.noteCommit("slot-1", "c0ffee");
+    expect(await pool.cleanForChecks("slot-1")).toEqual({ drifted: false });
     await pool.release("slot-1");
     expect(await pool.get("slot-1")).toBe(SLOT_RECORD);
     expect(await pool.list()).toEqual([SLOT_RECORD]);
     expect(await pool.gc(async () => null)).toEqual({ removed: [], reported: [] });
-    expect(calls).toEqual(["acquire", "acquireSpecial", "reset", "cleanForChecks", "release", "get", "list", "gc"]);
+    expect(calls).toEqual(["acquire", "acquireSpecial", "reset", "noteCommit", "cleanForChecks", "release", "get", "list", "gc"]);
   });
 
   it("IntegrationListener", () => {

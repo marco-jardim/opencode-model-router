@@ -106,6 +106,37 @@ describe("executor compile: parse, QA-2.3 round 1 (batch B)", () => {
 });
 
 describe("executor compile: parse (2.3.2)", () => {
+  describe("declared writers and explicit routes", () => {
+    it.each([
+      "class=search needs=edit",
+      "class=recon",
+      "class=design needs=edit",
+      "class=review needs=edit",
+      "needs=edit",
+    ])("refuses an incompatible explicit route instead of silently overriding it (%s)", async (fields) => {
+      const text = phaseDoc("1.1", `- **1.1.1** Produce the result.\n  [route ${fields} risk=high tier=heavy pin]\n  Writes: \`src/alpha/core.ts\``);
+      const h = makeHarness({ inline: { "writer.md": text } });
+      await expect(h.compiler.compile(planPathOf("writer.md"), compileOpts(h))).rejects.toMatchObject({
+        code: "E_COMPILE",
+        message: expect.stringContaining("task 1.1.1 declares writes but its explicit route is read-only"),
+        detail: { code: "route-write-conflict", line: 6, taskId: "1.1.1" },
+      });
+      expect(h.annotateCalls).toEqual([]);
+    });
+
+    it("keeps compatible explicit writer routes verbatim and leaves Writes: none read-only", async () => {
+      const writer = "[route class=debug risk=high scope=multi needs=shell,edit d=grader tier=heavy pin]";
+      const reader = "[route class=recon risk=low tier=fast]";
+      const text = phaseDoc("1.1", `- **1.1.1** Produce the result.\n  ${writer}\n  Writes: \`src/alpha/core.ts\`\n- **1.1.2** Read the result.\n  ${reader}\n  Writes: none\n  Reads: \`src/alpha/core.ts\``);
+      const h = makeHarness({ inline: { "routes.md": text } });
+      const { draft } = await h.compiler.compile(planPathOf("routes.md"), compileOpts(h));
+      expect(draft.tasks["1.1.1"]?.route).toMatchObject({ line: writer, tier: "heavy", pin: true });
+      expect(draft.tasks["1.1.2"]?.route.line).toBe(reader);
+      expect(draft.tasks["1.1.2"]?.footprint.writes).toEqual([]);
+      expect(h.annotateCalls).toEqual([]);
+    });
+  });
+
   describe("id forms (plan:2347)", () => {
     it.each([
       ["1.1", "- **1.1.1** `[tier:medium]` Implement it in `src/alpha/core.ts`.", "1.1.1"],

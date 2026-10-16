@@ -1,4 +1,5 @@
 import type { Plugin } from "@opencode-ai/plugin";
+import { completionIdentity, observeV2 } from "./compat/v2-observations";
 import type { RouterPluginInput } from "./compat/child-session";
 import { DEPTH_BANNER, ResumeRejectedError, TASK_VERIFICATION } from "./compat/child-session";
 
@@ -1195,6 +1196,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     background,
   } = createVerificationWiring({
     client: ctx.client,
+    observations: isV2Host ? ctx.routerObservations : undefined,
     childRunner: ctx.routerChildRunner,
     onChildSessionCreated: (sid, creator) => depthTracker.recordPluginChild(sid, creator),
     directory: ctx.directory,
@@ -2324,7 +2326,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               let verification;
               try {
                 // Cross-repo P3a (D23 as amended, QA C1): the dispatch's own start, the `since` of W's ignored-module listing.
-                verification = await prepareVerification(changedFileStore, baselineID, producerSid, effectiveCwd, gateDeadline, dispatchStart?.dispatchedAt);
+                verification = await prepareVerification(changedFileStore, baselineID, producerSid, effectiveCwd, gateDeadline, dispatchStart?.dispatchedAt, undefined, isV2Host ? toolCtx?.sessionID : undefined);
               } catch (error) {
                 gateDeadline.dispose();
                 throw error;
@@ -3923,7 +3925,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           try {
             // Cross-repo P3a (D23 as amended, QA C1): the dispatch's start (takeDispatch), the `since` of W's ignored-module
             // listing. A start that was never remembered reads as now (the return), which lists nothing older: never stale inputs.
-            verification = await prepareVerification(changedFileStore, dispatchID, childSessionID ?? "", captureRootOf(scope), gateDeadline, start.dispatchedAt, extra?.restoredHead);
+            verification = await prepareVerification(changedFileStore, dispatchID, childSessionID ?? "", captureRootOf(scope), gateDeadline, start.dispatchedAt, extra?.restoredHead, isV2Host ? orchestratorSessionID : undefined);
           } catch (error) {
             gateDeadline.dispose();
             throw error;
@@ -4052,6 +4054,12 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           // M6 (2.1.3): a real verdict of a registered child dispatch feeds the outcome store (v2, engine != static).
           // #84 P3.3 fix 2 (plan §2.6, I6): a grader's verdict is a grader signal of a role dispatch, never a deterministic one.
           if (childSessionID && !res.verdict.skipped) ingest?.onVerdict(childSessionID, verdictOf(res.verdict), verdictGraderOf(res.verdict));
+          // A gated child must not stay on medium when its return gate cannot verify it, even if accepted with a caveat.
+          // Strict children and incomplete returns keep their existing behaviour and text.
+          if (isV2Host && routedRole?.gated === true && childSessionID && !res.verdict.skipped &&
+              res.verdict.outcome === "unverifiable" && !isIncompleteVerdict(res.verdict)) {
+            roleEscalationAfterFail(cfg, childSessionID, orchestratorSessionID);
+          }
           if (!res.accepted && !res.verdict.skipped) {
             const ladder = cfg.enforcement?.escalate?.ladder ?? ["fast", "medium", "heavy"];
             const li = ladder.indexOf(producerTier);
@@ -4412,11 +4420,15 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       if (claim.kind !== "claimed") return postHeldDirect(handle, held.verdict, text, reason);
       rememberHeldText(handle, fin.parentSessionID, text, { verdict: held.verdict, ...(reason !== undefined ? { reason } : {}) });
       // QA-DF1-16: a gate verdict settles as the gate reached it (method, outcome, reasons, caveats, notes).
+      observeV2(isV2Host ? ctx.routerObservations : undefined, () => ({ family: "completion-effect", effect: "verification-settle", source: "held-gate", handle,
+        parentSessionID: fin.parentSessionID, callID: fin.callID, childSessionID: fin.childSessionID }));
       claim.settle(heldSettlementOf(outcome, held));
       // onVerdict posts only for an entry that carries its hold.
       return claim.entry.hold === undefined ? postHeldDirect(handle, held.verdict, text, reason) : undefined;
     };
     // DF-1-3: the held gate's grader launches from the orchestrator's retained context too (C14 launcher A).
+    observeV2(isV2Host ? ctx.routerObservations : undefined, () => ({ family: "completion-effect", effect: "verification-enqueue", source: "held-gate", handle,
+      parentSessionID: fin.parentSessionID, callID: fin.callID, childSessionID: fin.childSessionID }));
     trackHeldGate(finishDispatch(callInput, scratch, undefined, { ...extra, graderParentSessionID: fin.parentSessionID }).then(settleHeld, (error: unknown) => {
       logger.warn("[router] held verification failed", { handle, error: describeError(error) });
       return settleHeld({ kind: "error", reason: `verification unavailable: ${scrubText(String(error))}` });
@@ -4459,6 +4471,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     const settleLost = (reason: string): FinishResult => {
       const text = `${scratch.output.trimEnd()}\n\n[router] UNVERIFIABLE — ${reason}`;
       rememberHeldText(handle, fin.parentSessionID, text);
+      observeV2(isV2Host ? ctx.routerObservations : undefined, () => ({ family: "completion-effect", effect: "verification-settle", source: "held-lost", handle,
+        parentSessionID: fin.parentSessionID, callID: fin.callID, childSessionID: fin.childSessionID }));
       claim.settle(heldVerification("UNVERIFIABLE", [reason]));
       if (entry.hold === undefined) trackHeldGate(postHeldDirect(handle, "UNVERIFIABLE", text, reason));
       return heldResult;
@@ -4565,6 +4579,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       // QA-2.1-31: the verdict already reached the parent; settling must not post it a second time (onVerdict is synchronous).
       directlySettled.add(handle);
       try {
+        observeV2(isV2Host ? ctx.routerObservations : undefined, () => ({ family: "completion-effect", effect: "verification-settle", source: "held-direct", handle,
+          ...completionIdentity(parentSessionID, claim.entry.dispatchID, claim.entry.producerSessionID) }));
         claim.settle(heldVerification(v.verdict, v.reason === undefined ? [] : [scrubText(v.reason)]));
       } finally {
         directlySettled.delete(handle);
@@ -4590,6 +4606,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       const routed: RoutedRoleSnapshot | undefined = routedRole === undefined ? undefined : {
         verifyRoot: routedRole.verifyRoot, parentSessionID: routedRole.parentSessionID, resumeID: routedRole.resumeID,
         ...(routedRole.carried === true ? { carried: true as const } : {}),
+        ...(routedRole.gated === true ? { gated: true as const } : {}),
       };
       return {
         ...(prompt === undefined ? {} : { prompt }),
@@ -4643,6 +4660,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             ? { root: baseline.root ?? baseline.cwd, head: baseline.head, branch: baseline.branch }
             : undefined;
         const heldHead = dispatchHead === undefined && startHead === undefined && headRead !== undefined;
+        observeV2(isV2Host ? ctx.routerObservations : undefined, () => ({ family: "completion-effect", effect: "deferred-register", source: "held-register", handle,
+          parentSessionID: fin.parentSessionID, callID: fin.callID, childSessionID: fin.childSessionID }));
         const reg = pending.register({
           orchestratorSessionID: fin.parentSessionID,
           dispatchID: fin.callID,

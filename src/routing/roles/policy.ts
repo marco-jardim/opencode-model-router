@@ -221,9 +221,16 @@ function maxBuiltin(a: string, b: string): string {
  * - write without exec: deterministic → fast if risk low and scope single, else medium;
  *   grader → medium; none → medium, heavy if risk high
  * - write + exec: deterministic → medium; grader / none → heavy
+ *   Opt-in gated policy: grader → medium only below high risk with a gate at return.
  * An unknown detection is treated as `none` (the strictest column).
  */
-export function authorityFloor(grant: DispatchGrant, detection: Detection, risk: Risk, scope: Scope): string {
+export function authorityFloor(
+  grant: DispatchGrant,
+  detection: Detection,
+  risk: Risk,
+  scope: Scope,
+  policy: { mode: "strict" | "gated"; gateAtReturn: boolean } = { mode: "strict", gateAtReturn: false },
+): string {
   const write = hasAny(grant.actions, WRITE);
   const exec = hasAny(grant.actions, EXEC);
   let floor = "fast";
@@ -233,7 +240,8 @@ export function authorityFloor(grant: DispatchGrant, detection: Detection, risk:
     else floor = risk === "high" ? "heavy" : "medium";
   }
   if (write && exec) {
-    floor = maxBuiltin(floor, detection === "deterministic" ? "medium" : "heavy");
+    const gated = policy.mode === "gated" && detection === "grader" && risk !== "high" && policy.gateAtReturn;
+    floor = maxBuiltin(floor, detection === "deterministic" || gated ? "medium" : "heavy");
   }
   return floor;
 }
@@ -243,6 +251,8 @@ export function authorityFloor(grant: DispatchGrant, detection: Detection, risk:
 // ---------------------------------------------------------------------------
 
 export interface TierBoundsOptions {
+  /** Opt-in authority floor policy; absent keeps the strict floor and reasons unchanged. */
+  floorPolicy?: { mode: "strict" | "gated"; gateAtReturn: boolean };
   /** `enforcement.escalate.floorTier`, or null. */
   floorTier: string | null;
   /** The child's running tier on a resume (never move below it), or null. */
@@ -351,6 +361,7 @@ export function effectiveFactsOf(classified: ClassifiedDispatch): TaskFacts {
  *   unknown ceiling or pin name is ignored.
  *
  * Reasons (deduplicated, in order of application):
+ * `gated:authority` the opt-in authority policy lowered the final floor compared with strict;
  * `floor:<source>` a source raised the floor (source = authority | floorTier | running);
  * `round:<source>:<from>-><to>` a built-in name missing from the order was rounded (source adds role | ceiling);
  * `unknown:<source>:<name>-><top>` an unknown floor name was placed at the top of the order (fail closed);
@@ -371,9 +382,11 @@ export function tierBounds(
   const reasons: string[] = [];
 
   const { risk, scope } = effectiveFactsOf(classified);
+  const authority = authorityFloor(grant, detection, risk, scope, opts.floorPolicy);
+  const strictAuthority = authorityFloor(grant, detection, risk, scope);
   const sources: Array<[FloorSource, string | null]> = [
     ["role", role.tierRange.floor],
-    ["authority", authorityFloor(grant, detection, risk, scope)],
+    ["authority", authority],
     ["floorTier", opts.floorTier],
     ["running", opts.runningTier],
   ];
@@ -392,6 +405,11 @@ export function tierBounds(
     } else if (placed.index === floor && source === "authority") {
       owner = source;
     }
+  }
+  if (authority !== strictAuthority) {
+    const strictFloor = Math.max(0, ...sources.map(([source, tier]) =>
+      tier === null ? 0 : placeFloor(source === "authority" ? strictAuthority : tier, order).index));
+    if (floor < strictFloor) reasons.unshift("gated:authority");
   }
   const lift = owner === "authority" ? "lift:authority" : "lift:floor";
 

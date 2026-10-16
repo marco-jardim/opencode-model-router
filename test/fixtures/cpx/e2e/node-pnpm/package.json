@@ -1,0 +1,10 @@
+{
+  "name": "cpx-e2e-node-pnpm",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test test/*.test.mjs"
+  }
+}

@@ -17,25 +17,27 @@
 // Child session ids are unique per native call: the binding registry is process-wide and the launcher's release evicts (tombstones,
 // binding.ts `evict`) a finished child, so an id reused by a later test could never be bound again.
 import { randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import type { Hooks } from "@opencode-ai/plugin";
 import { registerV2Hooks, type V2ExecutorFactory } from "../../src/compat/v2-hooks";
 import { createV2Runtime } from "../../src/compat/v2-client";
+import { checkV2ObservationStream, createV2Observations, type V2Observations } from "../../src/compat/v2-observations";
 import { createCapacityController } from "../../src/executor/capacity";
 import { createLedgerStore, createNodeClock } from "../../src/executor/ledger";
 import { createTaskLauncher } from "../../src/executor/launch";
 import { createExecutorRuntime, type LeaseRegistryPort } from "../../src/executor/runtime";
 import { createScheduler } from "../../src/executor/schedule";
 import {
-  executorDefaults, type DispatchBookkeeping, type GitRunner, type IntegrationQueue, type LaunchRequest, type PlanCompiler,
+  executorDefaults, type Clock, type DispatchBookkeeping, type GitRunner, type IntegrationQueue, type LaunchRequest, type PlanCompiler,
   type QaLoop, type RouteResolver, type Scheduler, type SlotLease, type SlotPool, type SlotVerifier, type UnattendedPolicy,
 } from "../../src/executor/types";
 import { currentBinding } from "../../src/routing/roles/binding";
-import { invalidateConfigCache } from "../../src/router/config";
+import type { DispatchTimingRow } from "../../src/routing/outcomes/types";
+import { invalidateConfigCache, overridePath } from "../../src/router/config";
 import { buildDraft, holderOf, taskNode } from "../fixtures/cpx/ledger/builders";
 import { removeDirWhenReleased } from "../helpers/remove-dir";
 
@@ -62,6 +64,8 @@ interface Rig {
   runtime: ReturnType<typeof createV2Runtime>;
   executor: { value: ReturnType<V2ExecutorFactory> };
   capture(callID: string): Promise<void>;
+  /** Resolves after the adapter has handled the event, including its timing write. */
+  emit(event: unknown): Promise<void>;
   /** The adapter's cleanup (W7), once; `cleanup` calls it too. */
   disposeHooks(): Promise<void>;
   cleanup(): Promise<void>;
@@ -70,11 +74,18 @@ interface Rig {
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0)) await cleanup();
+  vi.unstubAllEnvs();
   invalidateConfigCache();
 });
 
-async function boot(): Promise<Rig> {
+async function boot(options: { observations?: V2Observations; launcherClock?: Clock; childReady?: Promise<void> } = {}): Promise<Rig> {
   const home = mkdtempSync(join(tmpdir(), "omr-v2-exec-"));
+  vi.stubEnv("HOME", home);
+  vi.stubEnv("USERPROFILE", home);
+  vi.stubEnv("XDG_STATE_HOME", join(home, ".local", "state"));
+  mkdirSync(dirname(overridePath()), { recursive: true });
+  writeFileSync(overridePath(), JSON.stringify({ routing: { outcomes: { path: join(home, "outcomes") } } }));
+  invalidateConfigCache();
   const slotsDir = join(home, "slots");
   const slotPath = join(slotsDir, "slot-1");
   const toplevel = join(home, "repo");
@@ -98,6 +109,7 @@ async function boot(): Promise<Rig> {
     bookkeeping: { decisionRow: [], dispatchStart: 0, registerInFlight: [], unregisterInFlight: 0 },
     firstToolBinding: undefined, firstToolRefusal: null,
     toolHooks: {}, runtime: undefined as never, executor: { value: null }, capture: async () => undefined,
+    emit: async () => undefined,
     disposeHooks: async () => undefined, cleanup: async () => undefined,
   };
 
@@ -110,8 +122,12 @@ async function boot(): Promise<Rig> {
     command: { add: (_command: unknown) => undefined },
     tool: { add: (_definition: unknown) => undefined },
   };
-  const eventQueue: unknown[] = [];
+  const eventQueue: Array<{ event: unknown; handled(): void }> = [];
   let wake = (): void => undefined;
+  rig.emit = (event) => new Promise<void>((resolve) => {
+    eventQueue.push({ event, handled: resolve });
+    wake();
+  });
   let native: { execute(args: { prompt: string; agent: string }, tctx: { signal: AbortSignal; progress(m: Record<string, unknown>): Promise<void> }): Promise<unknown> };
   const ctx = {
     location: { directory: toplevel, project: { directory: toplevel } },
@@ -137,8 +153,11 @@ async function boot(): Promise<Rig> {
       subscribe: async function* ({ signal }: { signal: AbortSignal }) {
         signal.addEventListener("abort", () => wake(), { once: true });
         while (!signal.aborted) {
-          if (eventQueue.length > 0) yield eventQueue.shift();
-          else await new Promise<void>((resolve) => { wake = resolve; });
+          const queued = eventQueue.shift();
+          if (queued !== undefined) {
+            yield queued.event;
+            queued.handled();
+          } else await new Promise<void>((resolve) => { wake = resolve; });
         }
       },
     },
@@ -151,6 +170,7 @@ async function boot(): Promise<Rig> {
       rig.children.push(child);
       rig.nativeCalls.push({ prompt: args.prompt, agent: args.agent, child });
       messages.set(child, [{ role: "user", content: [{ type: "text", text: args.prompt }] }]);
+      await options.childReady;
       await tctx.progress({ sessionID: child }); // the runner binds the child (onCreated) before this resolves
       rig.firstToolBinding = currentBinding(child, { maxOf: () => [] });
       rig.log.push("first-tool-call");
@@ -178,7 +198,8 @@ async function boot(): Promise<Rig> {
     acquire: async (planId, owner, commit): Promise<SlotLease> => ({ slot: "slot-1", path: slotPath, planId, owner, commit }),
     acquireSpecial: async (planId, kind): Promise<SlotLease> => ({ slot: `special-${kind}`, path: join(slotsDir, kind), planId, owner: kind, commit: "" }),
     reset: async () => undefined,
-    cleanForChecks: async () => undefined,
+    noteCommit: async () => undefined,
+    cleanForChecks: async () => ({ drifted: false }),
     release: async () => undefined,
     get: async () => null,
     list: async () => [],
@@ -219,7 +240,7 @@ async function boot(): Promise<Rig> {
       decisionRow: (req) => { rig.bookkeeping.decisionRow.push(req); host.bookkeeping.decisionRow(req); },
       recordDispatchStart: (req, startedAt) => { rig.bookkeeping.dispatchStart += 1; host.bookkeeping.recordDispatchStart(req, startedAt); },
       registerInFlight: (taskId, attempt, child) => { rig.bookkeeping.registerInFlight.push(child); host.bookkeeping.registerInFlight(taskId, attempt, child); },
-      unregisterInFlight: (taskId, attempt) => { rig.bookkeeping.unregisterInFlight += 1; host.bookkeeping.unregisterInFlight(taskId, attempt); },
+      unregisterInFlight: (taskId, attempt, status) => { rig.bookkeeping.unregisterInFlight += 1; host.bookkeeping.unregisterInFlight(taskId, attempt, status); },
     };
     const launcher = createTaskLauncher({
       runner: host.runner, hosts: host.hosts,
@@ -235,7 +256,7 @@ async function boot(): Promise<Rig> {
         },
         evict: (child) => host.bindings.evict(child),
       },
-      bookkeeping: spied, clock, lifetime: host.lifetime, knownAgent: host.knownAgent,
+      bookkeeping: spied, clock: options.launcherClock ?? clock, lifetime: host.lifetime, knownAgent: host.knownAgent,
       onMetric: (planId, m) => host.onLauncherMetric(planId, m),
     });
     // The real scheduler, observed: each ready set it returns is recorded (a tick launches only what is in it).
@@ -270,7 +291,7 @@ async function boot(): Promise<Rig> {
   };
 
   const hooks = { config: async (cfg: { agent: Record<string, unknown> }) => { cfg.agent.fast = { mode: "subagent" }; } } as unknown as Hooks;
-  const cleanupHooks = await registerV2Hooks(ctx as unknown as Context, hooks, v2, { executor: factory });
+  const cleanupHooks = await registerV2Hooks(ctx as unknown as Context, hooks, v2, { executor: factory, observations: options.observations });
   rig.capture = async (callID) => {
     const toolContext = { sessionID: ORCHESTRATOR, id: callID, messageID: `m-${callID}`, agent: "build", signal: new AbortController().signal, progress: async () => undefined };
     await v2.withToolContext(toolContext as unknown as Parameters<typeof v2.withToolContext>[0], async () => undefined);
@@ -287,6 +308,101 @@ async function boot(): Promise<Rig> {
 }
 
 describe("plan executor launch through the real v2 client (3.1.7 wiring, integration)", () => {
+  it("writes one timing for the launched child attempt, without duplicate rows or observations on repeated ends", async () => {
+    const lines: string[] = [];
+    const observations = createV2Observations({ write: (line) => { lines.push(line); } });
+    const rig = await boot({ observations });
+    await rig.capture("call-orchestrator-timing");
+    await vi.waitFor(() => expect(rig.log).toContain("first-tool-call"), { timeout: 10_000 });
+    const child = rig.children[0];
+    const req = rig.bookkeeping.decisionRow[0];
+    if (child === undefined || req === undefined) throw new Error("the executor did not launch a child");
+    expect(rig.bookkeeping.registerInFlight).toEqual([null, child]);
+    expect(rig.hookCalls.filter((call) => call.tool === "subagent")).toEqual([]);
+
+    const path = join(rig.home, "outcomes", "timings.jsonl");
+    const rows = (): DispatchTimingRow[] => existsSync(path)
+      ? readFileSync(path, "utf8").split("\n").filter((line) => line !== "").map((line) => JSON.parse(line) as DispatchTimingRow)
+      : [];
+    expect(rows()).toEqual([]);
+    const end = { id: `end-${child}`, type: "session.execution.succeeded", data: { sessionID: child } };
+    await rig.emit(end);
+
+    const written = rows();
+    expect(written).toHaveLength(1);
+    const identity = {
+      parentSessionID: ORCHESTRATOR, childSessionID: child,
+      callID: `executor:${PLAN}:T1#1:${req.nonce}`, outcome: "succeeded",
+    };
+    expect(written[0]).toMatchObject({ ...identity, kind: "dispatch-timing", role: "implementer", model: "prov/model-a", background: true, capacity: null });
+
+    await rig.emit(end); // the same host event redelivered
+    await rig.emit({ ...end, id: `later-end-${child}` }); // another end of the already-closed attempt
+    await rig.disposeHooks();
+    expect(rows()).toEqual(written);
+    observations.close();
+    const writes = checkV2ObservationStream(lines).filter((row) => row.family === "completion-effect" && row.effect === "timing-row-write");
+    expect(writes).toEqual([expect.objectContaining({ ...identity, source: "append-timings" })]);
+  }, 30_000);
+
+  it("writes one timing for a child adopted after confirmation timeout without reviving completion effects", async () => {
+    const lines: string[] = [];
+    const observations = createV2Observations({ write: (line) => { lines.push(line); } });
+    let createChild = (): void => undefined;
+    const childReady = new Promise<void>((resolve) => { createChild = resolve; });
+    const timers = new Map<number, { ms: number; fire(): void }>();
+    let nextTimer = 0;
+    const launcherClock: Clock = {
+      ...createNodeClock(),
+      setTimer(ms, fire) { const id = ++nextTimer; timers.set(id, { ms, fire }); return { id }; },
+      clearTimer(handle) { timers.delete(handle.id); },
+    };
+    const rig = await boot({ observations, launcherClock, childReady });
+    const built = rig.executor.value;
+    if (built === null) throw new Error("the factory was not called");
+    await rig.capture("call-orchestrator-late-timing");
+    await vi.waitFor(() => expect(rig.nativeCalls).toHaveLength(1), { timeout: 10_000 });
+    const child = rig.children[0];
+    const req = rig.bookkeeping.decisionRow[0];
+    if (child === undefined || req === undefined) throw new Error("the executor did not launch a child");
+    expect(rig.bookkeeping.registerInFlight).toEqual([null]);
+    const confirmationTimer = timers.get(1);
+    expect(confirmationTimer?.ms).toBe(30_000);
+    confirmationTimer?.fire();
+    expect(rig.bookkeeping.unregisterInFlight).toBe(1);
+    await built.runtime.settled(); // the timeout is fully settled before the late child is accepted (L12)
+
+    createChild();
+    await vi.waitFor(() => expect(rig.log).toContain("first-tool-call"), { timeout: 10_000 });
+    expect(rig.bookkeeping.registerInFlight).toEqual([null, child]);
+    expect(rig.log.filter((entry) => entry === "bind")).toHaveLength(1);
+    expect(rig.firstToolBinding?.childSessionID).toBe(child);
+    expect(rig.bookkeeping.dispatchStart).toBe(1);
+
+    const path = join(rig.home, "outcomes", "timings.jsonl");
+    const rows = (): DispatchTimingRow[] => existsSync(path)
+      ? readFileSync(path, "utf8").split("\n").filter((line) => line !== "").map((line) => JSON.parse(line) as DispatchTimingRow)
+      : [];
+    expect(rows()).toEqual([]);
+    const end = { id: `end-${child}`, type: "session.execution.succeeded", data: { sessionID: child } };
+    await rig.emit(end);
+    const written = rows();
+    expect(written).toHaveLength(1);
+    const identity = {
+      parentSessionID: ORCHESTRATOR, childSessionID: child,
+      callID: `executor:${PLAN}:T1#1:${req.nonce}`, outcome: "succeeded",
+    };
+    expect(written[0]).toMatchObject({ ...identity, kind: "dispatch-timing", role: "implementer", model: "prov/model-a", background: true, capacity: null });
+
+    await rig.emit(end);
+    await rig.emit({ ...end, id: `later-end-${child}` });
+    await rig.disposeHooks();
+    expect(rows()).toEqual(written);
+    observations.close();
+    const effects = checkV2ObservationStream(lines).filter((row) => row.family === "completion-effect");
+    expect(effects).toEqual([expect.objectContaining({ ...identity, effect: "timing-row-write", source: "append-timings" })]);
+  }, 30_000);
+
   it("binds the child with its role and root = slot before its first tool call; one executor row, no router decision row", async () => {
     const rig = await boot();
     const built = rig.executor.value;

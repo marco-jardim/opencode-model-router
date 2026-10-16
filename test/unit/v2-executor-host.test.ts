@@ -2,7 +2,7 @@
 // an explicit terminal `idle` entry exists only when the host's history shows the child ended, with the real end outcome.
 // QA-4.2-27: that end comes from `childHistoryEnd`, the one end rule background's recovery (`childEndState`) also uses.
 import { describe, expect, it } from "vitest";
-import { childHistoryEnd, executorHostContext, historyEntryKind } from "../../src/compat/v2-hooks";
+import { childHistoryEnd, executorHostContext, historyEntryKind, historyToolInFlight } from "../../src/compat/v2-hooks";
 import { classifyChild } from "../../src/executor/recovery";
 import { formatLaunchPrompt } from "../../src/executor/types";
 import { PLAN_ID, nonceFor } from "../fixtures/cpx/ledger/builders.js";
@@ -25,6 +25,7 @@ describe("executorHostContext (QA-4.2-2)", () => {
     expect(c.messages.some((m) => m.role === "idle")).toBe(false);
     expect(c.messages.map((m) => m.role)).toEqual(["user", "assistant", "assistant"]);
     expect(c.messages[2]).toEqual({ role: "assistant", text: null, outcome: null });
+    expect(c.toolInFlight).toBe(true);
   });
 
   it("an assistant step cut mid-stream (no completion marker) has no terminal entry", () => {
@@ -55,7 +56,7 @@ describe("executorHostContext (QA-4.2-2)", () => {
   });
 
   it("a non-array history is empty", () => {
-    expect(executorHostContext(undefined)).toEqual({ messages: [] });
+    expect(executorHostContext(undefined)).toEqual({ messages: [], toolInFlight: false });
   });
 
   it("QA-4.2-27: a completed step without text is an end (succeeded), as the live launcher treats it", () => {
@@ -87,6 +88,42 @@ describe("executorHostContext (QA-4.2-2)", () => {
     expect(c.messages.map((m) => [m.role, m.text, m.outcome])).toEqual([
       ["user", prompt(), null], ["assistant", "REPORT", null], ["assistant", null, null], ["idle", null, "succeeded"],
     ]);
+  });
+});
+
+describe("historyToolInFlight (R2-1)", () => {
+  it.each(["running", "streaming", "pending", "unknown-status", undefined])("an open or unknown tool status (%s) is in flight in every history shape", (status) => {
+    for (const state of [{ state: { status } }, { state: status }, { status }]) {
+      const part = { type: "tool", ...state };
+      expect(historyToolInFlight([part])).toBe(true);
+      expect(historyToolInFlight([{ type: "assistant", parts: [part] }])).toBe(true);
+      expect(historyToolInFlight([{ type: "assistant", content: [part] }])).toBe(true);
+    }
+    expect(historyToolInFlight([{ type: "tool" }])).toBe(true);
+  });
+
+  it.each(["completed", "error"])("%s tools are not in flight, standalone or in parts/content", (status) => {
+    for (const state of [{ state: { status } }, { state: status }, { status }]) {
+      const part = { type: "tool", ...state };
+      expect(historyToolInFlight([part, { type: "assistant", parts: [part] }, { type: "assistant", content: [part] }])).toBe(false);
+    }
+  });
+
+  it("checks all entries and both part arrays, even after a user turn", () => {
+    expect(historyToolInFlight([midTool(), user("again")])).toBe(true);
+    expect(historyToolInFlight([{ type: "assistant", content: [{ type: "text", text: "" }], parts: [{ type: "tool" }] }])).toBe(true);
+  });
+
+  it("a user turn last or a text-only step cut mid-stream has no tool in flight", () => {
+    for (const history of [
+      [user(prompt()), finished("REPORT"), user("again")],
+      [user(prompt()), { type: "assistant", text: "partial", time: { created: 1 } }],
+      [null, { type: "assistant", parts: [null, { type: "text", text: "partial" }] }],
+      undefined,
+    ]) {
+      expect(historyToolInFlight(history)).toBe(false);
+      expect(executorHostContext(history).toolInFlight).toBe(false);
+    }
   });
 });
 

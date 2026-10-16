@@ -55,6 +55,7 @@ import { accept } from "../../src/verify/gate";
 import { REFERENCE_NONE } from "../../src/verify/baseline";
 import type { DispatchReference } from "../../src/verify/reference";
 import type { ReferenceState, Verdict } from "../../src/verify/types";
+import { createV2Observations, type ObservationRecord, type V2Observations } from "../../src/compat/v2-observations";
 
 type ExecOut = { code: number; stdout: string; stderr: string; timedOut: boolean };
 
@@ -365,10 +366,12 @@ function makeWiring(
   verify: NonNullable<NonNullable<RouterConfig["enforcement"]>["verify"]> = {},
   pendingSeams: Parameters<typeof createVerificationWiring>[0]["pending"] = undefined,
   backgroundSeams: Parameters<typeof createVerificationWiring>[0]["background"] = undefined,
+  observations?: V2Observations,
 ) {
   const cfg = config(verify);
   const client = { session: { create: vi.fn(async () => ({ data: { id: "never" } })), abort: vi.fn(async () => ({})), delete: vi.fn(async () => ({})) } };
   const wiring = createVerificationWiring({
+    observations,
     client,
     directory: state.root,
     getConfig: () => cfg,
@@ -1281,7 +1284,9 @@ describe("background mode (2.4.5)", () => {
   });
 
   it("an unattributed change set is not queued (nothing could run; it stays listed); a failing enqueue keeps the handle", async () => {
-    const { wiring } = makeWiring({ background: true }, undefined, FAST);
+    const rows: ObservationRecord[] = [];
+    const observations = createV2Observations({ write: (line) => { rows.push(JSON.parse(line)); } });
+    const { wiring } = makeWiring({ background: true }, undefined, FAST, observations);
     const queue = queueOf(wiring);
     const finish = (store: ReturnType<typeof createChangedFileStore>, id: string, child: string) =>
       wiring.finishDeferred(store, { dispatchID: id, orchestratorSessionID: "orch", producerSessionID: child, producerTier: "fast", description: "w", cwd: state.root, dod: DOD, dispatchedAt: 0 });
@@ -1303,6 +1308,41 @@ describe("background mode (2.4.5)", () => {
     if (!kept.deferred) throw new Error(kept.detail);
     expect(kept.footer).toContain(`[router] unverified \u00b7 ${kept.handle} \u00b7`);
     expect(wiring.sweepVerification()).toBe(0);
+    // Even a throwing invocation is counted; an unattributed dispatch did not invoke enqueue at all.
+    observations.flush();
+    expect(rows.filter((r) => r.family === "completion-effect" && r.effect === "verification-enqueue")).toMatchObject([
+      { callID: "v", parentSessionID: "orch", childSessionID: "child-v", handle: kept.handle },
+    ]);
+  });
+
+  it.each(["off", "on", "broken"] as const)("completion observations (%s) preserve the deferred verification path", async (mode) => {
+    const rows: ObservationRecord[] = [];
+    const observations = mode === "off" ? undefined : createV2Observations({ write: (line) => {
+      if (mode === "broken") throw new Error("diagnostic sink failed");
+      rows.push(JSON.parse(line));
+    } });
+    const { wiring } = makeWiring({ background: true }, undefined, FAST, observations);
+    const store = createChangedFileStore();
+    await wiring.startDispatch(store, "task:orch:observed", state.root, DOD, "", false);
+    state.treeFiles = [{ path: src("a"), status: " M" }];
+    const result = await wiring.finishDeferred(store, { dispatchID: "task:orch:observed", orchestratorSessionID: "orch", producerSessionID: "child-observed",
+      producerTier: "fast", description: "private task", cwd: state.root, dod: DOD, dispatchedAt: 0 });
+    if (!result.deferred) throw new Error(result.detail);
+    await queueOf(wiring).whenIdle();
+    expect(queueOf(wiring).stats().runs).toBe(1);
+    expect(wiring.pending.get("orch", result.handle)).toMatchObject({ entry: { state: "verified", result: { verdict: { outcome: "pass" } } } });
+    expect(inputsOf("a")).toBe(1);
+    observations?.flush();
+    if (mode !== "on") expect(rows).toEqual([]);
+    else {
+      expect(rows.map((r) => r.family === "completion-effect" ? r.effect : "")).toEqual([
+        "change-set-capture", "deferred-register", "verification-enqueue", "verification-settle",
+      ]);
+      for (const row of rows) expect(row).toMatchObject({ callID: "observed", parentSessionID: "orch", childSessionID: "child-observed" });
+      expect(JSON.stringify(rows)).not.toContain("private task");
+      expect(JSON.stringify(rows)).not.toContain(state.root);
+    }
+    await wiring.disposeVerification();
   });
 });
 

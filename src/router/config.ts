@@ -342,6 +342,8 @@ export type ExecutorOverrides = Partial<Omit<ExecutorConfig, "circuitBreaker">> 
   circuitBreaker?: Partial<ExecutorConfig["circuitBreaker"]>;
 };
 
+export type RoleFloorMode = "strict" | "gated";
+
 export interface RoutingConfig {
   background?: BackgroundConfig;
   leases?: LeasesConfig;
@@ -360,6 +362,8 @@ export interface RoutingConfig {
   advisor?: AdvisorConfig;
   /** `tiers` (default) or `roles`; global and project layers. Inert on v1. */
   delegation?: DelegationMode;
+  /** Global only. Authority floor policy; default strict. Inert on v1. */
+  roleFloor?: RoleFloorMode;
   /** Global only. `rate` 0..0.2, default 0; `requireDetection` is fixed. Inert on v1. */
   exploration?: Partial<ExplorationConfig>;
   /** Global only. `router_run` allow-list. Inert on v1. */
@@ -1874,6 +1878,13 @@ function sanitizeBackground(value: unknown): TolerantBlock<BackgroundConfig> {
   return { value: out, issues };
 }
 
+/** `routing.roleFloor` (v2 roles only): an invalid value fails closed to strict, with an issue. */
+export function sanitizeRoleFloor(value: unknown): TolerantBlock<RoleFloorMode> {
+  const issues: string[] = [];
+  const mode = tolerantEnum({ roleFloor: value }, "roleFloor", "routing", ["strict", "gated"] as const, "strict", issues);
+  return { value: mode ?? (value === undefined ? undefined : "strict"), issues };
+}
+
 /** `routing.leases` (OpenCode v2 only); tolerant, see {@link sanitizeBackground}. */
 function sanitizeLeases(value: unknown): TolerantBlock<LeasesConfig> {
   const issues: string[] = [];
@@ -2195,6 +2206,8 @@ function validateRouting(value: unknown): RoutingConfig | undefined {
   // Roles keys (#84): tolerant per entry, never throw (see roles-config.ts).
   const delegation = sanitizeDelegation(routing.delegation).value;
   if (delegation !== undefined) out.delegation = delegation;
+  const roleFloor = sanitizeRoleFloor(routing.roleFloor).value;
+  if (roleFloor !== undefined) out.roleFloor = roleFloor;
   const exploration = sanitizeExploration(routing.exploration).value;
   if (exploration !== undefined) out.exploration = exploration;
   const run = sanitizeRun(routing.run).value;
@@ -2615,6 +2628,7 @@ const GLOBAL_ONLY_ROUTING_KEYS: ReadonlyArray<readonly [block: string, key: stri
 
 /** Roles keys (#84) a project layer must not carry; `routing.delegation` is allowed there. */
 const GLOBAL_ONLY_ROLES_ROUTING_KEYS = [
+  "roleFloor",
   "exploration",
   "run",
   "workRoots",
@@ -2949,6 +2963,7 @@ const ROUTING_KNOWN_KEYS: Readonly<Record<string, readonly string[]>> = {
     "sessionReuse",
     "advisor",
     "delegation",
+    "roleFloor",
     "exploration",
     "run",
     "workRoots",
@@ -3064,6 +3079,7 @@ function collectTaggedRoutingNotices(rawRouting: unknown, cfg: RouterConfig): Ar
   if (unknownV2Only.length > 0) tagged.push({ message: unknownMessage(unknownV2Only), v2Only: true });
   if (isPlainObject(rawRouting)) {
     for (const message of [
+      ...sanitizeRoleFloor(rawRouting.roleFloor).issues,
       ...sanitizeBackground(rawRouting.background).issues,
       ...sanitizeLeases(rawRouting.leases).issues,
       ...sanitizeExecutor(rawRouting.executor).issues,
@@ -3914,6 +3930,7 @@ export function resolveRouting(
 /** The roles keys with their defaults applied, for one host (#84). Never mutates `cfg`. */
 export interface ResolvedRolesRouting {
   readonly delegation: DelegationMode;
+  readonly roleFloor: RoleFloorMode;
   readonly exploration: Readonly<ExplorationConfig>;
   readonly run: Readonly<RunConfig>;
   readonly workRoots: readonly string[];
@@ -3935,9 +3952,9 @@ export function resetRolesWarnings(): void {
 }
 
 /**
- * Defaults for `routing.delegation`, `exploration`, `run` and `workRoots`. On v1 (`routerHost`
+ * Defaults for `routing.delegation`, `roleFloor`, `exploration`, `run` and `workRoots`. On v1 (`routerHost`
  * `v1`) delegation is always `tiers`, and one notice says so when any of delegation `roles`,
- * `roleAgents`, `exploration`, `run` or `workRoots` was set. Exploration is off (rate 0) unless
+ * `roleAgents`, `roleFloor`, `exploration`, `run` or `workRoots` was set. Exploration is off (rate 0) unless
  * the effective delegation is `roles`. Switching `delegation` is only a config value here;
  * registration follows a hot reload elsewhere. The plugin logs the v1 notice at start-up by
  * calling this with its logger next to `resolveRouting` (wired with the roles runtime, #84 P2.1).
@@ -3952,7 +3969,7 @@ export function resolveRolesRouting(
   const touched = requested === "roles" || cfg?.roleAgents !== undefined || r.exploration !== undefined
     || r.run !== undefined || r.workRoots !== undefined
     || r.repoParents !== undefined || r.repoDepth !== undefined || r.repoExclude !== undefined
-    || r.repoApprovalDays !== undefined;
+    || r.repoApprovalDays !== undefined || r.roleFloor !== undefined;
   const inert = host === "v1" && touched;
   if (inert && !warnedRolesInertOnV1) {
     warnedRolesInertOnV1 = true;
@@ -3962,6 +3979,7 @@ export function resolveRolesRouting(
   const delegation: DelegationMode = host === "v1" ? "tiers" : requested;
   return Object.freeze({
     delegation,
+    roleFloor: host === "v1" ? "strict" : (r.roleFloor ?? "strict"),
     exploration: Object.freeze({
       rate: delegation === "roles" ? (r.exploration?.rate ?? 0) : 0,
       requireDetection: "deterministic" as const,

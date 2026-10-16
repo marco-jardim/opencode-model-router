@@ -1,14 +1,21 @@
+import { spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { hardenedEnvironment } from "../../src/executor/git";
 import {
-  COMMIT_SUBJECT_PATTERN, SLOT_EXCLUDES_CONTENT, commitTypeFor, createGitOps, encodeRefId, executorGitArgs, formatCommitMessage,
+  COMMIT_SUBJECT_PATTERN, SLOT_EXCLUDES_CONTENT, commitTypeFor, createGitOps, createGitRunner, encodeRefId, executorGitArgs, formatCommitMessage,
   integrationBranchName, phaseTagName, planRefPrefix, readCommitIdentity, taskBranchName,
   type GitOps,
 } from "../../src/executor/git";
 import { ExecutorError, type FileSystem, type Footprint, type GitRunner, type ProcessResult } from "../../src/executor/types";
+import { createV2Observations } from "../../src/compat/v2-observations";
+import { serviceObservation } from "../../src/executor/observations";
+import * as gitTools from "../../src/router/git-tools";
+import { completedServiceProcess, servicePairs } from "../helpers/service-observations";
+
+vi.mock("node:child_process", async original => ({ ...await original<typeof import("node:child_process")>(), spawn: vi.fn() }));
 
 const PLAN = "p-20261010-abc123";
 
@@ -585,6 +592,57 @@ describe("GitOps refs", () => {
 });
 
 describe("GitOps repository reads", () => {
+  it.each(["executable", "environment"] as const)("excludes the production GitRunner's %s preparation from merge service", async preparation => {
+    const run = async (delayMs: number) => {
+      let now = 0;
+      const lines: string[] = [];
+      const sink = createV2Observations({ write: line => { lines.push(line); } });
+      const repo = resolve(".");
+      const guards = vi.spyOn(gitTools, "workRootGuards").mockReturnValue([repo]);
+      const executable = vi.spyOn(gitTools, "gitExecutable").mockImplementation(() => {
+        if (preparation === "executable") now += delayMs;
+        return "git";
+      });
+      const gitEnvironment = gitTools.gitEnvironment;
+      const environment = vi.spyOn(gitTools, "gitEnvironment").mockImplementation(extra => {
+        if (preparation === "environment") now += delayMs;
+        return gitEnvironment(extra);
+      });
+      vi.mocked(spawn).mockImplementation(() => completedServiceProcess(() => { now += 11; }));
+      const production = createGitRunner({ mode: "hardened", toplevel: repo });
+      const git: GitRunner = {
+        // Repository preconditions are doubles; the observed merge uses the REAL runner and spawnBounded.
+        run: async (args, opts) => sub(args)[0] === "merge" ? production.run(args, opts) : result({ stdout: OID_B }),
+      };
+      const ops = createGitOps({ git, userGit: identityRunner(), fs: memoryFs(), planId: PLAN, toplevel: repo, executorHome: HOME });
+      const observation = serviceObservation(sink, () => ({ planId: PLAN, taskId: null, attempt: null,
+        phaseId: "p1", entryId: "i-1", taskIds: ["T1"], component: "fast-forward", candidate: OID_B }), () => now);
+      try {
+        expect(await ops.mergeFfOnly(repo, OID_B, observation)).toEqual({ ok: true, head: OID_B });
+        expect(executable).toHaveBeenCalledOnce();
+        expect(environment).toHaveBeenCalledOnce();
+        expect(spawn).toHaveBeenCalledOnce();
+        sink.close();
+        return { elapsed: now, rows: servicePairs(lines) };
+      } finally {
+        sink.close();
+        guards.mockRestore();
+        executable.mockRestore();
+        environment.mockRestore();
+        vi.mocked(spawn).mockReset();
+      }
+    };
+    const baseline = await run(0);
+    const delayed = await run(2_000);
+    expect(delayed.elapsed - baseline.elapsed).toBe(2_000);
+    for (const result of [baseline, delayed]) {
+      expect(result.rows.filter(r => r.spanKind === "service" && r.action === "end")).toMatchObject([
+        { stage: "merge", candidate: OID_B, durationMs: 11, result: "pass" },
+      ]);
+    }
+    expect(delayed.rows).toContainEqual(expect.objectContaining({ spanKind: "service-prep", action: "end", durationMs: 2_000 }));
+  });
+
   it("revParse peels to a commit and validates the revision and the output", async () => {
     const git = fakeRunner(() => ({ stdout: `${OID_A}\n` }));
     const ops = makeOps(git);
@@ -651,6 +709,55 @@ describe("GitOps in a slot", () => {
     const fs = memoryFs({ ...BACK(), ...seed });
     return { git, fs, ops: createGitOps({ git, userGit: user, fs, planId: PLAN, toplevel: top, executorHome: HOME }) };
   }
+
+  it.each([false, true])("G8 git process spans exclude identity/pointer/precondition/result preparation, with parity (failure=%s)", async failure => {
+    const run = async (mode: "off" | "on" | "throw") => {
+      let now = 0;
+      const lines: string[] = [];
+      const sink = createV2Observations({ write: line => { lines.push(line); } });
+      if (mode === "throw") sink.record = () => { throw new Error("observer"); };
+      const user = identityRunner();
+      const userRun = user.run.bind(user);
+      user.run = async (args, options) => { now += 1_000; return userRun(args, options); };
+      const { ops, git, fs } = slotOps(args => {
+        const op = sub(args)[0];
+        if (op === "rebase") {
+          now += 7;
+          if (failure) throw new Error("rebase spawn failed");
+        } else if (op === "merge") now += 5;
+        else if (op === "update-ref") now += 3;
+        else now += 500;
+        if (op === "rev-parse") return { stdout: OID_B };
+        if (op === "symbolic-ref") return { code: 1 };
+        return undefined;
+      }, {}, user);
+      const lstat = fs.lstat.bind(fs);
+      fs.lstat = async path => { now += 1_000; return lstat(path); };
+      const observation = (component: "rebase" | "fast-forward") => serviceObservation(mode === "off" ? undefined : sink,
+        () => ({ planId: PLAN, taskId: null, attempt: null, phaseId: "p1", entryId: "i-1", taskIds: ["T1", "T2"], component, candidate: OID_B }), () => now);
+      try {
+        const rebase = await ops.rebaseOnto(slot, OID_A, OID_B, observation("rebase")).catch((e: unknown) => e instanceof Error ? e.message : String(e));
+        const merge = await ops.mergeFfOnly(top, OID_B, observation("fast-forward"));
+        await ops.branchForce(integrationBranchName(PLAN), OID_B, OID_A, observation("fast-forward"));
+        sink.close();
+        return { rebase, merge, calls: git.calls, userCalls: user.calls, elapsed: now, rows: mode === "on" ? servicePairs(lines) : [] };
+      } finally { sink.close(); }
+    };
+    const off = await run("off");
+    for (const mode of ["on", "throw"] as const) {
+      const { rows, ...effects } = await run(mode);
+      const { rows: _offRows, ...original } = off;
+      expect(effects).toEqual(original);
+      if (mode === "on") {
+        expect(rows.filter(r => r.action === "end" && r.spanKind === "service")).toMatchObject([
+          { stage: "rebase", durationMs: 7, result: failure ? "error" : "pass" },
+          { stage: "merge", durationMs: 5, result: "pass" }, { stage: "cas", durationMs: 3, result: "pass" },
+        ]);
+        expect(rows.some(r => r.spanKind === "service-prep" && r.durationMs >= 1_000)).toBe(true);
+        expect(effects.elapsed).toBeGreaterThan(5_000);
+      }
+    }
+  });
 
   it("verifySlotPointers accepts a linked worktree of this repository", async () => {
     const { ops } = slotOps();
@@ -898,31 +1005,81 @@ describe("GitOps in a slot", () => {
     await expect(slotOps(() => ({ stdout: "xx\0" })).ops.statusPorcelain(slot)).rejects.toMatchObject({ code: "E_GIT" });
   });
 
-  it("rebaseOnto returns the new head, or the conflicts after aborting", async () => {
+  it("rebaseOnto returns the new head", async () => {
     const ok = slotOps(args => (sub(args)[0] === "rev-parse" ? { stdout: `${OID_B}\n` } : undefined));
     await expect(ok.ops.rebaseOnto(slot, OID_A, OID_B)).resolves.toEqual({ ok: true, head: OID_B });
     expect(subs(ok.git)[0]).toEqual(["rebase", "--onto", OID_A, OID_B]);
+  });
+
+  it.each(["rebase-merge", "rebase-apply"])("rebaseOnto reports conflicts after aborting an active %s", async state => {
     const conflict = slotOps(args => {
       const s = sub(args);
       if (s[0] === "rebase" && s[1] === "--onto") return { code: 1 };
       if (s[0] === "diff") return { stdout: "a.txt\0b.txt\0a.txt\0" };
       return undefined;
-    });
+    }, { [join(gitdir, state)]: "dir" });
     await expect(conflict.ops.rebaseOnto(slot, OID_A, OID_B)).resolves.toEqual({ ok: false, conflicts: ["a.txt", "b.txt"] });
     expect(subs(conflict.git).map(s => s.slice(0, 2).join(" "))).toEqual(["rebase --onto", "diff --name-only", "rebase --abort"]);
   });
 
-  it("a failed rebase with no conflicted path is a git failure, and a failing abort is reported", async () => {
-    const none = slotOps(args => (sub(args)[0] === "rebase" && sub(args)[1] === "--onto" ? { code: 1, stderr: "boom" } : undefined));
-    await expect(none.ops.rebaseOnto(slot, OID_A, OID_B)).rejects.toMatchObject({ code: "E_GIT" });
-    const abortFails = slotOps(args => {
+  it.each([1, 128])("a rebase refused before starting (exit %s) keeps its bounded sanitized error and never aborts", async code => {
+    const none = slotOps(args => {
       const s = sub(args);
-      if (s[0] === "rebase" && s[1] === "--onto") return { code: 1 };
-      if (s[0] === "diff") return { stdout: "a.txt\0" };
-      if (s[0] === "rebase" && s[1] === "--abort") return { code: 128 };
+      if (s[0] === "rebase" && s[1] === "--onto") return { code, stderr: `${"é".repeat(3000)}\nfatal: https://alice:secret@example.test/repo?token=private` };
+      if (s[0] === "diff") return { stdout: "pre-existing-conflict.txt\0" };
+      if (s[0] === "rebase" && s[1] === "--abort") return { code: 128, stderr: "fatal: no rebase in progress" };
       return undefined;
     });
-    await expect(abortFails.ops.rebaseOnto(slot, OID_A, OID_B)).rejects.toMatchObject({ code: "E_GIT" });
+    const error: unknown = await none.ops.rebaseOnto(slot, OID_A, OID_B).catch((e: unknown) => e);
+    expect(error).toMatchObject({ code: "E_GIT", message: `git rebase failed (exit ${code})`, detail: {
+      op: "rebase", code, stderr: expect.stringContaining("fatal: https://example.test/repo?token=***"),
+    } });
+    const text = JSON.stringify(error);
+    expect(text).not.toMatch(/alice|secret|private|\uFFFD/);
+    expect(Buffer.byteLength(text, "utf8")).toBeLessThan(2200);
+    expect(subs(none.git)).toEqual([["rebase", "--onto", OID_A, OID_B]]);
+  });
+
+  it("an active failed rebase with no conflicted path is aborted and retains the initiating failure", async () => {
+    const none = slotOps(args => (sub(args)[0] === "rebase" && sub(args)[1] === "--onto" ? { code: 128, stderr: "boom" } : undefined),
+      { [join(gitdir, "rebase-merge")]: "dir" });
+    await expect(none.ops.rebaseOnto(slot, OID_A, OID_B)).rejects.toMatchObject({
+      code: "E_GIT", message: "git rebase failed (exit 128)", detail: { op: "rebase", code: 128, stderr: "boom" },
+    });
+    expect(subs(none.git).map(s => s.slice(0, 2).join(" "))).toEqual(["rebase --onto", "diff --name-only", "rebase --abort"]);
+  });
+
+  it("a real abort failure retains both bounded sanitized errors and never falls back to reset", async () => {
+    const abortFails = slotOps(args => {
+      const s = sub(args);
+      if (s[0] === "rebase" && s[1] === "--onto") return { code: 1, stderr: `${"é".repeat(3000)}\nconflict https://alice:secret@example.test/repo?token=private` };
+      if (s[0] === "diff") return { stdout: "a.txt\0" };
+      if (s[0] === "rebase" && s[1] === "--abort") return { code: 128, stderr: `${"é".repeat(3000)}\nlocked https://bob:hidden@example.test/repo?password=private` };
+      return undefined;
+    }, { [join(gitdir, "rebase-merge")]: "dir" });
+    const error: unknown = await abortFails.ops.rebaseOnto(slot, OID_A, OID_B).catch((e: unknown) => e);
+    expect(error).toMatchObject({ code: "E_GIT", message: "git rebase failed (exit 1); rebase cleanup failed: git rebase --abort failed (exit 128)", detail: {
+      original: { op: "rebase", code: 1, stderr: expect.stringContaining("conflict https://example.test/repo?token=***") },
+      cleanup: { op: "rebase --abort", code: 128, stderr: expect.stringContaining("locked https://example.test/repo?password=***") },
+    } });
+    const text = JSON.stringify(error);
+    expect(text).not.toMatch(/alice|secret|bob|hidden|private|\uFFFD/);
+    expect(Buffer.byteLength(text, "utf8")).toBeLessThan(4400);
+    expect(subs(abortFails.git).map(s => s.slice(0, 2).join(" "))).toEqual(["rebase --onto", "diff --name-only", "rebase --abort"]);
+  });
+
+  it("an abort runner exception also retains the initiating rebase context", async () => {
+    const abortThrows = slotOps(args => {
+      const s = sub(args);
+      if (s[0] === "rebase" && s[1] === "--onto") return { code: 1, stderr: "initiating failure" };
+      if (s[0] === "diff") return { stdout: "a.txt\0" };
+      if (s[0] === "rebase" && s[1] === "--abort") throw Object.assign(new Error("timed out https://alice:secret@example.test/repo"), { code: "ETIMEDOUT" });
+      return undefined;
+    }, { [join(gitdir, "rebase-apply")]: "dir" });
+    await expect(abortThrows.ops.rebaseOnto(slot, OID_A, OID_B)).rejects.toMatchObject({ code: "E_GIT",
+      message: "git rebase failed (exit 1); rebase cleanup failed: git rebase --abort could not run: timed out https://example.test/repo",
+      detail: { original: { op: "rebase", code: 1, stderr: "initiating failure" }, cleanup: { op: "rebase --abort", code: "ETIMEDOUT", stderr: "" } },
+    });
   });
 
   it("rebaseAbort is a no-op unless a rebase is in progress", async () => {

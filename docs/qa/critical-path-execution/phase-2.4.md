@@ -271,7 +271,7 @@ broken|any (gc / repair) --> retired --dir gone + admin entry removed--> marker 
 ### 4.2 `acquire(planId, owner, baseCommit)`
 
 - Preconditions: `planId === d.planId`, `GIT_ID(baseCommit)`, and `owner` is 1–128 printable characters. Otherwise `E_INVALID_INPUT`.
-- Claim step, under the pool mutex (marker I/O only):
+- Claim step, under the pool mutex (await this caller's already-started base lookup, then marker I/O only; claims follow call order):
   1. If a non-retired task slot already has `owner === owner`, take it in "same" mode.
   2. Else take the `ready` task slot ordered by `commit === baseCommit` first, then oldest `updatedAt`. Write it as `resetting` with this owner.
   3. Else, if fewer than `maxParallel` task slots are non-retired, pick the smallest `n` with no marker and no directory. Write `creating` with this owner.

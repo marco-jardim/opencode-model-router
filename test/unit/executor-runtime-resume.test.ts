@@ -11,7 +11,7 @@ import {
   RESUME_PROMPT, classifyChildText, createExecutorRuntime, realCollaborators,
   type CollaboratorInput, type ExecutorRuntimeHandle, type PlanCollaborators, type RuntimeDeps,
 } from "../../src/executor/runtime";
-import { orphanRefName, restoreSlotWork, snapshotSlotWork, wipRefName, wipTrailer } from "../../src/executor/git";
+import { orphanRefName, restoreSlotWork, snapshotSlotWork, taskBranchName, wipRefName, wipTrailer } from "../../src/executor/git";
 import { createLedgerStore, createNodeClock } from "../../src/executor/ledger";
 import { createCapacityController } from "../../src/executor/capacity";
 import { createScheduler } from "../../src/executor/schedule";
@@ -224,7 +224,8 @@ async function rig(o: RigOptions = {}) {
       await sh(r.slot, "clean", "-q", "-ffd");
       recCommit = commit;
     }),
-    cleanForChecks: vi.fn<SlotPool["cleanForChecks"]>(async () => {}),
+    noteCommit: vi.fn<SlotPool["noteCommit"]>(async () => {}),
+    cleanForChecks: vi.fn<SlotPool["cleanForChecks"]>(async () => ({ drifted: false })),
     release: vi.fn<SlotPool["release"]>(async () => { owner = null; }),
     get: vi.fn<SlotPool["get"]>(async (slot) => slot !== "slot-1" || owner === null ? null : {
       schema: 1, slot: "slot-1", path: r.slot, kind: "task", planId: PLAN, repoKey: "repo", state: "leased",
@@ -327,7 +328,7 @@ async function rig(o: RigOptions = {}) {
   };
   const pause = (ms = 30): Promise<void> => new Promise((res) => { setTimeout(res, ms); });
   const h = {
-    r, runtime, store, pool, queue, launches, launcher, collabs, begun, ledger, pause, journal, acquireResets, begunStatus,
+    r, runtime, store, pool, queue, launches, launcher, collabs, begun, ledger, pause, journal, acquireResets, begunStatus, deps,
     async restart(): Promise<ExecutorRuntimeHandle> {
       await runtime.dispose();
       const next = createExecutorRuntime(deps);
@@ -1218,6 +1219,72 @@ describe("pdf2-1 (a): the budget-cap park trigger", () => {
 // ---------------------------------------------------------------------------------------------------------------
 
 describe("pdf2-1 (a): a budget end resumes the same attempt", () => {
+  it("a recovered budget end waits for root admission, then resumes the same child without resetting its WIP or beginning verification again", async () => {
+    const h = await rig();
+    await h.start();
+    const first = await h.launched(1);
+    await h.child(first, "ses-1");
+    await writeFile(join(h.r.slot, "b.txt"), "kept across recovery\n");
+    const resets = h.pool.reset.mock.calls.length;
+    const feed = {
+      taskId: "T1", from: "running", evidence: "finished", action: "process-result", n: 1, childSessionID: "ses-1",
+      context: { messages: [{ role: "assistant", text: "NEED MORE: budget", outcome: null }, { role: "idle", text: null, outcome: "completed" }] },
+      probation: null, mismatch: false, orphans: [], slotValid: true,
+    } satisfies import("../../src/executor/recovery").ReconcileFeed;
+    h.deps.recovery = { recover: async () => [{ planId: PLAN, actions: [feed] }], adopt: async () => {}, reconcile: async () => [feed] };
+    const gate = vi.spyOn(h.deps.launcher, "gate").mockReturnValue({ ok: false, reason: "no-context", wake: { reason: "stale-context", stateKey: "recovery-context" } });
+    const next = await h.restart();
+    await next.start();
+    await next.settled();
+    expect(h.launches).toHaveLength(1);
+    expect(h.pool.reset).toHaveBeenCalledTimes(resets);
+    expect(h.pool.release).not.toHaveBeenCalled();
+    expect(await readFile(join(h.r.slot, "b.txt"), "utf8")).toBe("kept across recovery\n");
+    gate.mockRestore();
+    next.onRouterToolCall(ORCH);
+    const resumed = await h.launched(2);
+    expect(resumed.req).toMatchObject({ attempt: 1, nonce: first.req.nonce, resume: { childSessionID: "ses-1" }, prompt: RESUME_PROMPT });
+    resumed.confirm({ kind: "confirmed", childSessionID: "ses-1", latencyMs: 0 });
+    expect(h.begun).toEqual(["T1#1"]);
+    expect(h.pool.reset).toHaveBeenCalledTimes(resets);
+    expect(h.pool.release).not.toHaveBeenCalled();
+    expect((await h.ledger()).tasks.T1?.attempts).toHaveLength(1);
+    expect((await h.ledger()).tasks.T1?.attempts[0]?.resumes).toBe(1);
+  }, TEST_MS);
+
+  it("recovered re-provisioning retains an owned slot whose dirty work cannot be saved", async () => {
+    let failSave = false;
+    const h = await rig({ git: faultyGit(args => failSave && args[0] === "add" ? "fail" : null) });
+    await h.start();
+    const first = await h.launched(1);
+    await h.child(first, "ses-1");
+    await h.runtime.dispose();
+    const branch = taskBranchName(PLAN, "T1");
+    await sh(h.r.top, "branch", branch, h.r.base);
+    const writer = await h.store.open(PLAN, h.deps.holder(ORCH));
+    await writer.append([
+      { type: "attempt-ended", taskId: "T1", n: 1, outcome: "succeeded", endedAt: h.deps.clock.iso(), detail: null },
+      { type: "task-transition", taskId: "T1", from: "running", to: "completed", trigger: "child-ended", detail: null },
+      { type: "task-slot", taskId: "T1", slot: "slot-1", branch },
+      { type: "task-transition", taskId: "T1", from: "completed", to: "verifying", trigger: "committed", detail: null },
+    ]);
+    await writer.close();
+    await writeFile(join(h.r.slot, "b.txt"), "unsaved recovered work\n");
+    failSave = true;
+    const feed = { taskId: "T1", from: "verifying", evidence: "none", action: "reverify", n: 1, childSessionID: "ses-1",
+      context: null, probation: null, mismatch: false, orphans: [], slotValid: false } satisfies import("../../src/executor/recovery").ReconcileFeed;
+    h.deps.recovery = { recover: async () => [{ planId: PLAN, actions: [feed] }], adopt: async () => {}, reconcile: async () => [feed] };
+    const resets = h.pool.reset.mock.calls.length;
+    const next = await h.restart();
+    await next.start();
+    await next.settled();
+    expect(h.pool.reset).toHaveBeenCalledTimes(resets);
+    expect(h.pool.release).not.toHaveBeenCalled();
+    expect((await h.ledger()).tasks.T1).toMatchObject({ state: "verifying", slot: "slot-1" });
+    expect((await h.ledger()).inbox.some(item => item.answer === null && item.text.startsWith("the work in slot slot-1 could not be saved"))).toBe(true);
+    expect(await readFile(join(h.r.slot, "b.txt"), "utf8")).toBe("unsaved recovered work\n");
+  }, TEST_MS);
+
   it("2. resumes the same child with the same attempt and nonce up to BUDGET_RESUMES times, then parks with budget-cap", async () => {
     const h = await rig();
     await h.start();

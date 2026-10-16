@@ -6,7 +6,6 @@ import { join } from "node:path";
 import type { V2Executor, V2ExecutorHost } from "../compat/v2-hooks";
 import { loadConfig, parseModelRef, resolveActiveTiers, resolveRolesRouting, resolveRouting, validateSlotsDir, type RouterHost } from "../router/config";
 import { resolveRoles } from "../router/roles";
-import { planRun } from "../router/run-tools";
 import { annotateSteps } from "../routing/engine/plan";
 import { classifyMany } from "../routing/classify";
 import { CLASS_STATIC_TIER } from "../routing/classify/types";
@@ -17,15 +16,18 @@ import { hardeningArgs, spawnBounded, workRootGuards } from "../router/git-tools
 import { createCapacityController } from "./capacity";
 import { createPlanCompiler, type CompilerDeps } from "./compile";
 import { createGitOps, createGitRunner } from "./git";
-import { BackgroundRuns, createIntegrateGit, createIntegrationChecks, createWriteGuard, type RunResolver } from "./integrate/checks";
+import { BackgroundRuns, createIntegrateGit, createIntegrationChecks, createWriteGuard } from "./integrate/checks";
 import { createLander } from "./integrate/land";
 import { createPhaseSuiteRunner } from "./integrate/phase-suite";
+import { createRunResolver } from "./integrate/run-resolver";
 import { createIntegrationQueue, createRepoLockFactory, type IntegrationStepEvent } from "./integrate/queue";
 import { createTaskLauncher } from "./launch";
 import { createLedgerStore, createNodeClock, createNodeFileSystem } from "./ledger";
 import { resolveExecutorHome } from "./paths";
+import { processIdentity } from "./process-identity";
 import { createRecoveryService, sameToplevel } from "./recovery";
 import { createExecutorRuntime, realCollaborators, type ExecutorRuntimeHandle, type RuntimeDeps } from "./runtime";
+import type { V2Observations } from "../compat/v2-observations";
 import { createScheduler } from "./schedule";
 import { countPlanMarkers, createSlotPool, defaultSlotsDir, type SlotPoolOpenOptions } from "./slots/pool";
 import { createProvisioner } from "./slots/provision";
@@ -64,6 +66,7 @@ export class PlanSlotPools {
     acquire: (id, ...args) => this.of(id).acquire(id, ...args),
     acquireSpecial: (id, ...args) => this.of(id).acquireSpecial(id, ...args),
     reset: async () => { throw new ExecutorError("E_PLAN_STATE", "a slot operation requires a plan"); },
+    noteCommit: async () => { throw new ExecutorError("E_PLAN_STATE", "a slot operation requires a plan"); },
     cleanForChecks: async () => { throw new ExecutorError("E_PLAN_STATE", "a slot operation requires a plan"); },
     release: async () => { throw new ExecutorError("E_PLAN_STATE", "a slot operation requires a plan"); },
     get: async () => null,
@@ -75,6 +78,7 @@ export class PlanSlotPools {
     const have = this.entries.get(planId);
     if (have !== undefined) return have.view;
     const entry = { view: null as SlotPool | null, pool: null as Promise<OpenPool> | null, closed: false };
+    const releaseListeners = new Set<() => void>();
     const get = (): Promise<OpenPool> => {
       if (entry.closed) return Promise.reject(new ExecutorError("E_PLAN_STATE", `slots of plan ${planId} are closed`));
       entry.pool ??= this.deps.store.read(planId).then(async (ledger) => {
@@ -85,6 +89,12 @@ export class PlanSlotPools {
         }
         catch (error) { pool.close(); throw error; }
         if (entry.closed) { pool.close(); throw new ExecutorError("E_PLAN_STATE", `slots of plan ${planId} are closed`); }
+        pool.onTaskSlotReleased?.(() => {
+          if (entry.closed) return;
+          for (const listener of releaseListeners) {
+            try { listener(); } catch { /* Notification failures must not fail release. */ }
+          }
+        });
         return pool;
       });
       return entry.pool;
@@ -103,8 +113,13 @@ export class PlanSlotPools {
       acquire: async (...args) => (await get()).acquire(...args),
       acquireSpecial: async (...args) => (await get()).acquireSpecial(...args),
       reset: async (...args) => (await get()).reset(...args),
+      noteCommit: async (...args) => (await get()).noteCommit(...args),
       cleanForChecks: async (...args) => (await get()).cleanForChecks(...args),
       release: async (...args) => { if (!entry.closed) await (await get()).release(...args); },
+      onTaskSlotReleased(listener) {
+        releaseListeners.add(listener);
+        return () => { releaseListeners.delete(listener); };
+      },
       get: (...args) => inspect((pool) => pool.get(...args), null),
       list: (...args) => inspect((pool) => pool.list(...args), []),
       gc: async (finished, opts) => {
@@ -219,22 +234,6 @@ async function checkBase(git: RuntimeDeps["git"], repo: LedgerV1["repo"]): Promi
   }
 }
 
-function runResolver(directory: string): RunResolver {
-  return {
-    async resolve(ref, cwd) {
-      try {
-        const config = resolveRolesRouting(loadConfig(directory), "v2").run;
-        const plan = planRun({ script: ref.script, args: ref.args, cwd }, cwd, config, { platform: process.platform, env: process.env });
-        return { ok: true, command: { label: ref.script, file: plan.executable, args: plan.argv,
-          source: plan.kind === "script" ? "package-script" : "run-command", ref, cwd: plan.cwd,
-          env: Object.fromEntries(Object.entries(plan.env).filter((entry): entry is [string, string] => entry[1] !== undefined)) } };
-      } catch (error) {
-        return { ok: false, reason: error instanceof Error ? error.message : String(error) };
-      }
-    },
-  };
-}
-
 const processClaimKey = Symbol.for("omr.executor.claim.v1");
 /**
  * QA-5.1-20: the retry callbacks of copies refused by the claim (a hot reload starts the new copy before the old one has
@@ -282,6 +281,7 @@ function staticTierDurations(cfg: Parameters<typeof resolveRoles>[0]): DurationM
 }
 
 export interface CreateExecutorOptions {
+  observations?: V2Observations;
   host: V2ExecutorHost;
   prepared: PreparedExecutor;
   access: ExecutorAccess;
@@ -384,7 +384,7 @@ function assembleExecutor(context: { directory: string }, options: CreateExecuto
     const rawGit = createGitRunner({ mode: "hardened", toplevel });
     const git: RuntimeDeps["git"] = { run: (args, opts) => rawGit.run([...hardeningArgs(), ...args], opts) };
     const userGit = createGitRunner({ mode: "user", toplevel });
-    const store = createLedgerStore({ home });
+    const store = createLedgerStore({ home, observations: options.observations });
     const opsOf = (planId: PlanId) => createGitOps({ git, userGit, fs, planId, toplevel, executorHome: home });
     pools = new PlanSlotPools({
       store, toplevel, log,
@@ -428,7 +428,7 @@ function assembleExecutor(context: { directory: string }, options: CreateExecuto
       const candidates = [...roles.values()].filter((role) => role.enabled).sort((a, b) => a.agent.localeCompare(b.agent));
       const chosen = candidates.find((role) => role.kind === kind) ?? candidates.find((role) => role.kind === "general");
       if (chosen === undefined) throw new ExecutorError("E_INVALID_INPUT", `no enabled role for ${kind}`);
-      return chosen.agent;
+      return chosen;
     };
     const innerCompiler = createPlanCompiler({
       fs,
@@ -466,7 +466,7 @@ function assembleExecutor(context: { directory: string }, options: CreateExecuto
     let launcherDisposal: Promise<void> | null = null;
     launcher = { ...innerLauncher, dispose: () => launcherDisposal ??= innerLauncher.dispose() };
     const taskLauncher = launcher;
-    const resolver = runResolver(directory);
+    const resolver = createRunResolver(() => resolveRolesRouting(loadConfig(directory), "v2").run);
     const buildQueue: Parameters<typeof realCollaborators>[0]["queue"] = (input) => {
       const planId = input.writer.planId;
       const pool = planPools.of(planId), ops = opsOf(planId);
@@ -477,6 +477,7 @@ function assembleExecutor(context: { directory: string }, options: CreateExecuto
         spawn: async (command, opts) => {
           const start = clock.now();
           const result = await runArgv(command.file, command.args, { cwd: command.cwd ?? opts.cwd, env: command.env,
+            ...(opts.service === undefined ? {} : { service: opts.service }),
             signal: opts.signal, lowPriority: opts.lowPriority, timeoutMs: resolveRolesRouting(loadConfig(directory), "v2").run.timeoutMs });
           return { exitCode: result.code, timedOut: result.timedOut, stdout: result.stdout, stderr: result.stderr, durationMs: clock.now() - start };
         },
@@ -519,7 +520,9 @@ function assembleExecutor(context: { directory: string }, options: CreateExecuto
       const now = clock.iso();
       return { sessionID, pid: spawner.pid, hostname: spawner.hostname, startedAt: now, heartbeatAt: now };
     };
-    runtime = createExecutorRuntime({ store, compiler, executorHome: home,
+    const self = processIdentity();
+    runtime = createExecutorRuntime({ store, compiler, self, executorHome: home,
+      observations: options.observations,
       slots: planPools.facade, slotsFor: (id) => planPools.of(id), purgeSlots: (id, finished) => planPools.purge(id, finished),
       scheduler: createScheduler(), launcher: taskLauncher, routes, verifier: host.verifier, git, hosts: host.hosts, bindings: host.bindings, clock,
       leaseRegistry: { acquireWrite: (owner, writes) => {
@@ -536,7 +539,8 @@ function assembleExecutor(context: { directory: string }, options: CreateExecuto
           return holder === null ? null : { holderID: holder.holderID, taskRef: holder.taskRef ?? null };
         },
         releaseTask: (ref) => { leases.registry.releaseTask(ref); leases.notifyReleased(); } },
-      recovery: createRecoveryService({ store, host: host.hosts, toplevel, holder, slotMarker: (slot) => planPools.markerOf(slot), clock, log }),
+      recovery: createRecoveryService({ store, host: host.hosts, toplevel, holder, slotMarker: (slot) => planPools.markerOf(slot), clock, log,
+        launcherLiveness: { self, isAlive: spawner.isAlive } }),
       holder, capacity: createCapacityController, collaborators: realCollaborators({ queue: buildQueue, clock, log }),
       pinOrchestrator: host.pinOrchestrator, log,
       config: () => ({ ...resolveRouting(loadConfig(directory), "v2").executor, slotsDir: null }), toplevel,

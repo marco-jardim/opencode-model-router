@@ -4,11 +4,12 @@ import { join, win32 } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { runArgv } from "../../src/verify/exec";
 import type { GitOps, StatusEntry } from "../../src/executor/git";
+import { BackgroundRuns, createIntegrationChecks } from "../../src/executor/integrate/checks";
 import { assertSafeSlotDir, createSlotPool, defaultSlotsDir, gcSlots, isSlotRecord, markerPath, slotLockReason, SLOT_NAME_PATTERN, SLOT_SWEEP_MAX_ENTRIES, UNKNOWN_PLAN_GC_AGE_MS } from "../../src/executor/slots/pool";
 import { applySlotEnv, registerSlot, slotEnvFor, unregisterSlot } from "../../src/executor/slots/env";
 import { detectManagers, SLOT_SWEEP_MAX_ENTRIES as PROVISION_SWEEP_MAX_ENTRIES } from "../../src/executor/slots/provision";
 import type { Detection, Provisioner } from "../../src/executor/slots/provision";
-import { ExecutorError, GIT_ID_PATTERN, type Clock, type ExecutorConfig, type FileSystem, type FsStat, type SlotRecord } from "../../src/executor/types";
+import { ExecutorError, GIT_ID_PATTERN, type Clock, type ExecutorConfig, type FileSystem, type FsStat, type LedgerV1, type SlotRecord } from "../../src/executor/types";
 
 // ---------------------------------------------------------------------------------------------------------------
 // Fakes: file system, clock, git, provisioner
@@ -236,6 +237,13 @@ function autoClock(start = Date.parse("2026-10-11T00:00:00.000Z")): Clock & { ti
 
 const unused = async (): Promise<never> => { throw new Error("not used by the pool"); };
 
+function deferred<T>(): { promise: Promise<T>; resolve(value: T): void; reject(error: unknown): void } {
+  let resolve: (value: T) => void = () => undefined;
+  let reject: (error: unknown) => void = () => undefined;
+  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+}
+
 interface FakeGit extends GitOps {
   log: string[];
   heads: Map<string, string>;
@@ -431,6 +439,39 @@ describe("SlotPool lifecycle", () => {
     expect(await h.pool.get("slot-9")).toBeNull();
   });
 
+  it("notifies task-slot release only after durability, never on failure, no-op, special slots or unsubscribe", async () => {
+    const h = harness();
+    await h.pool.open();
+    const lease = await h.pool.acquire(PLAN, "task-1", C1);
+    const special = await h.pool.acquireSpecial(PLAN, "integration");
+    let flushed = false;
+    const notifications: boolean[] = [];
+    h.pool.onTaskSlotReleased?.(() => { throw new Error("subscriber failed"); });
+    const off = h.pool.onTaskSlotReleased?.(() => { notifications.push(flushed); });
+    const fsync = h.fs.fsyncDir.bind(h.fs);
+    h.fs.fsyncDir = async () => { throw new Error("flush failed"); };
+    await expect(h.pool.release(lease.slot)).rejects.toThrow("flush failed");
+    expect(notifications).toEqual([]);
+    expect(await h.pool.get(lease.slot)).toMatchObject({ state: "leased" });
+    h.fs.fsyncDir = async path => {
+      expect(notifications).toEqual([]);
+      await fsync(path);
+      flushed = true;
+    };
+    await h.pool.release(lease.slot);
+    expect(notifications).toEqual([true]);
+    h.fs.fsyncDir = fsync;
+    await h.pool.release(lease.slot);
+    await h.pool.release("slot-9");
+    await h.pool.release(special.slot);
+    expect(notifications).toEqual([true]);
+    off?.();
+    const again = await h.pool.acquire(PLAN, "task-2", C1);
+    await h.pool.release(again.slot);
+    expect(notifications).toEqual([true]);
+    h.pool.close();
+  });
+
   it("reuses a ready slot through resetting without reinstalling", async () => {
     const h = harness();
     await h.pool.open();
@@ -453,6 +494,53 @@ describe("SlotPool lifecycle", () => {
     await h.pool.release(b.slot);
     const again = await h.pool.acquire(PLAN, "c", C2);
     expect(again.slot).toBe(b.slot);
+  });
+
+  it("persists the candidate commit after checkout reuse and preserves claim affinity", async () => {
+    const h = harness();
+    await h.pool.open();
+    const older = await h.pool.acquire(PLAN, "older", C1);
+    const reused = await h.pool.acquire(PLAN, "reused", C1);
+    h.git.heads.set(key(reused.path), C2); // The integration queue's rebase moved HEAD, not the marker.
+    const checks = createIntegrationChecks({
+      ledger: () => ({ config: { integrationChecks: "auto", python: "auto" } } as LedgerV1),
+      pool: h.pool, git: h.git, clock: h.clock, logger: { warn() {} }, background: new BackgroundRuns(),
+      igit: { showFile: async () => null, diffNameStatus: async () => [] } as unknown as Parameters<typeof createIntegrationChecks>[0]["igit"],
+      guard: { assertWriteCwd: async () => undefined },
+      resolver: { resolve: async () => { throw new Error("unexpected resolve"); } },
+      spawn: async () => { throw new Error("unexpected spawn"); },
+    });
+    const before = h.marker(reused.slot);
+    expect(before.commit).toBe(C1);
+    h.clock.tick(1);
+    expect(await checks.run({ slot: reused, base: C1, candidate: C2, reuseCheckout: true,
+      priority: "foreground", signal: new AbortController().signal })).toMatchObject({ verdict: "pass", note: "no-checks" });
+    expect(h.marker(reused.slot)).toMatchObject({ ...before, commit: C2, updatedAt: expect.any(String) });
+    expect(h.marker(reused.slot).updatedAt).not.toBe(before.updatedAt);
+    expect(await h.pool.get(reused.slot)).toEqual(h.marker(reused.slot));
+    expect(h.git.log.some(line => line.startsWith("checkout "))).toBe(false);
+    await h.pool.release(older.slot);
+    await h.pool.release(reused.slot);
+    expect((await h.pool.acquire(PLAN, "next", C2)).slot).toBe(reused.slot);
+    h.pool.close();
+  });
+
+  it("noteCommit validates the lease and object id and updates memory only after the marker save", async () => {
+    const h = harness();
+    await h.pool.open();
+    const lease = await h.pool.acquire(PLAN, "t", C1);
+    await expect(h.pool.noteCommit(lease.slot, "HEAD")).rejects.toMatchObject({ code: "E_INVALID_INPUT" });
+    await expect(h.pool.noteCommit("slot-9", C2)).rejects.toMatchObject({ code: "E_INVALID_INPUT" });
+    const fsync = h.fs.fsyncDir.bind(h.fs);
+    h.fs.fsyncDir = async () => { throw new Error("marker flush failed"); };
+    await expect(h.pool.noteCommit(lease.slot, C2)).rejects.toThrow("marker flush failed");
+    expect(await h.pool.get(lease.slot)).toMatchObject({ commit: C1 });
+    h.fs.fsyncDir = fsync;
+    await h.pool.noteCommit(lease.slot, C2);
+    expect(h.marker(lease.slot).commit).toBe(C2);
+    await h.pool.release(lease.slot);
+    await expect(h.pool.noteCommit(lease.slot, C3)).rejects.toMatchObject({ code: "E_INVALID_INPUT" });
+    h.pool.close();
   });
 
   it("returns the same slot to the same owner", async () => {
@@ -481,6 +569,47 @@ describe("SlotPool lifecycle", () => {
     expect(h.prov.calls[1]).toMatchObject({ fresh: true, managers: ["pip"] });
     expect(h.states("slot-1").slice(5)).toEqual(["resetting", "provisioning", "leased"]);
     expect(h.marker("slot-1").manifests).not.toEqual(before);
+  });
+
+  it.each(["tracked file", "HEAD"] as const)("public reset restores and verifies its requested base after a drift installer changes %s", async (mutation) => {
+    const h = harness();
+    h.git.files["tracked.txt"] = "checked in\n";
+    const checkout = h.git.checkoutDetach.bind(h.git);
+    h.git.checkoutDetach = async (path, commit) => {
+      await checkout(path, commit);
+      h.fs.put(win32.join(path, "requirements.txt"), commit === C1 ? "pytest\n" : "pytest==9\n");
+      h.fs.put(win32.join(path, "tracked.txt"), "checked in\n");
+    };
+    h.git.statusPorcelain = async path => h.fs.text(win32.join(path, "tracked.txt")) === "checked in\n"
+      ? [] : [{ xy: " M", path: "tracked.txt", orig: null }];
+    const provision = h.prov.provision.bind(h.prov);
+    const mutations: Array<{ head: string; status: StatusEntry[] }> = [];
+    h.prov.provision = async (path, detection, opts) => {
+      await provision(path, detection, opts);
+      if (await h.git.revParse(path, "HEAD") !== C2) return;
+      if (mutation === "tracked file") h.fs.put(win32.join(path, "tracked.txt"), "installer mutation\n");
+      else h.git.heads.set(key(path), C3);
+      mutations.push({ head: await h.git.revParse(path, "HEAD"), status: await h.git.statusPorcelain(path) });
+    };
+    await h.pool.open();
+    try {
+      const first = await h.pool.acquire(PLAN, "previous", C1);
+      await h.pool.release(first.slot);
+      const acquired = await h.pool.acquire(PLAN, "task-1", C1);
+      expect(acquired.verifiedResetBase).toBe(C1);
+      await h.pool.reset(acquired.slot, C2);
+
+      expect(h.prov.calls).toHaveLength(2);
+      expect(mutations).toEqual([{
+        head: mutation === "HEAD" ? C3 : C2,
+        status: mutation === "tracked file" ? [{ xy: " M", path: "tracked.txt", orig: null }] : [],
+      }]);
+      expect({ head: await h.git.revParse(acquired.path, "HEAD"), status: await h.git.statusPorcelain(acquired.path) })
+        .toEqual({ head: C2, status: [] });
+      expect(h.marker(acquired.slot)).toMatchObject({ state: "leased", owner: "task-1", commit: C2 });
+    } finally {
+      h.pool.close();
+    }
   });
 
   it("reset retries once after a delay and then reports the slot as held by a process", async () => {
@@ -547,6 +676,21 @@ describe("SlotPool lifecycle", () => {
     await h.pool.release("slot-1");
     await expect(h.pool.cleanForChecks("slot-1")).rejects.toMatchObject({ code: "E_INVALID_INPUT" });
     await expect(h.pool.cleanForChecks("slot-5")).rejects.toMatchObject({ code: "E_INVALID_INPUT" });
+  });
+
+  it("cleanForChecks reports drift explicitly, including under an unchanged clock", async () => {
+    const h = harness();
+    await h.pool.open();
+    const lease = await h.pool.acquire(PLAN, "t", C1);
+    const before = h.marker(lease.slot);
+    h.clock.iso = () => before.updatedAt;
+    expect(await h.pool.cleanForChecks(lease.slot)).toEqual({ drifted: false });
+    h.fs.put(win32.join(lease.path, "requirements.txt"), "changed\n");
+    expect(await h.pool.cleanForChecks(lease.slot)).toEqual({ drifted: true });
+    expect(h.marker(lease.slot).updatedAt).toBe(before.updatedAt);
+    expect(h.prov.calls).toHaveLength(2);
+    expect(await h.pool.cleanForChecks(lease.slot)).toEqual({ drifted: false });
+    h.pool.close();
   });
 
   it("cleanForChecks sweeps links that are not tracked and leaves the dependency directories", async () => {
@@ -657,6 +801,82 @@ describe("QA-5.1-22: gc-only handle and the purge's empty plan directory", () =>
 });
 
 describe("SlotPool concurrency", () => {
+  it.each([false, true])("claims four concurrent acquisitions in call order when base lookups finish in reverse (special slots=%s)", async (specials) => {
+    const h = harness({ maxParallel: 4 });
+    await h.pool.open();
+    const bases = [C1, C2, C3, "4".repeat(40)];
+    const lookups = bases.map(() => deferred<string>());
+    const owners = specials ? ["integration", "owner-2", "ci", "owner-4"] : ["owner-1", "owner-2", "owner-3", "owner-4"];
+    const slots = specials ? ["integration", "slot-1", "ci", "slot-2"] : ["slot-1", "slot-2", "slot-3", "slot-4"];
+    const revParse = h.git.revParse.bind(h.git);
+    let calls = 0;
+    h.git.revParse = (cwd, rev) => cwd === TOP ? lookups[calls++]!.promise : revParse(cwd, rev);
+    const attempts = owners.map(owner => owner === "integration" || owner === "ci"
+      ? h.pool.acquireSpecial(PLAN, owner) : h.pool.acquire(PLAN, owner, C1));
+    const settled = Promise.allSettled(attempts);
+    try {
+      expect(calls).toBe(4); // Every lookup starts eagerly, even behind the first pending claim.
+      for (let n = lookups.length - 1; n >= 0; n--) {
+        lookups[n]!.resolve(bases[n]!);
+        await new Promise<void>(resolve => { setImmediate(resolve); });
+      }
+      expect(await settled).toEqual(owners.map((owner, n) => ({ status: "fulfilled", value: expect.objectContaining({
+        slot: slots[n], owner, commit: bases[n],
+      }) })));
+      expect(h.fs.markerWrites.map(text => JSON.parse(text) as SlotRecord).filter(r => r.state === "creating")
+        .map(r => r.owner)).toEqual(owners);
+      for (const [n, slot] of slots.entries()) expect(h.marker(slot)).toMatchObject({ state: "leased", owner: owners[n], commit: bases[n] });
+    } finally {
+      lookups.forEach((lookup, n) => { lookup.resolve(bases[n]!); });
+      await settled;
+      h.pool.close();
+    }
+  });
+
+  it.each(["task", "special"] as const)("handles a queued %s lookup rejection without affecting the next claimer or emitting an unhandled rejection", async (kind) => {
+    const h = harness({ maxParallel: 2 });
+    await h.pool.open();
+    const lookups = Array.from({ length: 3 }, () => deferred<string>());
+    const revParse = h.git.revParse.bind(h.git);
+    let calls = 0;
+    h.git.revParse = (cwd, rev) => cwd === TOP ? lookups[calls++]!.promise : revParse(cwd, rev);
+    const failure = new ExecutorError("E_GIT", "base lookup failed", { op: "rev-parse", code: 128, stderr: "unknown commit" });
+    const unhandled: unknown[] = [];
+    const onUnhandled = (error: unknown): void => { unhandled.push(error); };
+    process.on("unhandledRejection", onUnhandled);
+    const attempts = [
+      h.pool.acquire(PLAN, "first", C1),
+      kind === "task" ? h.pool.acquire(PLAN, "bad", C2) : h.pool.acquireSpecial(PLAN, "integration"),
+      h.pool.acquire(PLAN, "next", C3),
+    ];
+    const settled = Promise.allSettled(attempts);
+    try {
+      expect(calls).toBe(3);
+      lookups[1]!.reject(failure); // Rejected before the pool mutex reaches this caller's lookup.
+      lookups[2]!.resolve(C3);
+      await new Promise<void>(resolve => { setImmediate(resolve); });
+      expect(unhandled).toEqual([]);
+      expect(await h.pool.list()).toEqual([]); // Neither queued caller can overtake the first lookup.
+      lookups[0]!.resolve(C1);
+      expect(await settled).toEqual([
+        { status: "fulfilled", value: expect.objectContaining({ slot: "slot-1", owner: "first", commit: C1 }) },
+        { status: "rejected", reason: failure },
+        { status: "fulfilled", value: expect.objectContaining({ slot: "slot-2", owner: "next", commit: C3 }) },
+      ]);
+      await expect(attempts[1]).rejects.toBe(failure); // Preserve the original error object, code and git detail.
+      await new Promise<void>(resolve => { setImmediate(resolve); });
+      expect(unhandled).toEqual([]);
+      expect((await h.pool.list()).map(r => ({ slot: r.slot, state: r.state, owner: r.owner }))).toEqual([
+        { slot: "slot-1", state: "leased", owner: "first" }, { slot: "slot-2", state: "leased", owner: "next" },
+      ]);
+    } finally {
+      lookups.forEach(lookup => { lookup.resolve(C1); });
+      await settled;
+      process.off("unhandledRejection", onUnhandled);
+      h.pool.close();
+    }
+  });
+
   it("8 acquires on 4 slots: 4 succeed with distinct slots, 4 are refused as unavailable", async () => {
     const h = harness({ maxParallel: 4 });
     await h.pool.open();

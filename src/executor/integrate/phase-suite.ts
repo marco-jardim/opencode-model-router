@@ -15,6 +15,7 @@ import type {
   PhaseSuiteRunner, RevertRequest, RevertVerdict, StepDetail, StepJournal, SuiteResolution, SuiteRunRequest, SuiteVerdict,
 } from "./queue";
 import { COMMIT_SUBJECT_PATTERN, formatCommitMessage, type GitOps } from "../git";
+import { executorServiceObservation } from "../observations";
 import { ExecutorError, type Clock, type IntegrationStep, type LedgerV1, type PhaseId, type PlanId, type SlotPool, type TaskId } from "../types";
 
 export interface PhaseSuiteDeps {
@@ -95,10 +96,10 @@ async function stepped<T>(j: StepJournal, step: IntegrationStep, detail: StepDet
   }
 }
 
-/** Raised inside the bisect probe to unwind `bisectRanges` with the non-ok outcome of a probe. */
+/** Raised inside the bisect probe to unwind `bisectRanges` when a probe cannot supply comparable evidence. */
 class ProbeStop extends Error {
   override readonly name = "ProbeStop" as const;
-  constructor(readonly outcome: Exclude<Stepped<CommandRunResult>, { kind: "ok" }>) {
+  constructor(readonly outcome: Exclude<Stepped<CommandRunResult>, { kind: "ok" }> | Extract<SuiteVerdict, { kind: "unattributed" }>) {
     super("bisect probe stopped");
   }
 }
@@ -120,6 +121,9 @@ function failedIdsOf(r: CommandRunResult, original: readonly string[]): string[]
 }
 
 async function runSuite(d: PhaseSuiteDeps, req: SuiteRunRequest, j: StepJournal): Promise<SuiteVerdict> {
+  const observation = executorServiceObservation(d.clock, req.planId, () => ({ planId: req.planId,
+    phaseId: req.phaseId, entryId: j.entry.id, taskId: null, attempt: null, taskIds: j.entry.taskIds,
+    component: "phase-suite", candidate: req.commit }));
   const startDetail: StepDetail = { v: 1, commit: req.commit, base: req.base, commands: req.commands.map(c => ({ label: c.label, ref: c.ref })) };
   // QA-3.2-8 (M38): one preemption budget for the whole suite entry, shared by every run below. Once spent, the
   // entry's runs register with nothing left, so a foreground check waits instead of preempting again.
@@ -128,6 +132,7 @@ async function runSuite(d: PhaseSuiteDeps, req: SuiteRunRequest, j: StepJournal)
     await j.assertWriteCwd(req.slot.path, "slot");
     const r = await d.checks.runCommands({
       slot: req.slot, commit, commands: req.commands, mode, priority: "background", signal: j.signal, prepare: true, preempt, requireRun,
+      ...(observation === undefined ? {} : { observation }),
     });
     if (r.verdict === "error") return { error: r.error ?? { reason: "spawn", message: "the run failed without a reason" } };
     return { error: null, value: r };
@@ -165,7 +170,10 @@ async function runSuite(d: PhaseSuiteDeps, req: SuiteRunRequest, j: StepJournal)
     if (s.kind !== "ok") return s;
     rerunFailed.push(failedIdsOf(s.value, ids));
     if (s.value.verdict === "fail") anyRerunFailed = true;
-    if (attributable && s.value.verdict === "fail" && !s.value.idsUnparsed) for (const id of s.value.ids) if (ids.includes(id)) fileSeen.add(id);
+    // A requested file rerun may execute full commands; even parsed failures then prove no file isolation.
+    if (attributable && s.value.scope === "rerun" && s.value.verdict === "fail" && !s.value.idsUnparsed) {
+      for (const id of s.value.ids) if (ids.includes(id)) fileSeen.add(id);
+    }
     if (n === 1) {
       await j.end(s.value.verdict === "fail" ? "failed" : "ok", { v: 1, durationMs: s.value.durationMs, output: s.value.output }, rerunFailed[0] ?? []);
       continue;
@@ -259,6 +267,14 @@ async function runSuite(d: PhaseSuiteDeps, req: SuiteRunRequest, j: StepJournal)
     const s = await stepped(j, "bisect", detail, () => exec(commit, probeMode));
     if (s.kind !== "ok") throw new ProbeStop(s);
     probes++;
+    // Historical runner/config changes can force a full fallback even after the suite commit genuinely scoped.
+    // Do not compare that broader verdict with file-scoped seeds (especially a red base seeded as passing).
+    if (fileScoped && s.value.scope !== "rerun") {
+      await j.end("refused", { v: 1, reason: "full-command-fallback" });
+      j.counter("integration.bisect.probes", probes, { kind: "suite" });
+      await memoStep(ordered.map(r => r.taskId));
+      throw new ProbeStop({ kind: "unattributed", ids: regression, reason: "base-overlap" });
+    }
     // QA-3.2-26: fail closed. A failing probe fails, whichever ids it names: a run of the regression files that names
     // none of the regression ids (another id form, or another failure masking them) is no evidence of a pass.
     const failed = s.value.verdict === "fail";
@@ -288,6 +304,9 @@ type BuiltRevert = { kind: "built"; head: string; reverted: string[] } | { kind:
  * The runner never fast-forwards; the queue does that on `ok`. The `revert-build` step is open on entry.
  */
 async function runRevert(d: PhaseSuiteDeps, req: RevertRequest, j: StepJournal): Promise<RevertVerdict> {
+  const observation = executorServiceObservation(d.clock, req.planId, () => ({ planId: req.planId,
+    phaseId: req.phaseId, entryId: j.entry.id, taskId: null, attempt: null, taskIds: j.entry.taskIds,
+    component: "checks", candidate: req.head }));
   const cwd = req.slot.path;
   const { culprit } = req;
   const range = { taskId: culprit.taskId, from: culprit.from, to: culprit.to };
@@ -323,6 +342,7 @@ async function runRevert(d: PhaseSuiteDeps, req: RevertRequest, j: StepJournal):
     const r = await d.checks.run({
       slot: req.slot, base: req.head, candidate: revertHead, priority: "foreground", signal: j.signal,
       extra: { ids: [...req.regression.ids], files: [...req.regression.files], commands: [...req.regression.commands] },
+      ...(observation === undefined ? {} : { observation }),
     });
     return r.verdict === "error" ? { error: { reason: r.reason, message: r.message } } : { error: null, value: r };
   });
@@ -333,7 +353,7 @@ async function runRevert(d: PhaseSuiteDeps, req: RevertRequest, j: StepJournal):
   return { kind: "ok", revertHead, reverted };
 }
 
-/** M21: what the phase suite is at `commit`. Reads through git, so no slot is touched before the journal. */
+/** M21: discovery reads `commit` through git; inherited router plans are re-resolved by checks after slot preparation. */
 async function resolveSuite(d: PhaseSuiteDeps, ledger: Readonly<LedgerV1>, phaseId: PhaseId, commit: string): Promise<SuiteResolution> {
   const setting = ledger.config.phaseSuite;
   if (setting === "off") return { kind: "off" };

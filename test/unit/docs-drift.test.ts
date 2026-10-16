@@ -434,17 +434,45 @@ function executorLeafKeys(defaults: Record<string, unknown>, prefix = ""): strin
   return keys;
 }
 
+/** Parse the actual /plan dispatch switch as well as its help, so a parser-only addition cannot escape the pin. */
+function planParserSubcommands(source: string): string[] {
+  const body = /switch \(sub\) \{([\s\S]*?)\n  \}/.exec(source)?.[1] ?? "";
+  return [...body.matchAll(/^\s*case "([a-z][a-z-]*)":/gm)].map((m) => m[1]!);
+}
+
+/** The private config allowlist, read as source (not evaluated); recurse into blocks such as circuitBreaker. */
+function executorKnownLeafKeys(source: string): string[] {
+  const known = /const ROUTING_KNOWN_KEYS[^=]*= \{([\s\S]*?)\n\};/.exec(source)?.[1] ?? "";
+  const block = (name: string): string[] => {
+    const body = new RegExp(`(?:^|\\n)  ${name}: \\[([^\\]]*)\\]`).exec(known)?.[1] ?? "";
+    return [...body.matchAll(/"([A-Za-z][A-Za-z0-9]*)"/g)].map((m) => m[1]!);
+  };
+  const leaves = (name: string, prefix = ""): string[] => block(name).flatMap((key) =>
+    block(key).length > 0 ? leaves(key, `${prefix}${key}.`) : [`${prefix}${key}`],
+  );
+  return leaves("executor");
+}
+
+const executorDefaultKeys = executorLeafKeys(ROUTING_DEFAULTS.executor as unknown as Record<string, unknown>);
+const executorKnownKeys = executorKnownLeafKeys(read("src/router/config.ts"));
+const executorParserCommands = planParserSubcommands(read("src/executor/command.ts"));
+const executorDocSurface = {
+  commands: [...new Set([...planSubcommands(PLAN_HELP_LINES), ...executorParserCommands])],
+  actions: ROUTER_PLAN_ACTIONS as readonly string[],
+  keys: [...new Set([...executorDefaultKeys, ...executorKnownKeys])],
+};
+
 /** What `doc` lacks of the plan executor surface: one entry per missing command, action or config key. */
-function executorDocProblems(doc: string): string[] {
+function executorDocProblems(doc: string, surface = executorDocSurface): string[] {
   const problems: string[] = [];
-  for (const sub of planSubcommands(PLAN_HELP_LINES)) {
+  for (const sub of surface.commands) {
     if (!doc.includes(`| \`/plan ${sub}`)) problems.push(`/plan ${sub}`);
   }
-  for (const action of ROUTER_PLAN_ACTIONS) {
+  for (const action of surface.actions) {
     if (!doc.includes(`| \`${action}\` |`)) problems.push(`router_plan action ${action}`);
   }
-  for (const key of executorLeafKeys(ROUTING_DEFAULTS.executor as unknown as Record<string, unknown>)) {
-    if (!doc.includes(`\`routing.executor.${key}\``)) problems.push(`routing.executor.${key}`);
+  for (const key of surface.keys) {
+    if (!doc.includes(`| \`routing.executor.${key}\` |`)) problems.push(`routing.executor.${key}`);
   }
   return problems;
 }
@@ -458,6 +486,11 @@ describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
     );
     expect(ROUTER_PLAN_ACTIONS.length).toBeGreaterThanOrEqual(16);
     expect(executorLeafKeys(ROUTING_DEFAULTS.executor as unknown as Record<string, unknown>)).toContain("circuitBreaker.minAttempts");
+    expect(executorParserCommands.length).toBeGreaterThan(0);
+    expect([...executorParserCommands].sort()).toEqual(planSubcommands(PLAN_HELP_LINES).sort());
+    expect(executorKnownKeys.length).toBeGreaterThan(0);
+    expect([...executorKnownKeys].sort()).toEqual([...executorDefaultKeys].sort());
+    expect(read("src/executor/tool.ts")).toContain("action: tool.schema.enum(ROUTER_PLAN_ACTIONS)");
   });
 
   it("names every /plan subcommand, router_plan action and routing.executor key", () => {
@@ -472,6 +505,59 @@ describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
     expect(executorDocProblems(doc.replaceAll("`routing.executor.circuitBreaker.minAttempts`", "`x`"))).toContain(
       "routing.executor.circuitBreaker.minAttempts",
     );
+  });
+
+  it("detects deletion of every source-derived command, action and config table row", () => {
+    const missingRow = (prefix: string) => doc.split(/\r?\n/).filter((line) => !line.startsWith(prefix)).join("\n");
+    for (const sub of executorDocSurface.commands) {
+      expect(executorDocProblems(missingRow(`| \`/plan ${sub}`)), sub).toEqual([`/plan ${sub}`]);
+    }
+    for (const action of executorDocSurface.actions) {
+      expect(executorDocProblems(missingRow(`| \`${action}\` |`)), action).toEqual([`router_plan action ${action}`]);
+    }
+    for (const key of executorDocSurface.keys) {
+      expect(executorDocProblems(missingRow(`| \`routing.executor.${key}\` |`)), key).toEqual([`routing.executor.${key}`]);
+    }
+  });
+
+  it("detects additions to each code surface and extracts nested known keys and parser cases", () => {
+    expect(planParserSubcommands('switch (sub) {\n    case "new-command":\n  }')).toEqual(["new-command"]);
+    expect(executorKnownLeafKeys('const ROUTING_KNOWN_KEYS = {\n  executor: ["newKey", "nested"],\n  nested: ["leaf"],\n};'))
+      .toEqual(["newKey", "nested.leaf"]);
+    expect(executorDocProblems(doc, {
+      commands: [...executorDocSurface.commands, "new-command"],
+      actions: [...executorDocSurface.actions, "new-action"],
+      keys: [...executorDocSurface.keys, ...executorLeafKeys({ newBlock: { newKey: null } })],
+    })).toEqual(["/plan new-command", "router_plan action new-action", "routing.executor.newBlock.newKey"]);
+  });
+
+  it("pins the final safety model, Windows notes, metrics and next-plan checklist", () => {
+    const safety = sectionOf(doc, "## Safety model");
+    for (const id of ["I1", "I2", "I3", "I4", "I5"]) expect(safety).toContain(`| **${id}** |`);
+    expect(safety.replace(/\s+/g, " ")).toContain("claimed in that launch-priority order");
+    const windows = sectionOf(doc, "## Windows notes");
+    for (const note of ["Same drive", "pnpm store", "UV_CACHE_DIR", "core.longpaths", "260 characters"]) expect(windows).toContain(note);
+    expect(sectionOf(doc, "## Troubleshooting")).toContain("60 s probation");
+    const metrics = sectionOf(doc, "## Metrics and observations");
+    for (const note of ["MODEL_ROUTER_V2_OBSERVATIONS", "dropped=failed=0", "g8Ratio = makespan/bound", "10,000 ms", "not a Phase 6.1 acceptance gate"]) {
+      expect(metrics).toContain(note);
+    }
+    expect(sectionOf(doc, "## Owner checklist for the next real plan")).toContain("/plan run <path>");
+    expect(sectionOf(read("README.md"), "## Executing plans")).toContain("docs/EXECUTOR.md");
+    expect(read("docs/ROLES.md")).toContain("[the plan executor guide](EXECUTOR.md)");
+  });
+
+  it("pins ADR 0007's Accepted status and D1–D20 decision list against the binding plan", () => {
+    const plan = read("docs/plans/critical-path-execution-plan.md");
+    const expected = [...plan.matchAll(/^\| D(\d+) \|/gm)].map((m) => Number(m[1]));
+    const decisions = (text: string) => [...text.matchAll(/^### D(\d+) — /gm)].map((m) => Number(m[1]));
+    const adr = read("docs/adr/0007-critical-path-execution.md");
+    expect(expected).toEqual(Array.from({ length: 20 }, (_, i) => i + 1));
+    expect(decisions(adr)).toEqual(expected);
+    expect(adr).toContain("**Status:** Accepted **Date:** 2026-10-15");
+    for (const id of expected) {
+      expect(decisions(adr.replace(`### D${id} — `, `### Missing${id} — `)), `missing D${id}`).not.toEqual(expected);
+    }
   });
 
   it("pins the QA-4.1 operator surface: human approval, path rule, --phases format, --plan, attempts, checks, slotsDir", () => {
@@ -651,6 +737,19 @@ describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
     expect(source.indexOf("let reruns = 0;")).toBeLessThan(source.indexOf("const withReruns ="));
   });
 
+  it("documents inferred-writer routing and the owner's all-verification-modes M39 amendment", () => {
+    const routing = sectionOf(doc, "## Task routing and write footprints").replace(/\s+/g, " ");
+    expect(routing).toContain("`route-write-conflict`, the task id and source line");
+    expect(routing).toContain("read-only role permissions are not widened");
+    const verification = sectionOf(doc, "## Verification of plan tasks").replace(/\s+/g, " ");
+    expect(verification).toContain("whether `VERIFY` is `required`, `deferred` or `none`");
+    expect(verification).toContain("already-implemented/idempotent explanation is not an exception");
+    expect(verification).toContain("With an empty write footprint, no-change success remains allowed");
+    const amendment = sectionOf(read("docs/qa/critical-path-execution/phase-3.1.md"), "## Owner amendment to M39 (2026-10-14)").replace(/\s+/g, " ");
+    expect(amendment).toContain("supersedes the verification-dependent no-change rule in M39");
+    expect(amendment).toContain("No idempotent/already-implemented exception was authorized");
+  });
+
   it("pins the never-deferred plan-task gate in both code and docs", () => {
     const source = read("src/verify/plan-task.ts");
     // Required dispatch-gate wiring: modeA/trivial:false cannot skip the gate; accept is awaited directly, not deferred.
@@ -684,6 +783,7 @@ describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
     expect(read("src/executor/runtime.ts")).toContain("const PROBATION_INTERRUPT_FAILS = 5;");
     const recovery = sectionOf(doc, "## Recovery");
     for (const threshold of ["**60 s**", "**10 s**", "**5 tries**"]) expect(recovery).toContain(threshold);
+    expect(recovery.replace(/\s+/g, " ")).toContain("A `running` child whose launching process is provably dead on the same host, and whose stored history shows no tool call in flight, is requeued at once; a child stopped inside a tool, whose processes (for example a `router_run` test) can outlive the host, gets the **60 s** liveness probation like any other unknown child.");
     expect(sectionOf(doc, "## Unattended operation")).toContain("**4000 characters plus an ellipsis**");
     const unattended = sectionOf(doc, "## Unattended operation").replace(/\s+/g, " ");
     expect(unattended).toContain("default **3**, integer range **1–6**");
@@ -700,7 +800,7 @@ describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
   });
 
   it("has links that resolve", () => {
-    expect(brokenLinks(["docs/EXECUTOR.md", "docs/OPENCODE_V2.md"], readRepo)).toEqual([]);
+    expect(brokenLinks(["docs/EXECUTOR.md", "docs/OPENCODE_V2.md", "docs/ROLES.md", "docs/adr/0007-critical-path-execution.md"], readRepo)).toEqual([]);
   });
 
   it("describes the executor in the changelog as registered on v2 only, v1 maps unchanged (Phase 5.1.2)", () => {
@@ -1256,6 +1356,7 @@ describe("docs drift: roles delegation keys (#84)", () => {
     "roleAgents.<name>.tierRange", "roleAgents.<name>.budget", "roleAgents.<name>.deny", "routing.exploration.rate",
     "routing.exploration.requireDetection", "routing.run.scripts", "routing.run.commands", "routing.run.timeoutMs", "routing.workRoots",
     "routing.repoParents", "routing.repoDepth", "routing.repoExclude", "routing.repoApprovalDays",
+    "routing.roleFloor",
   ];
 
   it("documents every key, and a missing one is detected", () => {
@@ -1267,6 +1368,12 @@ describe("docs drift: roles delegation keys (#84)", () => {
   it("the Default column is what resolveRolesRouting applies", () => {
     const cell = (key: string) => keyRow(doc, key)?.[2];
     expect(cell("routing.delegation")).toBe(defaultCell(defaults.delegation));
+    expect(cell("routing.roleFloor")).toBe(defaultCell(defaults.roleFloor));
+    expect(defaults.roleFloor).toBe("strict");
+    expect(keyRow(doc, "routing.roleFloor")?.[4]).toBe("tiers.json, global (stripped from the project layer)");
+    const roleFloorNotice = "only tiers.json or the global override may set it";
+    expect(read("src/router/config.ts")).toContain(roleFloorNotice);
+    expect(doc.replace(/\s+/g, " ")).toContain(`this key is stripped from the project layer; ${roleFloorNotice}`);
     expect(cell("routing.exploration.rate")).toBe(defaultCell(defaults.exploration.rate));
     expect(cell("routing.exploration.requireDetection")).toBe(defaultCell(defaults.exploration.requireDetection));
     expect(cell("routing.run.timeoutMs")).toBe(defaultCell(defaults.run.timeoutMs));
@@ -1286,6 +1393,7 @@ describe("docs drift: roles delegation keys (#84)", () => {
     const block = /<!-- roles-defaults: v2 -->\s*```jsonc\r?\n([\s\S]*?)```/.exec(doc);
     expect(block).not.toBeNull();
     const documented = parseJsonc(block![1]!) as Record<string, unknown>;
+    expect(documented.roleFloor).toBe("strict");
     const { inert: _inert, ...code } = defaults;
     expect(documented).toEqual(JSON.parse(JSON.stringify(code)));
   });
@@ -1487,6 +1595,16 @@ function floorTableProblems(doc: string, floor: typeof authorityFloor): string[]
   return problems;
 }
 
+/** Reuse every strict-table pin for the separately marked gated table, with a live return gate. */
+function gatedFloorTableProblems(doc: string, floor: typeof authorityFloor = authorityFloor): string[] {
+  const marker = "<!-- authority-floor-gated-table -->";
+  const at = doc.indexOf(marker);
+  if (at < 0) return ["no gated floor table"];
+  const table = doc.slice(at).replace(marker, "<!-- authority-floor-table -->");
+  return floorTableProblems(table, (grant, detection, risk, scope) =>
+    floor(grant, detection, risk, scope, { mode: "gated", gateAtReturn: true }));
+}
+
 describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () => {
   const guide = read("docs/ROLES.md");
   const flat = guide.replace(/\r?\n>\s?/g, " ").replace(/\s+/g, " ");
@@ -1519,6 +1637,51 @@ describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () =
 
   it("the floor table of ROLES.md is authorityFloor for every grant, detection, risk and scope", () => {
     expect(floorTableProblems(guide, authorityFloor)).toEqual([]);
+  });
+
+  it("the gated floor table is authorityFloor with a return gate for every grant, detection, risk and scope", () => {
+    expect(gatedFloorTableProblems(guide)).toEqual([]);
+    expect(flat).toContain('`routing.roleFloor: "strict"`, the default');
+    expect(flat).toContain('`routing.roleFloor: "gated"`, opt-in, global only, OpenCode v2 only');
+    expect(flat).toContain("Otherwise the strict table applies.");
+    expect(flat).toContain("Deferred `testsPass` does not qualify.");
+    expect(flat).toContain("`raise:verification-fail:heavy`");
+    expect(flat).toContain("the next tier above `medium` within the role's ceiling and active tier order is `heavy`");
+    expect(flat).toContain("only when gating lowers the final floor compared with strict");
+    expect(flat).toContain("For gated children, **UNVERIFIABLE** at return also records the same raise");
+  });
+
+  it("detects gated table cell and code mutations without weakening the strict-table pins", () => {
+    const cell = "| write + exec | `medium` | `medium`; `heavy` if risk `high` | `heavy` |";
+    const changed = guide.replace(cell, "| write + exec | `medium` | `heavy` | `heavy` |");
+    expect(changed).not.toBe(guide);
+    const problems = gatedFloorTableProblems(changed);
+    expect(problems.length).toBeGreaterThan(0);
+    expect(problems.every((problem) => /^write \+ exec \/ grader \/ (low|medium) \//.test(problem))).toBe(true);
+    expect(floorTableProblems(changed, authorityFloor)).toEqual([]);
+    const strictMutant: typeof authorityFloor = (grant, detection, risk, scope) => authorityFloor(grant, detection, risk, scope);
+    expect(gatedFloorTableProblems(guide, strictMutant)).toEqual(problems.map((problem) => problem.replace("doc heavy, code medium", "doc medium, code heavy")));
+    const noHighRiskGuard: typeof authorityFloor = (grant, detection, risk, scope, policy) =>
+      grant.actions.has("edit") && grant.actions.has("router_run") && detection === "grader"
+        ? "medium" : authorityFloor(grant, detection, risk, scope, policy);
+    const highRisk = gatedFloorTableProblems(guide, noHighRiskGuard);
+    expect(highRisk.length).toBeGreaterThan(0);
+    expect(highRisk.every((problem) => problem.startsWith("write + exec / grader / high /"))).toBe(true);
+    expect(gatedFloorTableProblems(guide.replace(cell, cell.replace("`medium`; `heavy` if risk `high`", "medium-ish"))))
+      .toEqual(["write + exec / grader: unreadable cell medium-ish"]);
+    expect(gatedFloorTableProblems("no table")).toEqual(["no gated floor table"]);
+  });
+
+  it("D4 records the opt-in cell and the FAIL-to-heavy safety net", () => {
+    const d4 = sectionOf(read("docs/adr/0006-role-tier-assurance-delegation.md"), "### D4 — The tier floor is authority × effective detection").replace(/\s+/g, " ");
+    for (const text of ['`routing.roleFloor: "strict" | "gated"` defaults to `strict`', "global-only", "inert on OpenCode v1",
+      "effective detection `grader`", "other than `high`", "verification actually runs at return (not deferred,",
+      "acceptance other than `none`", "`gated:authority`", "FAIL → heavy safety net", "`raise:verification-fail:heavy`"]) {
+      expect(d4, text).toContain(text);
+    }
+    expect(d4).toContain("the next tier above `medium` within the role's ceiling and active tier order is `heavy`");
+    expect(d4).toContain("only when gating lowers the final floor compared with strict");
+    expect(d4).toContain("For gated children, UNVERIFIABLE at return also records the same raise");
   });
 
   it("detects a floor cell that differs from the code, a code change and an unreadable cell", () => {
@@ -1619,7 +1782,7 @@ describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () =
     expect(flat).toContain(denied);
     for (const key of ["routing.delegation", "roleAgents", "routing.exploration.rate", "routing.exploration.requireDetection", "routing.run.scripts",
       "routing.run.commands", "routing.run.timeoutMs", "routing.workRoots", "routing.repoParents", "routing.repoDepth",
-      "routing.repoExclude", "routing.repoApprovalDays"]) expect(guide, key).toContain(`\`${key}`);
+      "routing.repoExclude", "routing.repoApprovalDays", "routing.roleFloor"]) expect(guide, key).toContain(`\`${key}`);
   });
 
   it("cross-repo Phase 4: quotes the /router approve help lines, the refusal note and the reload/restart lines the code emits", async () => {

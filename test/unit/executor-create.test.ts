@@ -13,6 +13,10 @@ import * as runtimeModule from "../../src/executor/runtime";
 import * as launchModule from "../../src/executor/launch";
 import * as ledgerModule from "../../src/executor/ledger";
 import * as compilerModule from "../../src/executor/compile";
+import { parsePlan } from "../../src/executor/compile/parse";
+import { parseRouteLine } from "../../src/routing/classify/route-line";
+import { grantFor, GRANT_NOTES } from "../../src/routing/roles/policy";
+import { renderRouteLine } from "../../src/executor/expand";
 import * as rolesModule from "../../src/router/roles";
 import * as poolModule from "../../src/executor/slots/pool";
 import * as provisionModule from "../../src/executor/slots/provision";
@@ -21,10 +25,11 @@ import * as checksModule from "../../src/executor/integrate/checks";
 import * as queueModule from "../../src/executor/integrate/queue";
 import * as runToolsModule from "../../src/router/run-tools";
 import * as execModule from "../../src/verify/exec";
-import type { LedgerWriter, IntegrationQueue, Clock } from "../../src/executor/types";
+import type { LedgerWriter, IntegrationQueue, Clock, Tier } from "../../src/executor/types";
 import type { LeaseRegistry } from "../../src/router/leases";
 import { ExecutorError, isLedgerV1, ledgerViolations, type ExecutorRuntime, type TaskLauncher, type SlotPool, type SlotRecord, type LedgerV1 } from "../../src/executor/types";
 import { buildDraft, holderOf, taskNode } from "../fixtures/cpx/ledger/builders";
+import { compileOpts, makeHarness, planPathOf } from "../fixtures/cpx/plans/harness";
 import { removeDirWhenReleased } from "../helpers/remove-dir";
 
 const bundled = JSON.parse(readFileSync(fileURLToPath(new URL("../../tiers.json", import.meta.url)), "utf8")) as Record<string, unknown>;
@@ -173,7 +178,8 @@ describe("PlanSlotPools lazy facades", () => {
         records, open: vi.fn(open), close: vi.fn(),
         acquire: vi.fn<SlotPool["acquire"]>(async (planId, owner, commit) => ({ slot: "slot-1", path: records[0]!.path, planId, owner, commit })),
         acquireSpecial: vi.fn<SlotPool["acquireSpecial"]>(async (planId, kind) => ({ slot: kind, path: `C:/slots/${planId}/${kind}`, planId, owner: kind, commit: ledger.repo.baseCommit })),
-        reset: vi.fn<SlotPool["reset"]>(async () => {}), cleanForChecks: vi.fn<SlotPool["cleanForChecks"]>(async () => {}),
+        reset: vi.fn<SlotPool["reset"]>(async () => {}), cleanForChecks: vi.fn<SlotPool["cleanForChecks"]>(async () => ({ drifted: false })),
+        noteCommit: vi.fn<SlotPool["noteCommit"]>(async () => {}),
         release: vi.fn<SlotPool["release"]>(async () => {}), get: vi.fn<SlotPool["get"]>(async () => records[0] ?? null),
         list: vi.fn<SlotPool["list"]>(async () => records), gc: vi.fn<SlotPool["gc"]>(async predicate => ({ removed: await predicate(ledger.planId) ? [ledger.planId] : [], reported: [] })),
       };
@@ -195,14 +201,44 @@ describe("PlanSlotPools lazy facades", () => {
     await a.reset("slot-1", "d".repeat(40)); await a.cleanForChecks("slot-1"); await a.release("slot-1");
     expect(made.get("plan-a")?.reset).toHaveBeenCalledWith("slot-1", "d".repeat(40));
     expect(made.get("plan-a")?.cleanForChecks).toHaveBeenCalledWith("slot-1");
+    await a.noteCommit("slot-1", "d".repeat(40));
+    expect(made.get("plan-a")?.noteCommit).toHaveBeenCalledWith("slot-1", "d".repeat(40));
     expect(made.get("plan-a")?.release).toHaveBeenCalledWith("slot-1");
     expect(await pool.facade.list("plan-a")).toHaveLength(1);
     expect(await pool.facade.list()).toHaveLength(2);
     expect(await pool.facade.get("slot-1")).toBeNull();
     await expect(pool.facade.reset("slot-1", "c".repeat(40))).rejects.toMatchObject({ code: "E_PLAN_STATE" });
+    await expect(pool.facade.noteCommit("slot-1", "c".repeat(40))).rejects.toMatchObject({ code: "E_PLAN_STATE" });
     await expect(pool.facade.cleanForChecks("slot-1")).rejects.toMatchObject({ code: "E_PLAN_STATE" });
     await expect(pool.facade.release("slot-1")).rejects.toMatchObject({ code: "E_PLAN_STATE" });
   }, 15_000);
+
+  it("forwards durable task-slot release notifications without opening the lazy pool to subscribe", async () => {
+    const { pool, factory } = await rig();
+    const listeners = new Set<() => void>();
+    const make = factory.getMockImplementation()!;
+    factory.mockImplementation(ledger => Object.assign(make(ledger), {
+      onTaskSlotReleased(listener: () => void) {
+        listeners.add(listener);
+        return () => { listeners.delete(listener); };
+      },
+    }));
+    const view = pool.of("plan-a"), notified = vi.fn();
+    const off = view.onTaskSlotReleased?.(notified);
+    expect(factory).not.toHaveBeenCalled();
+    await view.list();
+    for (const listener of listeners) listener();
+    expect(notified).toHaveBeenCalledTimes(1);
+    off?.();
+    for (const listener of listeners) listener();
+    expect(notified).toHaveBeenCalledTimes(1);
+    view.onTaskSlotReleased?.(notified); // A subscriber added after open also receives the pool's notification.
+    for (const listener of listeners) listener();
+    expect(notified).toHaveBeenCalledTimes(2);
+    await view.gc(async () => true);
+    for (const listener of listeners) listener();
+    expect(notified).toHaveBeenCalledTimes(2);
+  });
 
   it("collects same-repository plans only; closed facades fence slot operations but permit gc-only handles", async () => {
     const { pool, made } = await rig();
@@ -354,7 +390,8 @@ describe("createExecutor assembly seams", () => {
       open: vi.fn(async () => {}), close: vi.fn(),
       acquire: vi.fn<SlotPool["acquire"]>(async (planId, owner, commit) => ({ planId, owner, commit, slot: "slot-1", path: "D:/slots/plan-a/slot-1" })),
       acquireSpecial: vi.fn<SlotPool["acquireSpecial"]>(async (planId, kind) => ({ planId, owner: kind, commit: "c".repeat(40), slot: kind, path: `D:/slots/${planId}/${kind}` })),
-      reset: vi.fn<SlotPool["reset"]>(async () => {}), cleanForChecks: vi.fn<SlotPool["cleanForChecks"]>(async () => {}),
+      reset: vi.fn<SlotPool["reset"]>(async () => {}), cleanForChecks: vi.fn<SlotPool["cleanForChecks"]>(async () => ({ drifted: false })),
+      noteCommit: vi.fn<SlotPool["noteCommit"]>(async () => {}),
       release: vi.fn<SlotPool["release"]>(async () => {}), get: vi.fn<SlotPool["get"]>(async () => null),
       list: vi.fn<SlotPool["list"]>(async () => []), gc: vi.fn<SlotPool["gc"]>(async () => ({ removed: [], reported: [] })),
       removeEmptyDir: vi.fn(async () => true),
@@ -598,13 +635,13 @@ describe("createExecutor assembly seams", () => {
     const annotated = await h.compiler.annotate([{ id: "step", text: "Implement src/a.ts" }]);
     expect(JSON.stringify(annotated)).toContain("[route");
     expect(JSON.stringify(annotated)).toContain("step");
-    expect(h.compiler.roleOf(null, "heavy")).toBe("reviewer");
-    expect(h.compiler.roleOf(null, "fast")).toBe("general");
-    expect(h.compiler.roleOf({ class: "implement", pin: false, ignored: [] }, "heavy")).toBe("implementer");
-    expect(h.compiler.roleOf({ pin: false, ignored: [] }, "heavy")).toBe("reviewer");
+    expect(h.compiler.roleOf(null, "heavy").agent).toBe("reviewer");
+    expect(h.compiler.roleOf(null, "fast").agent).toBe("general");
+    expect(h.compiler.roleOf({ class: "implement", pin: false, ignored: [] }, "heavy").agent).toBe("implementer");
+    expect(h.compiler.roleOf({ pin: false, ignored: [] }, "heavy").agent).toBe("reviewer");
     const roles = rolesModule.resolveRoles(executorConfig(), "v2"), general = roles.get("general")!;
     const table = vi.spyOn(rolesModule, "resolveRoles").mockReturnValue(new Map([["general", general]]));
-    expect(h.compiler.roleOf(null, "heavy")).toBe("general");
+    expect(h.compiler.roleOf(null, "heavy").agent).toBe("general");
     table.mockReturnValue(new Map([["general", { ...general, enabled: false }]]));
     expect(() => h.compiler.roleOf(null, "fast")).toThrow("no enabled role");
   }, 15_000);
@@ -616,6 +653,177 @@ describe("createExecutor assembly seams", () => {
     await expect(h.compiler.annotate([])).rejects.toThrow("provided annotator");
     expect(annotate).toHaveBeenCalledExactlyOnceWith([]);
   }, 15_000);
+
+  it.each([
+    ["[route class=other needs=shell tier=medium]", "", "general", "medium"],
+    ["[route tier=medium]", "", "general", "medium"],
+    ["[route class=other needs=shell tier=heavy pin]", "", "general", "heavy"],
+    ["[route tier=heavy]", "[tier:medium] ", "general", "medium"],
+    ["[route needs=edit tier=medium]", "[tier:heavy] ", "reviewer", "heavy"],
+  ] satisfies Array<[string, string, string, Tier]>)("rejects explicit writer routes whose selected role has no edit grant (%s, %s)", async (line, tierTag, agent, tier) => {
+    const h = capture();
+    const text = `# Plan\n\n## Phase 1.1 Work\n\n**Tasks**\n- **1.1.1** ${tierTag}Produce the result.\n  ${line}\n  Writes: \`src/alpha/core.ts\`\n`;
+    const fixture = makeHarness({ inline: { "writer.md": text } });
+    const annotate = vi.fn(h.compiler.annotate);
+    fixture.deps.annotate = annotate;
+    fixture.deps.roleOf = h.compiler.roleOf;
+    const source = parsePlan(text).tasks[0]!;
+    const route = source.route!.fields!;
+    expect(source.tierTag ?? route.tier ?? null).toBe(tier);
+    expect(h.compiler.roleOf(route, tier).agent).toBe(agent);
+    await expect(fixture.compiler.compile(planPathOf("writer.md"), compileOpts(fixture))).rejects.toMatchObject({
+      code: "E_COMPILE",
+      message: expect.stringContaining("task 1.1.1 declares writes but its explicit route is read-only"),
+      detail: { code: "route-write-conflict", line: 6, taskId: "1.1.1" },
+    });
+    expect(annotate).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["[route class=other risk=high scope=multi needs=shell,edit d=grader tier=medium pin]", "general"],
+    ["[route needs=edit tier=medium]", "general"],
+    ["[route class=implement needs=shell tier=medium]", "implementer"],
+  ] as const)("keeps explicit writer routes with an effective edit grant verbatim (%s)", async (line, agent) => {
+    const h = capture();
+    const text = `# Plan\n\n## Phase 1.1 Work\n\n**Tasks**\n- **1.1.1** Produce the result.\n  ${line}\n  Writes: \`src/alpha/core.ts\`\n`;
+    const fixture = makeHarness({ inline: { "writer.md": text } });
+    const annotate = vi.fn(h.compiler.annotate);
+    fixture.deps.annotate = annotate;
+    fixture.deps.roleOf = h.compiler.roleOf;
+    const { draft } = await fixture.compiler.compile(planPathOf("writer.md"), compileOpts(fixture));
+    const task = draft.tasks["1.1.1"]!;
+    const route = parseRouteLine(line, { positions: "any" }).line!;
+    expect(task.route).toEqual({ line, role: agent, tier: "medium", pin: route.pin });
+    expect(task.footprint.writes).toEqual(["src/alpha/core.ts"]);
+    const resolved = h.deps.routes.route(task);
+    expect(resolved.agent).toBe(agent);
+    const role = rolesModule.resolveRoles(executorConfig(), "v2").get(resolved.agent)!;
+    const grant = grantFor(role, { class: route.class ?? "other", risk: route.risk ?? "low", scope: route.scope ?? "single",
+      needs: route.needs ?? [], confidence: 1, source: "route-line" }, [], "D:/slots/writer/slot-1", route);
+    expect(grant.actions.has("edit")).toBe(true);
+    expect(annotate).not.toHaveBeenCalled();
+  });
+
+  it("G6: unchanged throughput writers 1.1.4/1.1.5 receive editing roles and grants through real rules annotation", async () => {
+    const h = capture();
+    const text = readFileSync(new URL("../fixtures/cpx/e2e/throughput.md", import.meta.url), "utf8");
+    const parsed = parsePlan(text);
+    const original = await h.compiler.annotate(parsed.tasks.map(t => ({ id: t.id, text: t.body })));
+    const fixture = makeHarness({ inline: { "throughput.md": text } });
+    fixture.deps.annotate = h.compiler.annotate;
+    fixture.deps.roleOf = h.compiler.roleOf;
+    const { draft } = await fixture.compiler.compile(planPathOf("throughput.md"), compileOpts(fixture, {
+      config: { ...fixture.config, crossPhase: "inferred" },
+    }));
+    const roles = rolesModule.resolveRoles(executorConfig(), "v2");
+    const explorer = roles.get("explorer")!;
+    expect(explorer.authority.mode).toBe("fixed");
+    expect(explorer.authority.allow).not.toContain("edit");
+    for (const [id, artifact, reads] of [
+      ["1.1.4", "d", ["a"]],
+      ["1.1.5", "e", ["b", "c"]],
+    ] as const) {
+      const source = parsed.tasks.find(t => t.id === id)!;
+      expect(source.route).toBeNull();
+      expect(source.readsLine).not.toBeNull();
+      const annotation = original.find(t => t.id === id)!;
+      const before = parseRouteLine(annotation.routeLine, { positions: "any" }).line!;
+      expect(["search", "recon"]).toContain(before.class);
+      expect(before.needs).toContain("edit");
+      const task = draft.tasks[id]!;
+      expect(task.footprint.writes).toEqual([`node-pnpm/artifacts/${artifact}.json`]);
+      expect(task.footprint.reads).toEqual(reads.map(name => `node-pnpm/artifacts/${name}.json`));
+      expect(task.route).toMatchObject({ role: "implementer", tier: "medium", pin: before.pin });
+      const root = "D:/slots/throughput/slot-1";
+      const route = parseRouteLine(renderRouteLine(task, root), { positions: "any" }).line!;
+      expect(route).toMatchObject({ class: "implement", risk: before.risk, scope: before.scope, needs: before.needs });
+      const resolved = h.deps.routes.route(task);
+      expect(resolved.agent).toBe("implementer");
+      const facts = { ...annotation.facts, class: route.class!, needs: route.needs! };
+      const grant = grantFor(roles.get(resolved.agent)!, facts, [], root, route);
+      expect(grant.actions.has("edit")).toBe(true);
+      expect(grant.notes).not.toContain(GRANT_NOTES.edit);
+      // Even a widened request cannot give this same writer edit authority while it is an explorer.
+      const denied = grantFor(explorer, facts, ["edit"], root, route);
+      expect(denied.actions.has("edit")).toBe(false);
+      expect(denied.notes).toContain(GRANT_NOTES.edit);
+    }
+  });
+
+  it.each([
+    ["Find references to `src/alpha/core.ts`.", "ownership"],
+    ["Find references to the entry point.", "inferred"],
+  ])("reconciles inferred read-only routing with phase ownership before selecting a role (%s)", async (title, confidence) => {
+    const h = capture();
+    const text = `# Plan\n\n| Phase | Owns (writes) |\n|---|---|\n| 1.1 | \`src/alpha/core.ts\` |\n\n## Phase 1.1 Work\n\n**Tasks**\n- **1.1.1** [tier:heavy] ${title}\n`;
+    const fixture = makeHarness({ inline: { "writer.md": text } });
+    fixture.deps.annotate = h.compiler.annotate;
+    fixture.deps.roleOf = h.compiler.roleOf;
+    const original = await h.compiler.annotate(parsePlan(text).tasks.map(t => ({ id: t.id, text: t.body })));
+    const before = parseRouteLine(original[0]!.routeLine, { positions: "any" }).line!;
+    expect(["search", "recon"]).toContain(before.class);
+    expect(before.needs ?? []).not.toContain("edit");
+    const { draft } = await fixture.compiler.compile(planPathOf("writer.md"), compileOpts(fixture));
+    const task = draft.tasks["1.1.1"]!;
+    const after = parseRouteLine(task.route.line, { positions: "any" }).line!;
+    expect(task.footprint).toMatchObject({ writes: ["src/alpha/core.ts"], confidence });
+    expect(task.route).toMatchObject({ role: "implementer", tier: "heavy", pin: true });
+    expect(after).toMatchObject({ class: "implement", risk: before.risk, scope: before.scope, pin: before.pin, needs: ["edit"] });
+    expect(h.deps.routes.route(task)).toMatchObject({ agent: "implementer", heavy: true });
+  });
+
+  it.each(["search", "recon", "design", "review", "mechanical", "implement", "debug", "other"] as const)(
+    "writer reconciliation preserves metadata and existing needs, and changes only read-only classes (%s)", async (cls) => {
+      const h = capture();
+      const fixture = makeHarness({ inline: { "writer.md": "## Phase 1.1 Work\n\n**Tasks**\n- **1.1.1** Produce the result.\n  Writes: `src/alpha/core.ts`\n" } });
+      fixture.deps.annotate = async steps => {
+        const annotations = await h.compiler.annotate(steps);
+        return Object.assign(annotations.map(a => ({ ...a, tier: "heavy",
+          routeLine: `[route class=${cls} risk=high scope=repo needs=shell,web,network,external_dir d=grader tier=heavy budget=7 pin]`,
+        })), { pinnedCount: annotations.pinnedCount });
+      };
+      fixture.deps.roleOf = h.compiler.roleOf;
+      const { draft } = await fixture.compiler.compile(planPathOf("writer.md"), compileOpts(fixture));
+      const task = draft.tasks["1.1.1"]!;
+      const expected = ["search", "recon", "design", "review"].includes(cls) ? "implement" : cls;
+      expect(task.route).toMatchObject({ role: cls === "other" ? "general" : "implementer", tier: "heavy", pin: true });
+      expect(parseRouteLine(task.route.line, { positions: "any" }).line).toMatchObject({
+        class: expected, risk: "high", scope: "repo", needs: ["shell", "web", "edit", "network", "external_dir"],
+        detection: "grader", tier: "heavy", budget: 7, pin: true,
+      });
+    },
+  );
+
+  it("does not promote manual, preflight, QA or Writes: none tasks to writer roles", async () => {
+    const h = capture();
+    const text = [
+      "# Plan", "", "| Phase | Owns (writes) |", "|---|---|", "| 1.1 | `src/alpha/core.ts` |", "",
+      "## Phase 1.1 Work", "", "**Pre-flight**", "- Find the prerequisites.", "  Writes: `src/preflight.json`", "",
+      "**Tasks**", "- **1.1.1** Orchestrator: handle the manual result.", "  Writes: `src/manual.json`",
+      "- **1.1.2** Find references to the entry point.", "  Writes: none", "  Reads: `src/alpha/core.ts`",
+      "- **1.1.QA** [tier:heavy] QA review the result.", "  Writes: `src/qa.json`", "",
+    ].join("\n");
+    const fixture = makeHarness({ inline: { "excluded.md": text } });
+    const annotate = vi.fn(h.compiler.annotate);
+    fixture.deps.annotate = annotate;
+    fixture.deps.roleOf = h.compiler.roleOf;
+    const { draft } = await fixture.compiler.compile(planPathOf("excluded.md"), compileOpts(fixture));
+    expect(annotate).toHaveBeenCalledOnce();
+    expect(annotate.mock.calls[0]?.[0].map(t => t.id)).toEqual(["1.1.2", "1.1.QA"]);
+    for (const id of ["1.1.PF1", "1.1.1"]) {
+      expect(draft.tasks[id]?.route).toEqual({ line: "", role: "", tier: null, pin: false });
+    }
+    expect(draft.tasks["1.1.2"]?.footprint.writes).toEqual([]);
+    expect(draft.tasks["1.1.2"]?.route.role).toBe("explorer");
+    const qa = draft.tasks["1.1.QA"]!;
+    expect(qa.kind).toBe("qa");
+    expect(qa.footprint.writes).toEqual(["src/qa.json"]);
+    const result = annotate.mock.results[0];
+    if (result?.type !== "return") throw new Error("annotation did not return");
+    const original = await result.value;
+    expect(qa.route.line).toBe(original.find(t => t.id === qa.id)?.routeLine);
+    expect(qa.route.role).toBe("reviewer");
+  });
 
   it("static durations use class priors for role names within that role's tier range", async () => {
     const h = capture(), model = h.compiler.durations;
@@ -694,14 +902,14 @@ describe("createExecutor assembly seams", () => {
     expect(await h.poolFactory.mock.calls[0]?.[0].integrationHead?.()).toBe(h.value.integration.head);
   }, 15_000);
 
-  it("run resolver preserves argv/cwd, distinguishes scripts and commands, filters undefined env and reports refusals", async () => {
+  it("run resolver preserves argv and inherited cwd/env under resolution, distinguishes scripts and commands and reports refusals", async () => {
     const h = await queueRig(), resolver = h.checksDeps.resolver;
     const planRun = vi.spyOn(runToolsModule, "planRun");
     for (const kind of ["script", "command"] as const) {
       planRun.mockReturnValue({ kind, name: "typecheck", executable: process.execPath, argv: ["check.js"], cwd: "D:/slot",
         env: { KEEP: "yes", OMIT: undefined }, timeoutMs: 1000 });
       expect(await resolver.resolve({ script: "typecheck", args: [] }, "D:/slot")).toEqual({ ok: true,
-        command: { label: "typecheck", file: process.execPath, args: ["check.js"], cwd: "D:/slot", env: { KEEP: "yes" },
+        command: { label: "typecheck", file: process.execPath, args: ["check.js"], resolution: { cwd: "D:/slot", env: { KEEP: "yes" } },
           source: kind === "script" ? "package-script" : "run-command", ref: { script: "typecheck", args: [] } } });
     }
     for (const error of [new Error("not allowlisted"), "not allowlisted"]) {

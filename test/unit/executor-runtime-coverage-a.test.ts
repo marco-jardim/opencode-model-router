@@ -276,15 +276,19 @@ class SlotPoolDouble implements SlotPool {
     this.log.push(`slots.reset:${slot}`);
     if (this.resetFailure !== null) throw this.resetFailure;
   }
-  async cleanForChecks(slot: string): Promise<void> {
+  async noteCommit(): Promise<void> {}
+  async cleanForChecks(slot: string): Promise<{ drifted: boolean }> {
     this.log.push(`slots.cleanForChecks:${slot}`);
     if (this.cleanFailure !== null) throw this.cleanFailure;
+    return { drifted: false };
   }
   async release(slot: string): Promise<void> {
     this.log.push(`slots.release:${slot}`);
     if (this.releaseFailure !== null) throw this.releaseFailure;
     this.released.push(slot);
     for (const [owner, l] of this.byOwner) if (l.slot === slot) this.byOwner.delete(owner);
+    const rec = this.records.get(slot);
+    if (rec?.state === "leased") this.records.set(slot, { ...rec, state: "ready", owner: null });
   }
   async get(slot: string): Promise<SlotRecord | null> {
     if (this.getFailure !== null) throw this.getFailure;

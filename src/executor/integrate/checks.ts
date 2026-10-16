@@ -14,6 +14,7 @@ import { observeTests } from "../../verify/baseline";
 import { acquireSlot, type SlotHandle } from "../../verify/slot";
 import type { ExecResult } from "../../verify/types";
 import type { GitOps } from "../git";
+import type { ServiceExecution, ServiceObservation } from "../observations";
 import {
   ExecutorError,
   type Clock, type GitRunner, type LedgerV1, type RunCommandRef, type SlotLease, type SlotPool,
@@ -37,13 +38,15 @@ export interface Logger { warn(m: string): void }
 export interface ResolvedCommand {
   label: string; file: string; args: readonly string[];
   source: "package-script" | "run-command" | "pytest"; ref: RunCommandRef | null;
+  /** Inherited router plan, not explicit overrides. Re-resolve `ref` after preparing the execution checkout. */
+  resolution?: { cwd: string; env: Readonly<Record<string, string>> };
   /** Extra environment for the child (scoped test specs). */
   env?: Readonly<Record<string, string>>;
-  /** Working directory override (scoped test specs); default: the check's cwd. */
+  /** Explicit working directory override (for example scoped test specs); default: the check's cwd. */
   cwd?: string;
 }
 export interface CommandOutput { exitCode: number | null; timedOut: boolean; stdout: string; stderr: string; durationMs: number }
-export type CommandRunner = (c: ResolvedCommand, o: { cwd: string; signal: AbortSignal; lowPriority: boolean }) => Promise<CommandOutput>;
+export type CommandRunner = (c: ResolvedCommand, o: { cwd: string; signal: AbortSignal; lowPriority: boolean; service?: ServiceExecution }) => Promise<CommandOutput>;
 export interface RunResolver {
   resolve(ref: RunCommandRef, cwd: string): Promise<{ ok: true; command: ResolvedCommand } | { ok: false; reason: string }>;
 }
@@ -59,10 +62,14 @@ export type CheckResult =
   | { verdict: "fail"; components: ComponentResult[]; failingIds: string[]; failingFiles: string[]; flakyIds: string[]; output: string; durationMs: number }
   | { verdict: "error"; reason: CheckErrorReason; message: string; components: ComponentResult[]; durationMs: number };
 export interface CheckRequest {
+  observation?: ServiceObservation;
   slot: SlotLease; base: string; candidate: string; priority: "foreground" | "background";
+  /** The queue just rebased this slot to candidate; clean and verify before reusing it. */
+  reuseCheckout?: boolean;
   extra?: { ids: string[]; files: string[]; commands: ResolvedCommand[] } | null; signal: AbortSignal;
 }
 export interface CommandRunRequest {
+  observation?: ServiceObservation;
   slot: SlotLease; commit: string; commands: readonly ResolvedCommand[];
   mode: "full" | { rerun: readonly string[] }; priority: "foreground" | "background"; signal: AbortSignal; prepare: boolean;
   /** M38: the preemption budget of the suite entry, shared by all of its runs (default: a fresh PREEMPT_BUDGET per run). */
@@ -75,6 +82,8 @@ export interface CommandRunRequest {
 }
 export interface CommandRunResult {
   verdict: "pass" | "fail" | "error"; ids: string[]; files: string[]; idsUnparsed: boolean;
+  /** Effective scope, not the requested mode: any full-command execution (including a mixed run) makes this full. */
+  scope: "full" | "rerun";
   output: string; durationMs: number; error: { reason: CheckErrorReason; message: string } | null;
 }
 export interface IntegrationChecks {
@@ -214,7 +223,11 @@ export function createIntegrateGit(run: GitRunner, guard: WriteGuard, lstatOf: L
     },
     async showFile(cwd, commit, path) {
       const r = await exec(cwd, ["show", `${commit}:${path}`]);
-      return r.code === 0 ? r.stdout : null;
+      if (r.code === 0) return r.stdout;
+      const error = r.stderr.trim();
+      if (r.code === 128 && (error === `fatal: path '${path}' does not exist in '${commit}'`
+        || error === `fatal: path '${path}' exists on disk, but not in '${commit}'`)) return null;
+      throw new ExecutorError("E_GIT", `git show failed (exit ${r.code ?? r.signal ?? "unknown"})`, { op: "show", code: r.code, stderr: r.stderr.slice(-2048) });
     },
     async subject(cwd, commit) {
       return (await ok(cwd, "log", ["log", "-1", "--format=%s", commit, "--"])).replace(/\r?\n$/, "");
@@ -371,6 +384,12 @@ function errText(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
+/** Immutable-object reads must all release their slot cwd before a failed attempt can be retried. */
+async function settledReads<T extends readonly unknown[]>(reads: T) {
+  await Promise.allSettled(reads);
+  return Promise.all(reads);
+}
+
 /** The test file part of a stable failing id (`<file> > a > b`, `<file>::Cls::test`, or a bare file). */
 function fileOfId(id: string): string {
   const gt = id.indexOf(" > ");
@@ -469,6 +488,10 @@ interface TestOutcome {
 }
 
 export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationChecks {
+  // Each underSlot call owns its signal. Never use a mutable instance-wide "current entry": foreground checks
+  // and the background suite can overlap. Search/planning spawns intentionally do not go through exec below.
+  const executions = new WeakMap<AbortSignal, { observation: ServiceObservation; candidate: string;
+    preparation: ReturnType<ServiceObservation["start"]> }>();
   async function prepare(slot: SlotLease, commit: string): Promise<void> {
     try {
       await d.pool.reset(slot.slot, commit);
@@ -481,21 +504,47 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
     }
   }
 
+  async function prepareReused(slot: SlotLease, commit: string): Promise<void> {
+    try {
+      const { drifted } = await d.pool.cleanForChecks(slot.slot);
+      const head = await d.git.revParse(slot.path, "HEAD");
+      // A drift install can change tracked files after the clean. Only a full prepare restores and verifies those.
+      if (head !== commit || drifted) {
+        await prepare(slot, commit);
+      } else {
+        await d.pool.noteCommit(slot.slot, commit);
+      }
+    } catch (e) {
+      if (e instanceof CheckPrepareError) throw e;
+      throw new CheckPrepareError(`could not prepare slot ${slot.slot}: ${errText(e)}`);
+    }
+  }
+
   async function resolveRef(ref: RunCommandRef, cwd: string): Promise<ResolvedCommand> {
     const r = await d.resolver.resolve(ref, cwd);
     if (!r.ok) throw new CheckResolveError(`${ref.script}: ${r.reason}`);
     return r.command;
   }
 
-  async function select(cwd: string, commit: string): Promise<CheckSelection> {
+  async function resolveForSlot(c: ResolvedCommand, cwd: string): Promise<ResolvedCommand> {
+    if (c.resolution === undefined || c.ref === null) return c;
+    // Executable, environment and checkout-dependent authorization all belong to the prepared slot, even when
+    // its path is unchanged (base/bisect/revert). Only explicit overrides survive; never reuse the inherited plan.
+    return { ...await resolveRef(c.ref, c.cwd ?? cwd),
+      ...(c.cwd === undefined ? {} : { cwd: c.cwd }), ...(c.env === undefined ? {} : { env: c.env }) };
+  }
+
+  async function readSelection(cwd: string, commit: string) {
     const read = (p: string) => d.igit.showFile(cwd, commit, p);
-    const [packageJson, pytestIni, conftest, pyproject, setupCfg, toxIni] = await Promise.all([
+    const [packageJson, pytestIni, conftest, pyproject, setupCfg, toxIni] = await settledReads([
       read("package.json"), read("pytest.ini"), read("conftest.py"), read("pyproject.toml"), read("setup.cfg"), read("tox.ini"),
-    ]);
+    ] as const);
+    return { packageJson, pytestIni: pytestIni !== null, conftest: conftest !== null, pyproject, setupCfg, toxIni };
+  }
+
+  async function resolveSelection(cwd: string, files: Awaited<ReturnType<typeof readSelection>>): Promise<CheckSelection> {
     const cfg = d.ledger().config;
-    const sel = selectFromFiles(
-      { packageJson, pytestIni: pytestIni !== null, conftest: conftest !== null, pyproject, setupCfg, toxIni }, cfg.integrationChecks,
-    );
+    const sel = selectFromFiles(files, cfg.integrationChecks);
     const typecheck = sel.typecheck ? await resolveRef({ script: "typecheck", args: [] }, cwd) : null;
     const tests: TestComponent[] = [];
     if (sel.node) tests.push({ framework: "node", full: await resolveRef({ script: "test", args: [] }, cwd) });
@@ -511,9 +560,14 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
     return { typecheck, tests, extras };
   }
 
+  async function select(cwd: string, commit: string): Promise<CheckSelection> {
+    return resolveSelection(cwd, await readSelection(cwd, commit));
+  }
+
   /** M12: holds one machine-wide verification slot around `body`, which gets a signal for abort, preemption and a lost slot. */
   async function underSlot<T>(
-    o: { signal: AbortSignal; priority: "foreground" | "background"; cwd: string; command: string; budget?: PreemptBudget | undefined },
+    o: { signal: AbortSignal; priority: "foreground" | "background"; cwd: string; command: string; budget?: PreemptBudget | undefined;
+      observation?: ServiceObservation; candidate: string },
     body: (signal: AbortSignal) => Promise<T>,
   ): Promise<Held<T>> {
     const lost = new AbortController();
@@ -523,6 +577,7 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
     const signal = AbortSignal.any([o.signal, lost.signal, own.signal]);
     let handle: SlotHandle | null = null;
     let held: Held<T>;
+    const wait = o.observation?.start("service-wait", "verification-slot", o.candidate);
     try {
       if (o.priority === "foreground") {
         const preempt = d.preemptForeground ?? (async () => { await (await import("../../verify/wiring")).preemptBackgroundVerification(); });
@@ -537,7 +592,10 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
         if (!("busy" in r)) handle = r;
         else if (o.priority === "foreground") d.background.preemptOne();
       }
+      wait?.end(handle === null ? "interrupted" : "acquired");
       if (handle === null) return why(o.signal, lost.signal.aborted, false);
+      if (o.observation !== undefined) executions.set(signal, { observation: o.observation, candidate: o.candidate,
+        preparation: o.observation.start("service-prep", "command-planning", o.candidate) });
       try {
         const value = await body(signal);
         // QA-3.2-13: whatever the body returned, a run whose signal fired (abort, preemption, lost slot) is no result.
@@ -548,6 +606,9 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
         held = why(o.signal, lost.signal.aborted || handle.lost, true);
       }
     } finally {
+      wait?.end("error");
+      executions.get(signal)?.preparation?.end("completed");
+      executions.delete(signal);
       unregister();
       if (handle !== null) await handle.release();
     }
@@ -566,7 +627,32 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
   }
 
   async function exec(c: ResolvedCommand, cwd: string, signal: AbortSignal, low: boolean): Promise<CommandOutput> {
-    return d.spawn(c, { cwd: c.cwd ?? cwd, signal, lowPriority: low });
+    let command = c;
+    if (c.resolution !== undefined) {
+      const env = { ...c.resolution.env };
+      for (const [key, value] of Object.entries(c.env ?? {})) {
+        // Node keeps only one spelling on Windows; an explicit Path must replace an inherited PATH too.
+        if (process.platform === "win32") for (const inherited of Object.keys(env)) {
+          if (inherited.toUpperCase() === key.toUpperCase()) delete env[inherited];
+        }
+        env[key] = value;
+      }
+      command = { ...c, env };
+    }
+    const context = executions.get(signal);
+    if (context === undefined) return d.spawn(command, { cwd: c.cwd ?? cwd, signal, lowPriority: low });
+    context?.preparation?.end("completed");
+    const service = context.observation.execution("command", context.candidate);
+    let result = "error";
+    try {
+      const out = await d.spawn(command, { cwd: c.cwd ?? cwd, signal, lowPriority: low,
+        ...(service === undefined ? {} : { service }) });
+      result = signal.aborted ? "interrupted" : out.timedOut ? "timed-out" : out.exitCode === 0 ? "pass" : "fail";
+      return out;
+    } finally {
+      service?.end(result);
+      if (context !== undefined) context.preparation = context.observation.start("service-prep", "command-planning", context.candidate);
+    }
   }
 
   function asExec(o: CommandOutput): ExecResult {
@@ -605,11 +691,20 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
     return { name, label: c.label, exitCode: o.exitCode, timedOut: o.timedOut, durationMs: o.durationMs, scope, flakyIds };
   }
 
+  /** Only scope a known invocation. A ref named `test` can resolve to an unrelated configured command. */
+  function scopedCommand(c: ResolvedCommand): string | null {
+    // The planner derives its own cwd/environment; it cannot prove equivalence with explicit overrides.
+    if (c.cwd !== undefined || c.env !== undefined) return null;
+    if (c.source === "package-script" && c.ref?.script === "test" && c.ref.args.length === 0) return "npm test";
+    return c.source === "pytest" ? c.label : null;
+  }
+
   /** M10/M11: one tests component, scoped to the affected tests, with one confirmation rerun of the failing files. */
   async function runTests(
     t: TestComponent, cwd: string, changed: readonly ChangedPath[], signal: AbortSignal, low: boolean,
   ): Promise<TestOutcome> {
-    const command = t.framework === "node" ? "npm test" : t.full.label;
+    const command = scopedCommand(t.full);
+    if (command === null) return fullTests(t, command, cwd, signal, low);
     const plan = await planScopedRun({
       command, cwd, changedFiles: changed, budget: { maxWorkers: MAX_WORKERS }, fs: nodeFs, search: search(cwd, signal),
     });
@@ -619,7 +714,7 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
     }
     // Unscoped or unverifiable: never counted as verified without a run, so the full command decides.
     if (!isScopedSpec(plan)) return fullTests(t, command, cwd, signal, low);
-    const spec: ResolvedCommand = { label: t.full.label, file: plan.file, args: plan.args, source: t.full.source, ref: t.full.ref, env: plan.env, cwd: plan.cwd };
+    const spec: ResolvedCommand = { ...t.full, file: plan.file, args: plan.args, env: plan.env, cwd: plan.cwd };
     const out = await exec(spec, cwd, signal, low);
     const result = await readResult(plan, asExec(out), nodeFs);
     const comp = component("tests", spec, out, "spec");
@@ -645,10 +740,10 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
   async function runFull(c: ResolvedCommand, cwd: string, signal: AbortSignal, low: boolean) {
     const out = await exec(c, cwd, signal, low);
     const pass = out.exitCode === 0 && !out.timedOut;
-    return { out, pass, seen: pass || out.timedOut ? null : observeFull(out, cwd), output: tail(out.stdout + out.stderr, OUTPUT_TAIL_BYTES) };
+    return { out, pass, seen: pass || out.timedOut ? null : observeFull(out, c.cwd ?? cwd), output: tail(out.stdout + out.stderr, OUTPUT_TAIL_BYTES) };
   }
 
-  async function fullTests(t: TestComponent, command: string, cwd: string, signal: AbortSignal, low: boolean): Promise<TestOutcome> {
+  async function fullTests(t: TestComponent, command: string | null, cwd: string, signal: AbortSignal, low: boolean): Promise<TestOutcome> {
     const f = await runFull(t.full, cwd, signal, low);
     const comp = component("tests", t.full, f.out, "full");
     if (f.pass) return { comp, failing: null };
@@ -656,7 +751,7 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
     // planner drops would leave its ids unrun, and an unrun id must never read as flaky).
     const seen = f.seen;
     const failing: Failing = { ids: seen?.ids ?? [], files: seen?.files ?? [], output: f.output };
-    if (seen === null || !seen.complete || (await existing(seen.files)).length < seen.files.length) return { comp, failing };
+    if (command === null || seen === null || !seen.complete || (await existing(seen.files)).length < seen.files.length) return { comp, failing };
     return confirm(t, command, cwd, signal, low, comp, failing);
   }
 
@@ -669,7 +764,7 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
     if (isUnverifiable(runner)) return { comp, failing: first };
     const again = await planRerun(runner, first.files, cwd, { maxWorkers: MAX_WORKERS }, { fs: nodeFs });
     if (!isScopedSpec(again)) return { comp, failing: first };
-    const rerunSpec: ResolvedCommand = { label: t.full.label, file: again.file, args: again.args, source: t.full.source, ref: t.full.ref, env: again.env, cwd: again.cwd };
+    const rerunSpec: ResolvedCommand = { ...t.full, file: again.file, args: again.args, env: again.env, cwd: again.cwd };
     const out = await exec(rerunSpec, cwd, signal, low);
     const result = await readResult(again, asExec(out), nodeFs);
     const sure = !out.timedOut && !result.collectionError;
@@ -728,8 +823,9 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
       return { ids: still.length > 0 ? still : [...ids], files: [...files], output };
     };
     const present = await existing(files);
-    if (present.length > 0 && (c.source === "pytest" || c.ref?.script === "test")) {
-      const runner = await detectRunner(c.source === "pytest" ? c.label : "npm test", cwd, nodeFs);
+    const command = scopedCommand(c);
+    if (present.length > 0 && command !== null) {
+      const runner = await detectRunner(command, cwd, nodeFs);
       const plan = isUnverifiable(runner) ? runner : await planRerun(runner, present, cwd, { maxWorkers: MAX_WORKERS }, { fs: nodeFs });
       if (isScopedSpec(plan)) {
         const spec: ResolvedCommand = { ...c, file: plan.file, args: plan.args, env: plan.env, cwd: plan.cwd };
@@ -749,32 +845,50 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
     const started = d.clock.now();
     const components: ComponentResult[] = [];
     const elapsed = () => d.clock.now() - started;
-    const err = (reason: CheckErrorReason, message: string): CheckResult => ({ verdict: "error", reason, message, components, durationMs: elapsed() });
+    const preparation = req.observation?.start("service-prep", "checkout-and-selection", req.candidate);
+    const err = (reason: CheckErrorReason, message: string): CheckResult => {
+      preparation?.end("error");
+      return { verdict: "error", reason, message, components, durationMs: elapsed() };
+    };
     const cwd = req.slot.path;
     let selection: CheckSelection;
     let changed: ChangedPath[];
+    // These read immutable commit objects, not the checkout. Handle rejection immediately, but let prepare fail first.
+    const reads = settledReads([readSelection(cwd, req.candidate), Promise.resolve().then(() => d.igit.diffNameStatus(cwd, req.base, req.candidate))] as const)
+      .then(value => ({ ok: true as const, value }), (error: unknown) => ({ ok: false as const, error }));
     try {
-      await prepare(req.slot, req.candidate);
+      if (req.reuseCheckout) await prepareReused(req.slot, req.candidate);
+      else await prepare(req.slot, req.candidate);
     } catch (e) {
+      await reads;
       return err("prepare", errText(e));
     }
     let extraFiles: string[];
     try {
-      selection = await select(cwd, req.candidate);
-      changed = (await d.igit.diffNameStatus(cwd, req.base, req.candidate)).map(n => ({ path: nodePath.join(cwd, n.path), status: n.status }));
+      const read = await reads;
+      if (!read.ok) throw read.error;
+      selection = await resolveSelection(cwd, read.value[0]);
+      changed = read.value[1].map(n => ({ path: nodePath.join(cwd, n.path), status: n.status }));
       extraFiles = await reroot(req.extra?.files ?? [], cwd);
     } catch (e) {
       return err(e instanceof CheckResolveError ? "resolve" : "prepare", errText(e));
     }
     const extraIds = req.extra?.ids ?? [];
     // QA-3.2-6: regression ids need test commands to rerun them; without the suite's, this commit's tests serve.
-    const regression = extraIds.length > 0 && (req.extra?.commands ?? []).length === 0 ? selection.tests.map(t => t.full) : req.extra?.commands ?? [];
+    let regression = extraIds.length > 0 && (req.extra?.commands ?? []).length === 0 ? selection.tests.map(t => t.full) : req.extra?.commands ?? [];
+    try {
+      regression = await Promise.all(regression.map(c => resolveForSlot(c, cwd)));
+    } catch (e) {
+      return err("resolve", errText(e));
+    }
     if (extraIds.length > 0 && regression.length === 0) return err("resolve", "the regression ids have no test command to rerun them");
+    preparation?.end("completed");
     if (selection.typecheck === null && selection.tests.length === 0 && selection.extras.length === 0 && regression.length === 0) {
       return { verdict: "pass", components, flakyIds: [], note: "no-checks", durationMs: elapsed() };
     }
     const low = req.priority === "background";
-    const held = await underSlot({ signal: req.signal, priority: req.priority, cwd, command: "integration checks" }, async (signal): Promise<CheckResult | null> => {
+    const held = await underSlot({ signal: req.signal, priority: req.priority, cwd, command: "integration checks",
+      observation: req.observation, candidate: req.candidate }, async (signal): Promise<CheckResult | null> => {
       const simple = async (name: "typecheck" | "extra" | "regression", c: ResolvedCommand): Promise<CheckResult | null> => {
         const out = await exec(c, cwd, signal, low);
         components.push(component(name, c, out, "full"));
@@ -821,8 +935,12 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
   async function runCommands(req: CommandRunRequest): Promise<CommandRunResult> {
     const started = d.clock.now();
     const cwd = req.slot.path;
-    const base = { ids: [] as string[], files: [] as string[], idsUnparsed: false, output: "", durationMs: 0, error: null };
-    const done = (r: Partial<CommandRunResult> & { verdict: CommandRunResult["verdict"] }): CommandRunResult => ({ ...base, ...r, durationMs: d.clock.now() - started });
+    const base = { ids: [] as string[], files: [] as string[], idsUnparsed: false, scope: "full" as const, output: "", durationMs: 0, error: null };
+    const preparation = req.observation?.start("service-prep", "checkout-and-selection", req.commit);
+    const done = (r: Partial<CommandRunResult> & { verdict: CommandRunResult["verdict"] }): CommandRunResult => {
+      preparation?.end(r.verdict === "error" ? "error" : "completed");
+      return { ...base, ...r, durationMs: d.clock.now() - started };
+    };
     if (req.prepare) {
       try {
         await prepare(req.slot, req.commit);
@@ -830,18 +948,26 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
         return done({ verdict: "error", error: { reason: "prepare", message: errText(e) } });
       }
     }
+    let commands: ResolvedCommand[];
+    try {
+      commands = await Promise.all(req.commands.map(c => resolveForSlot(c, cwd)));
+    } catch (e) {
+      return done({ verdict: "error", error: { reason: "resolve", message: errText(e) } });
+    }
+    preparation?.end("completed");
     const low = req.priority === "background";
-    const held = await underSlot({ signal: req.signal, priority: req.priority, cwd, command: "integration commands", budget: req.preempt }, async (signal): Promise<CommandRunResult> => {
+    const held = await underSlot({ signal: req.signal, priority: req.priority, cwd, command: "integration commands", budget: req.preempt,
+      observation: req.observation, candidate: req.commit }, async (signal): Promise<CommandRunResult> => {
       const ids = new Set<string>();
       const files = new Set<string>();
       let output = "";
       let unparsed = false;
       let failed = false;
-      for (const c of req.commands) {
-        const isTest = c.source === "pytest" || c.ref?.script === "test";
-        if (typeof req.mode !== "string" && isTest) {
+      let scope: CommandRunResult["scope"] = req.mode === "full" ? "full" : "rerun";
+      for (const c of commands) {
+        const command = scopedCommand(c);
+        if (typeof req.mode !== "string" && command !== null) {
           const wanted = [...new Set(req.mode.rerun.map(fileOfId))].map(f => nodePath.resolve(cwd, f));
-          const command = c.source === "pytest" ? c.label : "npm test";
           const runner = await detectRunner(command, cwd, nodeFs);
           const plan = isUnverifiable(runner) ? runner : await planRerun(runner, wanted, cwd, { maxWorkers: MAX_WORKERS }, { fs: nodeFs });
           if (isNoAffected(plan)) {
@@ -870,6 +996,7 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
             // An incomplete result (or a failure without ids): fall back to the full command below.
           }
         }
+        scope = "full";
         const out = await exec(c, cwd, signal, low);
         if (out.exitCode !== 0 || out.timedOut) {
           failed = true;
@@ -877,7 +1004,7 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
           // QA-3.2-1 (1): the failing ids of a full test run come from its output (vitest/jest `FAIL <file> > …`,
           // pytest `FAILED <file>::…`, a jest JSON report). An incomplete inventory, a timeout or output without ids
           // leaves the failure unattributable.
-          const seen = out.timedOut ? null : observeFull(out, cwd);
+          const seen = out.timedOut ? null : observeFull(out, c.cwd ?? cwd);
           if (seen === null) {
             unparsed = true;
             break;
@@ -890,7 +1017,7 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
         }
       }
       // Every failure path without ids sets `unparsed`, so a parsed failure always names at least one id.
-      return done({ verdict: failed ? "fail" : "pass", ids: [...ids].sort(), files: [...files].sort(), idsUnparsed: failed && unparsed, output });
+      return done({ verdict: failed ? "fail" : "pass", ids: [...ids].sort(), files: [...files].sort(), idsUnparsed: failed && unparsed, scope, output });
     }).catch((e: unknown): Held<CommandRunResult> => ({ ok: false, reason: "spawn", message: errText(e) }));
     if (!held.ok) return done({ verdict: "error", error: { reason: held.reason, message: held.message } });
     return held.value;

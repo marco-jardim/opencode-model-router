@@ -1,0 +1,10 @@
+[
+  { "action": "capacity-init", "state": { "maxParallel": 4, "providers": [] } },
+  { "action": "attach", "state": { "ledgerSeq": 1, "status": "running", "maxParallel": 4, "tasks": [{ "id": "a", "state": "ready", "kind": "task", "phase": null, "p50": 100, "slot": null, "attempts": [] }], "phases": [], "edges": [], "writeConflicts": [] } },
+  { "action": "runtime-attach", "state": { "clockMs": 0, "ledgerSeq": 1, "orchIdle": false, "disposed": false, "detail": null } },
+  { "action": "route", "state": { "clockMs": 0, "ledgerSeq": 1, "orchIdle": false, "detail": { "taskId": "a", "provider": "provider:fixture", "heavy": false } } },
+  { "action": "capacity-free", "state": { "clockMs": 0, "ledgerSeq": 1, "orchIdle": false, "detail": { "provider": "provider:fixture", "heavy": false, "free": 4 } } },
+  { "action": "orchestrator", "state": { "clockMs": 0, "ledgerSeq": 1, "orchIdle": true, "detail": { "event": "execution.completed" } } },
+  { "action": "ledger", "state": { "ledgerSeq": 2, "status": "completed", "maxParallel": 4, "tasks": [{ "id": "a", "state": "done", "kind": "task", "phase": null, "p50": 100, "slot": null, "attempts": [] }], "phases": [], "edges": [], "writeConflicts": [] } },
+  { "action": "detach", "state": { "clockMs": 0, "ledgerSeq": 2, "orchIdle": true, "disposed": true, "detail": null } }
+]

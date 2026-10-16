@@ -9,6 +9,7 @@ import type { DurationEstimate } from "../routing/outcomes/durations";
 import { createLeaseRegistry, foldKeyPath, formatRunNote } from "../router/leases";
 import type { LeaseActor, LeaseRegistry, LeaseSeams, Holder, HolderInput } from "../router/leases";
 import { toolTargets } from "../router/tool-paths";
+import { observeV2, type V2Observations } from "./v2-observations";
 
 // ---- constants -------------------------------------------------------------------------------
 
@@ -217,15 +218,18 @@ export interface RoutedRoleSnapshot {
   readonly verifyRoot: string;
   readonly parentSessionID: string;
   readonly carried?: true;
+  /** Gating lowered this dispatch's final floor; UNVERIFIABLE at return also records its raise. Absent for strict children. */
+  readonly gated?: true;
   readonly resumeID: string | null;
 }
 
-const ROUTED_SNAPSHOT_KEYS: ReadonlySet<string> = new Set(["verifyRoot", "parentSessionID", "carried", "resumeID"]);
+const ROUTED_SNAPSHOT_KEYS: ReadonlySet<string> = new Set(["verifyRoot", "parentSessionID", "carried", "gated", "resumeID"]);
 
 /**
  * QA-SYNC1-13: the journaled routed-role snapshot, validated strictly: a plain object with only the known keys, a non-empty
  * `verifyRoot`, a string `parentSessionID`, `resumeID` a non-empty string or null, `carried` absent or `true` (and only with a
- * `resumeID`). Anything else is malformed: undefined, and the record is dropped (never a partial or a guessed snapshot).
+ * `resumeID`), `gated` absent or `true`. Anything else is malformed: undefined, and the record is dropped (never a partial or
+ * a guessed snapshot).
  * Pure; never throws.
  */
 export function routedRoleSnapshotOf(value: unknown): RoutedRoleSnapshot | undefined {
@@ -235,12 +239,14 @@ export function routedRoleSnapshotOf(value: unknown): RoutedRoleSnapshot | undef
   const parentSessionID: unknown = Reflect.get(value, "parentSessionID");
   const resumeID: unknown = Reflect.get(value, "resumeID");
   const carried: unknown = Reflect.get(value, "carried");
+  const gated: unknown = Reflect.get(value, "gated");
   if (typeof verifyRoot !== "string" || verifyRoot === "") return undefined;
   // An empty parent is the dispatch module's own "no orchestrator" value (roleReadSetFor reads it as no read set).
   if (typeof parentSessionID !== "string") return undefined;
   if (resumeID !== null && (typeof resumeID !== "string" || resumeID === "")) return undefined;
   if (carried !== undefined && (carried !== true || resumeID === null)) return undefined;
-  return { verifyRoot, parentSessionID, resumeID, ...(carried === true ? { carried: true as const } : {}) };
+  if (gated !== undefined && gated !== true) return undefined;
+  return { verifyRoot, parentSessionID, resumeID, ...(carried === true ? { carried: true as const } : {}), ...(gated === true ? { gated: true as const } : {}) };
 }
 
 /** QA-2.1-17: the `dispatch` field of a journaled record, keeping only string fields. Pure; never throws. */
@@ -928,6 +934,7 @@ const MAX_EARLY_VERDICTS = 200;
  * released hold stays in force for the session's life (the host history keeps the original, C4).
  */
 export function createHeldResults(deps: {
+  observations?: V2Observations;
   synthetic: SyntheticFn;
   journal: InflightJournal;
   available: boolean;
@@ -1041,6 +1048,8 @@ export function createHeldResults(deps: {
     let delivered = false;
     for (let attempt = 0; attempt < SYNTHETIC_ATTEMPTS && !delivered; attempt += 1) {
       try {
+        observeV2(deps.observations, () => ({ family: "completion-effect", effect: "annotation-delivery", source: "held-synthetic",
+          parentSessionID: entry.parentSessionID, callID: entry.callID, childSessionID: entry.childSessionID, handle: entry.handle }));
         await deps.synthetic({
           sessionID: entry.parentSessionID,
           text,
@@ -1082,6 +1091,8 @@ export function createHeldResults(deps: {
     let lastError: unknown;
     for (let attempt = 0; attempt < SYNTHETIC_ATTEMPTS; attempt += 1) {
       try {
+        observeV2(deps.observations, () => ({ family: "completion-effect", effect: "annotation-delivery", source: "unheld-synthetic",
+          parentSessionID: rec.parentSessionID, callID: rec.callID, childSessionID: rec.childSessionID, handle: rec.handle }));
         await deps.synthetic({
           sessionID: rec.parentSessionID,
           text: unheldVerdictText(rec.handle, rec.childSessionID, v),
@@ -1419,6 +1430,7 @@ export type Trigger =
   | { kind: "runner"; status: EndFact["outcome"]; text: string; at: number };
 
 export interface CompletionDeps {
+  observations?: V2Observations;
   /** `caller` (QA-PDF12-9): the caller journaled on the attempt being finished, for the context the finish runs in. */
   finish(input: FinishInput, caller: FinishCaller): Promise<FinishResult>;
   /** The child's last assistant message (`ctx.session.context`, C7/O1). */
@@ -1647,6 +1659,8 @@ export function createCompletionProcessor(reg: InFlightRegistry, deps: Completio
     if (deps.captureDelta !== undefined) {
       try {
         // QA-2.1-7: the change-set store keys a dispatch by `task:<parent>:<callID>`; the parent is known here.
+        observeV2(deps.observations, () => ({ family: "completion-effect", effect: "change-set-capture", source: "background-delta",
+          parentSessionID: a.parentSessionID, callID: a.callID, childSessionID: a.childSessionID }));
         delta = await deps.captureDelta(a.callID, a.childSessionID, `task:${a.parentSessionID}:${a.callID}`);
       } catch (error) {
         warnSafe(deps.logger, "[router] change-set capture failed", { callID: a.callID, error: errorText(error) });
@@ -1654,6 +1668,8 @@ export function createCompletionProcessor(reg: InFlightRegistry, deps: Completio
     }
     const notices = await deps.roleCompletion(a, text);
     const holdForGate = status === "succeeded" ? handle : undefined;
+    observeV2(deps.observations, () => ({ family: "completion-effect", effect: "finish-dispatch", source: "background",
+      parentSessionID: a.parentSessionID, callID: a.callID, childSessionID: a.childSessionID }));
     const result = await deps.finish({
       callID: a.callID,
       parentSessionID: a.parentSessionID,
@@ -1794,23 +1810,28 @@ export function createCompletionProcessor(reg: InFlightRegistry, deps: Completio
 
     completedFor(parent) {
       const turn = turnOf(parent);
-      const lines: Array<{ at: number; line: CompletedLine }> = [];
+      const lines: Array<{ at: number; line: CompletedLine; attempt: Attempt; annotated: boolean }> = [];
       for (const a of reg.listForParent(parent)) {
         refresh(a);
         const at = a.endedAt ?? a.at;
         const line = (text: string): CompletedLine => ({ child: a.childSessionID, label: attemptLabel(a), text });
         if (a.state === "child-ended" || a.state === "processing") {
           a.pendingShown = true;
-          lines.push({ at, line: line(PENDING_GUARANTEES_TEXT) });
+          lines.push({ at, line: line(PENDING_GUARANTEES_TEXT), attempt: a, annotated: false });
         } else if (a.state === "annotated" || (a.state === "closed-unknown" && a.annotations.length > 0)) {
           if (a.shownInTurn !== undefined && a.shownInTurn !== turn) continue;
           a.shownInTurn = turn;
           const text = a.annotations.join(" ").replace(/\s+/g, " ").trim();
-          lines.push({ at, line: line(text.length > 0 ? text : "completed") });
+          lines.push({ at, line: line(text.length > 0 ? text : "completed"), attempt: a, annotated: true });
         }
       }
       lines.sort((x, y) => x.at - y.at);
-      return lines.slice(-MAX_COMPLETED_PER_PARENT).map((l) => l.line);
+      return lines.slice(-MAX_COMPLETED_PER_PARENT).map((l) => {
+        // Only returned annotations, never the lines dropped by the provider's cap or a pending placeholder.
+        if (l.annotated) observeV2(deps.observations, () => ({ family: "completion-effect", effect: "annotation-delivery", source: "completed-provider",
+          parentSessionID: l.attempt.parentSessionID, callID: l.attempt.callID, childSessionID: l.attempt.childSessionID }));
+        return l.line;
+      });
     },
 
     endTurn(parent) {
@@ -1901,32 +1922,92 @@ interface SharedLeases {
   listeners: Set<() => void>;
   refs: number;
   logger: Logger;
+  initializing: boolean;
 }
 
-/** Shared registries by snapshot path: every plugin instance of the process sees one set of leases. */
-const SHARED_LEASES = new Map<string, SharedLeases>();
+interface SharedLeaseRegistries {
+  readonly version: 1;
+  readonly registries: Map<string, unknown>;
+}
+
+/** Versioned process state, shared even when plugin instances load separate copies of this module. */
+const SHARED_LEASES_KEY = Symbol.for("opencode-model-router.leases@1");
+
+function isSharedLeaseRegistries(value: unknown): value is SharedLeaseRegistries {
+  if (typeof value !== "object" || value === null) return false;
+  const state = value as Partial<SharedLeaseRegistries>;
+  return state.version === 1 && state.registries instanceof Map;
+}
+
+/** Validate each entry independently: a malformed neighbour must not replace a live registry or replay its snapshot. */
+function isSharedLeases(value: unknown): value is SharedLeases {
+  if (typeof value !== "object" || value === null) return false;
+  try {
+    const state = value as Partial<SharedLeases>;
+    const registry = state.registry;
+    return state.listeners instanceof Set
+      && typeof state.refs === "number" && Number.isSafeInteger(state.refs)
+      && typeof state.initializing === "boolean" && (state.initializing ? state.refs === 0 : state.refs > 0)
+      && typeof state.logger?.warn === "function"
+      && typeof registry === "object" && registry !== null
+      && ["acquireWrite", "checkRead", "checkRun", "filterSearchResults", "planHolderOf", "release", "releaseTask", "sweep", "snapshot", "restore"]
+        .every(method => typeof Reflect.get(registry, method) === "function");
+  } catch {
+    return false;
+  }
+}
+
+function sharedLeaseRegistries(): Map<string, unknown> {
+  const existing: unknown = Reflect.get(globalThis, SHARED_LEASES_KEY);
+  if (isSharedLeaseRegistries(existing)) return existing.registries;
+  const state: SharedLeaseRegistries = { version: 1, registries: new Map() };
+  Reflect.set(globalThis, SHARED_LEASES_KEY, state);
+  return state.registries;
+}
 
 /**
- * Acquires the process-wide lease registry (ref-counted). The first acquirer's seams and run mode win. The
- * `until-integrated` snapshot at `snapshotPath` is inert in 2.1 (no such holder exists before 3.1), so nothing
- * touches the filesystem here.
+ * Acquires the process-wide lease registry (ref-counted). The first acquirer's seams, run mode and snapshot win.
+ * Initialization is synchronous: no guard can acquire a live lease before restoration completes, and subsequent
+ * adapters never restore over live state (including when the first snapshot was absent or invalid).
  */
 export function acquireLeaseRegistry(opts: {
   runMode: "annotate" | "refuse";
   seams: LeaseSeams;
   snapshotPath: string;
   logger: Logger;
+  /** Optional synchronous loader, called only when creating the shared registry. */
+  loadSnapshot?(): unknown;
 }): LeaseRegistryHandle {
-  let shared = SHARED_LEASES.get(opts.snapshotPath);
-  if (shared === undefined) {
+  const registries = sharedLeaseRegistries();
+  let shared: SharedLeases;
+  if (registries.has(opts.snapshotPath)) {
+    const existing = registries.get(opts.snapshotPath);
+    // Do not guess whether malformed state still owns live leases. Refuse acquisition without replacing it.
+    if (!isSharedLeases(existing)) throw new Error("lease registry state is invalid");
+    shared = existing;
+  } else {
     shared = {
       registry: createLeaseRegistry(opts.seams, { runMode: opts.runMode }),
       listeners: new Set(),
       refs: 0,
       logger: opts.logger,
+      initializing: true,
     };
-    SHARED_LEASES.set(opts.snapshotPath, shared);
+    registries.set(opts.snapshotPath, shared);
+    try {
+      if (opts.loadSnapshot !== undefined) {
+        const restored = shared.registry.restore(opts.loadSnapshot(), { dropCompleteHolders: true });
+        if (!restored.ok) warnSafe(shared.logger, "[router] leases: the snapshot was rejected", { error: restored.message });
+        else if (restored.skipped !== undefined) warnSafe(shared.logger, "[router] leases: snapshot lines skipped on restore", { skipped: restored.skipped });
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") warnSafe(shared.logger, "[router] leases: the snapshot could not be restored", { error: String(error) });
+    } finally {
+      shared.initializing = false;
+    }
   }
+  // A synchronous loader must not re-enter acquisition and expose the registry before its restore.
+  if (shared.initializing) throw new Error("lease registry initialization is already in progress");
   shared.refs += 1;
   const state = shared;
   let released = false;
@@ -1951,9 +2032,17 @@ export function acquireLeaseRegistry(opts: {
       if (released) return;
       released = true;
       state.refs -= 1;
-      if (state.refs <= 0 && SHARED_LEASES.get(opts.snapshotPath) === state) SHARED_LEASES.delete(opts.snapshotPath);
+      if (state.refs <= 0 && registries.get(opts.snapshotPath) === state) registries.delete(opts.snapshotPath);
     },
   };
+}
+
+/** Observes an existing, initialized registry without creating one or extending its lifetime. */
+export function peekLeaseRegistry(snapshotPath: string): LeaseRegistry | undefined {
+  const state: unknown = Reflect.get(globalThis, SHARED_LEASES_KEY);
+  if (!isSharedLeaseRegistries(state)) return undefined;
+  const shared = state.registries.get(snapshotPath);
+  return isSharedLeases(shared) && !shared.initializing ? shared.registry : undefined;
 }
 
 export interface LeaseGuard {

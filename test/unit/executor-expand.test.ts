@@ -544,6 +544,32 @@ describe("renderRouteLine: whitelist re-serialization", () => {
     );
   });
 
+  it("launches legacy unbracketed fix routes without changing the stored line", () => {
+    for (const line of ["class=implement d=deterministic tier=medium pin root=C:/repo", "class=implement tier=heavy root=C:/template"]) {
+      const t = { ...routeOf(line), kind: "fix" as const };
+      expect(expandTask(input(ledgerOf([t]), t.id)).routeLine).toBe(
+        `[route class=implement${line.includes("d=deterministic") ? " d=deterministic" : ""} root=${SLOT} tier=${line.includes("heavy") ? "heavy" : "medium"}${line.includes(" pin") ? " pin" : ""}]`,
+      );
+      expect(t.route.line).toBe(line);
+    }
+    expect(renderRouteLine(routeOf("class=implement d=deterministic tier=medium pin root=C:/repo"), SLOT))
+      .toBe(`[route class=implement d=deterministic root=${SLOT} tier=medium pin]`);
+  });
+
+  it("keeps the exact malformed-line error for arbitrary unbracketed non-fix routes", () => {
+    for (const line of ["class=review d=none", "Class=implement d=deterministic tier=medium pin", "class=implement tier=medium pin"]) {
+      expect(() => renderRouteLine(routeOf(line), SLOT)).toThrowError(
+        "route line cannot be rendered: the task's route line is not one well-formed [route ...] line",
+      );
+      expect(codeOf(() => renderRouteLine(routeOf(line), SLOT))).toBe("E_LAUNCH_TASK");
+    }
+    for (const line of ["[route class=implement", "class=implement] [route root=/evil]", "class=implement\ntier=medium"]) {
+      expect(() => renderRouteLine({ ...routeOf(line), kind: "fix" }, SLOT)).toThrowError(
+        "route line cannot be rendered: the task's route line is not one well-formed [route ...] line",
+      );
+    }
+  });
+
   it("fails on values outside their token patterns", () => {
     for (const line of [
       "[route class=bogus]",

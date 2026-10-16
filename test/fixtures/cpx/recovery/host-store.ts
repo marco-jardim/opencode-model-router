@@ -70,6 +70,8 @@ export interface ChildConfig {
   kill: { point: KillPoint; task: string } | null;
   /** Per task: what its first launched child does in this run (`normal` when absent). */
   scripts: Record<string, ChildScript>;
+  /** Where scripted children pause (default: tool); the host simulator can advance them before the kill. */
+  stopAt?: "tool" | "provider";
   /** Per task: the file the child writes in its slot and the text it writes. */
   work: Record<string, { file: string; content: string }>;
   /** R1a seams (memo §10: 1500 / 200). */
@@ -80,6 +82,8 @@ export interface ChildConfig {
    * (variant): "active" for a child scripted `alive`, "inactive" for one scripted `dead`, "unknown" otherwise.
    */
   activity: "unknown" | "scripted";
+  /** Separate variant: simulated workers stop with their launcher; wire the v2 launcher-liveness dependency. */
+  launcherLiveness?: boolean;
 }
 
 /** The `activity` a session reports under `mode`. */
@@ -106,6 +110,10 @@ export interface StoredSession {
   interrupted: number;
   /** Which executor run (0 = first process) created it. */
   run: number;
+  /** Only the launcher-liveness variant ties the simulated worker's lifetime to a process. */
+  launcherPid?: number;
+  /** The worker stopped without a terminal host-history entry (e.g. cut mid-tool-call). */
+  stopped?: boolean;
 }
 
 export function sessionsDir(root: string): string {

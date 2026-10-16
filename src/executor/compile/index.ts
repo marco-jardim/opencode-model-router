@@ -1,10 +1,12 @@
 import { createHash } from "node:crypto";
 import { posix, win32 } from "node:path";
 
-import type { RouteLine } from "../../routing/classify/types";
+import type { RoleSpec } from "../../router/roles";
+import { NEEDS, type RouteLine } from "../../routing/classify/types";
 import type { AnnotatedPlan, PlanStep } from "../../routing/engine";
 import type { DurationModel } from "../../routing/outcomes/durations";
 import { neutralizeDirectives } from "../../verify/pending";
+import { grantFor } from "../../routing/roles/policy";
 import {
   EXECUTOR_LIMITS,
   ExecutorError,
@@ -310,8 +312,8 @@ export interface CompilerDeps {
   durations: DurationModel;
   /** Bound to `annotateSteps`. */
   annotate: (steps: readonly PlanStep[]) => Promise<AnnotatedPlan>;
-  /** Roles policy class -> role (docs/ROLES.md); stubbed in tests. */
-  roleOf: (route: RouteLine | null, tier: Tier | null) => string;
+  /** Selected role's resolved policy (including configured narrowing); stubbed in tests. */
+  roleOf: (route: RouteLine | null, tier: Tier | null) => RoleSpec;
   /** `<defaultSlotsDir(toplevel, planId)>\integration` (O1). */
   integrationWorktree: (planId: PlanId, repo: LedgerV1["repo"]) => string;
 }
@@ -454,6 +456,29 @@ function ownershipOf(parsed: ParsedPlan, phase: string | null): OwnershipInput[]
   return parsed.ownership.filter((r) => r.owners.includes(phase)).map((r) => ({ path: r.path, owners: r.owners, line: r.line }));
 }
 
+function isRoutedWriter(t: ParsedTask, fp: TaskFootprint): boolean {
+  return t.kind !== "manual" && t.kind !== "preflight" && t.kind !== "qa"
+    && !t.writesLine?.none && fp.footprint.writes.length > 0;
+}
+
+/** Footprints outrank inferred intent, never an author's explicit route. Role maxima stay unchanged. */
+function writerRouteOf(t: ParsedTask, fp: TaskFootprint): ParsedTask["route"] {
+  const route = t.route;
+  if (route === null || route.inferred !== true || !isRoutedWriter(t, fp)) return route;
+  const fields = route.fields;
+  if (fields === null) return route;
+  const readOnlyClass = fields.class === "search" || fields.class === "recon" || fields.class === "design" || fields.class === "review";
+  const cls = readOnlyClass || fields.class === undefined ? "implement" : fields.class;
+  const needs = NEEDS.filter((need) => need === "edit" || fields.needs?.includes(need));
+  // Only engine-generated lines reach here: canonical class/needs tokens, with every other field kept verbatim.
+  let line = route.line;
+  for (const [key, value] of [["class", cls], ["needs", needs.join(",")]]) {
+    const token = new RegExp(`(\\s)${key}=[^\\s\\]]+`);
+    line = token.test(line) ? line.replace(token, `$1${key}=${value}`) : line.replace(/\]$/, ` ${key}=${value}]`);
+  }
+  return { ...route, line, fields: { ...fields, class: cls, needs } };
+}
+
 function nodeOf(
   deps: CompilerDeps,
   t: ParsedTask,
@@ -463,12 +488,23 @@ function nodeOf(
   warnings: CompileIssue[],
 ): TaskNode {
   const manual = t.kind === "manual" || t.kind === "preflight";
-  const fields = t.route?.fields ?? null;
+  const reconciled = writerRouteOf(t, fp);
+  const fields = reconciled?.fields ?? null;
   const tier: Tier | null = t.tierTag ?? (isTier(fields?.tier) ? fields.tier : null);
-  const role = manual ? "" : deps.roleOf(fields, tier);
+  const spec = manual ? null : deps.roleOf(fields, tier);
+  const role = spec?.agent ?? "";
+  if (spec !== null && reconciled !== null && reconciled.inferred !== true && isRoutedWriter(t, fp)) {
+    // Launch binds a slot work root. Check the selected role's declared grant, not its maximum or prose-inferred needs.
+    const grant = grantFor(spec, { class: fields?.class ?? "other", risk: fields?.risk ?? "low", scope: fields?.scope ?? "single",
+      needs: fields?.needs ?? [], confidence: 1, source: "route-line" }, [], "<executor-slot>");
+    if (!grant.actions.has("edit")) {
+      throw new ExecutorError("E_COMPILE", `route-write-conflict (line ${t.span.line}): task ${t.id} declares writes but its explicit route is read-only (${role} has no edit grant); choose an edit-capable class and needs=edit`,
+        { code: "route-write-conflict", line: t.span.line, taskId: t.id });
+    }
+  }
   const route: TaskNode["route"] = manual
     ? { line: "", role: "", tier: null, pin: false }
-    : { line: t.route?.line ?? "", role, tier, pin: fields?.pin ?? false };
+    : { line: reconciled?.line ?? "", role, tier, pin: fields?.pin ?? false };
   let verify: TaskNode["verify"];
   if (manual) verify = "none";
   else if (t.verify !== null) verify = t.verify;

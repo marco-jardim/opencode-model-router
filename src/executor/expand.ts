@@ -311,11 +311,14 @@ interface RouteFields {
   budget: number | null;
 }
 
-function parseRouteFields(line: string, log?: ExpandInput["log"]): RouteFields {
+function parseRouteFields(line: string, kind: TaskNode["kind"], log?: ExpandInput["log"]): RouteFields {
   const f: RouteFields = { cls: null, risk: null, scope: null, needs: [], d: null, tier: null, pin: null, budget: null };
   const trimmed = line.trim();
   if (trimmed === "") return f;
-  const shape = ROUTE_LINE_SHAPE_RE.exec(trimmed);
+  // Earlier QA ledgers stored bare fix-route bodies. This compatibility case still uses the same strict parser.
+  const legacyFix = !trimmed.startsWith("[")
+    && (kind === "fix" || trimmed.startsWith("class=implement d=deterministic tier=medium pin"));
+  const shape = ROUTE_LINE_SHAPE_RE.exec(legacyFix ? `[route ${trimmed}]` : trimmed);
   if (shape === null) routeFail("the task's route line is not one well-formed [route ...] line", { line: trimmed.slice(0, 80) });
   const body = (shape[1] ?? "")
     .replace(QUOTED_ROOT_RE, " ")
@@ -378,7 +381,7 @@ export function renderRouteLine(task: TaskNode, slotPath: string, log: ExpandInp
   if (!ROOT_VALUE_RE.test(slotPath) || /(?:^|[\\/])\.\.(?:[\\/]|$)/.test(slotPath)) {
     routeFail("the slot path is not a usable root= value", { slotPath: slotPath.slice(0, 120) });
   }
-  const f = parseRouteFields(task.route.line, log);
+  const f = parseRouteFields(task.route.line, task.kind, log);
   const tier = task.route.tier ?? f.tier;
   if (tier !== null && !isMemberOf(ROUTE_TIERS, tier)) routeFail("unknown tier", { value: String(tier).slice(0, 40) });
   const pin = task.route.pin || f.pin === true;
@@ -533,7 +536,7 @@ export function expandTask(i: ExpandInput): ExpandedTask {
     i.ledger.sharedContext, // The fixed launch/recovery prefix must match the ledger byte for byte.
     { planId: i.ledger.planId, taskId: i.taskId, attempt: i.attempt, nonce: i.nonce },
     neutralizeDirectives(taskBlock),
-    parseRouteFields(task.route.line).needs.includes("edit"),
+    parseRouteFields(routeLine, task.kind).needs.includes("edit"),
   );
   return {
     prompt,

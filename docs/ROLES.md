@@ -591,6 +591,7 @@ The window of a role dispatch is `[floor, ceiling]`:
 - a route-line `tier=` pin is honoured inside the window; below the floor it is lifted (reason `lift:authority` or
   `lift:floor`), above the ceiling it is clamped (`clamp:ceiling`).
 
+**Strict floor (`routing.roleFloor: "strict"`, the default).**
 `authorityFloor(grant, detection, risk, scope)` — the effective detection decides the column:
 
 <!-- authority-floor-table -->
@@ -604,6 +605,32 @@ Write authority goes to the cheapest tier only behind checks the router runs its
 edit + execution never runs on `fast`: an edit can change what a script does, so write + exec is treated like running
 code the agent wrote. After a verification FAIL the router raises the child's floor for its next resume itself; the
 orchestrator never sets `tier=` or `model` for that.
+
+**Gated floor (`routing.roleFloor: "gated"`, opt-in, global only, OpenCode v2 only).**
+This table applies only when verification actually runs **at return**: enforcement is on, not bypassed,
+`verify.require` is not `never`, the verification placement is allowed, verification is not deferred, and the
+effective acceptance is not `none`. It also requires that the next tier above `medium` within the role's ceiling and
+active tier order is `heavy`; a ceiling of `medium`, a missing tier, or an intermediate rung does not qualify.
+Otherwise the strict table applies. Effective detection and risk are unchanged;
+in particular, a criteria-only acceptance needs a route-line `d=grader` claim to count as `grader`.
+
+<!-- authority-floor-gated-table -->
+| Grant contains | `deterministic` | `grader` | `none` |
+|---|---|---|---|
+| no write (local, egress or exec only) | `fast` | `fast` | `fast` |
+| write without exec | `fast` if risk `low` and scope `single`, else `medium` | `medium` | `medium`; `heavy` if risk `high` |
+| write + exec | `medium` | `medium`; `heavy` if risk `high` | `heavy` |
+
+Exactly one cell changes: write + exec with effective `grader` detection and risk below `high` has authority floor
+`medium` instead of `heavy`. All other floors, including role ranges, configured floors and running tiers, still
+apply; bounds reason `gated:authority` is recorded only when gating lowers the final floor compared with strict.
+Deferred `testsPass` does not qualify. The FAIL → heavy safety net remains: a verification **FAIL** raises a child that
+ran on `medium` to `heavy` on its next resume (`raise:verification-fail:heavy`). For gated children, **UNVERIFIABLE**
+at return also records the same raise (including a grader timeout or error, an exhausted gate budget, or no fitting
+criterion), even when the result is accepted with a caveat. Strict children's UNVERIFIABLE behaviour is unchanged;
+incomplete returns do not escalate.
+Tier-agent and delegate (non-role) paths stay strict. On OpenCode v1 the key is inert and uses the existing single
+“roles delegation requires OpenCode v2; using tiers” notice.
 
 ## Dynamic authority and the ladder
 
@@ -792,6 +819,11 @@ results and the per-turn lists are in [OPENCODE_V2.md](OPENCODE_V2.md#background
 needs required verification is backgrounded only where its result can be held. A role dispatch that `auto` does not
 select with a thin outcome store gets no `background` key, so the host default applies; with `off` it is sent as
 before (`background: false` for a role-routed call).
+
+For execution of a written plan, see [the plan executor guide](EXECUTOR.md): `/plan` and `router_plan`, human approval,
+isolated slots, [leases and safety invariants](EXECUTOR.md#safety-model), recovery and the
+[owner checklist](EXECUTOR.md#owner-checklist-for-the-next-real-plan). It requires roles mode at start and enforced
+leases; plain role dispatches do not become plan tasks merely by running in the background.
 
 ## File leases
 

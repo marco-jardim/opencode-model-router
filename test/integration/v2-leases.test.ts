@@ -10,17 +10,20 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { acquireLeaseRegistry, createLeaseGuard, LEASE_LOOKUP_NEGATIVE_TTL_MS } from "../../src/compat/background";
+import { acquireLeaseRegistry, createLeaseGuard, peekLeaseRegistry, LEASE_LOOKUP_NEGATIVE_TTL_MS } from "../../src/compat/background";
 import { createLeaseRegistry } from "../../src/router/leases";
 import { leaseRepoKeyOf, SESSION_KIND_NEGATIVE_TTL_MS } from "../../src/compat/v2-hooks";
+import { bindPlanChild, evict as evictBinding } from "../../src/routing/roles/binding";
 import { bootBgHost, restoreEnv, type BgHost, type ToolEvent } from "../helpers/v2-bg-host";
 import { removeDirWhenReleased } from "../helpers/remove-dir";
 
 let host: BgHost | undefined;
+const planChildren: string[] = [];
 
 afterEach(async () => {
   await host?.dispose();
   host = undefined;
+  for (const child of planChildren.splice(0)) evictBinding(child);
   restoreEnv();
 });
 
@@ -229,6 +232,46 @@ describe("leases: linked worktrees of one repository (DF-1.1-4)", () => {
     expect(restarted.acquireWrite(holder, join(linked, "src", "same.ts"))).toMatchObject({ ok: false, reason: "held" });
   });
 
+  it("separate module copies enforce repository-wide plan leases until releaseTask, not child end or adapter release", async () => {
+    const { main, linked } = linkedWorktrees();
+    const options = { runMode: "annotate" as const, snapshotPath: join(main, "leases.json"), logger: { warn: vi.fn() },
+      seams: { realpath: (path: string) => realpathSync.native(path), repoKeyOf: leaseRepoKeyOf, now: () => 1 } };
+    const one = acquireLeaseRegistry(options);
+    vi.resetModules();
+    const copy = await import("../../src/compat/background");
+    expect(copy.acquireLeaseRegistry).not.toBe(acquireLeaseRegistry);
+    const two = copy.acquireLeaseRegistry(options);
+    try {
+      expect(two.registry).toBe(one.registry);
+      expect(copy.peekLeaseRegistry(options.snapshotPath)).toBe(one.registry);
+      const guardFor = (module: { createLeaseGuard: typeof createLeaseGuard }, handle: typeof one, taskId: string, slot: string) =>
+        module.createLeaseGuard({ registry: handle.registry, sessionKind: async () => "child", sessionDir: async () => slot,
+          gitRootOf: (dir) => dir, holderLabel: (id) => `session ${id}`,
+          planTaskOf: () => ({ planId: "plan-copies", taskId, slot }), events: handle });
+      const first = guardFor({ createLeaseGuard }, one, "T1", main);
+      const second = guardFor(copy, two, "T2", linked);
+      const editIn = (guard: typeof first, sessionID: string, slot: string) =>
+        guard.before({ sessionID, tool: "edit", args: { filePath: join(slot, "src", "same.ts") }, callID: `call-${seq++}` });
+      await expect(editIn(first, "plan-first", main)).resolves.toEqual({});
+      expect(two.registry.planHolderOf(linked, "src/same.ts")).toMatchObject({ holderID: "plan-first", taskRef: "plan-copies:T1", scope: "until-integrated" });
+      const refusal = `Refused: ${join(main, "src", "same.ts")} is being edited by session plan-first.`;
+      expect((await editIn(second, "plan-second", linked)).refuse).toContain(refusal);
+      first.releaseChild("plan-first");
+      one.notifyReleased();
+      expect((await editIn(second, "plan-second", linked)).refuse).toContain(refusal);
+      await one.release(); // The other module still owns the same live registry.
+      expect((await editIn(second, "plan-second", linked)).refuse).toContain(refusal);
+      expect(two.registry.releaseTask("plan-copies:T1")).toEqual({ released: 1, holders: ["plan-first"] });
+      two.notifyReleased();
+      await expect(editIn(second, "plan-second", linked)).resolves.toEqual({});
+      expect(two.registry.planHolderOf(main, "src/same.ts")).toMatchObject({ holderID: "plan-second", taskRef: "plan-copies:T2" });
+    } finally {
+      await one.release();
+      await two.release();
+    }
+    expect(copy.peekLeaseRegistry(options.snapshotPath)).toBeUndefined();
+  });
+
   // QA-PDF13-5: the plan's home checkout is no slot, so its writers are keyed by it alone (landing refuses a dirty home
   // checkout). The repository-wide query still finds the plan task's lease from there.
   it("a root and a plain child in the home checkout may edit a path a plan task holds in its slot", async () => {
@@ -423,6 +466,130 @@ describe("acquireLeaseRegistry: the process-wide registry (ref-counted)", () => 
     handle.notifyReleased();
     expect(calls).toEqual(["second"]);
     await handle.release();
+  });
+});
+
+describe("leases: adapter registry observation and restoration across module copies", () => {
+  it.each([
+    ["null", null, "auto", "annotate"],
+    ["undefined", undefined, "off", "refuse"],
+    ["partial", { initializing: false }, "off", "annotate"],
+    ["invalid registry", { initializing: false, refs: 1, listeners: new Set(), logger: { warn() {} }, registry: {} }, "auto", "refuse"],
+  ] as const)("fails closed for enforced tools when the per-path entry is %s", async (_label, malformed, background, run) => {
+    const home = mkdtempSync(join(tmpdir(), "omr-v2-malformed-lease-"));
+    const snapshotPath = join(home, "outcomes", "leases.json");
+    const key = Symbol.for("opencode-model-router.leases@1");
+    const saved: unknown = Reflect.get(globalThis, key);
+    const registries = new Map<string, unknown>([[snapshotPath, malformed]]);
+    const state = { version: 1, registries };
+    Reflect.set(globalThis, key, state);
+    try {
+      const h = host = await bootBgHost({ home,
+        overrides: { routing: { leases: { mode: "enforce", run }, background: { mode: background } } },
+        sessions: { [ROOT]: {}, [A]: { parentID: ROOT, agent: "general" }, [B]: { parentID: ROOT, agent: "general" } },
+      });
+      const path = file(h, "unchecked.ts");
+      for (const session of [ROOT, A, B]) {
+        for (const event of [
+          edit(session, path), read(session, path),
+          tool(session, "write", { filePath: path, content: "changed" }),
+          tool(session, "patch", { patchText: "" }),
+          tool(session, "glob", { pattern: "**/*.ts" }),
+          tool(session, "grep", { pattern: "needle" }),
+          tool(session, "router_git_diff", {}),
+          tool(session, "router_git_ls_files", {}),
+          tool(session, "router_run", { script: "test", cwd: h.project }),
+        ]) {
+          await expect(h.before(event)).rejects.toThrow("Refused: enforced lease checks are unavailable because the lease registry could not start");
+        }
+      }
+      await expect(h.before(tool(A, "todowrite", { todos: [] }))).resolves.toBeDefined();
+      expect(peekLeaseRegistry(snapshotPath)).toBeUndefined();
+      expect(Reflect.get(globalThis, key)).toBe(state);
+      expect(registries.has(snapshotPath)).toBe(true);
+      expect(registries.get(snapshotPath)).toBe(malformed);
+      await h.dispose();
+      host = undefined;
+      expect(registries.get(snapshotPath)).toBe(malformed);
+    } finally {
+      await host?.dispose();
+      host = undefined;
+      if (saved === undefined) Reflect.deleteProperty(globalThis, key);
+      else Reflect.set(globalThis, key, saved);
+      await removeDirWhenReleased(home);
+    }
+  });
+
+  it("a fresh adapter restores plan leases, drops old ad-hoc leases, and retains the restored plan lease through child end", async () => {
+    const h = await boot();
+    const planned = file(h, "planned.ts");
+    const adHoc = file(h, "ad-hoc.ts");
+    const snapshotPath = join(h.home, "outcomes", "leases.json");
+    const registry = peekLeaseRegistry(snapshotPath);
+    if (registry === undefined) throw new Error("adapter created no lease registry");
+    expect(registry.acquireWrite({ holderID: C, tree: h.project, isChild: true, taskRef: "saved:T1", scope: "until-integrated" }, planned).ok).toBe(true);
+    await h.before(edit(A, adHoc));
+    const snapshot = registry.snapshot();
+    expect(snapshot.leases).toHaveLength(2);
+    await h.dispose();
+    host = undefined;
+    expect(peekLeaseRegistry(snapshotPath)).toBeUndefined();
+    mkdirSync(join(h.home, "outcomes"), { recursive: true });
+    writeFileSync(snapshotPath, JSON.stringify(snapshot));
+    host = await bootBgHost({ home: h.home, overrides: { routing: { leases: { mode: "enforce" }, background: { mode: "off" } } },
+      sessions: { [ROOT]: {}, [B]: { parentID: ROOT, agent: "general" }, [C]: { parentID: ROOT, agent: "general" } } });
+    const restored = peekLeaseRegistry(snapshotPath);
+    expect(restored).not.toBe(registry);
+    expect(restored?.snapshot().leases).toEqual([expect.objectContaining({ holderID: C })]);
+    await expect(host.before(edit(B, planned))).rejects.toThrow(/planned\.ts is being edited by session child-c/);
+    await end(host, C, "succeeded");
+    await expect(host.before(edit(B, planned))).rejects.toThrow(/planned\.ts is being edited by session child-c/);
+    restored?.releaseTask("saved:T1");
+    await expect(host.before(edit(B, planned))).resolves.toBeDefined();
+    await expect(host.before(edit(B, adHoc))).resolves.toBeDefined();
+  });
+
+  it("the non-creating probe sees actual guard leases; a later adapter cannot restore an empty snapshot over them", async () => {
+    const writer = `adapter-writer-${seq++}`, contender = `adapter-contender-${seq++}`;
+    const options = { overrides: { routing: { leases: { mode: "enforce" }, background: { mode: "off" } } },
+      sessions: { [ROOT]: {}, [writer]: { parentID: ROOT, agent: "general" }, [contender]: { parentID: ROOT, agent: "general" } } };
+    const h = host = await bootBgHost(options);
+    for (const [childSessionID, taskId] of [[writer, "T1"], [contender, "T2"]] as const) {
+      bindPlanChild({ childSessionID, role: "implementer", agent: "general", workRoot: h.project,
+        grant: ["edit"], planId: "adapter-copies", taskId, attempt: 1 });
+      planChildren.push(childSessionID);
+    }
+    const f = file(h, "live.ts");
+    await h.before(edit(writer, f));
+    const snapshotPath = join(h.home, "outcomes", "leases.json");
+    vi.resetModules();
+    const copy = await import("../../src/compat/background");
+    expect(copy.acquireLeaseRegistry).not.toBe(acquireLeaseRegistry);
+    const observed = copy.peekLeaseRegistry(snapshotPath);
+    expect(observed).toBeDefined();
+    expect(observed).toBe(peekLeaseRegistry(snapshotPath));
+    expect(observed?.snapshot().leases).toEqual([expect.objectContaining({ holderID: writer })]);
+    expect(observed?.snapshot().holders).toEqual([expect.objectContaining({ holderID: writer, taskRef: "adapter-copies:T1", scope: "until-integrated" })]);
+    mkdirSync(join(h.home, "outcomes"), { recursive: true });
+    writeFileSync(snapshotPath, JSON.stringify({ version: 1, takenAt: 1, holders: [], leases: [] }));
+    const otherModule = await import("../helpers/v2-bg-host");
+    expect(otherModule.bootBgHost).not.toBe(bootBgHost);
+    const other = await otherModule.bootBgHost({ ...options, home: h.home });
+    try {
+      expect(copy.peekLeaseRegistry(snapshotPath)).toBe(observed);
+      expect(observed?.snapshot().leases).toEqual([expect.objectContaining({ holderID: writer })]);
+      await expect(other.before(edit(contender, f))).rejects.toThrow(`live.ts is being edited by session ${writer}`);
+      await end(h, writer, "succeeded");
+      await expect(other.before(edit(contender, f))).rejects.toThrow(`live.ts is being edited by session ${writer}`);
+      observed?.releaseTask("adapter-copies:T1");
+      await expect(other.before(edit(contender, f))).resolves.toBeDefined();
+    } finally {
+      await other.dispose();
+    }
+    expect(copy.peekLeaseRegistry(snapshotPath)).toBe(observed);
+    await h.dispose();
+    host = undefined;
+    expect(copy.peekLeaseRegistry(snapshotPath)).toBeUndefined(); // Observation held no reference.
   });
 });
 

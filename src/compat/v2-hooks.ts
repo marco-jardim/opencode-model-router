@@ -89,8 +89,11 @@ import type {
 import type { PlanRoleBindings } from "../executor/launch";
 import { LAUNCH_HEADER_PATTERN, parseLaunchHeader, type LaunchHeaderFields } from "../executor/types";
 import { withoutHostPreamble } from "../executor/host-preamble";
+import { processToken } from "../executor/process-identity";
+export { processToken } from "../executor/process-identity";
 import { grantFor } from "../routing/roles/policy";
 import { NEEDS, UNKNOWN_FACTS, type Need } from "../routing/classify/types";
+import { observeV2, timingWriteObserver, type V2Observations } from "./v2-observations";
 
 /** §7 grammar (`formatLaunchPrompt`): every launcher prompt starts with this line. */
 const PLAN_CONTEXT_PREFIX = "PLAN CONTEXT\n";
@@ -164,6 +167,23 @@ export function childHistoryEnd(history: unknown): ChildHistoryEnd {
   return { kind: "none" };
 }
 
+/** An open tool can leave processes behind after its launcher dies; only completed/error states prove it closed. */
+export function historyToolInFlight(history: unknown): boolean {
+  const entries: readonly unknown[] = Array.isArray(history) ? history : [];
+  const toolOpen = (part: unknown): boolean => {
+    if (part === null || typeof part !== "object" || (part as Record<string, unknown>).type !== "tool") return false;
+    const state = (part as Record<string, unknown>).state;
+    const status = state !== null && typeof state === "object" ? (state as Record<string, unknown>).status : state ?? (part as Record<string, unknown>).status;
+    return status !== "completed" && status !== "error";
+  };
+  return entries.some((entry) => {
+    if (toolOpen(entry)) return true;
+    if (entry === null || typeof entry !== "object") return false;
+    const m = entry as Record<string, unknown>;
+    return [m.content, m.parts].some((parts) => Array.isArray(parts) && parts.some(toolOpen));
+  });
+}
+
 /**
  * QA-4.2-2: the executor's `HostSessions.context` over the host's history (amendment to memo R1 rule 5). User and assistant
  * entries (`historyEntryKind`) keep their role and text; every other entry (synthetic, tool turns) is a non-terminal `assistant`
@@ -181,7 +201,7 @@ export function executorHostContext(history: unknown): HostSessionContext {
   });
   const end = childHistoryEnd(entries);
   if (end.kind === "ended") messages.push({ role: "idle", text: null, outcome: end.outcome });
-  return { messages };
+  return { messages, toolInFlight: historyToolInFlight(entries) };
 }
 
 /** Translate the router's own v1 tool vocabulary at the v2 boundary. */
@@ -1045,21 +1065,6 @@ function completionElementsOf(text: string): CompletionElement[] {
   return found;
 }
 
-/** QA-DF1-21: the global slot of this process's journal token (`Symbol.for`: one token for every module copy in the process). */
-const PROCESS_TOKEN_SLOT = Symbol.for("opencode-model-router.v2.process-token");
-/**
- * QA-DF1-21: this process's identity, stamped on the `inflight` records it journals. A record bearing it was written by an
- * instance of this very process (an owning location the host evicted), never by an earlier one: a later process may reuse the
- * pid, never the token.
- */
-export function processToken(): string {
-  const known: unknown = Reflect.get(globalThis, PROCESS_TOKEN_SLOT);
-  if (typeof known === "string") return known;
-  const token = `${process.pid.toString(16)}-${Date.now().toString(16)}-${Math.random().toString(16).slice(2, 10)}`;
-  Reflect.set(globalThis, PROCESS_TOKEN_SLOT, token);
-  return token;
-}
-
 /**
  * QA-DF1-20: the identity of the message that holds a completion element, never its content: the host's message id when the
  * message carries one, else its position in the request's history (a session's history only grows between its requests).
@@ -1165,6 +1170,7 @@ export async function registerV2Hooks(
    * `hostSettleMs`: how long a role dispatch's result waits for the child's execution-end event (default 500 ms).
    */
   options: {
+    observations?: V2Observations;
     ingest?: Ingest; isBypassed?: () => boolean; hostBudget?: HostBudgetObserver; hostSettleMs?: number;
     onHostBudget?: (observe: (childSessionID: string, stepLimit: number | null) => HostBudgetObservation) => void;
     /**
@@ -1968,6 +1974,7 @@ export async function registerV2Hooks(
     void model.load(); // not awaited: until it loads, estimates are the prior (never selects a dispatch)
     const holder = acquireTimingRecorder({
       dir: outcomesDir, now: nowMs, logger: ingestLogger,
+      onTimingWrite: timingWriteObserver(options.observations),
       onRow: (row) => { if (row.kind === "dispatch-timing") model.observe(row); },
     });
     timings = holder;
@@ -2056,6 +2063,8 @@ export async function registerV2Hooks(
   const executorLaunches = new Map<string, {
     req: LaunchRequest; callID: string; child: string | null; end?: "succeeded" | "failed" | "interrupted";
   }>();
+  /** Timing-only identities of settled childless launches, for accepted late children; never reopen in-flight work. */
+  const executorLateTimings = new Map<string, string>();
   const executorAttemptKey = (taskId: string, attempt: number): string => `${taskId}#${attempt}`;
   const executorInFlight = {
     /**
@@ -2069,13 +2078,23 @@ export async function registerV2Hooks(
     },
     remember(req: LaunchRequest): void {
       const key = executorAttemptKey(req.taskId, req.attempt);
+      executorLateTimings.delete(key);
       executorLaunches.delete(key);
       executorLaunches.set(key, { req, callID: `executor:${req.planId}:${req.taskId}#${req.attempt}:${req.nonce}`, child: null });
       while (executorLaunches.size > 1000) executorLaunches.delete(executorLaunches.keys().next().value!);
     },
     register(taskId: string, attempt: number, child: string | null): void {
-      const entry = executorLaunches.get(executorAttemptKey(taskId, attempt));
-      if (entry === undefined) return;
+      const key = executorAttemptKey(taskId, attempt);
+      const entry = executorLaunches.get(key);
+      if (entry === undefined) {
+        if (child === null) return;
+        const callID = executorLateTimings.get(key);
+        if (callID === undefined) return;
+        executorLateTimings.delete(key); // consume once, without deciding or acknowledging another in-flight record
+        noteSessionKind(child, "child");
+        timings?.bindChild(callID, child);
+        return;
+      }
       if (inflight.byCall(entry.callID) === undefined) {
         inflight.decide({
           callID: entry.callID, parentSessionID: entry.req.orchestratorSessionID, agent: entry.req.route.agent, role: entry.req.role,
@@ -2086,6 +2105,8 @@ export async function registerV2Hooks(
       if (child !== null && entry.child === null) {
         entry.child = child;
         noteSessionKind(child, "child");
+        // Retained launches bypass the subagent result hook that binds ordinary dispatch timings.
+        timings?.bindChild(entry.callID, child);
         inflight.acknowledge(entry.callID, child, { userBackgrounded: false });
       }
     },
@@ -2095,6 +2116,8 @@ export async function registerV2Hooks(
       executorLaunches.delete(key);
       if (entry === undefined) return;
       if (entry.child === null) {
+        executorLateTimings.set(key, entry.callID);
+        while (executorLateTimings.size > 1000) executorLateTimings.delete(executorLateTimings.keys().next().value!);
         inflight.cancel(entry.callID);
         return;
       }
@@ -2190,6 +2213,7 @@ export async function registerV2Hooks(
     }
   }
   const held: HeldResults = createHeldResults({
+    observations: options.observations,
     synthetic: async (input) => { if (typeof syntheticRaw === "function") await Reflect.apply(syntheticRaw, ctx.session, [input]); },
     journal, available: syntheticOk && compactionRegistered, logger: ingestLogger,
   });
@@ -2362,6 +2386,7 @@ export async function registerV2Hooks(
   /** 1.3: the process-wide lease registry and the guard over it (every v2 child; roots take none). */
   let leaseHandle: ReturnType<typeof acquireLeaseRegistry> | undefined;
   let leaseGuard: LeaseGuard | undefined;
+  let leaseStartupRefusal: string | undefined;
   const holderLabel = (holderID: string): string => {
     const attempt = inflight.byChild(holderID);
     return attempt === undefined ? `session ${holderID}` : `${attemptLabel(attempt)} (session ${holderID})`;
@@ -2373,16 +2398,10 @@ export async function registerV2Hooks(
         runMode: startRouting.leases.run,
         seams: { realpath: (path) => realpathSync.native(path), repoKeyOf: leaseRepoKeyOf, now: nowMs },
         snapshotPath, logger: ingestLogger,
+        loadSnapshot: () => JSON.parse(readFileSync(snapshotPath, "utf8")) as unknown,
       });
       leaseHandle = handle;
       bgDisposers.push(() => handle.release());
-      try {
-        const restored = handle.registry.restore(JSON.parse(readFileSync(snapshotPath, "utf8")) as unknown, { dropCompleteHolders: true });
-        if (!restored.ok) ingestLogger.warn("[router] leases: the snapshot was rejected", { error: restored.message });
-        else if (restored.skipped !== undefined) ingestLogger.warn("[router] leases: snapshot lines skipped on restore", { skipped: restored.skipped });
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") ingestLogger.warn("[router] leases: the snapshot could not be restored", { error: String(error) });
-      }
       leaseGuard = createLeaseGuard({
         registry: handle.registry, sessionKind: sessionKindOf, sessionDir: sessionDirectoryOf, gitRootOf: nearestRepository,
         holderLabel,
@@ -2428,7 +2447,9 @@ export async function registerV2Hooks(
       }));
     } catch (error) {
       leaseGuard = undefined;
-      ingestLogger.warn("[router] leases: the lease registry could not start; no lease checks", { error: String(error) });
+      leaseHandle = undefined;
+      leaseStartupRefusal = "[router] Refused: enforced lease checks are unavailable because the lease registry could not start. Repair the shared lease state and restart the plugin.";
+      ingestLogger.warn("[router] leases: the lease registry could not start; enforced file, search, git and run calls are refused", { error: String(error) });
     }
   }
   // Memo §4.1 steps 3-4: the finish API is attached once (with the lease gate when leases are enforced), then the pending journal
@@ -3424,10 +3445,11 @@ export async function registerV2Hooks(
       // Only the tools the guard checks (file tools, `router_git_*`, `router_run`) and the search tools (`glob`/`grep`, whose
       // result the guard filters, so the actor must be resolved before them) reach it: no host call for any other tool.
       const leaseClass = roleActionOf(event.tool);
-      if (leaseGuard !== undefined && (leaseClass === "read" || leaseClass === "edit" || event.tool === "glob" || event.tool === "grep" || event.tool.startsWith("router_git_") || event.tool === "router_run")) {
-        const lease = await leaseGuard.before({ sessionID: String(event.sessionID), tool: event.tool, args, callID: event.id });
-        if (lease.refuse !== undefined) throw refused(lease.refuse, callerRole);
-        if (lease.runNote !== undefined) {
+      if (leaseClass === "read" || leaseClass === "edit" || event.tool === "glob" || event.tool === "grep" || event.tool.startsWith("router_git_") || event.tool === "router_run") {
+        if (leaseStartupRefusal !== undefined) throw refused(leaseStartupRefusal, callerRole);
+        const lease = await leaseGuard?.before({ sessionID: String(event.sessionID), tool: event.tool, args, callID: event.id });
+        if (lease?.refuse !== undefined) throw refused(lease.refuse, callerRole);
+        if (lease?.runNote !== undefined) {
           runNotes.delete(event.id);
           runNotes.set(event.id, lease.runNote);
           while (runNotes.size > 1000) runNotes.delete(runNotes.keys().next().value!);
@@ -3583,6 +3605,11 @@ export async function registerV2Hooks(
         }
         // QA-PDF12-6: without the claim, `undefined` keeps the `background` key the input already has (set by the copy that claimed).
         event.input = nativeArgs(event.tool, output.args, original, lostClaim ? undefined : background);
+        if (event.tool === "subagent") observeV2(options.observations, (fingerprint) => ({
+          family: "native-args", callID: event.id, sessionID: String(event.sessionID),
+          before: fingerprint(output.args), after: fingerprint(event.input),
+          backgroundDecision: (lostClaim ? undefined : background) ?? null,
+        }));
       } catch (error) {
         dispatchRouter.onCallFinished(event.id); // the hook chain rejected the call: it will never reach execute.after (2.2)
         inflight.cancel(event.id);
@@ -3770,10 +3797,14 @@ export async function registerV2Hooks(
         try {
           // QA-2.1-17: the plugin rebuilds the gate inputs from the journaled dispatch and the restored pending entry, and
           // re-posts a verdict the entry already reached.
-          const result = await withinCaller(hold, () => api.finish({
-            callID: hold.callID, parentSessionID: hold.parentSessionID, childSessionID: hold.childSessionID, outputText: childText,
-            status: "succeeded", mode: "background", heldHandle: hold.handle, endedAt: nowMs(), restored: hold.dispatch,
-          }));
+          const result = await withinCaller(hold, () => {
+            observeV2(options.observations, () => ({ family: "completion-effect", effect: "finish-dispatch", source: "restored-hold",
+              parentSessionID: hold.parentSessionID, callID: hold.callID, childSessionID: hold.childSessionID }));
+            return api.finish({
+              callID: hold.callID, parentSessionID: hold.parentSessionID, childSessionID: hold.childSessionID, outputText: childText,
+              status: "succeeded", mode: "background", heldHandle: hold.handle, endedAt: nowMs(), restored: hold.dispatch,
+            });
+          });
           // The gate runs behind `finish`; it posts the verdict through the HeldSink when it settles.
           if (result.verification.kind === "held") return;
           api.releaseHeld(hold.handle);
@@ -3790,6 +3821,7 @@ export async function registerV2Hooks(
         }
       };
       processor = executorProcessor = createCompletionProcessor(inflight, { // 3.1.7 W5: also the executor's runner-trigger sink
+        observations: options.observations,
         // QA-PDF12-9: the caller is the one the processor's attempt carries (journaled at decide), not a capped call-id lookup.
         // QA-PDF12-14: only a succeeded completion can launch a grader as the caller, so only it waits for the caller lookups.
         finish: (input, caller) => withinCaller({ parentSessionID: input.parentSessionID, callID: input.callID, ...caller }, () => api.finish(input), input.status === "succeeded"),
@@ -4334,6 +4366,10 @@ export async function registerV2Hooks(
           : structured && typeof structured === "object" && typeof structured.output === "string"
             ? { output: { ...structured, output: final } } : {}),
       };
+      if (event.tool === "subagent") observeV2(options.observations, () => ({
+        family: "completion-effect", effect: "annotation-delivery", source: "foreground-result",
+        parentSessionID: String(event.sessionID), callID: event.id, childSessionID: resultChild,
+      }));
       } finally {
         role?.finish();
         if (event.tool === "subagent") forgetRoutedRole(event.id);

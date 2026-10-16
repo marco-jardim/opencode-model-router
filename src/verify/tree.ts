@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { lstat, readdir, readFile, readlink, realpath, stat } from "node:fs/promises";
 import { constants as osConstants, setPriority } from "node:os";
 import { extname, join, resolve } from "node:path";
+import { scrubText } from "../guard/scrub";
 import * as tools from "../router/git-tools";
 import { ABSENT_DIGEST, FILE_DIGEST_PREFIX, LINK_DIGEST_PREFIX, type TreeSnapshot, type ChangedFile } from "./dispatch";
 
@@ -173,6 +174,8 @@ export interface SnapshotOptions {
   hardened?: boolean;
   /** The git process seam (tests). Default execGit. */
   git?: SnapshotGit;
+  /** Optional failure diagnostic: scrubbed, single-line, at most 200 chars. Callback errors are ignored. */
+  onError?: (reason: string) => void;
   /**
    * Cross-repo P2.6 (SD11): also compute `TreeSnapshot.ignored`, a bounded digest of the repository's ignored files (nothing
    * under a `node_modules` segment), with the snapshot's own git runner (hardened when `hardened`). QA-2 #9b: "over-bounds" when
@@ -509,24 +512,29 @@ export async function snapshotTree(cwd: string, signal: AbortSignal, options: Sn
   const lowPriority = options.lowPriority === true;
   let prefix: readonly string[] = ["--no-pager"];
   let hardening: Pick<SnapshotGitOptions, "env" | "executable"> = {};
-  const git = (args: string[]) => run([...prefix, ...args], {
-    cwd: gitCwd, signal, timeoutMs: SNAPSHOT_GIT_TIMEOUT_MS, maxBuffer: SNAPSHOT_GIT_MAX_BUFFER, lowPriority, ...hardening,
-  });
+  type Stage = "root" | "head" | "status" | "diff-worktree" | "diff-index" | "index" | "untracked-list" | "hash" | "index-tags" | "ignored-list";
+  let stage: Stage = "root";
+  const git = (label: Stage, args: string[]) => {
+    stage = label;
+    return run([...prefix, ...args], {
+      cwd: gitCwd, signal, timeoutMs: SNAPSHOT_GIT_TIMEOUT_MS, maxBuffer: SNAPSHOT_GIT_MAX_BUFFER, lowPriority, ...hardening,
+    });
+  };
   try {
     if (options.hardened === true) {
       const hardened = await hardenedGit(cwd);
       prefix = hardened.prefix;
       hardening = { env: hardened.env, executable: hardened.executable };
     }
-    const root = (await git(["rev-parse", "--show-toplevel"])).trim();
+    const root = (await git("root", ["rev-parse", "--show-toplevel"])).trim();
     // ls-files otherwise scopes untracked contents to a subdirectory cwd,
     // missing same-path edits in sibling packages that tests may import.
     gitCwd = root;
     // One process, so HEAD and its branch describe the same checkout.
-    const [headLine, refLine] = (await git(["rev-parse", "HEAD", "--symbolic-full-name", "HEAD"])).split(/\r?\n/);
+    const [headLine, refLine] = (await git("head", ["rev-parse", "HEAD", "--symbolic-full-name", "HEAD"])).split(/\r?\n/);
     const head = (headLine ?? "").trim();
     const branch = parseBranchLine(refLine);
-    const status = await git(["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+    const status = await git("status", ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
     const files: ChangedFile[] = [];
     const records = status.split("\0");
     for (let i = 0; i < records.length; i++) {
@@ -541,13 +549,14 @@ export async function snapshotTree(cwd: string, signal: AbortSignal, options: Sn
       files.push(file);
     }
     const hash = createHash("sha256").update(status);
-    hash.update(await git(["diff", "HEAD", "--binary", "--no-ext-diff", "--no-textconv"]));
-    hash.update(await git(["diff", "--cached", "--binary", "--no-ext-diff", "--no-textconv"]));
+    hash.update(await git("diff-worktree", ["diff", "HEAD", "--binary", "--no-ext-diff", "--no-textconv"]));
+    hash.update(await git("diff-index", ["diff", "--cached", "--binary", "--no-ext-diff", "--no-textconv"]));
     // A submodule's dirty marker does not describe its content. Refuse rather
     // than cache a fingerprint that would excuse unmeasured changes there.
-    if (/^160000 /m.test(await git(["ls-files", "--stage"]))) return undefined;
-    const untracked = (await git(["ls-files", "--others", "--exclude-standard", "--full-name", "-z"]))
+    if (/^160000 /m.test(await git("index", ["ls-files", "--stage"]))) return undefined;
+    const untracked = (await git("untracked-list", ["ls-files", "--others", "--exclude-standard", "--full-name", "-z"]))
       .split("\0").filter(Boolean).sort();
+    stage = "hash";
     for (const path of untracked) {
       const absolute = resolve(root, path);
       const stat = await lstat(absolute);
@@ -568,7 +577,7 @@ export async function snapshotTree(cwd: string, signal: AbortSignal, options: Sn
       // Cross-repo QA-2 #9b: a skip-worktree (`S`) or assume-unchanged (lowercase) entry hides its edits from `status` and
       // `diff`, so the fingerprint cannot vouch for it: the digest is unusable ("over-bounds"), as reference.ts treats it for W.
       // A failed listing leaves `ignored` absent and the snapshot intact, as a failed ignored listing does.
-      const hidden = await git([...INDEX_TAGS_ARGS]).then(
+      const hidden = await git("index-tags", [...INDEX_TAGS_ARGS]).then(
         tags => tags.split("\0").some(record => record !== "" && (record[0] === "S" || record[0] !== record[0]?.toUpperCase())),
         () => undefined,
       );
@@ -578,7 +587,7 @@ export async function snapshotTree(cwd: string, signal: AbortSignal, options: Sn
         ? "over-bounds"
         : await ignoredFilesDigest(
           root,
-          () => git([...IGNORED_LIST_ARGS]),
+          () => git("ignored-list", [...IGNORED_LIST_ARGS]),
           signal,
           options.maxIgnoredFiles ?? MAX_IGNORED_FILES,
           options.maxIgnoredBytes ?? MAX_IGNORED_BYTES,
@@ -588,8 +597,16 @@ export async function snapshotTree(cwd: string, signal: AbortSignal, options: Sn
       cwd: await realpath(cwd), root: await realpath(root), head, branch, fingerprint: hash.digest("hex"), dirty: files.length > 0, files, digests,
       ...(ignored !== undefined ? { ignored } : {}),
     };
-  } catch {
+  } catch (error) {
     // Not a Git checkout, unreadable file, timeout or concurrent deletion: no baseline.
+    try {
+      if (options.onError !== undefined) {
+        const code = errorCode(error);
+        const message = error instanceof Error ? error.message : String(error);
+        const reason = `${stage}: ${typeof code === "string" || typeof code === "number" ? `${code}: ` : ""}${message}`;
+        options.onError(scrubText(reason).replace(/\s+/g, " ").trim().slice(0, 200) || "snapshot failed");
+      }
+    } catch { /* Diagnostics never turn an unavailable snapshot into a throw. */ }
     return undefined;
   }
 }

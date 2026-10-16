@@ -1,5 +1,7 @@
+import { SHIPPED_ROLE_SPECS, type RoleSpec } from "../../../../src/router/roles";
 import type { RouteLine } from "../../../../src/routing/classify/types";
 import type { AnnotatedPlan, PlanStep } from "../../../../src/routing/engine";
+import { CLASS_ROLE_KIND } from "../../../../src/routing/engine/roles-taxonomy";
 import type { DurationEstimate, DurationModel } from "../../../../src/routing/outcomes/durations";
 import { createPlanCompiler, type CompilerDeps } from "../../../../src/executor/compile/index";
 import { repoViewFrom, type RepoView } from "../../../../src/executor/compile/footprint";
@@ -36,8 +38,10 @@ export function stubAnnotate(calls?: PlanStep[][]): CompilerDeps["annotate"] {
   };
 }
 
-export function stubRoleOf(_route: RouteLine | null, tier: Tier | null): string {
-  return `role-${tier ?? "medium"}`;
+export function stubRoleOf(route: RouteLine | null, tier: Tier | null): RoleSpec {
+  const kind = tier === "heavy" && route?.class === undefined ? "review" : CLASS_ROLE_KIND[route?.class ?? "other"];
+  const spec = SHIPPED_ROLE_SPECS.find((role) => role.kind === kind)!;
+  return { ...spec, agent: `role-${tier ?? "medium"}` };
 }
 
 export interface Harness {

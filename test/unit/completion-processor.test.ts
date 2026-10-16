@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createV2Observations, type ObservationRecord, type V2Observations } from "../../src/compat/v2-observations";
 import {
   ATTEMPT_SWEEP_AGE_MS,
   DECIDED_LIVE_MS,
@@ -69,7 +70,7 @@ function finishResult(over: Partial<FinishResult> = {}): FinishResult {
   return { outputText: "child text\n[router] ok", suffix: "[router] ok", verification: { kind: "none" }, metadata: {}, ...over };
 }
 
-function rig(opts: { withCapture?: boolean } = {}): Rig {
+function rig(opts: { withCapture?: boolean; observations?: V2Observations } = {}): Rig {
   const clock = { t: 1_000_000 };
   const closed: Array<{ attempt: Attempt; cause: CloseCause }> = [];
   const warns: string[] = [];
@@ -103,6 +104,7 @@ function rig(opts: { withCapture?: boolean } = {}): Rig {
     synthetic: async () => undefined,
   };
   const held = createHeldResults({
+    observations: opts.observations,
     synthetic: async (input) => {
       posts.push(input);
       return behavior.synthetic(input);
@@ -114,6 +116,7 @@ function rig(opts: { withCapture?: boolean } = {}): Rig {
     sleep: async () => undefined,
   });
   const proc = createCompletionProcessor(reg, {
+    observations: opts.observations,
     finish: async (input, caller) => {
       finishCalls.push(input);
       finishCallers.push(caller);
@@ -214,6 +217,47 @@ async function flushAll(): Promise<void> {
 }
 
 describe("registry: decide / acknowledge / claims", () => {
+  it("observes actual completion invocations per resumed attempt, unchanged off/on/broken", async () => {
+    const outputs: string[] = [];
+    for (const mode of ["off", "on", "broken"] as const) {
+      const rows: ObservationRecord[] = [];
+      const observations = mode === "off" ? undefined : createV2Observations({ write: (line) => {
+        if (mode === "broken") throw new Error("broken sink");
+        rows.push(JSON.parse(line));
+      } });
+      const r = rig({ withCapture: true, observations });
+      r.behavior.finish = async () => finishResult({ verification: { kind: "required", verdict: "PASS" } });
+      for (const callID of ["observe-1", "observe-2"]) {
+        await launch(r, callID, "same-child", { handle: `vrf_${callID}` });
+        await Promise.all([r.proc.process("same-child", completion()), r.proc.process("same-child", endEvent())]);
+        await r.proc.process("same-child", completion());
+      }
+      outputs.push(JSON.stringify({ finish: r.finishCalls, records: r.records, posts: r.posts, released: r.released }));
+      observations?.flush();
+      if (mode !== "on") expect(rows).toEqual([]);
+      else for (const callID of ["observe-1", "observe-2"]) {
+        const effects = rows.filter((row) => row.family === "completion-effect" && row.callID === callID);
+        expect(effects.map((row) => row.family === "completion-effect" ? row.effect : "")).toEqual([
+          "change-set-capture", "finish-dispatch", "annotation-delivery",
+        ]);
+        for (const row of effects) expect(row).toMatchObject({ parentSessionID: PARENT, childSessionID: "same-child" });
+      }
+    }
+    expect(new Set(outputs).size).toBe(1);
+  });
+
+  it("counts annotation retries, not the idempotent posted record", async () => {
+    const rows: ObservationRecord[] = [];
+    const observations = createV2Observations({ write: (line) => { rows.push(JSON.parse(line)); } });
+    const r = rig({ observations });
+    await launch(r, "observe-retry", "child-retry", { handle: "vrf_retry" });
+    let tries = 0;
+    r.behavior.synthetic = async () => { if (++tries < 3) throw new Error("retry"); };
+    await r.proc.process("child-retry", completion());
+    observations.flush();
+    expect(rows.filter((r) => r.family === "completion-effect" && r.effect === "annotation-delivery")).toHaveLength(3);
+    expect(r.records.filter((r) => r.kind === "posted")).toHaveLength(1);
+  });
   it("decide claims a callID once per process-wide set", () => {
     const r = rig();
     expect(r.reg.decide(callRecord("c1"))).toBe(true);

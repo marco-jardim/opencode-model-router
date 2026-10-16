@@ -1,4 +1,4 @@
-/** CPX Phase 0.1 (tasks 0.1.2, 0.1.6): OpenCode v2 host-contract smoke: observation + decided-branch assertions for C1-C15 and O1-O6.
+/** CPX Phase 0.1 (tasks 0.1.2, 0.1.6): OpenCode v2 host-contract smoke: observation + decided-branch assertions for C1-C16, O1-O6 and O16.
  *
  *   RUN_OC_SMOKE_CPX=1 OPENCODE_V2_BIN=<abs path to opencode 2> npm run smoke:cpx
  *
@@ -10,7 +10,7 @@
  * `<OBS_DIR>/C<n>.json` BEFORE asserting (also when the scenario throws: `scenarioError`), then asserts the DECIDED branch of ADR 0007
  * ("Host contracts: branch taken") through the `DECISIONS` table at the end of the file: every check is `<contract>/<decision id>` with a
  * message saying what to reopen, all failed checks of a contract are reported together, and the results are in the file's `checks`.
- * Besides C1-C15 the file closes ADR open observations O1-O6: C7 pins the child's final text path (O1), C10 records the 529 error type
+ * Besides C1-C16 the file closes ADR open observations O1-O6: C7 pins the child's final text path (O1), C10 records the 529 error type
  * (O2), C14 launches 8 retained children (O3), C13 / C14b interrupt an ACTIVE root (O4), C15 completes a compaction (O5) and the O6
  * scenario posts `session.synthetic` with `resume`. A host upgrade that changes a decided behaviour fails `npm run smoke:cpx`.
  *
@@ -25,6 +25,10 @@
  * `server.mjs` of the wrapper directory starts with `process.env.CPX_PROBE_* = ...` lines (the host loads native plugins in-process; only
  * `node:` modules are imported, so the assignments run before the probe reads its env), followed by the unchanged probe source. One host
  * per scenario, so the config is fixed per host (it also survives `RoutingHost.restart()`).
+ * C16 uses probe mode `spawn-hold`: CPX_PROBE_SPAWN_DIR=<project>/.cpx-c16, CPX_PROBE_NODE=<real node executable>,
+ * CPX_PROBE_NPM_CLI=<npm-cli.js>, CPX_PROBE_HOLD=<absolute test/smoke/probe/cpx-hold.cjs> (and CPX_PROBE_TOOL_URL for the schema).
+ * Two executing probe tools and a host shell hold silent heartbeat leaves across a server-pid-only kill/relaunch. Stored OPEN
+ * tool calls are asserted twice with the product's historyToolInFlight; descendant process fate is O16 evidence, NOT a host contract.
  *
  * Output: OBS_DIR = `<OMR_CPX_PROBE_DIR | OMR_SMOKE_REAL_TMPDIR | os.tmpdir()>/omr-cpx-probe`. The smoke globalSetup (test/setup/smoke-tmp-guard.ts)
  * points TEMP at a per-run directory it deletes at the end, so the REAL temp directory it recorded is used (same as role-spikes). Every run
@@ -35,16 +39,19 @@
  */
 import { afterAll, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
-import { spawnSync } from "node:child_process";
+import { execFile, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { promisify } from "node:util";
+import { historyToolInFlight } from "../../src/compat/v2-hooks";
 import { removeDirWhenReleased } from "../helpers/remove-dir";
+import { c16StoredTool, parseC16Processes, type C16Process } from "./helpers/cpx-c16";
 import type { CpxFront, CpxRequest, FaultKind, UsageLimitVariant } from "./helpers/cpx-scripted-provider";
 import {
-  RoutingHost, ROOT, agentWithoutModel, arr, clip, obj, redact, ref, scriptLine, stopAllHosts, str, waitFor, type Dispatched, type HostOptions, type Obj,
+  RoutingHost, ROOT, agentWithoutModel, arr, clip, delay, obj, redact, ref, scriptLine, stopAllHosts, str, waitFor, type Dispatched, type HostOptions, type Obj,
 } from "./helpers/routing-host";
 
 const RUN = process.env.RUN_OC_SMOKE_CPX === "1";
@@ -63,7 +70,7 @@ const CHILD_ENDED = new Set(["session.execution.succeeded", "session.execution.f
 /** Verification off, so the router does not rewrite `background: true` into a foreground call (role-spikes S6B); engine shadow as everywhere. */
 const BASE: HostOptions = { routing: { engine: "shadow" }, overrides: { enforcement: { mode: "off" } }, hostConfig: { agents: { [CHILD]: agentWithoutModel() } } };
 
-type ProbeMode = "rewrite-completion" | "append-tail-system" | "append-tail-user" | "append-tail-newest" | "cache-hint-1h" | "cache-hint-1h-message" | "cache-hint-1h-all" | "append-tail-user+hint-last-real" | "filter-grep" | "mutate-subagent-prompt" | "rewrite-compaction" | "retained-launch" | "rewrite-completion+compaction" | "retry-observe" | "retry-stop" | "plugin-session-api";
+type ProbeMode = "rewrite-completion" | "append-tail-system" | "append-tail-user" | "append-tail-newest" | "cache-hint-1h" | "cache-hint-1h-message" | "cache-hint-1h-all" | "append-tail-user+hint-last-real" | "filter-grep" | "mutate-subagent-prompt" | "rewrite-compaction" | "retained-launch" | "rewrite-completion+compaction" | "retry-observe" | "retry-stop" | "plugin-session-api" | "spawn-hold";
 /** One probe JSON line: `{ t, kind, ...fields }` (see cpx-probe-plugin.js). */
 interface ProbeLine extends Obj { t: number; kind: string }
 
@@ -808,9 +815,10 @@ d("C8 a user-backgrounded running subagent gets the same running acknowledgement
 // ---------------------------------------------------------------------------- C9 ----
 const PATH_TOOLS = new Set(["glob", "grep", "list"]);
 /** The tool input for the scripted call: keys are taken from the advertised schema (`props`) when the host lists the tool, else the common names. */
-function toolInput(tool: string, props: readonly string[], project: string): Obj {
+function toolInput(tool: string, props: readonly string[], project: string, command?: string): Obj {
   const pick = (...names: string[]): string => names.find(n => props.includes(n)) ?? names[0]!;
   const input: Obj = {};
+  if (tool === "shell") return { [pick("command", "script")]: command, [pick("description")]: "C16 host-shell heartbeat hold", [pick("timeout", "timeoutMs")]: 120_000 };
   const file = path.join(project, tool === "write" ? "written.txt" : tool === "edit" || tool === "multiedit" ? "edit-me.txt" : "visible.txt");
   if (tool === "router_run") return { script: "typecheck", cwd: project };
   input[pick("filePath", "file_path", "path")] = PATH_TOOLS.has(tool) ? project : file;
@@ -1805,6 +1813,271 @@ d("O6b plugin-side session API: synthetic with resume, context, interrupt", () =
   }, 300_000);
 });
 
+// ---------------------------------------------------------------------------- C16 ----
+const C16_HOLD = path.join(ROOT, "test", "smoke", "probe", "cpx-hold.cjs");
+const C16_TOKENS = ["C16_DIRECT", "C16_NPM", "C16_SHELL"] as const;
+const c16Exec = promisify(execFile);
+
+/** Same real-Node/npm-cli layout used by the other Node smokes; never use the OpenCode executable as Node. */
+function c16Executables(): { node: string; npm: string } {
+  let node: string | undefined;
+  for (const candidate of [process.env.npm_node_execpath, process.execPath, "node"].filter((v): v is string => Boolean(v))) {
+    const result = spawnSync(candidate, ["-p", 'process.release.name === "node" && !process.versions.bun ? process.execPath : ""'], { encoding: "utf8", windowsHide: true, timeout: 3000 });
+    if (result.status === 0 && path.isAbsolute(result.stdout.trim()) && existsSync(result.stdout.trim())) { node = result.stdout.trim(); break; }
+  }
+  if (!node) throw new Error("C16 requires a real Node executable (npm_node_execpath / process.execPath / PATH)");
+  const npm = [process.env.npm_execpath, path.join(path.dirname(node), "node_modules", "npm", "bin", "npm-cli.js"), path.resolve(path.dirname(node), "..", "lib", "node_modules", "npm", "bin", "npm-cli.js")]
+    .find((file): file is string => Boolean(file && /npm-cli\.(?:c?js)$/i.test(file) && existsSync(file)));
+  if (!npm) throw new Error("C16 requires npm-cli.js (npm_execpath / the real Node installation)");
+  return { node, npm };
+}
+
+/** Full initial table supplies the parent chains; later queries only inspect the recorded pids. Each subprocess is bounded. */
+async function c16ProcessTable(pids?: number[], timeout = 5000): Promise<C16Process[]> {
+  let stdout: string;
+  if (process.platform === "win32") {
+    const filter = pids ? ` -Filter '${pids.map(pid => `ProcessId=${pid}`).join(" OR ")}'` : "";
+    ({ stdout } = await c16Exec("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
+      `$ErrorActionPreference='Stop'; Get-CimInstance Win32_Process${filter} | Where-Object { $_.CreationDate } | Select-Object ProcessId,ParentProcessId,Name,@{Name='CreationDate';Expression={$_.CreationDate.ToUniversalTime().ToString('o')}},CommandLine | ConvertTo-Json -Compress`],
+    { cwd: ROOT, encoding: "utf8", windowsHide: true, timeout, maxBuffer: 8 * 1024 * 1024 }));
+  } else {
+    ({ stdout } = await c16Exec("ps", [...(pids ? ["-p", pids.join(",")] : ["-e"]), "-o", "pid=,ppid=,pgid=,lstart=,args="],
+      { cwd: ROOT, encoding: "utf8", timeout, maxBuffer: 8 * 1024 * 1024, env: { ...process.env, LC_ALL: "C" } }).catch(error => {
+      // ps exits 1 if every requested pid is gone; empty output, not an observation failure.
+      if (pids && error.code === 1 && !String(error.stdout).trim() && !String(error.stderr).trim()) return { stdout: "" };
+      throw error;
+    }));
+  }
+  return stdout.trim() ? parseC16Processes(stdout, process.platform) : [];
+}
+
+async function c16Beat(dir: string, token: string): Promise<number | null> {
+  try { const text = await readFile(path.join(dir, `${token}.beat`), "utf8"); return /^\d+$/.test(text) ? Number(text) : null; }
+  catch (error) { if (obj(error).code === "ENOENT") return null; throw error; }
+}
+async function c16Leaf(dir: string, token: string): Promise<Obj | null> {
+  try { return obj(JSON.parse(await readFile(path.join(dir, `${token}.pid.json`), "utf8"))); }
+  catch (error) { if (obj(error).code === "ENOENT" || error instanceof SyntaxError) return null; throw error; }
+}
+
+interface C16RecordedProcess extends C16Process { roles: string[]; token: string | null; parentChain: C16Process[] }
+/** Identity and existence are independent: EPERM means alive; an alive pid missing from the OS table is UNKNOWN, never dead. */
+async function c16Classify(records: C16RecordedProcess[], timeout = 3000): Promise<Obj[]> {
+  if (!records.length) return [];
+  const current = await c16ProcessTable(records.map(p => p.pid), timeout);
+  return records.map(p => {
+    let alive: boolean | null = true;
+    let error: string | undefined;
+    try { process.kill(p.pid, 0); } catch (failure) {
+      const code = obj(failure).code;
+      if (code === "ESRCH") alive = false;
+      else if (code !== "EPERM") { alive = null; error = String(failure); }
+    }
+    const now = current.find(row => row.pid === p.pid);
+    return { pid: p.pid, alive, sameProcess: alive === false ? false : now ? now.createdAt === p.createdAt : null,
+      creationAfter: now?.createdAt ?? null, observedAt: Date.now(), error };
+  });
+}
+
+d("C16 launcher liveness: plugins and child runs share the server process", () => {
+  it("kills only the server pid, observes the held child's connection close and checks its retained state after relaunch", async () => {
+    await observeContract("C16", async o => {
+      const executables = c16Executables();
+      await withHost("C16", "spawn-hold", o, async s => {
+        const { host } = s;
+        const dir = path.join(host.project, ".cpx-c16");
+        const processes: C16RecordedProcess[] = [];
+        const toolRuns: Obj[] = [];
+        let ownPgid: number | null = null;
+        o.observed.toolRuns = toolRuns;
+        const processEvidence: Obj = { observation: "O16", platform: process.platform, expectedNotAsserted: process.platform === "win32" ? "direct dies (job); npm-shell/leaf and host-shell leaf may survive with advancing beats" : "all may survive", processes, beforeRelaunch: [], cleanup: [] };
+        o.observed.O16 = processEvidence;
+        // Ancestors are evidence ONLY, never cleanup targets (in particular, never kill the test runner).
+        const snapshotProcesses = async (): Promise<void> => {
+          const table = await c16ProcessTable();
+          ownPgid = table.find(p => p.pid === process.pid)?.pgid ?? null;
+          const lines = (await probeLines(s.probeFile)).filter(l => l.kind === "spawn-hold-spawned");
+          const leaves = await Promise.all(C16_TOKENS.map(async token => ({ token, leaf: await c16Leaf(dir, token) })));
+          processEvidence.requiredPids ??= [...new Set([...lines.map(l => l.directPid), ...leaves.map(l => l.leaf?.pid)].filter((pid): pid is number => typeof pid === "number" && Number.isSafeInteger(pid) && pid > 0))];
+          const chainOf = (pid: number): C16Process[] => {
+            const chain: C16Process[] = [];
+            const seen = new Set([pid]);
+            let parent = table.find(p => p.pid === pid)?.ppid;
+            while (parent && !seen.has(parent)) {
+              seen.add(parent);
+              const row = table.find(p => p.pid === parent);
+              if (!row) break;
+              chain.push(row); parent = row.ppid;
+            }
+            return chain;
+          };
+          const protectedPids = new Set([process.pid, serverPid, ...chainOf(process.pid).map(p => p.pid), ...chainOf(serverPid).map(p => p.pid)]);
+          processEvidence.serverParentChain ??= chainOf(serverPid);
+          for (const p of table) {
+            // Never adopt a reused pid as a new cleanup target on the final snapshot.
+            if (protectedPids.has(p.pid) || processes.some(old => old.pid === p.pid)) continue;
+            const direct = lines.find(l => l.directPid === p.pid);
+            const leaf = leaves.find(l => l.leaf?.pid === p.pid);
+            if (!direct && !leaf && !p.commandLine.includes("C16_")) continue;
+            const token = str(direct?.token) ?? leaf?.token ?? C16_TOKENS.find(t => p.commandLine.includes(t)) ?? null;
+            const roles = [...(direct ? ["direct"] : []), ...(token === "C16_NPM" && /^(cmd\.exe|sh|bash)$/i.test(p.name) ? ["npm-shell"] : []), ...(leaf ? ["leaf"] : []), ...(token === "C16_SHELL" ? ["host-shell"] : [])];
+            processes.push({ ...p, token, roles: roles.length ? roles : ["descendant"], parentChain: chainOf(p.pid) });
+          }
+          processEvidence.snapshotAt ??= Date.now();
+        };
+        const loadedBefore = (await probeLines(s.probeFile)).find(l => l.kind === "loaded");
+        if (loadedBefore) o.relied.push(loadedBefore);
+        const probePid = loadedBefore?.pid;
+        const { pid: serverPid } = await host.client.server.info();
+        Object.assign(o.observed, { probePid, serverPid, killedPid: null, treeKill: false, childClosed: false });
+        const root = await host.newRoot("C16 root");
+        const token = "C16_HELD";
+        const gates = new Gates(host, root, [token]);
+        // Same context summary as C12, plus a full (unclipped) equality check across the restart below.
+        const contextShape = (context: Obj[]): Obj => ({ messageCount: context.length, roles: context.map(m => str(m.role) ?? str(m.type)), containsChildOk: json(context).includes("CHILD_OK"), last: clip(context.at(-1), 600) });
+        try {
+          const { childID } = await host.dispatch(root, childInput(token, true));
+          o.observed.childID = childID;
+          const arrival = await waitFor("C16's held child request", () => gates.arrivals.find(a => a.token === token && a.session === childID), 30_000);
+          const request = front(host).requests[arrival.index]!;
+          const dispatched = await host.callMany(root, (["direct", "npm"] as const).map(shape => ({
+            ...childInput(`C16_${shape.toUpperCase()}`, true),
+            prompt: `READ_ONLY_PROBE=${JSON.stringify({ tool: "cpx_probe_spawn_hold", input: { shape, token: `C16_${shape.toUpperCase()}` } })}`,
+          })));
+          for (const child of dispatched) {
+            if (!child.childID) throw new Error("C16 spawn-hold dispatch has no child sessionID");
+            toolRuns.push({ token: child.before.input?.description, sessionID: child.childID, ackStatus: obj(child.after.result?.output).status });
+          }
+          const r2 = await host.newRoot("C16 R2 host shell");
+          await host.prompt(r2, "C16 R2 warmup (advertise host shell schema)");
+          const shellDef = arr(obj(parentRequests(host, r2)[0]?.body).tools).map(obj).find(t => t.name === "shell");
+          // The host shell is pwsh on Windows: a quoted executable needs the call operator, or the line is a ParserError and nothing runs.
+    const command = `${process.platform === "win32" ? "& " : ""}"${executables.node}" "${C16_HOLD}" leaf C16_SHELL "${dir}"`;
+          const shellInput = toolInput("shell", Object.keys(obj(obj(shellDef?.input_schema).properties)), host.project, command);
+          const shellRun: Obj = { sessionID: r2, input: shellInput, command };
+          o.observed.shellRun = shellRun;
+          // Do not wait for the executing shell to finish; catch transport rejection when its server dies.
+          void host.client.session.prompt({ sessionID: r2, text: `READ_ONLY_PROBE=${JSON.stringify({ tool: "shell", input: shellInput })}` }).catch(error => { shellRun.promptError = String(error); });
+          let beatsAt: number | undefined;
+          let beatsBefore: (number | null)[] = [];
+          const ready = await tryWait("C16's three pid files, two spawned lines and advancing heartbeats", async () => {
+            const lines = await probeLines(s.probeFile);
+            const leaves = await Promise.all(C16_TOKENS.map(t => c16Leaf(dir, t)));
+            const beats = await Promise.all(C16_TOKENS.map(t => c16Beat(dir, t)));
+            const spawned = lines.filter(l => l.kind === "spawn-hold-spawned" && C16_TOKENS.includes(l.token as typeof C16_TOKENS[number]));
+            if (!leaves.every((leaf, i) => leaf?.token === C16_TOKENS[i] && Number.isSafeInteger(leaf?.pid) && Number(leaf?.pid) > 0) || spawned.length !== 2 || beats.some(b => b === null)) return undefined;
+            if (beatsAt === undefined) { beatsAt = Date.now(); beatsBefore = beats; }
+            if (Date.now() - beatsAt < 1000 || !beats.every((beat, i) => beat !== null && beat > Number(beatsBefore[i]))) return undefined;
+            return { leaves, beatsBefore, beatsAfter: beats, fromAt: beatsAt, toAt: Date.now(), spawned };
+          }, 30_000);
+          const preLines = await probeLines(s.probeFile);
+          for (const run of toolRuns) {
+            const spawned = preLines.find(l => l.kind === "spawn-hold-spawned" && l.token === run.token && l.sessionID === run.sessionID);
+            Object.assign(run, { callID: spawned?.callID, directPid: spawned?.directPid, selfView: spawned?.selfView,
+              activeBefore: await isActive(host, String(run.sessionID)), before: c16StoredTool(await host.client.session.context({ sessionID: String(run.sessionID) }), "cpx_probe_spawn_hold", str(spawned?.callID)) });
+          }
+          const shellBefore = preLines.find(l => l.kind === "execute.before" && l.tool === "shell" && l.sessionID === r2);
+          Object.assign(shellRun, { callID: shellBefore?.callID, activeBefore: await isActive(host, r2), before: c16StoredTool(await host.client.session.context({ sessionID: r2 }), "shell", str(shellBefore?.callID)) });
+          o.observed.holdPrecondition = { ready: ready !== undefined, evidence: ready ?? null, shellAdvertised: shellDef !== undefined };
+          o.relied.push(...preLines.filter(l => l.kind === "spawn-hold-self-view" || l.kind === "spawn-hold-spawned" || l === shellBefore));
+          await snapshotProcesses();
+          const before = await host.client.session.context({ sessionID: childID });
+          const endBefore = terminalOf(await probeLines(s.probeFile), childID);
+          o.observed.before = {
+            held: request.served === undefined && request.connectionClosed === undefined, requestIndex: request.index, heldAt: arrival.at,
+            active: await isActive(host, childID), endEvent: endBefore ? lineBrief(endBefore) : null, contextShape: contextShape(before),
+          };
+          const restartStartedAt = Date.now();
+          o.observed.killedPid = serverPid;
+          // Explicit SDK pid, not a wrapper's pid; no process-tree kill occurs on this restart path.
+          let relaunchStartedAt: number | undefined;
+          await host.restart({ tree: false, serverPid, beforeRelaunch: async () => {
+            const t0 = Date.now();
+            const beat0 = await Promise.all(C16_TOKENS.map(t => c16Beat(dir, t)));
+            const laterBeats = delay(2000).then(async () => ({ at: Date.now(), values: await Promise.all(C16_TOKENS.map(t => c16Beat(dir, t))) }));
+            const classified: Obj[] = [];
+            const errors: string[] = [];
+            // A shared 5 s classification window, not 5 s per process; sample beats independently at t0 + 2 s.
+            do {
+              try { classified.splice(0, classified.length, ...await c16Classify(processes, Math.max(1, Math.min(3000, t0 + 5000 - Date.now())))); }
+              catch (error) { errors.push(String(error)); }
+              if (classified.length === processes.length && classified.every(p => typeof p.alive === "boolean" && typeof p.sameProcess === "boolean")) break;
+              await delay(Math.min(200, Math.max(0, t0 + 5000 - Date.now())));
+            } while (Date.now() - t0 < 5000);
+            const { at: beatsAfterAt, values: beat1 } = await laterBeats;
+            processEvidence.beforeRelaunch = processes.map(p => {
+              const i = C16_TOKENS.findIndex(t => t === p.token);
+              return { ...classified.find(row => row.pid === p.pid), pid: p.pid, roles: p.roles, token: p.token,
+                beatBefore: beat0[i] ?? null, beatAfter: beat1[i] ?? null,
+                beatAdvancedAfterKill: i >= 0 && beat0[i] !== null && beat1[i] !== null ? Number(beat1[i]) > Number(beat0[i]) : null };
+            });
+            Object.assign(processEvidence, { fromAt: t0, beatsAfterAt, toAt: Date.now(), classificationErrors: errors });
+            // Inspect the FRONT's own premature-close marker with the server DEAD and the gate STILL HELD.
+            // Neither relaunch, release nor teardown may cause this evidence.
+            const closed = await tryWait("C16's held provider connection to close after the pid-only kill", () => request.connectionClosed, B_ABSENCE_WAIT_MS);
+            o.observed.childClosed = closed !== undefined;
+            o.observed.connectionClosed = closed ?? null;
+            relaunchStartedAt = Date.now();
+          } });
+          const restartEndedAt = Date.now();
+          const loadedAfter = await tryWait("C16's probe to load in a new process", async () => (await probeLines(s.probeFile)).find(l => l.kind === "loaded" && l.t >= restartStartedAt && l.pid !== undefined && l.pid !== probePid), 30_000);
+          if (loadedAfter) o.relied.push(loadedAfter);
+          o.observed.restartProcess = { pidAfter: loadedAfter?.pid, newProcess: loadedAfter !== undefined && loadedAfter.pid !== probePid };
+          const readRetained = async (run: Obj, tool: string): Promise<Obj> => {
+            const sessionID = String(run.sessionID);
+            const history = await host.client.session.context({ sessionID });
+            const lines = await probeLines(s.probeFile);
+            const terminal = terminalOf(lines, sessionID);
+            return { at: Date.now(), tool: c16StoredTool(history, tool, str(run.callID)), historyToolInFlight: historyToolInFlight(history),
+              active: await isActive(host, sessionID), terminal: terminal ? lineBrief(terminal) : null, history };
+          };
+          await Promise.all([...toolRuns.map(async run => { run.immediate = await readRetained(run, "cpx_probe_spawn_hold"); }),
+            (async () => { shellRun.immediate = await readRetained(shellRun, "shell"); })()]);
+          const firstReadsEndedAt = Date.now();
+          o.observed.providerHeldControl = { immediate: historyToolInFlight(await host.client.session.context({ sessionID: childID })) };
+          const releasedAt = Date.now();
+          gates.release(token);
+          o.observed.timing = { restartStartedAt, relaunchStartedAt, restartEndedAt, releasedAt };
+          const end = await tryWait("C16's child terminal event after relaunch and release", async () => terminalOf(await probeLines(s.probeFile), childID), B_ABSENCE_WAIT_MS);
+          if (end) o.relied.push(end);
+          const after = await host.client.session.context({ sessionID: childID });
+          o.observed.afterRelaunch = {
+            endEvent: end ? lineBrief(end) : null, active: await isActive(host, childID), contextShape: contextShape(after), contextUnchanged: json(before) === json(after),
+          };
+          await delay(Math.max(0, firstReadsEndedAt + B_ABSENCE_WAIT_MS - Date.now()));
+          await Promise.all([...toolRuns.map(async run => { run.delayed = await readRetained(run, "cpx_probe_spawn_hold"); }),
+            (async () => { shellRun.delayed = await readRetained(shellRun, "shell"); })()]);
+          obj(o.observed.providerHeldControl).delayed = historyToolInFlight(await host.client.session.context({ sessionID: childID }));
+        } finally {
+          gates.releaseAll();
+          // Also discover late-spawned leaves on a setup failure; recheck OS creation identity immediately before every kill.
+          try { await snapshotProcesses(); } catch (error) { processEvidence.cleanupSnapshotError = String(error); }
+          const cleanup = processEvidence.cleanup as Obj[];
+          for (const p of processes) {
+            try {
+              const identity = (await c16Classify([p]))[0]!;
+              if (identity.sameProcess !== true) { cleanup.push({ ...identity, skipped: "dead, reused pid or unknown identity" }); continue; }
+              if (process.platform === "win32") {
+                const result = await c16Exec("taskkill", ["/PID", String(p.pid), "/T", "/F"], { cwd: ROOT, encoding: "utf8", windowsHide: true, timeout: 3000 });
+                cleanup.push({ pid: p.pid, sameProcess: true, method: "taskkill /PID /T /F", ...result });
+              } else {
+                const errors: string[] = [];
+                if (ownPgid !== null && p.pgid && p.pgid > 1 && p.pgid !== ownPgid) { try { process.kill(-p.pgid, "SIGKILL"); } catch (error) { if (obj(error).code !== "ESRCH") errors.push(String(error)); } }
+                try { process.kill(p.pid, "SIGKILL"); } catch (error) { if (obj(error).code !== "ESRCH") errors.push(String(error)); }
+                cleanup.push({ pid: p.pid, sameProcess: true, method: "kill group then pid (never the test runner's group)", errors });
+              }
+            } catch (error) { cleanup.push({ pid: p.pid, error: String(error) }); }
+          }
+          try { await rm(dir, { recursive: true, force: true, maxRetries: 3 }); processEvidence.directoryRemoved = true; }
+          catch (error) { processEvidence.directoryRemoved = false; processEvidence.removeError = String(error); }
+        }
+      }, { ...BASE, hostConfig: { agents: { [CHILD]: agentWithoutModel({ permissions: [{ action: "cpx_probe_spawn_hold", resource: "*", effect: "allow" }] }) } },
+        prepare: async ({ project }) => { await mkdir(path.join(project, ".cpx-c16"), { recursive: true }); } },
+      project => ({ CPX_PROBE_TOOL_URL: TOOL_MODULE_URL, CPX_PROBE_SPAWN_DIR: path.join(project, ".cpx-c16"), CPX_PROBE_NODE: executables.node, CPX_PROBE_NPM_CLI: executables.npm, CPX_PROBE_HOLD: C16_HOLD }));
+    });
+  }, 300_000);
+});
+
 // ------------------------------------------------------------------ decided branches ----
 const at = (value: unknown, ...keys: (string | number)[]): unknown => keys.reduce<unknown>((acc, key) => (acc !== null && typeof acc === "object" ? Reflect.get(acc, String(key)) : undefined), value);
 const list = (value: unknown): unknown[] => (Array.isArray(value) ? value : []);
@@ -2128,6 +2401,31 @@ const DECISIONS: Record<string, (o: Observation) => void> = {
     check(o, "C15/D3", at(v, "hookSawEnvelope") === true && Number(at(v, "completionReplacements")) >= 1, "the compaction hook must see the real completion envelope in event.messages and be able to replace it with the placeholder (D3 held results in compaction)");
     check(o, "C15/D3", at(v, "requestKind") === "compaction" && at(v, "requestHasPlaceholder") === true && at(v, "requestHasEnvelope") === false, "the compaction request must carry the placeholder and NOT the raw completion envelope when a real background completion is in the compacted history");
     check(o, "C15/O5", at(v, "statuses") !== undefined && list(at(v, "statuses")).length >= 1 && at(v, "succeeded") === true, "the compaction of a session holding a real completion must complete: every compaction record has status `completed` and no error");
+  },
+  C16: o => {
+    const ob = o.observed;
+    const serverPid = at(ob, "serverPid");
+    check(o, "C16/D16", typeof serverPid === "number" && Number.isSafeInteger(serverPid) && serverPid > 0 && at(ob, "probePid") === serverPid, "the probe plugin's process.pid must equal client.server.info().pid; launcher liveness is server-process liveness");
+    check(o, "C16/D16", at(ob, "treeKill") === false && at(ob, "killedPid") === serverPid, "the restart must kill only the SDK-reported server pid, never its process tree");
+    check(o, "C16/D16", at(ob, "before", "held") === true && at(ob, "before", "active") === true && at(ob, "before", "endEvent") === null, "scenario precondition: the child must be active at a still-open, held provider request with no terminal event before the kill");
+    check(o, "C16/D16", at(ob, "childClosed") === true && at(ob, "connectionClosed", "kind") === "connection-closed" && Number(at(ob, "connectionClosed", "at")) >= Number(at(ob, "timing", "restartStartedAt")) && Number(at(ob, "connectionClosed", "at")) <= Number(at(ob, "timing", "relaunchStartedAt")), "killing only the server pid must close the held child's provider connection BEFORE relaunch, gate release or teardown");
+    check(o, "C16/D16", at(ob, "restartProcess", "newProcess") === true, "the probe must load in a new process before checking the retained child's state");
+    check(o, "C16/D16", at(ob, "afterRelaunch", "endEvent") === null && at(ob, "afterRelaunch", "active") === false, "after a pid-only kill and relaunch the held child must have no terminal event and must not be in session.active()");
+    check(o, "C16/D16", at(ob, "afterRelaunch", "contextUnchanged") === true && same(at(ob, "before", "contextShape"), at(ob, "afterRelaunch", "contextShape")) && same(at(ob, "afterRelaunch", "contextShape", "roles"), ["user"]) && at(ob, "afterRelaunch", "contextShape", "containsChildOk") === false, "the retained child's stored context must be unchanged and contain only its user message, as in C12 (no resumed response or idle/end message)");
+    const tools = list(at(ob, "toolRuns"));
+    const bothTools = tools.length === 2 && sortedKeys(tools.map(run => at(run, "token"))) === sortedKeys(["C16_DIRECT", "C16_NPM"]);
+    const open = (status: unknown): boolean => status === "running" || status === "streaming" || status === "pending";
+    const bothReads = (run: unknown, predicate: (read: unknown) => boolean): boolean => ["immediate", "delayed"].every(key => predicate(at(run, key)));
+    // Additional checks 9-15: R2-1's stored-open-tool premise; process survival itself is deliberately NOT asserted.
+    check(o, "C16/D16", bothTools && at(ob, "holdPrecondition", "ready") === true && at(ob, "holdPrecondition", "shellAdvertised") === true && tools.every(run => at(run, "ackStatus") === "running" && at(run, "activeBefore") === true && open(at(run, "before", "status"))) && at(ob, "shellRun", "activeBefore") === true && open(at(ob, "shellRun", "before", "status")), "9: precondition: both background spawn-hold tools and the host shell must be running, with all three pid files, both spawned records and every heartbeat advancing over >=1 s BEFORE the kill");
+    check(o, "C16/D16", bothTools && tools.every(run => bothReads(run, read => at(read, "terminal") === null && at(read, "active") === false)), "10: after relaunch both executing-tool children must have no terminal event and be absent from session.active() on both reads");
+    check(o, "C16/D16", bothTools && tools.every(run => typeof at(run, "callID") === "string" && bothReads(run, read => at(read, "tool", "visible") === true && open(at(read, "tool", "status")))), "11: each child's exact cpx_probe_spawn_hold call must remain running/streaming/pending on BOTH stored-context reads (never completed, error or missing)");
+    check(o, "C16/D16", bothTools && tools.every(run => bothReads(run, read => at(read, "historyToolInFlight") === true)) && at(ob, "providerHeldControl", "immediate") === false && at(ob, "providerHeldControl", "delayed") === false && same(at(ob, "afterRelaunch", "contextShape", "roles"), ["user"]), "12: the PRODUCT historyToolInFlight must be true for both tool children on both reads, and false for the provider-held user-only child (positive control)");
+    check(o, "C16/D16", bothTools && tools.every(run => at(run, "selfView", "visible") === true && open(at(run, "selfView", "status"))), "13: both tools must see their own OPEN stored call via ctx.session.context before spawning anything; an invisible/missing self-view disproves the premise");
+    check(o, "C16/D16", typeof at(ob, "shellRun", "callID") === "string" && bothReads(at(ob, "shellRun"), read => at(read, "tool", "visible") === true && open(at(read, "tool", "status"))), "14: R2's exact HOST shell tool call must still be open on both post-relaunch context reads");
+    const processes = list(at(ob, "O16", "processes"));
+    const classified = list(at(ob, "O16", "beforeRelaunch"));
+    check(o, "C16/O16", processes.length > 0 && processes.length === classified.length && list(at(ob, "O16", "requiredPids")).every(pid => processes.some(p => at(p, "pid") === pid)) && processes.every(p => classified.some(row => at(row, "pid") === at(p, "pid") && typeof at(row, "alive") === "boolean" && typeof at(row, "sameProcess") === "boolean" && Number(at(row, "observedAt")) <= Number(at(ob, "timing", "relaunchStartedAt")))), "15: O16 observation integrity: every directPid and leaf must be snapshotted, and every recorded process classified alive/dead with known creation-identity equality BEFORE relaunch; process fate and beat survival are observations, NOT host assertions");
   },
   O6b: o => {
     const ob = o.observed;
