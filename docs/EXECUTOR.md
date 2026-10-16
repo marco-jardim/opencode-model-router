@@ -548,6 +548,55 @@ G11) are disclosed gaps in the Phase 6.2 PR alongside G13 and G8's bound; G5 sta
 6.2. The soak is also executor dogfood evidence toward G13, which remains unmet until the owner decides. The owner
 may change the soak criteria; absence of evidence is never a pass.
 
+## Measured on its own implementation
+
+These **G13 time windows** come from the [dogfood record](qa/critical-path-execution/dogfood.md), including its
+post-freeze DF-2 summary. They distinguish using the router for delegation from running a plan through the executor.
+Commit-window wall-clock and scripted fixture makespan are not interchangeable.
+
+- **Before DF-1 — `cpx/df0` = `b716ee9`, 2026-10-10 18:55 → 2026-10-12.** Phases 0.P–2.4 used orchestrated
+  dispatches, not the plan executor. The record gives first/last phase commits (local UTC−3), including an owner
+  shutdown from 2026-10-11 ≈11:30 to 2026-10-12 ≈08:00. There were **0 background dispatches**; all ran in the
+  foreground, so the forced-foreground share is not meaningful. The shared outcome store reported **452 routed
+  dispatches / 114 orchestrator resumes**, an **upper bound**, not this plan's isolated count. Cache/duration telemetry
+  was unavailable and idle-with-ready was not reconstructible. No deviations recorded; this is the pre-feature
+  baseline, not executor completion evidence.
+- **After DF-1 — `cpx/df1` = `226d967`, loaded 2026-10-12 12:03:38 UTC−3.** Router self-checks ran
+  **12:04–12:25**, with follow-ups to **12:40**; pdf1-1 fixes were orchestrated, not an executor plan. Background,
+  held-result sequencing and cleanup passed; leases were partial and router cache telemetry was not measurable.
+  The shared store counted **11 dispatches, 7 belonging to these probes**. Host-DB cache evidence only: first
+  **39 steps**, p50 **0.964**, weighted **0.853**, not the missing router turn metric. Deviations included denied
+  graders, false PASS tags, stale resumed results, missing turn rows, false restart settlements, a cross-plugin cache
+  breakpoint fault and isolation probes. **DF-1 remained open**, with foreground resumes and foreground-or-checked
+  producers as binding workarounds; their aggregate forced-foreground share was not recorded.
+- **After DF-1.1 — `cpx/df1.1` = `9fa7607`, loaded 2026-10-12 16:06:54 UTC−3.** Lease re-probes passed,
+  including the delivered contamination annotation; telemetry appeared, but cache p50 was **7.1%** (p10 **4.9%**,
+  **13 turns**) and failed the probe's **0.5** threshold. Duplicate/restarting rows over-counted turns; the live
+  cross-plugin cache fix was still absent and background graders were still denied. The foreground workaround stayed;
+  no aggregate forced-foreground share or executor makespan was recorded. **STOP at 2026-10-12 19:17Z**:
+  another server drained/rebound this plan's sessions, affecting Phase 3.1 children and the other implementation.
+  This window cannot establish continuous DF-build use or clean isolation. The committed record has no separate
+  measured DF-1.2/DF-1.3 windows; no measurements are inferred for them.
+- **DF-2 — executor attempt, then owner fallback.** On **2026-10-13** (UTC−3), approval at
+  **16:57:46.8596402** described **9 tasks / 17 edges / work 41m / CP 34m / width 2**; first launches were at
+  **17:04:00.1603405**. Work-loss resets and budget thrashing forced a pause at **17:26:29.9108549**;
+  stale-base, read-cap and orchestrator-shell-criteria faults also required pdf2-1. Restart recovery was observed
+  **paused, 3/9**, not completed. At **21:29:48.2039134** the owner chose normal-phase execution in `cpx/p61`;
+  the executor plan was aborted/purged and salvaged work was applied outside its integration chain. No completed
+  repository-plan makespan, aggregate forced-foreground share or maximum successful retained-context age is recorded.
+  The later **scripted executor fixtures**, not the repository plan, passed runs **24–26** on code `2b2cb58`:
+  suite wall-clock **~1839 / ~1738 / ~1854 s**, respectively, each **32 passed / 9 documented `unmeasured` skips**.
+  Run 26 was 6.1.4's clean detached checkout at `9b8593f`. Across those runs, **g8Ratio 1.35–1.54** missed the
+  **≤1.0** target (measured/disclosed under A-6.1-2); max idle reached **9.4 s** against the unchanged **10 s** ceiling.
+  Per-fixture values are in [ADR 0007](adr/0007-critical-path-execution.md#measured-results--2026-10-16).
+
+**G13 is UNMET — owner decision pending.** Phase 6.1 did not run through compile → launch → verify → integrate →
+phase suite → QA loop → fast-forward into `cpx/main` end to end; the owner selected the fallback after DF-2 faults.
+The recorded isolation/build-use deviations and missing aggregates are not silently treated as passes. Later fixes
+and green scripted fixtures do not retroactively complete that dogfood run. The real-use soak remains pending under
+A-6.1-3, narrowed by A-6.1-6 to observable subcases; structurally unobservable G6/G9 subcases and G3/G11 are declared
+gaps, not passes. G13 and G8's missed bound must be disclosed in Phase 6.2.
+
 ## Owner checklist for the next real plan
 
 - [ ] Start in the intended git repository on OpenCode v2 with roles selected at start, enforced leases and an available

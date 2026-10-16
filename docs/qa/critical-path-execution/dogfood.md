@@ -390,3 +390,101 @@ Build `cpx/df1.1` = `9fa7607` (`D:\git\omr-cpx-dogfood-df1.1`), loaded since 202
   `D:\git\opencode-model-router`). Critical per handover §6 ("any effect on the other implementation"): dispatching is
   stopped until the owner decides. Uncommitted work in `D:\git\omr-cpx-p31` (`schedule.ts`, `capacity.ts`, `expand.ts`
   and tests, partial) is kept as is.
+
+## Window DF-2
+
+### Provenance and executor attempt
+
+Post-freeze record copied in summary from `D:\git\omr-cpx-p61\.cpx-logs\handover-df2.copy.md`
+(read-only handover copy). **That copy ends at smoke run 7, 2026-10-14T00:52:13.3543560-03:00; it contains no
+6.1.4 results.** The final metrics below are copied from the committed [Phase 6.1 report](phase-6.1.md),
+"Real-host smoke results", "Owner amendment A-6.1-4" and "Verdict", not attributed to the handover copy.
+
+- **2026-10-13T16:57:46.8596402-03:00:** the owner approved `critical-path-execution-plan-6-1-db-6-1`
+  ("aprovado"): **9 tasks, 17 edges, work 41m, CP 34m, width 2**. `cpx/main` was clean at `a682009` before approve.
+- **2026-10-13T17:04:00.1603405-03:00:** first launches, `6.1.1` and `6.1.2`, after the approval turn.
+  At **2026-10-13T17:26:29.9108549-03:00** the orchestrator paused the plan: repeated park/relaunch resets lost
+  work, and `6.1.2` could not finish within one dispatch budget. Q-7 remained unanswered rather than restarting
+  the thrash loop. The owner chose fix phase `pdf2-1` at **2026-10-13T17:29:58.7123138-03:00**.
+- An owner restart at **2026-10-13T18:42:57.0646063-03:00**, before pdf2-1 QA finished, still loaded `cpx/df2`;
+  the plan recovered **paused, 3/9**, with launch gated on the first router call. The QA dispatch was lost and
+  re-dispatched. At the later requested restart stop, **2026-10-13T19:19:28.1597987-03:00**, the plan was still
+  paused 3/9 on `cpx/df2`. Recovery of a paused plan is not end-to-end completion evidence.
+
+### Deviations from the handover
+
+| ID | Observation and disposition recorded in the copy |
+|---|---|
+| DF-2-3 (note) | Plan children cannot run their own smoke-config tests: `test-files` excludes `test/smoke`. The orchestrator runs `smoke:keyless` and the cpx scripted-provider tests on the integration head before 6.1.4 and QA. |
+| DF-2-4 (blocking work loss) | Answering a park relaunches into a reset slot without saving uncommitted work. 6.1.1 attempt 3's finished work was lost after attempt 4 was `lost` 1.3 s after launch with no child; 6.1.2 also lost its prior 22 files. A medium child could not complete 6.1.2 in one budget, so relaunching could not converge. Required fix: resume `NEED MORE: budget` in the same child/session/slot, bounded; save interrupted/parked work as WIP before reset/release and restore it on the next attempt. |
+| DF-2-5 | Executor launches carry no CAP directive, leaving children at the role's baseline read cap; reading before editing can stall. Fix phase covers the launch cap/budget contract. |
+| DF-2-6 (major, landing) | Ledger `repo.baseCommit` and integration head were `62af9e6`, but `cpx/main` was `a682009` at compile. The integration branch lacked the handover commit, so fast-forward landing would be refused. The handover suspected a cached start-time base; pdf2-1 requires a fresh base-branch lookup at compile. |
+| DF-2-7 (minor) | Children repeatedly escalate for acceptance checks marked "(orchestrator shell)". Those checks must stay with the orchestrator, outside the child's DoD. |
+| DF-2-8 (orchestrator) | Q-1/Q-4 quoted the plan; Q-2/Q-3/Q-5/Q-6 also carried invented orchestrator instructions (read/edit alternation, continuation, file checks and a restated feature spec), outside the rule allowing only the human's answer or plan text. Subsequent answers must follow the rule. |
+| DF-2-9 | The attempted router-wide whole-line CAP parser change was reverted: inline `CAP:N` is a documented behaviour. The executor instead puts its CAP line first (first-wins) and neutralises task/shared-context directives. |
+| DF-2-11 | At 2026-10-13T21:10:23.6228293-03:00 the owner selected the **openai** preset: fast `gpt-6-luna-fast`, medium `gpt-6.1-sol-fast`, heavy `gpt-6-astra-fast`. Registration changes after restart; earlier QA ran on `claude-opus-5-5`. The copy records the model change for subsequent DF2.QA/6.1.QA, not proof of a `df2.1` switch. |
+
+pdf2-1 QA in the copy was **not closed**:
+
+- Round 1, `ses_ec8c81694ffeftu7AfIEtdyxOI` at `2ff683d`: not ready (resume header, unsafe save/release paths,
+  criteria filtering and other findings). Fixes committed as `8e632fb`.
+- Round 2, `ses_ec8706a26ffe7lfvP6lId69UyC` at `8e632fb`: not ready (exhausted guard round on resume, stale
+  lease base/WIP overwrite and other findings). Fixes committed as `ecaf1b0`.
+- Bounded round 3, `ses_ec83a3632ffe6De2MreaWZLko8` at `ecaf1b0`: **2 critical, 4 major** remained, including
+  non-durable unsaved-slot holds, purge racing abort save, cross-instance resume guards, overlapping resumes,
+  role-floor budget selection and treating a slot without `.git` as clean. A planned `cpx/df2.1` switch was not completed.
+  Later fix/merge evidence is in [pdf2-1](pdf2-1.md), not a successful re-run of this dogfood attempt.
+
+### Fallback and subsequent scripted runs
+
+**2026-10-13T21:29:48.2039134-03:00:** the owner chose the **DF-2 fallback**: Phase 6.1 runs as a normal,
+orchestrator-managed phase in `D:\git\omr-cpx-p61` (`cpx/p61`, base `a682009`); **G13 is not met** and must be
+disclosed with the DF-2 faults. The paused plan was **aborted and purged**, lifting the freeze. pdf2-1 continued
+separately, to merge after QA, **not to be switched into dogfood for this plan**.
+
+Read-only salvage preserved 6.1.1's **26746-byte diff** and 6.1.2's **37 files**, without editing slots. Scratch
+commits/tags `cpx/df2-salvage-6.1.1` = `b10be70` and `cpx/df2-salvage-6.1.2` = `1b6253a` have parent `a682009`
+and an `Omr-Wip` trailer. Salvage applied cleanly in p61 (**39 files**); 6.1.1 was committed as `09d7b40` after
+orchestrator checks. This was salvage, not executor integration/landing.
+
+The handover's subsequent smoke history is failure evidence, not a green gate: runs 1–7 were red. It records driver
+problems and product faults: no-change completion failed to reconcile phase gates; phase/base checks ran in the
+integration tree instead of the prepared CI slot; inferred writers launched as explorers; and the G6 holder had no
+until-integrated lease. At run 7 the latter two were still being classified. Product fixes were required to be ported
+to pdf2-1. Another recorded deviation: the executor-fix implementer ran the full test script twice against the
+never-full-suite rule. The later committed Phase 6.1 report supersedes these in-progress snapshots.
+
+### Final scripted measurements (Phase 6.1 report, not the handover copy)
+
+These are **scripted executor fixture runs under the fallback**, not Phase 6.1 executed end to end by the executor.
+Runs **24–26** each passed **32 tests**, with **9 documented `unmeasured` skips**, on code **`2b2cb58`**:
+
+| Run | Checkout / suite wall-clock | Fixture | Makespan | g8Ratio | Max idle-with-ready |
+|---|---|---|---|---|---|
+| 24 | Working worktree, `2b2cb58`; ~1839 s | node-npm | 134.2 s | 1.47 | 6.6 s |
+| 24 | Same run | node-pnpm | 141.3 s | 1.49 | 7.6 s |
+| 24 | Same run | py-pip | 130.4 s | 1.52 | 6.3 s |
+| 25 | Working worktree, HEAD `9b8593f` (docs above `2b2cb58`); ~1738 s | node-npm | 118.5 s | 1.35 | 6.5 s |
+| 25 | Same run | node-pnpm | 128.6 s | 1.40 | 7.0 s |
+| 25 | Same run | py-pip | 128.5 s | 1.50 | 8.8 s |
+| 26 (6.1.4) | Detached `D:\git\omr-cpx-e2e`, HEAD `9b8593f`, after `npm ci`; ~1854 s | node-npm | 125.9 s | 1.41 | 6.3 s |
+| 26 (6.1.4) | Same run | node-pnpm | 146.1 s | 1.53 | 8.0 s |
+| 26 (6.1.4) | Same run | py-pip | 132.4 s | 1.54 | 9.4 s |
+
+`g8Ratio = makespan / (1.3 × max(CP_eff, W_auth/p, ΣI_service))`; target **≤ 1.0, not met** in these runs.
+Under **A-6.1-2** this is measured/disclosed, not a Phase 6.1 acceptance gate. The **10 s** idle ceiling is unchanged;
+run 26's py-pip maximum **9.4 s** is a timing risk for the soak/6.2. The detached checkout was clean after the run
+and removed. `6e643fd` and `532f209` landed after run 26 started; it did **not** run at those later heads.
+
+### Metrics limits and verdict
+
+The handover records approval/launch/pause/fallback timestamps and authored estimates, **not a completed repository
+plan makespan**. It supplies no aggregate dispatch count, forced-foreground share, cache-read share, lease-refusal
+total, idle total or maximum successful retained-context age for this DF-2 attempt. None is inferred from fixture
+timings. The earlier DF-1/DF-1.1 workarounds also have no recorded aggregate forced-foreground share.
+
+**G13: UNMET — owner decision pending.** Phase 6.1 did not complete the required executor chain
+compile → launch → verify → integrate → phase suite → QA loop → fast-forward into `cpx/main`; it used the fallback.
+The later green scripted runs do not repair that gap. Phase 6.1 was accepted on 2026-10-15 with G13 unmet,
+G8's bound not met and the real-use soak pending (**A-6.1-3**, narrowed by **A-6.1-6**). Only observable soak
+subcases are in scope; the not-observable G6/G9 subcases and G3/G11 remain declared gaps, never passes.
