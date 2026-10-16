@@ -251,6 +251,14 @@ describe("GitOps context and identity", () => {
     expect(git.calls[0]?.args).toContain("core.eol=lf");
   });
 
+  it("omits whitespace-only line-ending settings from the git context", async () => {
+    const user = identityRunner({ "user.name": "A", "user.email": "a@b.c", "core.autocrlf": " \t ", "core.eol": "  " });
+    await expect(readCommitIdentity(user, TOP)).resolves.toMatchObject({ conversion: { autocrlf: null, eol: null } });
+    const git = fakeRunner();
+    await makeOps(git, user).worktreeList();
+    expect(git.calls[0]?.args.some(arg => /^core\.(autocrlf|eol)=/.test(arg))).toBe(false);
+  });
+
   it("throws E_IDENTITY with an actionable message when user.name or user.email is absent", async () => {
     for (const missing of ["user.name", "user.email"]) {
       const user = identityRunner({ "user.name": "A", "user.email": "a@b.c", [missing]: null });
@@ -315,6 +323,61 @@ describe("GitOps context and identity", () => {
     await expect(makeOps(fakeRunner(), identityRunner(), fs).worktreeList()).rejects.toMatchObject({ code: "E_GIT" });
   });
 
+  it("propagates directory creation failures without invoking git", async () => {
+    const fs = memoryFs();
+    const failure = Object.assign(new Error("executor home is read-only"), { code: "EACCES" });
+    vi.spyOn(fs, "mkdir").mockRejectedValue(failure);
+    const git = fakeRunner();
+    await expect(makeOps(git, identityRunner(), fs).worktreeList()).rejects.toBe(failure);
+    expect(git.calls).toHaveLength(0);
+  });
+
+  it("tolerates a concurrent creator of the executor git directories", async () => {
+    const fs = memoryFs();
+    const mkdir = fs.mkdir.bind(fs);
+    fs.mkdir = async path => {
+      await mkdir(path);
+      throw Object.assign(new Error("created concurrently"), { code: "EEXIST" });
+    };
+    const git = fakeRunner();
+    await expect(makeOps(git, identityRunner(), fs).worktreeList()).resolves.toEqual([]);
+    expect(fs.entries.get(resolve(join(HOME, "git", "slot-excludes")))).toBe(SLOT_EXCLUDES_CONTENT);
+    expect(subs(git)).toEqual([["worktree", "list", "--porcelain"]]);
+  });
+
+  it("refuses an excludes directory rather than overwriting it", async () => {
+    const excludes = join(HOME, "git", "slot-excludes");
+    const fs = memoryFs({ [excludes]: "dir" });
+    const git = fakeRunner();
+    await expect(makeOps(git, identityRunner(), fs).worktreeList()).rejects.toMatchObject({
+      code: "E_GIT", message: "slot excludes path is not a file", detail: { path: excludes },
+    });
+    expect(fs.entries.get(resolve(excludes))).toBe("dir");
+    expect(git.calls).toHaveLength(0);
+  });
+
+  it("refuses a hooks directory missing after creation", async () => {
+    const fs = memoryFs();
+    const hooks = join(HOME, "git", "no-hooks");
+    const mkdir = fs.mkdir.bind(fs);
+    fs.mkdir = async path => { if (path !== hooks) await mkdir(path); };
+    const git = fakeRunner();
+    await expect(makeOps(git, identityRunner(), fs).worktreeList()).rejects.toMatchObject({
+      code: "E_GIT", message: "hooks directory is not a real directory", detail: { path: hooks },
+    });
+    expect(git.calls).toHaveLength(0);
+  });
+
+  it("rechecks the hooks directory even after the context has been cached", async () => {
+    const fs = memoryFs();
+    const git = fakeRunner();
+    const ops = makeOps(git, identityRunner(), fs);
+    await ops.worktreeList();
+    fs.entries.delete(resolve(join(HOME, "git", "no-hooks")));
+    await expect(ops.worktreeList()).rejects.toMatchObject({ code: "E_GIT", message: "hooks directory is not a real directory" });
+    expect(git.calls).toHaveLength(1);
+  });
+
   it("every repository call starts with the hardening prefix and the hooks directory", async () => {
     const git = fakeRunner();
     await makeOps(git).worktreeList();
@@ -376,6 +439,32 @@ describe("GitOps version and ref format", () => {
 });
 
 describe("GitOps runner failures", () => {
+  it("stringifies non-Error runner failures and ignores a non-string error code", async () => {
+    const failing: GitRunner = {
+      async run() { throw { code: 7, toString: () => "cannot read https://user:secret@example.test/x" }; },
+    };
+    const error: unknown = await makeOps(failing).worktreeList().catch((e: unknown) => e);
+    expect(error).toMatchObject({ code: "E_GIT", detail: { op: "worktree list", code: null, stderr: "" } });
+    expect(error).toBeInstanceOf(ExecutorError);
+    expect(String(error)).toContain("cannot read");
+    expect(String(error)).not.toContain("secret");
+  });
+
+  it("preserves a runner's structured executor error", async () => {
+    const failure = new ExecutorError("E_GIT", "runner rejected the operation", { diagnostic: "kept" });
+    const failing: GitRunner = { async run() { throw failure; } };
+    await expect(makeOps(failing).worktreeList()).rejects.toBe(failure);
+  });
+
+  it.each(["SIGTERM", null] as const)("reports a missing exit code using signal %s or unknown", async signal => {
+    const git = fakeRunner(() => ({ code: null, signal, stderr: "fatal: interrupted" }));
+    await expect(makeOps(git).worktreeList()).rejects.toMatchObject({
+      code: "E_GIT",
+      message: `git worktree list failed (exit ${signal ?? "unknown"})`,
+      detail: { op: "worktree list", code: null, stderr: "fatal: interrupted" },
+    });
+  });
+
   it("wraps a thrown runner error as E_GIT without leaking URL credentials", async () => {
     const failing: GitRunner = {
       async run() { throw Object.assign(new Error("could not read https://user:secret@example.test/x"), { code: "ETIMEDOUT" }); },

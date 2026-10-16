@@ -1046,6 +1046,159 @@ function expectOrdered(log: CallLog, prefixes: string[]): void {
 
 const ERR_RATE_LIMIT = { type: "provider.rate-limit", status: 429, message: "slow down" };
 
+describe("defensive gate recovery", () => {
+  it("does not invent a QA result when a qa-running gate has no completed QA attempt", async () => {
+    const h = await mk(planOf([task("QA", { kind: "qa", verify: "none", state: "done" })], { gate: "qa-running" }));
+    await h.begin();
+    await h.settled();
+    await h.restart();
+    await h.settled();
+    expect(h.ledger().phases[0]?.gate).toBe("qa-running");
+    expect(h.parts().qa.results).toEqual([]);
+    expect(h.launcher.runs).toEqual([]);
+    expect(h.state("QA")).toBe("done");
+    expect(h.task("QA").attempts).toEqual([]);
+  });
+});
+
+describe("verifier cleanup guards", () => {
+  it("does not turn a commit interrupted by disposal into a counted task failure", async () => {
+    const h = await mk(planOf([task("T1")]));
+    const committing = deferred<void>();
+    const commit = deferred<ProcessResult>();
+    const cut = deferred<void>();
+    const runGit = h.git.run.bind(h.git);
+    vi.spyOn(h.git, "run").mockImplementation(async (args, opts) => {
+      if (args[0] === "commit") {
+        committing.resolve(undefined);
+        return commit.promise;
+      }
+      return runGit(args, opts);
+    });
+    h.deps.verifier.dispose = async () => { cut.resolve(undefined); };
+    await h.begin();
+    const run = await h.running("T1", 1, "ses-cut-commit");
+    run.complete("Implemented it.");
+    await committing.promise;
+    const closing = h.close();
+    await cut.promise;
+    commit.reject(new Error("commit interrupted during disposal"));
+    await closing;
+    const saved = await h.store.read(PLAN_ID);
+    expect(saved.tasks["T1"]).toMatchObject({ state: "completed", attempts: [{ n: 1, outcome: "succeeded", verdict: null }] });
+    expect(h.parts().policy.counted).toEqual([]);
+    expect(h.verifier.calls).toEqual([]);
+    expect((await h.events()).some(event => event.type === "task-transition" && event.trigger === "commit-failed")).toBe(false);
+  });
+
+  it("forgets closed unverified attempts once, tolerates cleanup failure, and keeps live verification intact", async () => {
+    const h = await mk(planOf([
+      task("READ", { phase: null, footprint: { writes: [], reads: [], confidence: "explicit", sources: [] } }),
+      task("WRITE"),
+    ], { edges: [edge("READ", "WRITE")] }));
+    const forget = vi.fn<NonNullable<RuntimeDeps["verifier"]["forget"]>>().mockImplementation(async (_plan, id) => {
+      if (id === "READ") throw new Error("cleanup unavailable");
+    });
+    h.deps.verifier.forget = forget;
+    h.git.dirty = cwd => cwd !== slotPathOf("slot-1");
+    await h.begin();
+    const read = await h.running("READ", 1, "ses-read");
+    expect(forget).not.toHaveBeenCalled();
+    read.complete("Nothing to change.");
+    const write = await h.running("WRITE", 1, "ses-write");
+    expect(h.state("READ")).toBe("done");
+    expect(h.parts().queue.checked).toEqual([]);
+    expect(forget.mock.calls.filter(([, id]) => id === "READ")).toEqual([[PLAN_ID, "READ", 1]]);
+    expect(forget.mock.calls.some(([, id]) => id === "WRITE")).toBe(false);
+    write.complete("Implemented the change.");
+    await untilEnqueued(h, "WRITE");
+    await h.settled();
+    expect(h.task("WRITE").attempts[0]).toMatchObject({ outcome: "succeeded", verdict: "pass" });
+    expect(h.verifier.calls).toEqual(["WRITE#1"]);
+    expect(forget.mock.calls.filter(([, id]) => id === "READ")).toHaveLength(1);
+    await h.close();
+    expect(forget.mock.calls.filter(([, id]) => id === "READ")).toEqual([[PLAN_ID, "READ", 1]]);
+    expect(forget.mock.calls.filter(([, id]) => id === "WRITE")).toEqual([[PLAN_ID, "WRITE", 1]]);
+    expect(h.logs.filter(line => line.includes("verifier forget failed"))).toEqual([expect.stringContaining("cleanup unavailable")]);
+  });
+});
+
+describe("runtime liveness and purge guards", () => {
+  it("observes a foreign lease holder without launching until that holder releases the path", async () => {
+    const rows: ObservationRecord[] = [];
+    const observations = createV2Observations({ write: line => { rows.push(JSON.parse(line)); } });
+    const h = await mk(planOf([task("T1")]), observations);
+    h.registry.plant("src/T1.ts", "foreign-holder", "other-plan:T9");
+    try {
+      await h.begin();
+      await h.settled();
+      expect((await h.runtime.ready(PLAN_ID)).launchable).toEqual([]);
+      expect(h.launcher.runs).toEqual([]);
+      expect(h.task("T1").attempts).toEqual([]);
+      observations.flush();
+      expect(observations.counts()).toMatchObject({ dropped: 0, failed: 0 });
+      expect(rows).toContainEqual(expect.objectContaining({
+        family: "scheduler", action: "lease-eligibility",
+        state: expect.objectContaining({ detail: { writers: ["T1"], holder: { planId: "other-plan", taskId: "T9" } } }),
+      }));
+      h.registry.releaseTask("other-plan:T9");
+      h.runtime.onLeaseReleased();
+      const run = await h.running("T1", 1, "ses-unblocked");
+      expect(run.durableNonce).toBe(true);
+      run.complete("Implemented after the lease was released.");
+      await untilEnqueued(h, "T1");
+      await h.settled();
+      expect(h.registry.heldBy(`${PLAN_ID}:T1`)).toEqual(["src/T1.ts"]);
+    } finally {
+      await h.close();
+      observations.close();
+    }
+  });
+
+  it("reports only live children, not missing plans, missing tasks or tasks without attempts", async () => {
+    const h = await mk(planOf([task("MAN", { kind: "manual" }), task("T1")], { edges: [edge("MAN", "T1")] }));
+    const childLive = need(h.runtime.childLive, "child liveness query");
+    expect(childLive(PLAN_ID, "T1")).toBe(false);
+    await h.begin();
+    await h.settled();
+    expect(childLive(PLAN_ID, "missing-task")).toBe(false);
+    expect(childLive(PLAN_ID, "MAN")).toBe(false);
+    expect(childLive(PLAN_ID, "T1")).toBe(false);
+    await h.runtime.done(PLAN_ID, "MAN", ORCH);
+    const run = await h.running("T1", 1, "ses-live");
+    expect(childLive(PLAN_ID, "T1")).toBe(true);
+    run.complete("Implemented it.");
+    await untilEnqueued(h, "T1");
+    await h.settled();
+    expect(childLive(PLAN_ID, "T1")).toBe(false);
+    expect(childLive("missing-plan", "missing-task")).toBe(false);
+    await h.close();
+    expect(childLive(PLAN_ID, "T1")).toBe(false);
+  });
+
+  it("refuses purge when the slot pool reports unsaved work, preserving the ledger and refs", async () => {
+    const draft = planOf([]);
+    draft.status = "aborted";
+    const h = await mk(draft);
+    await h.begin();
+    await h.settled();
+    const remove = vi.spyOn(h.store, "remove");
+    const purgeSlots = vi.fn<NonNullable<RuntimeDeps["purgeSlots"]>>().mockResolvedValue({
+      removed: [], reported: ["slot-1: unsaved work remains"],
+    });
+    h.deps.purgeSlots = purgeSlots;
+    const before = h.git.calls.length;
+    await expect(h.runtime.purge(PLAN_ID, ORCH)).rejects.toMatchObject({
+      code: "E_PLAN_STATE", message: expect.stringContaining("pool refused unsaved work"),
+      detail: { planId: PLAN_ID, reported: ["slot-1: unsaved work remains"] },
+    });
+    expect(purgeSlots).toHaveBeenCalledOnce();
+    expect(remove).not.toHaveBeenCalled();
+    await expect(h.store.read(PLAN_ID)).resolves.toMatchObject({ status: "aborted" });
+    expect(h.git.calls.slice(before)).toEqual([]);
+  });
+});
+
 // ---------------------------------------------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------------------------------------------
