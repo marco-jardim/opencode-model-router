@@ -303,6 +303,21 @@ Orchestrator validation: `npm run typecheck` exit 0; `role-agents-work-roots`, `
 `docs-drift`, `routing-advisor` integration: 326 passed, 1 skipped; on 2.0.26: role-spikes S2+S6 4/4 (with the
 auto run), roles + role-spikes 22/24 before the S6 matcher fix (S6 matcher, S11 = G-14), `smoke:v2:e2e` 4/4.
 
+### Focused QA round 2 (heavy, 2026-10-16)
+
+Reviewer session `ses_ebb3c667dffeX2mkwSDnJR5PAb` at `10a8f1e`: QA-62F-1..-5 closed (inside-work-roots gating
+identical to `8c8c6e0`; every new unit case except the boundary guard fails on `25fd915`); three new nits, all fixed:
+- **QA-62F-7 (docs):** `docs/EXECUTOR.md` separates plan-executor assembly (no discovery outside the work roots)
+  from role registration (read-only executor-home lookup to deny it); `CHANGELOG.md` states the home deny and the
+  missing slots-root allowance outside; `docs/ROLES.md` names the start directory; docs-drift pins added/updated.
+- **QA-62F-8 (wording):** the unresolved-home warning now says the home is not denied; test retitled.
+- **QA-62F-9 (low confidence):** outside the work roots a failed listing also runs the home lookup (in the start
+  directory), so a configured root covering the common directory still gets the deny; new unit test "QA-62F-9 …".
+
+Orchestrator validation: typecheck exit 0; role-agents-work-roots, roles.registration, work-roots, docs-drift,
+role-agents, dispatch.worktree-list, routing-advisor integration: 333 passed, 1 skipped. Round 2 had no major
+finding, so no round 3 (§0.7).
+
 ## Deferred findings
 
 pending 6.2.QA
