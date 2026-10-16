@@ -898,13 +898,29 @@ describe("QA-1 M2: bounds the reading cannot bypass", () => {
   });
 
   it("finds the finder MAPPING in linear time (no `}` after 100k MAPPING lines; 100k annotations; escaped quotes)", () => {
-    const started = performance.now();
-    expect(finderMappingBody("MAPPING={\n".repeat(100_000))).toBeUndefined();
-    expect(finderMappingBody("MAPPING: x\r".repeat(100_000))).toBeUndefined();
-    expect(finderMappingValues(`'${"\\'".repeat(300_000)}`)).toEqual([]);
-    expect(finderMappingValues(`${"'\\'".repeat(200_000)}`).length).toBe(0);
-    expect(performance.now() - started).toBeLessThan(200);
-  });
+    const run = (k: number): void => {
+      expect(finderMappingBody("MAPPING={\n".repeat(100_000 * k))).toBeUndefined();
+      expect(finderMappingBody("MAPPING: x\r".repeat(100_000 * k))).toBeUndefined();
+      expect(finderMappingValues(`'${"\\'".repeat(300_000 * k)}`)).toEqual([]);
+      expect(finderMappingValues(`${"'\\'".repeat(200_000 * k)}`).length).toBe(0);
+    };
+    // G-24: a wall-clock bound measured the runner (255 ms against 200 on a loaded Windows CI runner with coverage).
+    // Linearity is the property: doubling every input must not more than ~2.5x the time (quadratic work gives ~4x).
+    // The best of three runs per size filters scheduler noise.
+    const timeOf = (k: number): number => {
+      let best = Number.POSITIVE_INFINITY;
+      for (let i = 0; i < 3; i++) {
+        const started = performance.now();
+        run(k);
+        best = Math.min(best, performance.now() - started);
+      }
+      return best;
+    };
+    run(1); // warm-up (JIT)
+    const single = timeOf(1);
+    const double = timeOf(2);
+    expect(double / Math.max(single, 1)).toBeLessThan(2.5);
+  }, 30_000);
 });
 
 describe("UNC and device specs (SD-P3c-3)", () => {
