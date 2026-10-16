@@ -35,7 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are reported as `not-observable` declared gaps, never as passes (A-6.1-6); an overall passing verdict requires at least
   five working days and every required criterion to be `ok`. Absence of evidence is never a pass.
 - **OpenCode v2: `/router stats` shows a "Dispatch durations" table and an "Orchestrator cache-read share" line** when
-  timing logs exist. The logs are written once the router wires the timing recorder.
+  timing logs exist.
 - **OpenCode v2: background dispatch.** A subagent dispatch whose predicted duration is long runs in the background
   (`routing.background.mode`: `auto` decides from the predicted duration, `model` lets the orchestrating model decide,
   `off` keeps every dispatch in the foreground as before; `routing.background.minPredictedMs` sets the `auto` threshold).
@@ -64,8 +64,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `UNVERIFIABLE`, and a restored held result settles in place. A journal that vanishes under a running process is
   rewritten from memory. OpenCode v1 ignores every `routing.background.*` and `routing.leases.*` key and logs one
   notice per process that names them.
-- **OpenCode v2: plan executor registration.** `/router` lists `/plan`, and `router_plan` resolves the executor at call
-  time. State-changing and authority actions (`compile`, `residue`, `approve`, `adopt`, `abort`, `purge`, `land`,
+- **OpenCode v2: plan executor registration.** `router_plan` and `/plan` are registered only in roles mode selected at
+  start, and `router_plan` resolves the executor at call time; `/router` lists `/plan` only when it is registered, not
+  user-defined, and the executor prerequisites hold (roles delegation, enforced leases, verification not `never`, a
+  location inside `routing.workRoots` when configured). State-changing and authority actions (`compile`, `residue`, `approve`, `adopt`, `abort`, `purge`, `land`,
   `answer`, `pause`, `resume`, `add-tasks`, `done`, `gc`, and any other state-changing action) require a proven
   depth-0 session with no parent, with no bound-plan-child exception; failed parent lookups refuse. Read-only
   `status`, `ready`, `export` and `/plan inbox` allow roots or exactly bound plan children reading only their own
@@ -74,7 +76,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   v1 adds no `/plan` notice for that user command. Active plans add executor instructions to router state after the plan
   section. Assembly requires a git repository, roles delegation, enforced leases and a plan-task verifier with
   verification enabled; otherwise the tool and command report why the executor is unavailable. The keys, tool and
-  command have a user guide ([docs/EXECUTOR.md](docs/EXECUTOR.md)); `slotsDir`, `integrationChecks`, `phaseSuite`,
+  command have a user guide ([docs/EXECUTOR.md](docs/EXECUTOR.md)) and a design record
+  ([ADR 0007](docs/adr/0007-critical-path-execution.md)); `slotsDir`, `integrationChecks`, `phaseSuite`,
   `provision` and `python` are trusted keys that only the global override sets. `/router approve` refuses a repository's
   executor home (`<git common dir>\omr-executor`, with its plan and slot-marker directories) and any repository inside
   it; that check runs git within one 15 s bound in all, and
@@ -149,8 +152,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **OpenCode v2: `/router` lists `/plan` only with executor-capable routing configuration.** Without a routing block,
-  help remains byte-identical to the legacy output; OpenCode v1 is unchanged.
+- **OpenCode v2: `/router` lists `/plan` only when `/plan` is registered and the executor can assemble.** That is roles
+  mode selected at start and still configured, no user-defined `/plan`, enforced leases, verification not `never` and a location inside
+  `routing.workRoots` when configured. Without a routing block, help remains byte-identical to the legacy output;
+  OpenCode v1 is unchanged.
 - **OpenCode v2: a task blocked by a reverted dependency keeps its unsaved work.** The integration queue no longer
   gives such a task's slot back to the pool unsaved. The work is first saved at the task's WIP ref (a failed save keeps
   the slot leased). A running task's slot is released once, by the executor, after its cancelled child has ended.
