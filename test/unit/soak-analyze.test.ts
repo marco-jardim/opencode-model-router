@@ -166,7 +166,7 @@ describe("offline soak evidence statuses", () => {
       if (status === "ok" && ["G6", "G8", "G9"].includes(id)) {
         const primary = { G6: "leaseNonOverlap", G8: "idleEpisodes", G9: "heldPendingAcrossRestart" }[id as "G6" | "G8" | "G9"];
         expect(c.subcases[primary].status).toBe("ok");
-        expect(c.status).toBe("insufficient");
+        expect(c.status).toBe(id === "G8" ? "insufficient" : "ok");
       } else expect(c.status).toBe(status);
       expect(c.observed).toBe(n);
       expect(c.violationCount > 0).toBe(bad);
@@ -323,10 +323,10 @@ describe("MA-2 subcase evidence and overall verdict", () => {
   it("G6 lease acquisitions cannot pass shared-tree guards or deferred plugin verification", async () => {
     const s = await setup(); await populate(s, "G6", 3);
     const c = (await analyze(s)).criteria.G6;
-    expect(c.status).toBe("insufficient");
+    expect(c).toMatchObject({ status: "ok", observed: 3 });
     expect(c.subcases.leaseNonOverlap).toMatchObject({ status: "ok", observed: 3, violationCount: 0 });
     for (const name of ["sharedTreeRead", "sharedTreeSearch", "sharedTreeRun", "deferredPluginVerification"]) {
-      expect(c.subcases[name]).toMatchObject({ status: "not-observable", observed: 0 });
+      expect(c.subcases[name]).toMatchObject({ status: "not-observable", observed: 0, evidence: [] });
       expect(c.subcases[name].reason).toEqual(expect.any(String));
     }
   });
@@ -363,9 +363,9 @@ describe("MA-2 subcase evidence and overall verdict", () => {
   it("G9 restored holds do not prove non-held deferred pending survived restart", async () => {
     const s = await setup(); await populate(s, "G9", 3);
     const c = (await analyze(s)).criteria.G9;
-    expect(c.status).toBe("insufficient");
+    expect(c).toMatchObject({ status: "ok", observed: 3 });
     expect(c.subcases.heldPendingAcrossRestart).toMatchObject({ status: "ok", observed: 3 });
-    expect(c.subcases.deferredPendingAcrossRestart).toMatchObject({ status: "not-observable", observed: 0 });
+    expect(c.subcases.deferredPendingAcrossRestart).toMatchObject({ status: "not-observable", observed: 0, evidence: [] });
   });
   it("rejects four working days even with all currently observable required subcases ok", async () => {
     const s = await setup(); await observableEvidence(s, 4);
@@ -373,24 +373,50 @@ describe("MA-2 subcase evidence and overall verdict", () => {
     expect(report.coverage.workingDays).toBe(4);
     expect(report.verdict.status).toBe("fail"); expect(report.verdict.reasons).toContain("working days: 4 < 5");
   });
-  it("cannot pass A-6.1-3 with current formats even after five working days and all observable subcases ok", async () => {
+  it("passes under A-6.1-6 after five working days with observable subcases ok and not-observable subcases declared gaps", async () => {
     const s = await setup(); await observableEvidence(s, 5);
     const report = await analyze(s);
     expect(report.unreadableEvidence).toEqual([]); expect(report.coverage.workingDays).toBe(5);
-    for (const id of ["G1", "G2", "G8"]) expect(report.criteria[id].status).toBe("ok");
+    for (const id of ["G1", "G2", "G6", "G8", "G9"]) expect(report.criteria[id].status).toBe("ok");
     expect(report.criteria.G6.subcases.leaseNonOverlap.status).toBe("ok");
     expect(report.criteria.G9.subcases.heldPendingAcrossRestart.status).toBe("ok");
-    expect(report.verdict).toMatchObject({ status: "fail", declaredGaps: ["G3", "G11"] });
-    expect(report.verdict.reasons).toHaveLength(2);
-    expect(report.verdict.reasons[0]).toContain("sharedTreeRead=not-observable");
-    expect(report.verdict.reasons[0]).toContain("deferredPluginVerification=not-observable");
-    expect(report.verdict.reasons[1]).toContain("deferredPendingAcrossRestart=not-observable");
-    expect(reportExitCode(report)).toBe(2);
-    expect(formatReport(report)).toContain("Verdict: fail; declared gaps: G3, G11");
+    const gaps = [
+      ["G6", "sharedTreeRead"], ["G6", "sharedTreeSearch"], ["G6", "sharedTreeRun"],
+      ["G6", "deferredPluginVerification"], ["G9", "deferredPendingAcrossRestart"],
+    ].map(([criterion, subcase]) => ({ criterion, subcase, reason: "not observable with current log formats (A-6.1-6)" }));
+    expect(report.verdict).toEqual({ status: "pass", reasons: [], declaredGaps: [...gaps, "G3", "G11"] });
+    for (const gap of gaps) {
+      expect(report.criteria[gap.criterion].subcases[gap.subcase]).toMatchObject({ status: "not-observable", observed: 0, evidence: [] });
+      expect(formatReport(report)).toContain(`${gap.criterion}.${gap.subcase}: ${gap.reason}`);
+    }
+    expect(report.criteria.G6.observed).toBe(3); expect(report.criteria.G9.observed).toBe(3);
+    expect(reportExitCode(report)).toBe(0);
+    expect(formatReport(report)).toContain("Verdict: pass; declared gaps:");
     expect(formatReport(report)).toContain("not-observable");
   });
+  it.each(["violated", "insufficient"] as const)("an observable %s subcase still blocks a five-day pass", async status => {
+    const s = await setup(); await observableEvidence(s, 5);
+    expect((await analyze(s)).verdict.status).toBe("pass");
+    const rows: Row[] = (await readFile(path.join(s.observations, "123-fixture.jsonl"), "utf8"))
+      .trimEnd().split("\n").map(line => JSON.parse(line)).filter(row => row.kind !== "end");
+    const index = rows.findIndex(row => row.action === "lease-acquire");
+    if (status === "violated") {
+      // Acquire the conflicting writer before releasing a's lease.
+      rows.splice(index + 1, 0,
+        scheduler("lease-acquire", { taskRef: "plan-0:b", ok: true }, BASE, "plan-0"),
+        scheduler("lease-release", { taskRef: "plan-0:b" }, BASE, "plan-0"));
+    } else rows[index].state.ok = false; // Only two successful acquisitions remain.
+    await stream(s, rows);
+    const report = await analyze(s);
+    expect(report.coverage.workingDays).toBe(5); expect(report.unreadable).toBe(0);
+    for (const id of ["G1", "G2", "G8", "G9"]) expect(report.criteria[id].status).toBe("ok");
+    expect(report.criteria.G6.status).toBe(status);
+    expect(report.criteria.G6.subcases.leaseNonOverlap.status).toBe(status);
+    expect(report.verdict.status).toBe("fail"); expect(report.verdict.reasons).toHaveLength(1);
+    expect(report.verdict.reasons[0]).toContain(`leaseNonOverlap=${status}`);
+    expect(reportExitCode(report)).toBe(status === "violated" ? 1 : 2);
+  });
   it("only returns exit 0 for a passing policy verdict, 1 for any violation, otherwise 2", () => {
-    // Policy-only hypothetical: no current-format capture can make G6/G9's unobservable subcases ok.
     const report = { coverage: { workingDays: 5 }, unreadable: 0, criteria: Object.fromEntries(IDS.map(id =>
       [id, { status: ["G3", "G11"].includes(id) ? "not-observed" : "ok", violationCount: 0 }])) } as Row;
     report.verdict = overallVerdict(report);
@@ -512,13 +538,14 @@ describe("G2 durable journal deliveries", () => {
 });
 
 describe("real soak analyzer CLI (without Vitest's TypeScript transforms)", () => {
-  it.each(["empty", "fixtures", "violation", "unreadable", "missing"] as const)("runs on %s inputs from the repository root", async kind => {
+  it.each(["empty", "fixtures", "passing", "violation", "unreadable", "missing"] as const)("runs on %s inputs from the repository root", async kind => {
     const s = await setup();
     if (kind === "fixtures") {
       await populate(s, "G1", 3);
       await populate(s, "G2", 3);
       await populate(s, "G11", 3);
     }
+    if (kind === "passing") await observableEvidence(s, 5);
     if (kind === "violation") await populate(s, "G1", 3, true);
     if (kind === "unreadable") await copyFile(path.join(fixtures, "malformed.jsonl"), s.pending);
     if (kind === "missing") await rm(s.observations, { recursive: true });
@@ -533,15 +560,17 @@ describe("real soak analyzer CLI (without Vitest's TypeScript transforms)", () =
     });
     expect(result.error, result.stderr).toBeUndefined();
     expect(result.signal, result.stderr).toBeNull();
-    expect(result.status, result.stderr + result.stdout).toBe(kind === "violation" ? 1 : 2);
+    expect(result.status, result.stderr + result.stdout).toBe(kind === "passing" ? 0 : kind === "violation" ? 1 : 2);
     if (kind === "missing") {
       expect(result.stderr).toContain(`--observations directory does not exist: ${s.observations}`);
       await expect(readFile(output)).rejects.toThrow();
       return;
     }
     const report = JSON.parse(await readFile(output, "utf8"));
-    expect(report.verdict.status).toBe("fail"); expect(report.verdict.reasons.length).toBeGreaterThan(0);
-    expect(result.stdout).toContain("Verdict: fail");
+    expect(report.verdict.status).toBe(kind === "passing" ? "pass" : "fail");
+    if (kind === "passing") expect(report.verdict.reasons).toEqual([]);
+    else expect(report.verdict.reasons.length).toBeGreaterThan(0);
+    expect(result.stdout).toContain(`Verdict: ${report.verdict.status}`);
     expect(Object.keys(report.criteria).sort()).toEqual([...IDS].sort());
     expect(report.unreadable).toBe(kind === "unreadable" ? 3 : 0);
     expect(result.stdout).toContain("Criterion");

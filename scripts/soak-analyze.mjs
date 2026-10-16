@@ -6,9 +6,11 @@
  * Collect at least five working days with MODEL_ROUTER_V2_OBSERVATIONS enabled.
  * Keep original files, including seals; a live/unsealed stream is insufficient evidence.
  * Missing evidence is never a pass. JSON defaults to ./soak-analysis.json, outside input trees.
+ * A-6.1-6: criterion status checks observable subcases only. Not-observable subcases
+ * remain unobserved declared gaps, never ok and never counted as observations.
  * Node >=22.13 (stripTypeScriptTypes); imports product TS through an extensionless-import loader.
  * Exit codes: 0 only for verdict pass; 1 for any violation; 2 for unreadable input
- * or a non-passing verdict due to insufficient, missing or unobservable evidence.
+ * or a non-passing verdict due to insufficient or missing observable evidence.
  * Also reads this checkout's git-common-dir/omr-executor. Optional archived journal copies:
  * <observations>/executor/<planId>/events.<seq>.<epoch>.jsonl
  * and history.jsonl. Optional g8-inputs.jsonl there supplies {plan,final,events,rawΣI} to
@@ -38,8 +40,11 @@ export function overallVerdict(report) {
   if (report.coverage.workingDays < 5) reasons.push(`working days: ${report.coverage.workingDays} < 5`);
   if (report.unreadable) reasons.push(`unreadable inputs: ${report.unreadable}`);
   for (const [id, c] of Object.entries(report.criteria)) {
+    for (const [name, s] of Object.entries(c.subcases ?? {})) if (s.status === "not-observable") {
+      declaredGaps.push({ criterion: id, subcase: name, reason: "not observable with current log formats (A-6.1-6)" });
+    }
     if (!REQUIRED.includes(id) && c.status === "not-observed") { declaredGaps.push(id); continue; }
-    const gaps = Object.entries(c.subcases ?? {}).filter(([, s]) => s.status !== "ok")
+    const gaps = Object.entries(c.subcases ?? {}).filter(([, s]) => s.status !== "ok" && s.status !== "not-observable")
       .map(([name, s]) => `${name}=${s.status}`);
     if (c.status !== "ok" || gaps.length) reasons.push(`${id}: ${c.status}${gaps.length ? `; subcases: ${gaps.join(", ")}` : ""}`);
   }
@@ -388,7 +393,8 @@ export async function analyze(options) {
       s.evidenceTruncated = s.observed > s.evidence.length;
     }
     c.status = evidenceStatus(c.observed, c.violationCount);
-    if (c.status === "ok" && (c.faultCount || Object.values(c.subcases ?? {}).some(s => s.status !== "ok"))) c.status = "insufficient";
+    if (c.status === "ok" && (c.faultCount
+      || Object.values(c.subcases ?? {}).some(s => s.status !== "ok" && s.status !== "not-observable"))) c.status = "insufficient";
     if (id === "G8" && c.status === "not-observed" && c.faultCount) c.status = "insufficient";
     c.label = c.status === "not-observed" ? "not observed" : c.status;
     c.evidenceTruncated = c.observed > c.evidence.length;
@@ -677,6 +683,8 @@ export async function analyze(options) {
 
 export function formatReport(report) {
   const rows = [["Criterion", "Observed", "Violations", "Unreadable/faults", "Status", "Evidence"]];
+  const gaps = report.verdict.declaredGaps.map(gap => typeof gap === "string" ? gap
+    : `${gap.criterion}.${gap.subcase}: ${gap.reason}`);
   for (const [id, c] of Object.entries(report.criteria)) {
     rows.push([id, c.observed, c.violationCount, c.faultCount, c.label, c.evidence[0]?.file ?? c.faults[0]?.file ?? "none"]);
     for (const [name, s] of Object.entries(c.subcases ?? {})) rows.push([`  ${id}.${name}`, s.observed, s.violationCount,
@@ -690,7 +698,7 @@ export function formatReport(report) {
     + `G8 ratio: ${JSON.stringify(report.criteria.G8.g8Ratio)}\n`
     + `Dogfood: ${JSON.stringify(report.dogfood)}\n`
     + `Missing inputs: ${JSON.stringify(report.missingInputs)}\n`
-    + `Verdict: ${report.verdict.status}; declared gaps: ${report.verdict.declaredGaps.join(", ") || "none"}\n`
+    + `Verdict: ${report.verdict.status}; declared gaps: ${gaps.join(", ") || "none"}\n`
     + report.verdict.reasons.map(reason => `  - ${reason}\n`).join("")
     + `Absence is not a pass. Samples capped at ${MAX_EXAMPLES}; totals are not capped. See JSON for violations and evidence gaps.\n`;
 }
