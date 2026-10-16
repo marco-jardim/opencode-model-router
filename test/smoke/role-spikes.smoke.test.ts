@@ -198,7 +198,9 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1)", () => {
   }, 300_000);
 
   it("S2 serialised samples: child session as seen from the first context build and first permission evaluation (parentID / agent / title / model), session.created order", async () => {
-    const host = await startSpikeHost("s2", { [NO_MODEL]: agentWithoutModel() });
+    // Phase 2.1 honours explicit background:true unless routing.background.mode is "off"; these spikes pin the legacy path.
+    // The 2.1 background path is covered by cpx-background.
+    const host = await startSpikeHost("s2", { [NO_MODEL]: agentWithoutModel() }, { routing: { engine: "shadow", background: { mode: "off" } } });
     try {
       const rootA = await host.newRoot("s2 root A");
       const rootB = await host.newRoot("s2 root B");
@@ -209,7 +211,7 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1)", () => {
       // (1) two roots dispatch the same agent with the same title, started together (NOT proven to overlap: see the next test).
       const parallel = await Promise.all([host.dispatch(rootA, input("S2 parallel A")), host.dispatch(rootB, input("S2 parallel B"))]);
       // (2) the same root dispatches twice in successive turns, flagged background:true (separate turns, each settled before the next). With the
-      //     default enforcement (not off) the router rewrites every subagent call to background:false before the host sees it (asserted
+      //     background mode off and default verification enforcement (not off), the router rewrites these calls to background:false before the host sees them (asserted
       //     below from the probe's before record), so these are foreground children in practice.
       const bg1 = await host.call(rootA, "subagent", { ...input("S2 background 1"), background: true });
       const bg2 = await host.call(rootA, "subagent", { ...input("S2 background 2"), background: true });
@@ -666,8 +668,10 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1)", () => {
   it("S6 order against the router's own after-hook, and a background-flagged dispatch with verification on and off", async () => {
     const NOTE = "S6B_APPENDED_NOTE";
     const OK = "[router \u2713 verified: deterministic]";
+    // Phase 2.1 honours explicit background:true unless routing.background.mode is "off"; these spikes pin the legacy path.
+    // The 2.1 background path is covered by cpx-background; both runs below keep background mode off while varying verification enforcement.
     const run = async (mode: "enforced" | "off") => {
-      const host = await startSpikeHost(`s6b-${mode}`, { [NO_MODEL]: agentWithoutModel() }, { probe: { afterAppend: { tool: "subagent", text: NOTE } }, overrides: { enforcement: { mode } } });
+      const host = await startSpikeHost(`s6b-${mode}`, { [NO_MODEL]: agentWithoutModel() }, { routing: { engine: "shadow", background: { mode: "off" } }, probe: { afterAppend: { tool: "subagent", text: NOTE } }, overrides: { enforcement: { mode } } });
       try {
         const present = path.join(host.project, "s6b-present.txt");
         await writeFile(present, "x\n");
@@ -706,15 +710,15 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1)", () => {
     expect(enforced.fgParts[0]).toMatch(/^<subagent sessionID="ses_[A-Za-z0-9]+" state="completed">\nCHILD_OK\n<\/subagent>$/);
     expect(enforced.fgParts[1]).toBe(`\n\n${OK}`);
     expect(enforced.fgParts[2]).toBe(NOTE);
-    // Background WITH verification on (mode enforced): the ROUTER turns the call into a foreground one before the host sees it - the probe's
-    // execute.before record (the probe loads after the router) shows background:false although the model sent true (src/index.ts:1663-1665 flags
-    // the call as verifying, v2-hooks.ts:513/:528/:60 write background:false). The call returns the completed result with the verification line.
+    // With background mode off and verification enforced, the ROUTER turns the call into a foreground one before the host sees it: the probe's
+    // execute.before record (the probe loads after the router) shows background:false although the model sent true.
+    // The call returns the completed result with the verification line.
     expect(enforced.bgInputBackground).toBe(false);
     expect(enforced.bgAckStatus).toBe("completed");
     expect(enforced.bgBlockedMs).toBeGreaterThanOrEqual(3_500);
     expect(enforced.bgParts.at(-1)).toBe(NOTE);
     expect(enforced.bgParts.join("\n")).toContain(OK);
-    // Background with verification OFF (mode off): the call reaches the host with background:true (asserted from the probe's before record).
+    // With verification OFF (enforcement mode off, background mode still off), the call reaches the host with background:true (probe's before record).
     expect(off.bgInputBackground).toBe(true);
     expect(off.hostErrors).toEqual([]);
     expect(enforced.hostErrors).toEqual([]);
