@@ -43,8 +43,11 @@ jobs:
       - run: npm run typecheck
       # Report even after test failures so the gate can merge Windows branch coverage.
       # The test step still fails the job when a test fails.
+      # G-25: the hosted Windows runner with coverage takes about twice a developer machine's time (1142 s for the
+      # suite), so each run tripped a different git/IO-heavy test on the 5 s default. This job alone raises the
+      # default test and hook timeouts; tests with their own bound keep it, and Linux and local runs keep 5 s.
       - name: Windows unit coverage
-        run: npx vitest run --coverage --coverage.reportOnFailure --coverage.reporter=json --coverage.reporter=text-summary --coverage.reportsDirectory=coverage/win-unit
+        run: npx vitest run --testTimeout=20000 --hookTimeout=60000 --coverage --coverage.reportOnFailure --coverage.reporter=json --coverage.reporter=text-summary --coverage.reportsDirectory=coverage/win-unit
         env:
           OMR_COVERAGE_ARTIFACT: "1"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

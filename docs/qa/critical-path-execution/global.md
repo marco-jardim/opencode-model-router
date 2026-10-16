@@ -445,6 +445,23 @@ unmerged) and locally on Windows and on Linux (WSL Ubuntu, clean clone with the 
   local pre-push hook (owner decision). Commits `8b81baf`, `977c84b`.
 - **PR #117 CI at `977c84b`: all green** (test node 22/24, e2e, bun smoke, coverage, coverage gate, smoke-keyless;
   Windows job skipped on the PR by design).
+- **PR #116 merged into `master` as `1e499a4`.** Its first master run: the Windows job and every Linux job green;
+  the merged coverage gate (3 inputs) failed the `src/executor/` prefix on branches: `git.ts` 89.57%, `runtime.ts`
+  89.76% (90% required).
+- **G-23 (CI, tests only):** edge-branch tests for `src/executor/git.ts` (11 branches) and `runtime.ts` (18), each
+  asserting behaviour. A manual run on `cpx/main` (38976927615): gate passed, `git.ts` 91.73%, `runtime.ts` 90.56%.
+- **G-24 (CI, test only):** that run's Windows job failed one test, `edges.test.ts` "finds the finder MAPPING in
+  linear time" (255 ms against a 200 ms wall-clock bound under coverage). Replaced by a scaling check (doubling
+  every input stays under 2.5x the time, best of three); the property is linearity, not machine speed. Manual run
+  38979038442 at `faf31e1`: every job green, Windows included, gate passed. Merged into `master` via PR #118.
+  The file's other wall-clock bounds (≈712, ≈735, ≈1166) did not fail and are unchanged.
+- **PR #118 merged into `master` as `7a498e4`.** Its master run 38980548142: every Linux job and the coverage gate
+  green; the Windows job failed one test, `roles-dispatch.test.ts` "Phase 4 QA M1: a linked worktree of an approved
+  repository binds marked…" (cross-repo, on master since 2.8.0): 5 s default timeout while creating real git
+  worktrees, then EBUSY in the cleanup of the still-running test.
+- **G-25 (CI):** each Windows run so far tripped a different git/IO-heavy test on the 5 s default (the suite takes
+  1142 s there with coverage, about twice a developer machine). The Windows job alone now runs with
+  `--testTimeout=20000 --hookTimeout=60000`; explicit per-test bounds are kept, and Linux and local runs keep 5 s.
 - `verify-resource-budget.deferred` 3.1.2.f (e2e, p50 capture wait): measured 1101-7060 ms locally at `origin/master`
   and 2820-5181 ms on this branch with the same command, and passed on PR #117's Linux e2e; no product overhead found
   by QA (the measured hook is v1, unchanged); recorded with G-10's load-sensitive family.
