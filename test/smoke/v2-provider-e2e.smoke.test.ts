@@ -8,7 +8,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createServer, type Server } from "node:http";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -114,7 +114,9 @@ async function startProvider(allowGraderTemperature: boolean) {
     for await (const chunk of request) chunks.push(Buffer.from(chunk));
     const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as ChatRequest;
     const text = textOf(body.messages);
-    const system = textOf(body.messages?.filter(message => message?.role === "system"));
+    // Keep system content decoded so exact Windows paths are not JSON-escaped.
+    const system = body.messages?.filter(message => message?.role === "system")
+      .map(message => message.content).join("\n") ?? "";
     const toolNames = body.tools?.map(tool => tool.function?.name).filter((name): name is string => typeof name === "string") ?? [];
     requests.push({ ...body, url: request.url, text, system, toolNames });
 
@@ -171,8 +173,10 @@ async function runStandalone(scenario: "native" | "delegate", allowGraderTempera
   const root = await mkdtemp(path.join(tempParent, "omr-v2-e2e-"));
   const fixture: typeof fixtures[number] = { root };
   fixtures.push(fixture);
-  const project = path.join(root, "project");
-  await mkdir(project);
+  const projectDir = path.join(root, "project");
+  await mkdir(projectDir);
+  // The host reports the long path even when TEMP uses an 8.3 spelling.
+  const project = await realpath(projectDir);
   await writeFile(path.join(project, "README.md"), "# Isolated router fixture\n");
 
   const provider = await startProvider(allowGraderTemperature);

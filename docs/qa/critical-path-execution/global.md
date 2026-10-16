@@ -239,6 +239,16 @@ pending 6.2.QA
   low-confidence edge, there is no reproduction, and a fix without one would be speculative; recorded for 6.2.QA.
   No checks run by this implementer for N-A-1 or the minors; typecheck and tests remain with the orchestrator.
 
+- **G-11 (minor, test, pre-existing): v2-provider-e2e Windows path assertion against a JSON-serialised body**
+  — fixed. All four cases fail identically at `7181165` and `8c8c6e0`; this is not host drift. Supplied evidence:
+  `D:\git\omr-cpx-p61\.cpx-logs\gate62-longtemp\v2-e2e.log` shows the exact working-directory expectation uses
+  single Windows backslashes while the received JSON-serialised system messages escape them. The capture now
+  reads system content from the already `JSON.parse`-decoded request; both working-directory assertions retain
+  the same substring and exact project path. The created project directory is canonicalised with `realpath`
+  so an 8.3 TEMP spelling matches the host's long-form path. The file imports no smoke helpers; inspection found
+  no other Windows-path `toContain` checks against serialised bodies in this file. No new helper or unit test;
+  no smokes or checks run by this implementer. Validation remains with the orchestrator.
+
 ## Deferred findings
 
 pending 6.2.QA
