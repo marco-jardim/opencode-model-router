@@ -775,6 +775,11 @@ describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
     expect(workRoots).toContain("The executor home (`<git common dir>\\omr-executor`) is denied");
     expect(workRoots).toContain("A project-local `slotsDir` is ignored");
     expect(workRoots).toContain("no slots-root allowance is added (fail closed)");
+    // QA-62F-1/QA-62F-2: outside every work root the home is still denied, but the slots root is not granted.
+    expect(workRoots).toContain("Outside every `routing.workRoots` entry the worktrees are still listed and the executor home is still denied, but there is no executor slots-root allowance");
+    expect(read("docs/CONFIG_REFERENCE.md").replace(/\s+/g, " ")).toContain(
+      "the executor home (`<git common dir>\\omr-executor`) is still denied there, but there is no executor slots-root allowance",
+    );
   });
 
   it("pins plan-task deadline constants, formulae, shared transient re-runs and backoffs", () => {
