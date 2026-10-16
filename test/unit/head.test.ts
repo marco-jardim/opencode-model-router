@@ -35,7 +35,13 @@ const repo = (): string => {
   return dir;
 };
 
-describe("readHeadState", () => {
+// G-17, QA-62C-16: every test here spawns real git, synchronously, three to ten processes per test. On a loaded 2-4 core
+// windows-latest runner one spawn took about 1.5 s, so a seven-spawn test took 10.5 s against the 5 s default (PR #116,
+// win22); it passes in about 1 s elsewhere (win24: 1095 ms). Every describe below spawns real git, so each carries the limit
+// the other real-git files use (reference.test.ts: 60 s). No assertion changes.
+const REAL_GIT = { timeout: 60_000 };
+
+describe("readHeadState", REAL_GIT, () => {
   it("attached: root (realpath), head, branch name and the reflog count", async () => {
     const dir = repo();
     const state = await readHeadState(dir);
@@ -104,7 +110,7 @@ describe("readHeadState", () => {
   });
 });
 
-describe("readHead", () => {
+describe("readHead", REAL_GIT, () => {
   it("a repository gives the same state as readHeadState", async () => {
     const dir = repo();
     expect(await readHead(dir)).toEqual(await readHeadState(dir));
@@ -142,7 +148,7 @@ describe("readHead", () => {
   });
 });
 
-describe("readReflogWindow", () => {
+describe("readReflogWindow", REAL_GIT, () => {
   it("count + 1 entries, newest first, with the commit and the subject", async () => {
     const dir = repo();
     const one = git(dir, "rev-parse", "HEAD");
@@ -176,10 +182,6 @@ describe("readReflogWindow", () => {
     expect(await readReflogWindow(dir, 5)).toHaveLength(1);
   });
 
-  // G-17: every test here spawns real git, synchronously, three to ten processes per test. This test spawns seven, plus the
-  // reader's own. On a loaded 2-4 core windows-latest runner one spawn took about 1.5 s, so this test took 10.5 s against
-  // the 5 s default (PR #116, win22). It passes in about 1 s elsewhere (win24: 1095 ms). The limit is the one the other
-  // real-git files use (reference.test.ts: 60 s). No assertion changes.
   it("an empty subject is kept as an empty string", async () => {
     const dir = repo();
     commit(dir, "two");
@@ -187,7 +189,7 @@ describe("readReflogWindow", () => {
     const window = await readReflogWindow(dir, 1);
     expect(window?.[0]?.subject).toBe("");
     expect(window?.[0]?.commit).toBe(git(dir, "rev-parse", "HEAD"));
-  }, 60_000);
+  });
 
   it("a count of 0 or less is [] without running git (even outside a repository)", async () => {
     const outside = fresh();
@@ -216,7 +218,7 @@ async function moveSince(dir: string, before: HeadState): Promise<TreeMove | und
   return treeMove(before, now, window);
 }
 
-describe("readHead + readReflogWindow + treeMove, real git", () => {
+describe("readHead + readReflogWindow + treeMove, real git", REAL_GIT, () => {
   const started = async (): Promise<{ dir: string; before: HeadState }> => {
     const dir = repo();
     commit(dir, "two");

@@ -716,16 +716,18 @@ describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
     expect(executor).toContain("so on platforms other than Windows the executor is inert on OpenCode v2");
     expect(executor).not.toMatch(/on Linux and macOS the executor is inert/);
     expect(executor).toContain("role agents get no slots rule and no executor-home lookup runs, and no executor discovery runs at start");
-    // QA-62C-1: an existing executor home is still denied off Windows, found on disk without git.
-    expect(executor).toContain("is still denied to role agents: the router finds `<git common dir>/omr-executor` on disk, without running git");
+    // QA-62C-1, QA-62C-14: the executor home is still denied off Windows, found on disk without git, even before it exists.
+    expect(executor).toContain("whether or not it exists yet, is still denied to role agents whenever the git common directory resolves: the router finds `<git common dir>/omr-executor` on disk, without running git");
+    expect(executor).not.toMatch(/An executor home that already exists/);
     // QA-62C-12: the notice condition is the one src/index.ts checks.
     expect(executor).toContain(`When roles mode at start with enforced leases and verification not \`never\` would assemble it, the router logs one notice per process: ${quoted}`);
     const roles = flat(read("docs/ROLES.md"));
     expect(roles).toContain("The plan executor is Windows only in this release: on other platforms it is inert");
     expect(roles).not.toMatch(/on Linux and macOS `router_plan`/);
-    // QA-62C-1: off Windows an existing executor home is still denied, found on disk without git.
-    expect(roles).toContain("so role agents get no slots-root allowance and no executor-home lookup runs. An executor home that already exists there");
-    expect(roles).toContain("is still denied: the router reads the listed worktree's `.git` (and its `commondir`) to find `<git common dir>/omr-executor` on disk, without running git");
+    // QA-62C-1, QA-62C-13, QA-62C-14: off Windows the executor home is still denied, found on disk without git, even before it exists.
+    expect(roles).toContain("so role agents get no slots-root allowance and no executor-home lookup runs. The executor home in the git common directory");
+    expect(roles).toContain("is still denied, whether or not it exists yet: starting at the listed worktree, else the directory OpenCode was started in, the router walks up to the nearest repository and reads its `.git` (and its `commondir`; each at most 4 KiB, regular files only, a linked `.git` refused) to find `<git common dir>/omr-executor` on disk, without running git. When no repository is found, nothing is denied.");
+    expect(roles).not.toMatch(/An executor home that already exists there/);
     // QA-62C-12: the scope and the notice condition src/index.ts checks.
     expect(roles).toContain(`on platforms other than Windows \`router_plan\` and \`/plan\` are not registered, and when roles mode at start with enforced leases and verification not \`never\` would assemble it the router logs one notice per process, ${quoted}`);
     const executorRows = read("docs/CONFIG_REFERENCE.md").split(/\r?\n/).filter((line) => line.startsWith("| `routing.executor."));
@@ -737,7 +739,8 @@ describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
     expect(flat(unreleased)).toContain(`logs one notice per process, ${quoted}`);
     expect(flat(unreleased)).toContain("On platforms other than Windows it is inert:");
     expect(flat(unreleased)).not.toMatch(/On Linux and macOS it is inert/);
-    expect(flat(unreleased)).toContain("an existing `<git common dir>/omr-executor`, found on disk without running git, is still denied to them");
+    expect(flat(unreleased)).toContain("`<git common dir>/omr-executor`, found on disk without running git, is still denied to them whenever the common directory resolves, even before it exists");
+    expect(flat(unreleased)).not.toMatch(/an existing `<git common dir>\/omr-executor`/);
     expect(flat(unreleased)).toContain("invalid `routing.executor.*` values are not reported");
     expect(flat(unreleased)).toContain("when roles mode at start with enforced leases and verification not `never` would assemble it the router logs one notice per process");
     // The code the docs describe: the one seam gates v2 discovery and the plugin's registration and notice.

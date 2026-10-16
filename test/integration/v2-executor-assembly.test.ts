@@ -888,12 +888,13 @@ describe("G-16: the plan executor off Windows (platform seam)", () => {
     const help = await first.router();
     expect(help).not.toBe("");
     expect(help).not.toContain("/plan");
-    // Role registration ran with the executor treated as disabled: no executor-home lookup, no slots root. The fixture
-    // has no `.git/omr-executor`, so the on-disk executor-home deny (QA-62C-1) has nothing to deny either.
+    // Role registration ran with the executor treated as disabled: no git executor-home lookup, no slots root. The
+    // repository's executor home is still denied from disk (QA-62C-1), before it exists (QA-62C-14).
     expect(roles).toHaveBeenCalledWith(expect.anything(), expect.anything(), expect.objectContaining({ executorPlatform: false }));
     const registration = await roles.mock.results[0]?.value as Awaited<ReturnType<typeof roleAgentsModule.registerRoleAgents>>;
     expect(registration.registered).toContain("implementer");
-    expect(registration.externalDirectoryDenied).toEqual([]);
+    expect(registration.externalDirectoryDenied).toHaveLength(1);
+    expect(registration.externalDirectoryDenied[0]).toMatch(/[\\/]\.git[\\/]omr-executor[\\/]\*$/);
     expect(registration.externalDirectory.some(pattern => pattern.includes(fixture.slotsRoot) || pattern.toLowerCase().includes(".omr-slots"))).toBe(false);
     expect(home).not.toHaveBeenCalled();
     // Start-up executor discovery did nothing.

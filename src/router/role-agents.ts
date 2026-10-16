@@ -15,11 +15,14 @@
  * anything (I1/I8). A failure while resolving or building the roles registers no role agent at
  * all (fail closed); tier agents are never touched.
  */
-import { lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { dirname, join, posix, resolve as resolvePath, win32 } from "node:path";
+import { lstatSync, realpathSync, statSync } from "node:fs";
+import { join, posix, resolve as resolvePath, win32 } from "node:path";
 import { EXECUTOR_HOME_DIRNAME, resolveExecutorHome } from "../executor/paths";
 import { resolveActiveTiers, resolveRolesRouting, resolveRouting, slotsDirProblem, type RouterConfig, type TierConfig } from "./config";
-import { GIT_TOOL_NAMES, gitEnvironment, gitExecutable, hardeningArgs, inheritedSafeDirectoryArgs, spawnBounded, workRootGuards } from "./git-tools";
+import {
+  GIT_TOOL_NAMES, gitEnvironment, gitExecutable, gitPointers, hardeningArgs, inheritedSafeDirectoryArgs, nearestRepository, spawnBounded,
+  workRootGuards,
+} from "./git-tools";
 import { positiveBudget, REFUSAL_CAP, ROUTE_BUDGET_RAISE_MAX, TIER_GUARD_BUDGET } from "./guard-profile";
 import { PLUGIN_AGENT, pluginAgentMarker, pluginAgentPolicy, type PluginAgentMarker } from "./plugin-agents";
 import { CONTEXT7_DOC_TOOLS, permissionMatches, type PermissionMap } from "./read-only";
@@ -241,40 +244,21 @@ export function approvedRootPattern(path: string, realpath: Realpath = nativeRea
 }
 
 /**
- * QA-62C-1: the git common directory of `directory` read from disk, without running git (used off Windows, where the
- * executor never runs but a Windows host sharing the repository may). Walks up from `directory` to the first `.git`:
- * a directory is the common directory itself; a file `gitdir: <path>` names the private git directory (relative to the
- * file's folder), whose `commondir` file, when present, names the common directory (relative to that git directory).
- * Undefined when no `.git` is found or it cannot be read.
+ * QA-62C-1, QA-62C-13: the git common directory of the repository holding `directory`, read from disk without running
+ * git (used off Windows, where the executor never runs but a Windows host sharing the repository may). The nearest
+ * checkout ({@link nearestRepository}) is read by the hardened {@link gitPointers}: `.git` and `commondir` at most 4 KiB,
+ * regular files only, opened non-blocking, a linked `.git` and a network or device pointer refused. `common` is the
+ * git directory's `commondir` target when present, else the git directory (`<checkout>/.git` or what `gitdir:` names).
+ * `{}` when no repository is found or its `.git` names no git directory; `problem` when the pointers are refused or unreadable.
  */
-export function gitCommonDirFromDisk(directory: string): string | undefined {
-  let current = resolvePath(directory);
-  for (;;) {
-    const dotGit = join(current, ".git");
-    let isDirectory: boolean | undefined;
-    try {
-      isDirectory = statSync(dotGit).isDirectory();
-    } catch { /* No `.git` here: try the parent. */ }
-    if (isDirectory === true) return dotGit;
-    if (isDirectory === false) {
-      try {
-        const match = /^gitdir:[ \t]*(.+?)[ \t]*$/m.exec(readFileSync(dotGit, "utf8"));
-        if (match === null) return undefined;
-        const gitDir = resolvePath(current, match[1] as string);
-        let commonDir: string;
-        try {
-          commonDir = readFileSync(join(gitDir, "commondir"), "utf8").replace(/\r?\n$/, "");
-        } catch {
-          return gitDir;
-        }
-        return commonDir.trim() === "" ? gitDir : resolvePath(gitDir, commonDir);
-      } catch {
-        return undefined;
-      }
-    }
-    const parent = dirname(current);
-    if (parent === current) return undefined;
-    current = parent;
+function gitCommonDirOnDisk(directory: string): { common?: string; problem?: string } {
+  const checkout = nearestRepository(resolvePath(directory));
+  if (checkout === undefined) return {};
+  try {
+    const pointers = gitPointers(checkout);
+    return pointers === undefined ? {} : { common: pointers.common };
+  } catch (error) {
+    return { problem: errorText(error) };
   }
 }
 
@@ -523,9 +507,10 @@ export interface RoleRegistrationOptions {
   executorHome?: (directory: string) => Promise<string>;
   /**
    * G-16: false when the plan executor cannot run on this platform (the caller asks `executorPlatformSupported`): the
-   * executor is treated as disabled, so no executor-home lookup runs and no slots root is granted. An executor home that
-   * already exists in the git common directory (found on disk by {@link gitCommonDirFromDisk}, no git) is still denied
-   * (QA-62C-1: a Windows host may run the executor on a repository shared with WSL). Absent: true.
+   * executor is treated as disabled, so no executor-home lookup runs and no slots root is granted. The executor home in
+   * the git common directory (found on disk by {@link gitCommonDirOnDisk}, no git) is still denied whenever that directory
+   * resolves, even before the home exists (QA-62C-1, QA-62C-14: a Windows host may run the executor on a repository
+   * shared with WSL). Absent: true.
    */
   executorPlatform?: boolean;
   /** Clock in epoch ms for the approval expiry; default `Date.now`. */
@@ -657,21 +642,19 @@ export async function registerRoleAgents(
     } else if (opts.executorPlatform === false && table.roles.size > 0
       && (!outside || worktrees.length > 0 || worktreeListingProblem !== undefined)) {
       // QA-62C-1: the executor does not run on this platform, but a Windows host sharing the repository (WSL) may run it.
-      // Deny an existing executor home, found on disk without running git; never grant the slots root here.
-      const common = gitCommonDirFromDisk(worktrees[0] ?? opts.directory);
-      if (common !== undefined) {
-        const home = join(common, EXECUTOR_HOME_DIRNAME);
-        let exists = false;
-        try {
-          exists = statSync(home).isDirectory();
-        } catch { /* No executor home: nothing to deny. */ }
-        if (exists) {
-          const canonical = executorDirectoryRoot(home, opts.realpath ?? nativeRealpath, false);
-          if (canonical.root !== undefined) {
-            externalDirectoryDenied = [join(canonical.root, "*")];
-          } else {
-            executorProblems.push(["roles:executor-home", `${PREFIX}the executor home ${home} ${canonical.problem ?? "has no canonical long form"}; the executor home is not denied`]);
-          }
+      // Deny the executor home in the common directory, found on disk without running git, whether or not it exists yet
+      // (QA-62C-14: a deny on a missing path is harmless, and the Windows host may create it later); never grant the slots
+      // root here. A home that does not exist yet gets its canonical parent and the literal name, like the win32 branch.
+      const found = gitCommonDirOnDisk(worktrees[0] ?? opts.directory);
+      if (found.problem !== undefined) {
+        executorProblems.push(["roles:executor-home", `${PREFIX}the git common directory could not be read (${found.problem}); the executor home is not denied`]);
+      } else if (found.common !== undefined) {
+        const home = join(found.common, EXECUTOR_HOME_DIRNAME);
+        const canonical = executorDirectoryRoot(home, opts.realpath ?? nativeRealpath, false);
+        if (canonical.root !== undefined) {
+          externalDirectoryDenied = [join(canonical.root, "*")];
+        } else {
+          executorProblems.push(["roles:executor-home", `${PREFIX}the executor home ${home} ${canonical.problem ?? "has no canonical long form"}; the executor home is not denied`]);
         }
       }
     }

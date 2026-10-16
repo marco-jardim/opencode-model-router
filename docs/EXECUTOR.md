@@ -10,9 +10,10 @@
 > **Windows only in this release.** Execution slots need a drive-letter path (`routing.executor.slotsDir`, default
 > `<drive>:\.omr-slots\<planId>`), so on platforms other than Windows the executor is inert on OpenCode v2:
 > `router_plan` and `/plan` are not registered, `/router` does not list `/plan`, role agents get no slots rule and no
-> executor-home lookup runs, and no executor discovery runs at start. An executor home that already exists (a Windows
-> host runs the executor on a repository shared with, for example, WSL) is still denied to role agents: the router
-> finds `<git common dir>/omr-executor` on disk, without running git. When roles mode at start with enforced leases and
+> executor-home lookup runs, and no executor discovery runs at start. The executor home (a Windows host runs the
+> executor on a repository shared with, for example, WSL), whether or not it exists yet, is still denied to role agents
+> whenever the git common directory resolves: the router finds `<git common dir>/omr-executor` on disk, without running
+> git. When roles mode at start with enforced leases and
 > verification not `never` would assemble it, the router logs one notice per process:
 > `plan executor requires Windows; router_plan and /plan are not registered`.
 

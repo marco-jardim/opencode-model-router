@@ -676,12 +676,13 @@ describe("createRepoLockFactory (M5, I3)", () => {
     let settled = false;
     const waiting = f.acquire("repo-live", holder(), ctl.signal);
     void waiting.then(() => { settled = true; }, () => { settled = true; });
+    // QA-62C-17: each fire waits until the previous poll judged the holder and armed its sleep (G-20, see pollArmed).
     for (let i = 0; i < 4; i++) {
-      await realPause(20);
+      await pollArmed(clock);
       clock.advance(1_000);
       clock.fire();
     }
-    await realPause(20);
+    await pollArmed(clock); // the poll after the fourth fire judged the live holder again and sleeps
     expect(settled).toBe(false);
     ctl.abort();
     await expect(waiting).rejects.toMatchObject({ code: "E_DISPOSED" });
@@ -783,10 +784,13 @@ describe("createRepoLockFactory (M5, I3)", () => {
     expect(settled).toBe(false);
     ctl.abort();
     await expect(waiting).rejects.toMatchObject({ code: "E_DISPOSED" });
+    // The abort cleared the first acquire's poll timer (queue.ts `sleep`), so nothing is held now.
+    expect(clock.heldCount()).toBe(0);
     // the in-process mutex was released: a second attempt reaches the file again instead of queueing behind the first
     const ctl2 = new AbortController();
     const second = f.acquire("repo-F", holder(), ctl2.signal);
-    await realPause(30);
+    // QA-62C-17: only an acquire that holds the mutex reads the file, judges the live holder and arms its poll sleep.
+    await pollArmed(clock);
     ctl2.abort();
     await expect(second).rejects.toMatchObject({ code: "E_DISPOSED" });
   });
