@@ -76,10 +76,10 @@
       },
       "heavy": {
         "model": "anthropic/claude-opus-5-5",
-        "variant": "xhigh",
-        "effort": "xhigh",
+        "variant": "high",
+        "effort": "high",
         "costRatio": 20,
-        "description": "Opus 5.5 xhigh for architecture, complex debugging, and security",
+        "description": "Opus 5.5 high for architecture, complex debugging, and security",
         "steps": 120,
         "whenToUse": [
           "Architecture decisions",
@@ -117,9 +117,9 @@
       },
       "heavy": {
         "model": "openai/gpt-6-astra-fast",
-        "variant": "max",
+        "variant": "xhigh",
         "costRatio": 20,
-        "description": "GPT-6 Astra Fast (max) for architecture and complex tasks",
+        "description": "GPT-6 Astra Fast (xhigh) for architecture and complex tasks",
         "steps": 120,
         "whenToUse": [
           "Architecture decisions",
@@ -282,10 +282,10 @@
       },
       "heavy": {
         "model": "anthropic/claude-opus-5-5",
-        "variant": "xhigh",
-        "effort": "xhigh",
+        "variant": "high",
+        "effort": "high",
         "costRatio": 20,
-        "description": "Claude Opus 5.5 xhigh for architecture, complex debugging, and security",
+        "description": "Claude Opus 5.5 high for architecture, complex debugging, and security",
         "steps": 120,
         "whenToUse": [
           "Architecture decisions",

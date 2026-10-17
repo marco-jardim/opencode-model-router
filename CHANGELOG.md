@@ -132,6 +132,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Bundled tiers: lower the heavy-tier reasoning variants.** Claude Opus 5.5 heavy tiers in the `anthropic` and
+  `hybrid` presets use `high` (was `xhigh`); GPT-6 Astra Fast heavy in `openai` uses `xhigh` (was `max`).
 - **CI: pull requests are Linux-only; one Windows Node 22 typecheck + full-suite coverage job runs on master pushes
   and manual runs.** Linux e2e and Bun smoke stay blocking. Without Windows coverage, only `src/verify/exec.ts`
   and the `src/executor/` prefix are warn-only; with it, all coverage gates block (G-21).
