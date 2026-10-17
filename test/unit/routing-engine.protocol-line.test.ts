@@ -50,8 +50,8 @@ const ANTHROPIC_FAST_SONNET_D2 = {
 
 /**
  * 2.6.0 moved the `anthropic` fast tier from Haiku 5.5 low to Haiku 5.5 medium and the medium tier from Sonnet 5.5 medium to
- * Sonnet 5.5 high. The 2.5.0 (Haiku low) D2 hashes are kept here: the lineage test below proves the current protocol is that
- * text with only these two tier tokens changed.
+ * Sonnet 5.5 high. The heavy tier now uses Opus 5.5 high instead of xhigh. The 2.5.0 (Haiku low) D2 hashes are kept here:
+ * the lineage test below proves the current protocol is that text with only these three tier tokens changed.
  */
 const ANTHROPIC_FAST_HAIKU_LOW_D2 = {
   raw: "a1b84e7a68b96016cafdef434aa5fdd2d8824ad7e363fa481b4ea4f3eedff130",
@@ -59,18 +59,19 @@ const ANTHROPIC_FAST_HAIKU_LOW_D2 = {
   chars: 3248,
 } as const;
 
-/** The two `anthropic` tier tokens 2.6.0 changed, as `[current, 2.5.0]`. */
-const ANTHROPIC_2_6_0_TIERS: ReadonlyArray<readonly [string, string]> = [
+/** The `anthropic` tier tokens changed since 2.5.0, as `[current, 2.5.0]`. */
+const ANTHROPIC_TO_2_5_0_TIERS: ReadonlyArray<readonly [string, string]> = [
   ["@fast=claude-haiku-5-5/medium(1x)", "@fast=claude-haiku-5-5/low(1x)"],
   ["@medium=claude-sonnet-5-5/high(5x)", "@medium=claude-sonnet-5-5/medium(5x)"],
+  ["@heavy=claude-opus-5-5/high(20x)", "@heavy=claude-opus-5-5/xhigh(20x)"],
 ];
 
 const D2: Readonly<Record<string, { raw: string; rawChars: number; v2: string; v2Chars: number }>> = {
   anthropic: {
-    raw: "5d0a043b6c865b10563385fe4b50ca95a258cac7cd6dae477ad0ebb998c58847",
-    rawChars: 3249,
-    v2: "6725dbc85e24cb324dcb3edea4336aceeaa7a60fca2eb87fc75773ee8658509a",
-    v2Chars: 3249,
+    raw: "3d436295a222cc1a25fb83bb664932e86ae1e25f6dec2c4cdbd3c7fb43b7fc31",
+    rawChars: 3248,
+    v2: "638945afd8309a0ac8bdac460d1dc4048f05ddbc592fb02fd92ce5e63bc58b6a",
+    v2Chars: 3248,
   },
   "hybrid-2": {
     raw: "f79fde6484ae5a8f4ca64dc0b1a89910bd55e12f649f39e54e4817d770877211",
@@ -157,12 +158,12 @@ describe("D2 snapshot: raw protocol text (0.P.3)", () => {
 });
 
 describe("D2 lineage: anthropic fast tier on Haiku 5.5", () => {
-  it("the protocol is the 2.5.0 text with only the fast and medium tier tokens changed, and the Sonnet-era text with also the fast model name changed", () => {
+  it("the protocol is the 2.5.0 text with only the three tier tokens changed, and the Sonnet-era text with also the fast model name changed", () => {
     const cfg = shipped("anthropic");
     const raw = buildDelegationProtocol(cfg);
     const v2 = v2Instructions(raw);
-    for (const [current] of ANTHROPIC_2_6_0_TIERS) expect(raw.split(current).length - 1).toBe(1);
-    const to250 = (text: string) => ANTHROPIC_2_6_0_TIERS.reduce((t, [current, old]) => t.replace(current, old), text);
+    for (const [current] of ANTHROPIC_TO_2_5_0_TIERS) expect(raw.split(current).length - 1).toBe(1);
+    const to250 = (text: string) => ANTHROPIC_TO_2_5_0_TIERS.reduce((t, [current, old]) => t.replace(current, old), text);
     expect(sha256(to250(raw))).toBe(ANTHROPIC_FAST_HAIKU_LOW_D2.raw);
     expect(to250(raw)).toHaveLength(ANTHROPIC_FAST_HAIKU_LOW_D2.chars);
     expect(sha256(to250(v2))).toBe(ANTHROPIC_FAST_HAIKU_LOW_D2.v2);
