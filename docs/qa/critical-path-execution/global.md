@@ -296,7 +296,7 @@ Notes:
 
 - **G-11 (minor, test, pre-existing): v2-provider-e2e Windows path assertion against a JSON-serialised body**
   — fixed. All four cases fail identically at `7181165` and `8c8c6e0`; this is not host drift. Supplied evidence:
-  `D:\git\omr-cpx-p61\.cpx-logs\gate62-longtemp\v2-e2e.log` shows the exact working-directory expectation uses
+  `D:\git\.omr-cpx-evidence\p61-cpx-logs\gate62-longtemp\v2-e2e.log` shows the exact working-directory expectation uses
   single Windows backslashes while the received JSON-serialised system messages escape them. The capture now
   reads system content from the already `JSON.parse`-decoded request; both working-directory assertions retain
   the same substring and exact project path. The created project directory is canonicalised with `realpath`
@@ -376,7 +376,7 @@ finding, so no round 3 (§0.7).
 ### Final smoke gate (A-6.2-1), 2026-10-16
 
 Head `fcf6b1b`, host OpenCode 2.0.26 (`OPENCODE_V2_BIN`), v1 lanes with 1.18.35 first on `PATH`, no
-`OPENCODE_CONFIG_DIR`/XDG overrides. Logs: `D:\git\omr-cpx-p61\.cpx-logs\gate62-final\`.
+`OPENCODE_CONFIG_DIR`/XDG overrides. Logs: `D:\git\.omr-cpx-evidence\p61-cpx-logs\gate62-final\`.
 
 - `smoke:cpx`: 74/74.
 - `smoke:cpx:provision`: 4/4.
@@ -400,7 +400,7 @@ fsck clean).
 
 Merge `87629fc` (`cpx/p62` into `cpx/main`): `git diff fcf6b1b 87629fc -- src test package.json package-lock.json` is
 empty, so the smoke gate above stands for the merged code. Run in `D:\git\omr-cpx-p62` fast-forwarded to `87629fc`
-(no `.opencode\`, no `OPENCODE_CONFIG_DIR`); logs `D:\git\omr-cpx-p61\.cpx-logs\p62-final-*.log`.
+(no `.opencode\`, no `OPENCODE_CONFIG_DIR`); logs `D:\git\.omr-cpx-evidence\p61-cpx-logs\p62-final-*.log`.
 - `npm run typecheck`: exit 0.
 - `npx vitest run --coverage --coverage.reportOnFailure --maxWorkers=8`: 314 files, **20265 passed, 1 failed, 87
   skipped**; coverage **statements 95.63%, branches 92.21%, functions 96.66%, lines 97.28%**, no threshold error.
@@ -465,6 +465,25 @@ unmerged) and locally on Windows and on Linux (WSL Ubuntu, clean clone with the 
 - `verify-resource-budget.deferred` 3.1.2.f (e2e, p50 capture wait): measured 1101-7060 ms locally at `origin/master`
   and 2820-5181 ms on this branch with the same command, and passed on PR #117's Linux e2e; no product overhead found
   by QA (the measured hook is v1, unchanged); recorded with G-10's load-sensitive family.
+
+### 6.2.4 delivered and 6.2.3 cleanup (2026-10-16/17)
+
+- **Delivered.** PR #116 merged as `1e499a4`; follow-ups PR #118 (`7a498e4`, G-23/G-24) and PR #119 (`841fa6e`,
+  G-25). Master run 38984293973 at `841fa6e`: every job green, the Windows job (full suite with coverage, about
+  20 min) and the merged coverage gate included.
+- **Cleanup (6.2.3).** Removed with `git worktree remove` (no prune): every phase and dogfood-fix worktree
+  (`p01`…`p62`, `pdf1-1`…`pdf2-1`, `sync1`) and the bisection scratch `D:\git\omr-cpx-scratch-master`, each first
+  checked clean and contained in `origin/master`. Local and remote branches `cpx/p*`, `cpx/pdf*`, `cpx/sync1`,
+  `cpx/scratch-df11` deleted; 18 `cpx/*-base` tags deleted locally and the 13 that had been pushed deleted remotely.
+  Kept: `cpx/main`, `D:\git\omr-cpx-main`, the `cpx/df*` tags and dogfood worktrees (6.2.5).
+- **Evidence moved, not deleted:** `D:\git\omr-cpx-p61\.cpx-logs` (412 files, 1.8 GB: gate and run logs cited here)
+  is now `D:\git\.omr-cpx-evidence\p61-cpx-logs`; the paths in this report point there. Earlier reports
+  (`dogfood.md`, `phase-6.1-handover.md`) keep their historical paths.
+- **Not done here (no `router_plan` in this session):** the two locked executor slots of the aborted DF-2 plan,
+  `D:\git\.omr-cpx-slots\critical-path-execution-plan-6-1-db-6-1\slot-{1,2}`. 6.2.3-1 removes them through
+  `router_plan action=purge` (or `/plan purge`) in a host that loads the router; never by deleting the slot
+  directories. An empty `D:\git\omr-cpx-p62` directory stays until the process holding it (an OpenCode watcher)
+  exits.
 
 ## Deferred findings
 
