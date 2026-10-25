@@ -73,6 +73,7 @@ import { routerRunTool, type RunRecord } from "./router/run-tools";
 import type { WorkRootAnswer } from "./router/git-tools";
 import { GUARD_CUMULATIVE_MULTIPLIER, roleGuardProfile, type GuardProfile } from "./router/guard-profile";
 import { currentBinding } from "./routing/roles/binding";
+import { readRoleOrphans } from "./routing/roles/orphans";
 import { authorityTool, requestedAuthority } from "./routing/roles/authority";
 import {
   CARRIED_NO_PROCESS_REASON, lapsedApprovalReason, pruneLapsedApprovals, roleAttemptVerification, roleEscalationAfterFail, roleMaxActions,
@@ -90,6 +91,7 @@ import { createCatalogPricing, createIngest, ingestSettings } from "./routing/ou
 import type { Ingest } from "./routing/outcomes/ingest";
 import { isAnnotationRow, verdictGraderOf, verdictOf, type LogRow } from "./routing/outcomes/types";
 import { createPersister, nodePersistDeps, summarizeRoles } from "./routing/outcomes";
+import { countUnknownBindings } from "./routing/outcomes/stats";
 import { roleAgentSteps } from "./router/role-agents";
 import type { HostBudgetObservation } from "./compat/v2-hooks";
 import { ROUTER_TURN_STATE_ATTACH, TURN_STATE_ROOT, type TurnStateRegistry } from "./compat/turn-state";
@@ -987,11 +989,12 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       const background = names("background");
       const leases = names("leases");
       const executor = names("executor");
-      const features = [background ? "background dispatch" : "", leases ? "leases" : "", executor ? "the plan executor" : ""].filter((f) => f !== "");
+      const orphans = names("orphans");
+      const features = [background ? "background dispatch" : "", leases ? "leases" : "", executor ? "the plan executor" : "", orphans ? "orphan cleanup" : ""].filter((f) => f !== "");
       const subject = features.length === 0
         ? "background dispatch requires"
         : features.length === 1
-          ? `${features[0]} ${leases && !background && !executor ? "require" : "requires"}`
+          ? `${features[0]} ${leases && !background && !executor && !orphans ? "require" : "requires"}`
           : `${features.slice(0, -1).join(", ")} and ${features[features.length - 1]} require`;
       logger.warn(`[router] ${subject} OpenCode v2; ignored: ${keys.join(", ")}`);
     }
@@ -1407,21 +1410,30 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   const ADVISOR_ROLE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
   /**
    * #84 P2.2: the extras of the cost doctor's roles checks — the host and, in roles mode with a live engine, the role × tier
-   * statistics and the tier dispatch count of the decision log over {@link ADVISOR_ROLE_WINDOW_MS}. Tiers mode and v1 read nothing
-   * (`{ host }` only, which no tier check reads); a read failure leaves the statistics out, so those checks stay silent.
+   * statistics, unknown-binding counts and tier dispatch count over {@link ADVISOR_ROLE_WINDOW_MS}, plus process-lifetime orphan
+   * counters. The v2 adapter uses this same gatherer. Tiers mode and v1 read nothing (`{ host }` only); a read failure leaves
+   * the windowed statistics out but keeps the process counters.
    */
   const advisorExtras = async (): Promise<AdvisorExtras> => {
     const host = isV2Host ? "v2" as const : "v1" as const;
     if (rolesNow().size === 0) return { host };
+    const orphanCounters = readRoleOrphans().counters;
     const live = ingestSettings(cfg, "v2");
-    if (live === null) return { host }; // engine static: no decision log
+    if (live === null) return { host, orphanCounters }; // engine static: no decision log
     try {
       const read = await createPersister(live.outcomesDir, nodePersistDeps({ warn: () => undefined })).readRows();
       const since = Date.now() - ADVISOR_ROLE_WINDOW_MS;
-      return { host, roleStats: summarizeRoles(null, read.rows, { since, until: null }), tierDispatches: tierDispatchCount(read.rows, since) };
+      const window = { since, until: null };
+      return {
+        host,
+        roleStats: summarizeRoles(null, read.rows, window),
+        tierDispatches: tierDispatchCount(read.rows, since),
+        unknownBindings: countUnknownBindings(read.rows, window),
+        orphanCounters,
+      };
     } catch (error) {
       logger.warn("[router] cost doctor: the role statistics are unavailable", { error: describeError(error) });
-      return { host };
+      return { host, orphanCounters };
     }
   };
   const gatherAdvisorInputs = async (

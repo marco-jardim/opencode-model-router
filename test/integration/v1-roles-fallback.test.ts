@@ -46,7 +46,9 @@ describe("v1 roles line: a failure leaves the baseline protocol (QA-2.4-13)", ()
 
   it("a throwing applyV1Roles is logged and the system prompt is exactly the baseline", async () => {
     mkdirSync(dirname(overridePath()), { recursive: true });
-    writeFileSync(overridePath(), JSON.stringify({ activePreset: "anthropic", routing: { roles: { search: ["explore"] } } }));
+    writeFileSync(overridePath(), JSON.stringify({ activePreset: "anthropic", routing: {
+      roles: { search: ["explore"] }, orphans: { resume: "allow" }, leases: { mode: "off" },
+    } }));
     invalidateConfigCache();
     const logs: string[] = [];
     const ctx = {
@@ -68,6 +70,11 @@ describe("v1 roles line: a failure leaves the baseline protocol (QA-2.4-13)", ()
       const cfg = loadConfig(home);
       expect(output.system).toEqual([assembleSystemPrompt(cfg, "anthropic/claude-sonnet-5-5", resolveEnforcementMode({ config: cfg, env: process.env }).mode !== "off")]);
       expect(logs.some((m) => m.includes("the R: line could not be extended"))).toBe(true);
+      const notices = logs.filter((m) => m.includes("orphan cleanup") && m.includes("OpenCode v2"));
+      expect(notices).toHaveLength(1);
+      expect(notices[0]).toContain("routing.orphans.resume");
+      expect(notices[0]).toContain("leases");
+      expect(notices[0]).toContain("routing.leases.mode");
     } finally {
       await hooks.dispose();
     }

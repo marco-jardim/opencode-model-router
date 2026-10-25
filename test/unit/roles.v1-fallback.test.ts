@@ -124,6 +124,7 @@ const rolesOverride = (dir: string) => ({
     workRoots: [`${dir.replaceAll("\\", "/")}/wt-*`],
     exploration: { rate: 0.1 },
     run: { scripts: ["test", "typecheck"] },
+    orphans: { resume: "allow" },
   },
   roleAgents: { explorer: { budget: { fast: 10 } }, researcher: { enabled: false } },
 });

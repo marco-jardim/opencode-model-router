@@ -21,6 +21,7 @@ import { locationOutsideWorkRoots } from "../../src/router/work-roots";
 import { DECISIONS_FILE, acquireOutcomes, createSideLogs, makeKey, nodePersistDeps } from "../../src/routing/outcomes";
 import type { DecisionRow, DispatchTimingRow, OrchestratorTurnRow } from "../../src/routing/outcomes";
 import { readLastCheckpoint } from "../../src/routing/commands/stats";
+import { recordRoleOrphan, resetRoleOrphansForTests } from "../../src/routing/roles/orphans";
 import { advisorSettings, createAdvisorNotifier, noticeFiles } from "../../src/routing/advisor";
 import type { AdvisorFs, AdvisorNotifierDeps, AdvisorSettings } from "../../src/routing/advisor";
 import type { RouterConfig, TierConfig } from "../../src/router/config";
@@ -1619,6 +1620,7 @@ describe("cost doctor in the plugin", { timeout: 60_000 }, () => {
     process.env.HOME = home;
     process.env.USERPROFILE = home;
     invalidateConfigCache();
+    resetRoleOrphansForTests();
   });
 
   afterEach(async () => {
@@ -1626,6 +1628,7 @@ describe("cost doctor in the plugin", { timeout: 60_000 }, () => {
     if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
     if (savedProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = savedProfile;
     invalidateConfigCache();
+    resetRoleOrphansForTests();
     rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
 
@@ -1752,6 +1755,60 @@ describe("cost doctor in the plugin", { timeout: 60_000 }, () => {
     expect(text).toContain("[warning] variant-effort"); // the bundled anthropic preset carries variant + effort (QA-2.3-13)
     expect(text).toContain("Decision log: a ladder-attempt row's confidence"); // decision 16
     expect(text.indexOf("router: engine=shadow")).toBeLessThan(text.indexOf("Cost doctor: "));
+  });
+
+  it.each(["allow", "refuse"] as const)("v2 /router reports stale resumes as info, not a notice, with resume=%s", async (resume) => {
+    mkdirSync(store, { recursive: true });
+    const row = decisionRow("stale", new Date().toISOString(), {
+      role: "implementer", tier: "medium", resume: true, binding: "unknown", childSessionID: "stale-child",
+    });
+    const note = { ...row, reason: "note:binding:unknown" };
+    const old = { ...row, decisionID: "old", childSessionID: "old-child", ts: new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString() };
+    writeFileSync(join(store, DECISIONS_FILE), [row, note, note, old].map((r) => JSON.stringify(r)).join("\n") + "\n");
+    recordRoleOrphan("refused-1", "refused");
+    recordRoleOrphan("refused-2", "refused");
+    recordRoleOrphan("lost", "lost");
+    const { hooks, host } = await plugin({
+      routing: { delegation: "roles", engine: "advise", orphans: { resume }, outcomes: { path: store } },
+      agents: async () => rawAgents({ providerID: "anthropic", id: "claude-sonnet-5-5" }),
+    });
+    const text = await ask(hooks);
+    expect(text).toContain("[info] role-child-stale-resume:");
+    expect(text).toContain("1 resumed unknown-binding row in the decision-log window (pending)");
+    expect(text).toContain("2 stale resumes refused by this process (cleaned)");
+    expect(text).not.toContain("role-binding-unknown");
+    const snippet = 'fix (opencode-model-router.overrides.jsonc): {"routing":{"orphans":{"resume":"refuse"}}}';
+    if (resume === "allow") expect(text).toContain(snippet);
+    else expect(text).not.toContain(snippet);
+    await turn(hooks);
+    await until(noticeStateReady);
+    await userMessage(hooks, "root-1", "continue");
+    expect(host.synthetic).toEqual([]);
+  });
+
+  it("v2 /router warns only about fresh unknown bindings in its 7-day window", async () => {
+    mkdirSync(store, { recursive: true });
+    const row = decisionRow("fresh", new Date().toISOString(), {
+      role: "implementer", binding: "unknown", childSessionID: "fresh-child", reason: "note:binding:unknown",
+    });
+    const resumed = { ...row, decisionID: "resumed", resume: true, childSessionID: "resumed-child" };
+    const old = { ...row, decisionID: "old-fresh", ts: new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString() };
+    writeFileSync(join(store, DECISIONS_FILE), [row, row, resumed, old].map((r) => JSON.stringify(r)).join("\n") + "\n");
+    const { hooks } = await plugin({ routing: { delegation: "roles", engine: "shadow", outcomes: { path: store } } });
+    const text = await ask(hooks);
+    expect(text).toContain("[warning] role-binding-unknown: 1 child session could not be bound");
+    expect(text).toContain("[info] role-child-stale-resume:");
+    expect(text).toContain("1 resumed unknown-binding row in the decision-log window (pending)");
+  });
+
+  it("v2 /router shows cleaned resumes even with a static engine and no decision log", async () => {
+    recordRoleOrphan("refused", "refused");
+    const { hooks } = await plugin({ routing: { delegation: "roles", engine: "static" } });
+    const text = await ask(hooks);
+    expect(text).toContain("[info] role-child-stale-resume:");
+    expect(text).toContain("0 resumed unknown-binding rows in the decision-log window (pending)");
+    expect(text).toContain("1 stale resume refused by this process (cleaned)");
+    expect(text).not.toContain("role-binding-unknown");
   });
 
   it("the finding clears once the host has a title model", async () => {

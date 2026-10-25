@@ -22,7 +22,7 @@ import type { Hooks } from "@opencode-ai/plugin";
 import ModelRouterPlugin from "../../src/index";
 import {
   canonicalAuthorityPath, insideWorkRoot, isPermissionRefusal, listedWorktreeRoot, patchPaths, registerV2Hooks, roleActionOf, roleAuthorityDecision,
-  roleCatalogFailureNotice, roleToolKept, toolCallPaths, unsafeSearchPattern, HOST_TOOL_SUCCESS_EVENT,
+  roleCatalogFailureNotice, roleToolKept, toolCallPaths, unsafeSearchPattern, HOST_TOOL_SUCCESS_EVENT, createHostBudgetObserver,
 } from "../../src/compat/v2-hooks";
 import { budgetExhausted, captureBudget } from "../../src/guard/enforce";
 import { evaluatePermission } from "../../src/router/read-only";
@@ -30,7 +30,7 @@ import { SHIPPED_ROLE_SPECS } from "../../src/router/roles";
 import { V2_GRADER_AGENT } from "../../src/compat/v2-client";
 
 // QA-P23-B2: a pass-through spy on the adapter's dispatch router — the tests read which observed bindings it is told about.
-const noted = vi.hoisted(() => ({ calls: [] as Array<{ child: string; kind: string }> }));
+const noted = vi.hoisted(() => ({ calls: [] as Array<{ child: string; kind: string }>, beforeRoute: undefined as (() => void) | undefined }));
 vi.mock("../../src/routing/wire/dispatch", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../src/routing/wire/dispatch")>();
   return {
@@ -39,6 +39,10 @@ vi.mock("../../src/routing/wire/dispatch", async (importOriginal) => {
       const router = actual.createDispatchRouter(deps);
       return {
         ...router,
+        route: (call: Parameters<typeof router.route>[0]) => {
+          noted.beforeRoute?.();
+          return router.route(call);
+        },
         noteBinding: (child: string, binding: Parameters<typeof router.noteBinding>[1]) => {
           noted.calls.push({ child, kind: binding.kind });
           router.noteBinding(child, binding);
@@ -129,11 +133,12 @@ import { buildRoleLadder } from "../../src/routing/engine/ladders";
 import { acquireOutcomes } from "../../src/routing/outcomes";
 import type { DecisionRow, OutcomesBundle } from "../../src/routing/outcomes/types";
 import { resetIngestState } from "../../src/routing/outcomes/ingest";
-import { BINDING_NOTES, bind, currentBinding, resetBindingRegistryForTests } from "../../src/routing/roles/binding";
+import { BINDING_NOTES, bind, bindPlanChild, currentBinding, evictCall, registerPending, resetBindingRegistryForTests } from "../../src/routing/roles/binding";
+import { readRoleOrphans, resetRoleOrphansForTests } from "../../src/routing/roles/orphans";
 import { GRANT_NOTES } from "../../src/routing/roles/policy";
 import { AUTHORITY_TEXT, requestAuthority, requestedAuthority, resetAuthorityForTests } from "../../src/routing/roles/authority";
 import {
-  createDispatchRouter, gitWorktreeList, parseWorktreeList, resetDispatchRouting, roleMaxActions, routedRoleOf,
+  createDispatchRouter, gitWorktreeList, parseWorktreeList, resetDispatchRouting, roleMaxActions, routedRoleOf, ROLE_REFUSALS, RoleDispatchRefusal,
 } from "../../src/routing/wire/dispatch";
 import { createEngineRuntime } from "../../src/routing/wire/runtime";
 import { resolveRoles } from "../../src/router/roles";
@@ -153,11 +158,13 @@ afterEach(async () => {
   vi.restoreAllMocks();
   invalidateConfigCache();
   resetBindingRegistryForTests();
+  resetRoleOrphansForTests();
   resetAuthorityForTests();
   resetDispatchRouting();
   resetDispatchRegistry();
   resetIngestState();
   noted.calls.length = 0;
+  noted.beforeRoute = undefined;
   gated.inputs.length = 0;
   gated.failNext = false;
 });
@@ -334,6 +341,169 @@ async function dispatch(
 }
 
 const kindOf = (cfg: RouterConfig, child: string) => currentBinding(child, { maxOf: (agent) => roleMaxActions(resolveRoles(cfg, "v2").get(agent)) })?.kind;
+
+describe("stale role resumes (OpenCode v2 only)", () => {
+  const nonce = "orphan-nonce-12345678";
+  const stale = (agent = "explorer"): Record<string, unknown> => ({
+    parentID: "root", agent, title: `old work [nonce ${nonce}]`,
+  });
+  async function setup(resume: "refuse" | "allow" = "refuse", sessions: Sessions = { stale: stale() }) {
+    const { dir, cfg } = home({ routing: { delegation: "roles", orphans: { resume }, leases: { mode: "off" }, background: { mode: "off" } } });
+    const v2 = host(dir, cfg, sessions);
+    const budget = createHostBudgetObserver();
+    const begin = vi.spyOn(budget, "begin");
+    await v2.start(await plugin(dir), { hostBudget: budget });
+    return { dir, cfg, v2, begin, sessions };
+  }
+  const resumeChild = (v2: Host, child: string, key = "sessionID") => toolCall(v2, "root", "build", "subagent", {
+    agent: "explorer", prompt: "continue", description: "continue", [key]: child,
+  });
+
+  it("refuses unregistered and retired children before host budget begins; warns once, then debug", async () => {
+    const { v2, begin, sessions, dir } = await setup();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const debug = vi.spyOn(console, "debug").mockImplementation(() => {});
+    await expect(resumeChild(v2, "stale")).rejects.toBeInstanceOf(RoleDispatchRefusal);
+    await expect(resumeChild(v2, "stale", "task_id")).rejects.toThrow(ROLE_REFUSALS.staleResume("stale"));
+    await dispatch(v2, sessions, "retired-call", "retired", "explorer", "find a symbol", dir);
+    evictCall("root", "retired-call"); // no binding yet: the nonce is retired, not cached exact
+    await expect(resumeChild(v2, "retired")).rejects.toThrow(ROLE_REFUSALS.staleResume("retired"));
+    expect(begin).not.toHaveBeenCalled();
+    expect(warn.mock.calls.filter(([text]) => String(text).includes("resume refused:"))).toHaveLength(1);
+    expect(debug.mock.calls.filter(([text]) => String(text).includes("resume refused:"))).toHaveLength(2);
+    expect(readRoleOrphans().counters.refused).toBe(3);
+  });
+
+  it("binds an exact resume without changing its grant", async () => {
+    const { v2, sessions, dir, cfg, begin } = await setup();
+    await dispatch(v2, sessions, "exact-call", "exact", "explorer", "find a symbol", dir);
+    await resumeChild(v2, "exact");
+    expect(kindOf(cfg, "exact")).toBe("exact");
+    expect(begin).toHaveBeenCalledWith("exact");
+    expect(readRoleOrphans().counters.refused).toBe(0);
+    v2.ctx.session.context.mockClear();
+    await resumeChild(v2, "exact");
+    expect(v2.ctx.session.context.mock.calls.some(([args]) => args.sessionID === "exact")).toBe(false);
+    expect(kindOf(cfg, "exact")).toBe("exact");
+  });
+
+  it("names the role agent used by the call, not the child's previous role", async () => {
+    const { v2, begin } = await setup("refuse", { stale: stale("implementer") });
+    await expect(resumeChild(v2, "stale")).rejects.toMatchObject({
+      name: "RoleDispatchRefusal", agent: "explorer", reason: ROLE_REFUSALS.staleResume("stale"),
+      message: `[router] role dispatch @explorer refused: ${ROLE_REFUSALS.staleResume("stale")}`,
+    });
+    expect(begin).not.toHaveBeenCalled();
+  });
+
+  it("allow skips all early target lookups and binding (today's resume behaviour)", async () => {
+    const { v2, cfg, begin } = await setup("allow");
+    let routes = 0;
+    noted.beforeRoute = () => {
+      routes++;
+      expect(v2.ctx.session.get.mock.calls.some(([args]) => args.sessionID === "stale")).toBe(false);
+      expect(kindOf(cfg, "stale")).toBeUndefined();
+    };
+    await resumeChild(v2, "stale");
+    expect(routes).toBe(1);
+    // Ordinary routing still reads the child's current model in runningRungOf when no dispatch record exists.
+    // Only the orphan preflight's extra lookup/bind is disabled; the old routing lookup must remain.
+    expect(v2.ctx.session.get.mock.calls.filter(([args]) => args.sessionID === "stale")).toHaveLength(1);
+    expect(v2.ctx.session.context.mock.calls.some(([args]) => args.sessionID === "stale")).toBe(false);
+    expect(kindOf(cfg, "stale")).toBeUndefined();
+    expect(begin).toHaveBeenCalledWith("stale");
+  });
+
+  it("does not bind a tier target; after a role resume its agentless events remain fail-closed", async () => {
+    const { v2, cfg } = await setup("refuse", { tier: stale("fast") });
+    await resumeChild(v2, "tier");
+    expect(kindOf(cfg, "tier")).toBeUndefined();
+    // The mock session still names fast, but the committed resume ran as explorer. QA-P23-A8 trusts that current record.
+    await expect(v2.toolHooks["execute.before"]!({ sessionID: "tier", messageID: "m", id: "agentless-tier", tool: "todowrite", input: {} }))
+      .rejects.toThrow("Refused for role session tier: the calling agent is unknown (fail closed)");
+    expect(kindOf(cfg, "tier")).toBeUndefined();
+  });
+
+  it("leaves noNonce, foreign, conflicting markers and claimed bindings alone", async () => {
+    registerPending({ parentSessionID: "other-parent", callID: "foreign-call", agent: "explorer", nonce, description: "foreign work",
+      grant: { actions: new Set(["read"]), notes: [], workRoot: null }, budget: 8, decisionID: null, registeredAt: Date.now() });
+    const { v2 } = await setup("refuse", {
+      noNonce: { parentID: "root", agent: "explorer" }, foreign: stale(),
+      markers: { ...stale(), messages: [{ role: "user", content: [{ type: "text", text: "OMR_NONCE=another-nonce-12345678" }] }] },
+      claimed: { ...stale(), parentID: "other-parent" },
+    });
+    await bind("first-claim", async () => ({ parentID: "other-parent", agent: "explorer", title: `work [nonce ${nonce}]` }), { maxOf: () => ["read"] });
+    // Foreign is tested before the claimed check: it still belongs to another parent.
+    for (const child of ["noNonce", "foreign", "markers", "claimed"]) await resumeChild(v2, child);
+    expect(readRoleOrphans().counters.refused).toBe(0);
+  });
+
+  it("never treats plan bindings, context prefixes or launch headers as orphan role children", async () => {
+    const { v2, cfg, dir } = await setup("refuse", {
+      plan: { ...stale(), messages: [{ role: "user", content: [{ type: "text", text: "PLAN CONTEXT\nshared context" }] }] },
+      header: { ...stale(), messages: [{ role: "user", content: [{ type: "text", text: `[plan plan-one:task#1] nonce=${"a".repeat(32)}` }] }] },
+      boundPlan: stale(),
+    });
+    bindPlanChild({ childSessionID: "boundPlan", agent: "explorer", role: "explorer", workRoot: dir, grant: ["read"], planId: "plan-one", taskId: "task", attempt: 1 });
+    for (const child of ["plan", "header", "boundPlan"]) await resumeChild(v2, child);
+    for (const child of ["plan", "header"]) expect(kindOf(cfg, child)).toBeUndefined();
+    expect(currentBinding("boundPlan", { maxOf: () => [] })?.plan?.planId).toBe("plan-one");
+  });
+
+  it("binding lookup failures warn once, then debug, and are not refused or cached", async () => {
+    const { v2, cfg } = await setup();
+    const get = v2.ctx.session.get.getMockImplementation()!;
+    let targetReads = 0;
+    v2.ctx.session.get.mockImplementation(async (args) => {
+      if (args.sessionID === "stale" && ++targetReads >= 2) throw new Error("host unavailable during bind");
+      return get(args);
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const debug = vi.spyOn(console, "debug").mockImplementation(() => {});
+    await resumeChild(v2, "stale");
+    expect(kindOf(cfg, "stale")).toBeUndefined();
+    await resumeChild(v2, "stale");
+    expect(kindOf(cfg, "stale")).toBeUndefined();
+    const message = "[router] roles: a binding session could not be read";
+    expect(warn.mock.calls.filter(([text]) => String(text).includes(message))).toHaveLength(1);
+    expect(debug.mock.calls.filter(([text]) => String(text).includes(message))).toHaveLength(1);
+  });
+
+  it("a failed initial lookup or plan-context lookup leaves the target unbound", async () => {
+    const { v2, cfg } = await setup("refuse", { getFailed: stale(), contextFailed: stale() });
+    const get = v2.ctx.session.get.getMockImplementation()!;
+    v2.ctx.session.get.mockImplementation(async (args) => {
+      if (args.sessionID === "getFailed") throw new Error("session lookup unavailable");
+      return get(args);
+    });
+    const context = v2.ctx.session.context.getMockImplementation()!;
+    v2.ctx.session.context.mockImplementation(async (args) => {
+      if (args.sessionID === "contextFailed") throw new Error("context lookup unavailable");
+      return context(args);
+    });
+    for (const child of ["getFailed", "contextFailed"]) {
+      await resumeChild(v2, child);
+      expect(kindOf(cfg, child)).toBeUndefined();
+    }
+    expect(readRoleOrphans().counters.refused).toBe(0);
+  });
+
+  it("checks Code Mode execute's literal target without spending a host budget", async () => {
+    const { v2, begin } = await setup();
+    await expect(toolCall(v2, "root", "build", "execute", { code: 'await subagent({ task_id: "stale", prompt: "continue" })' }))
+      .rejects.toMatchObject({ name: "RoleDispatchRefusal", agent: "build", reason: ROLE_REFUSALS.staleResume("stale") });
+    expect(begin).not.toHaveBeenCalled();
+  });
+
+  it("caps Code Mode target host lookups at four", async () => {
+    const sessions = Object.fromEntries(Array.from({ length: 8 }, (_, i) => [`tier-${i}`, stale("fast")]));
+    const { v2 } = await setup("refuse", sessions);
+    const code = Object.keys(sessions).map((child) => `await subagent({ sessionID: "${child}" })`).join(";\n");
+    await toolCall(v2, "root", "build", "execute", { code });
+    const targets = v2.ctx.session.get.mock.calls.flatMap(([args]) => args.sessionID.startsWith("tier-") ? [args.sessionID] : []);
+    expect(targets).toEqual(["tier-0", "tier-1", "tier-2", "tier-3"]);
+  });
+});
 
 // ---------------------------------------------------------------------------
 // Pure helpers (the enforcement matrix)

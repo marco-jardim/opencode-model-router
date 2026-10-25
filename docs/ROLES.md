@@ -665,6 +665,14 @@ actions, no `router_run`, no `external_directory`, a note telling the child that
 finding `role-binding-unknown`. Ambiguity never widens authority: dispatch a fresh task instead of resuming.
 Errors fail closed: a context-hook error leaves the role child an empty tool catalog, a permission-hook error denies.
 
+On OpenCode v2, a resume of a **stale role child** whose nonce is unregistered or retired in this process (for example
+after a restart, or once its dispatch has finished) is refused before a new attempt starts: it would run unbound, with local actions only and no work
+root. Dispatch a fresh task with the same prompt and route line; do not resume that session. This also checks up to
+four literal resume targets in Code Mode `execute`. Exact bindings, other unknown-binding causes, plan children,
+live attempts and journaled dispatches awaiting recovery are not refused by this check. A failed host lookup warns
+and leaves the resume unchanged. `routing.orphans.resume: "allow"` skips the early check and keeps the old behaviour;
+the default is `"refuse"`.
+
 **The ladder** (dynamic roles only):
 
 1. The child calls `router_request_authority({ actions, reason })`.
@@ -899,6 +907,8 @@ On OpenCode v1, `routing.delegation: "roles"`, `roleAgents`, `routing.exploratio
 `roles delegation requires OpenCode v2; using tiers`. No role agent, tool, hook or prompt change is registered; v1
 keeps the tier model. `routing.background` and `routing.leases` are likewise OpenCode v2 only: v1 has no background
 policy, held results or leases, and its protocol has no `Background dispatches` block.
+`routing.orphans.resume` is also inert on v1: the existing single v2-only-features notice names the configured key
+and **orphan cleanup**; no separate notice or resume check is added.
 
 ## Migration from `subagentTiers` and `agents`
 
@@ -919,9 +929,17 @@ policy, held results or leases, and its protocol has no `Background dispatches` 
 
 ## Observability
 
+- Stale role-resume refusals log one `[router] roles: …` warning per process; later refusals log at debug. A shared,
+  bounded in-memory orphan registry records refused resumes and lost role dispatches, with process-lifetime counters;
+  it does not delete, retitle or interrupt host sessions.
+- Binding session/first-message lookup failures share a separate once-per-process warning; subsequent failures log at debug.
 - `/router` lists the role table with ranges and authority, and the advisor findings `role-separation`,
-  `roles-on-legacy-host`, `role-budget-low`, `role-range-clamped`, `role-binding-unknown`, `native-explore-aliased`,
+  `roles-on-legacy-host`, `role-budget-low`, `role-range-clamped`, `role-binding-unknown`, `role-child-stale-resume`, `native-explore-aliased`,
   `roles-none-enabled` and `role-usage-share` ([cost doctor](./ROUTING_ENGINE.md#the-cost-doctor)).
+- `role-binding-unknown` warns only about **fresh** unknown bindings in the last 7 days. `role-child-stale-resume`
+  is **info**, never a cost-doctor notice: it reports resumed unknown-binding rows in that window (pending) and
+  process-lifetime stale-resume refusals (cleaned). It suggests `routing.orphans.resume: "refuse"` only when set to
+  `"allow"`. These counts do not change the unknown-binding totals in `/router stats`.
 - The **dispatch row** of a role dispatch (written unless the engine is `static`) carries `role`, `tier`, `grant`,
   `detection`, `boundsReasons`, `explore` and `propensity`; a resume also records the child's current `binding`.
 - **Annotation rows** come later and share the dispatch's `decisionID`; they are never counted as dispatches: a

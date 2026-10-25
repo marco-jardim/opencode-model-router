@@ -27,13 +27,14 @@ import type { Ingest } from "../routing/outcomes/ingest";
 import { createEngineRuntime } from "../routing/wire/runtime";
 import {
   annotateSubagentResult, childSessionOf, createDispatchRouter, forgetRoutedRole, gitWorktreeList, normalizeRootText, parseWorktreeList,
-  roleMaxActions, routedRoleOf, takeSubagentAnnotations,
+  ROLE_REFUSALS, RoleDispatchRefusal, roleMaxActions, routedRoleOf, takeSubagentAnnotations,
 } from "../routing/wire/dispatch";
 import type { RouterConfig } from "../router/config";
 import { resolveRoles, type AuthorityAction, type RoleSpec } from "../router/roles";
 import {
   BINDING_NOTES, bind, bindPlanChild, currentBinding, evict as evictBinding, evictCall, type Binding, type SessionLookup,
 } from "../routing/roles/binding";
+import { recordRoleOrphan, takeRoleBindingLookupNotice } from "../routing/roles/orphans";
 import type { DispatchGrant } from "../routing/roles/policy";
 import { forgetWorkingSet, workingSetOf } from "../routing/wire/working-set";
 import {
@@ -98,6 +99,9 @@ import { observeV2, timingWriteObserver, type V2Observations } from "./v2-observ
 
 /** §7 grammar (`formatLaunchPrompt`): every launcher prompt starts with this line. */
 const PLAN_CONTEXT_PREFIX = "PLAN CONTEXT\n";
+const LIVE_STATES: ReadonlySet<Attempt["state"]> = new Set<Attempt["state"]>(["acknowledged", "child-ended", "processing"]);
+/** Bound host lookups for one Code Mode resume check. */
+const MAX_ORPHAN_RESUME_TARGETS = 4;
 
 /**
  * The status of an executor launch's `runner` trigger. QA-3.1 nit 4: the child's observed end (`execution.*`) decides;
@@ -1550,13 +1554,25 @@ export async function registerV2Hooks(
     return live.length === roles.size ? roles : new Map(live);
   };
   const maxOfRoles = (roles: ReadonlyMap<string, RoleSpec>) => (agent: string) => roleMaxActions(roles.get(agent));
+  const warnBindingLookup = (message: string, child: string, error: unknown): void => {
+    const extra = { child, error: String(error) };
+    if (takeRoleBindingLookupNotice()) ingestLogger.warn(message, extra);
+    else console.debug(message, extra);
+  };
   /** Handoff 32: what the binding reads of a child session (parent, agent, title, first message text). */
   const bindingLookup: SessionLookup = async (id) => {
-    const session = await ctx.session.get({ sessionID: id } as Parameters<typeof ctx.session.get>[0]) as unknown as Record<string, unknown>;
+    let session: Record<string, unknown>;
+    try {
+      session = await ctx.session.get({ sessionID: id } as Parameters<typeof ctx.session.get>[0]) as unknown as Record<string, unknown>;
+    } catch (error) {
+      warnBindingLookup("[router] roles: a binding session could not be read", id, error);
+      throw error; // bind treats this as lookupFailed, without caching it
+    }
     let firstText: string | undefined;
     try {
       firstText = firstMessageText(await ctx.session.context({ sessionID: id } as Parameters<typeof ctx.session.context>[0]));
-    } catch {
+    } catch (error) {
+      warnBindingLookup("[router] roles: a child's first message could not be read", id, error);
       firstText = undefined; // the title marker still binds
     }
     const text = (value: unknown): string | undefined => (typeof value === "string" && value !== "" ? value : undefined);
@@ -1650,7 +1666,7 @@ export async function registerV2Hooks(
    * and parent do not move), concurrent lookups share one host call, and a failed lookup is remembered for
    * SESSION_DIR_NEGATIVE_TTL_MS so a tool hook does not pay a failing `ctx.session.get` per call. Bounded; forgotten with the session.
    */
-  type SessionInfo = { directory: string; parentID: string | undefined };
+  type SessionInfo = { directory: string; parentID: string | undefined; agent?: string };
   const sessionDirs = new Map<string, { at: number; info: Promise<SessionInfo>; failed: boolean }>();
   const sessionInfoOf = (sessionID: string): Promise<SessionInfo> => {
     const cached = sessionDirs.get(sessionID);
@@ -1660,13 +1676,14 @@ export async function registerV2Hooks(
     };
     entry.info = (async () => {
       const session = await ctx.session.get({ sessionID } as Parameters<typeof ctx.session.get>[0]) as unknown as {
-        location?: { directory?: unknown }; parentID?: unknown;
+        location?: { directory?: unknown }; parentID?: unknown; agent?: unknown;
       };
       const directory = session?.location?.directory;
       const parentID = session?.parentID;
       return {
         directory: typeof directory === "string" && directory !== "" ? directory : ctx.location.directory,
         parentID: typeof parentID === "string" && parentID !== "" ? parentID : undefined,
+        agent: typeof session?.agent === "string" && session.agent !== "" ? session.agent : undefined,
       };
     })();
     entry.info.catch(() => {
@@ -3457,6 +3474,45 @@ export async function registerV2Hooks(
           while (runNotes.size > 1000) runNotes.delete(runNotes.keys().next().value!);
         }
       }
+      // A stale role resume must stop before hostBudget.begin or routing spends an attempt. Never bind a non-role:
+      // even an unknown cached binding would make knownRoleSession treat its agentless events as role events.
+      if ((event.tool === "subagent" || event.tool === "execute") && callerRoles.size > 0) {
+        const cfg = loadConfig(ctx.location.directory);
+        if ((cfg.routing?.orphans?.resume ?? "refuse") === "refuse") {
+          const raw = event.input !== null && typeof event.input === "object" ? event.input as Record<string, unknown> : undefined;
+          const resumeArgs = typeof raw?.task_id === "string" ? { ...args, task_id: raw.task_id } : args;
+          for (const child of [...new Set(resumeTargetsOf(event.tool, resumeArgs, String(event.sessionID)))].slice(0, MAX_ORPHAN_RESUME_TARGETS)) {
+            let stale = false;
+            try {
+              const info = await sessionInfoOf(child);
+              if (info.agent === undefined || !callerRoles.has(info.agent)) continue;
+              // Another live instance may still own the parent's dormant journal; leave its recovery alone.
+              if (info.parentID !== undefined && refusedAdoptions.has(info.parentID)) continue;
+              const attempt = inflight.byChild(child);
+              if (isExecutorOwned(attempt) || (attempt !== undefined && LIVE_STATES.has(attempt.state))) continue;
+              if ([...dormantInflight.values()].some((records) => records.some((rec) => (rec.childSessionID ?? rec.child) === child))) continue;
+              const cached = currentBinding(child, { maxOf: maxOfRoles(callerRoles) });
+              if (cached?.plan !== undefined) continue;
+              if (cached === undefined) {
+                // A restarted plan child may have lost its binding too; its launcher protocol belongs to the executor.
+                const first = withoutHostPreamble(firstMessageText(await ctx.session.context({ sessionID: child } as Parameters<typeof ctx.session.context>[0])) ?? "");
+                if (first.startsWith(PLAN_CONTEXT_PREFIX) || LAUNCH_HEADER_PATTERN.test(first)) continue;
+              }
+              const binding = cached ?? await bind(child, bindingLookup, { maxOf: maxOfRoles(callerRoles) });
+              if (binding.plan === undefined && binding.kind === "unknown" && (binding.cause === "unregistered" || binding.cause === "retired")) stale = true;
+            } catch (error) {
+              ingestLogger.warn("[router] roles: a resume target could not be checked", { child, error: String(error) });
+            }
+            if (stale) {
+              const message = `[router] roles: ${ROLE_REFUSALS.staleResume(child)}`;
+              if (recordRoleOrphan(child, "refused")) ingestLogger.warn(message);
+              else console.debug(message);
+              const agent = typeof args?.agent === "string" ? args.agent : String(event.agent ?? "unknown");
+              throw new RoleDispatchRefusal(agent, ROLE_REFUSALS.staleResume(child));
+            }
+          }
+        }
+      }
       // #84 P-5: a routed role dispatch runs in the foreground (separate from `verifying`).
       let roleForeground = false;
       if (event.tool === "subagent" && args && typeof args.agent === "string") {
@@ -3748,9 +3804,12 @@ export async function registerV2Hooks(
     const wakeParentLost = async (attempt: Attempt): Promise<void> => {
       if (typeof syntheticRaw !== "function") return;
       try {
+        const cfg = loadConfig(ctx.location.directory);
+        const resumeRefused = attempt.role !== undefined && rolesOf(cfg).has(attempt.agent)
+          && (cfg.routing?.orphans?.resume ?? "refuse") === "refuse";
         await Reflect.apply(syntheticRaw, ctx.session, [{
           sessionID: attempt.parentSessionID,
-          text: `[router] The background dispatch ${attemptLabel(attempt)} (${attempt.childSessionID}) was lost in a restart: its result never arrived. Dispatch it again if you still need it.`,
+          text: `[router] The background dispatch ${attemptLabel(attempt)} (${attempt.childSessionID}) was lost in a restart: its result never arrived. Dispatch it again if you still need it.${resumeRefused ? " Dispatch a fresh task: resuming it is refused." : ""}`,
           description: "Model router notice",
           metadata: { router: { kind: "lost-dispatch", child: attempt.childSessionID, callID: attempt.callID } },
           resume: true,
@@ -3905,6 +3964,7 @@ export async function registerV2Hooks(
             await closing.process(child, end.outcome === "lost"
               ? { kind: "recovery", outcome: "lost", text: undefined, at: nowMs() }
               : { kind: "recovery", outcome: end.outcome, text: end.text ?? "", at: nowMs() });
+            if (end.outcome === "lost" && attempt.role !== undefined) recordRoleOrphan(child, "lost");
             // QA-2.1-6: a lost dispatch without a hold wakes its parent once (a held one is woken by its verdict post). Once per child:
             // the processor runs once per attempt and journals `processed`, so the next start does not recover it again.
             if (end.outcome === "lost" && holdHandle === undefined) await wakeParentLost(attempt);
@@ -3925,7 +3985,6 @@ export async function registerV2Hooks(
     // Phase 2.1 (memo §13): the three turn-state providers. They render nothing (and are not registered) under `off`.
     if (bgActive() && processor !== undefined) {
       const completing = processor;
-      const LIVE_STATES: ReadonlySet<Attempt["state"]> = new Set<Attempt["state"]>(["acknowledged", "child-ended", "processing"]);
       const unregisters = [
           turnState.registerTurnStateProvider({
             name: "completed", order: PROVIDER_ORDER.completed,

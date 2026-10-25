@@ -1248,6 +1248,7 @@ describe("docs drift: defaults, ranges, ids and severities (QA-3.1-18)", () => {
       "background.minPredictedMs": defaults.background.minPredictedMs,
       "leases.mode": defaults.leases.mode,
       "leases.run": defaults.leases.run,
+      "orphans.resume": defaults.orphans.resume,
     };
     for (const key of leafPaths(defaults.executor as unknown as Record<string, unknown>)) {
       const value = key.split(".").reduce<unknown>((node, part) => (node as Record<string, unknown>)[part], defaults.executor);

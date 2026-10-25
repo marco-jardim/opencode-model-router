@@ -68,6 +68,8 @@ export interface PlanChildIdentity {
   scope: "until-integrated";
 }
 
+export type UnknownBindingCause = "unregistered" | "retired" | "foreign" | "claimed" | "markers" | "noNonce" | "noParent" | "lookupFailed";
+
 export interface Binding {
   /** Resolved executor route tier; its budget and cumulative ceiling must not fall back to the role floor. */
   tier?: string;
@@ -78,6 +80,8 @@ export interface Binding {
   childSessionID: string;
   /** `intersection` is part of the contract but never produced under R7 (ambiguity → unknown). */
   kind: "exact" | "intersection" | "unknown";
+  /** Set only for an unknown binding: why the session could not be matched to its dispatch. */
+  cause?: UnknownBindingCause;
   grant: DispatchGrant;
   /** callIDs of the pending dispatches that matched. */
   candidates: readonly string[];
@@ -330,11 +334,12 @@ function exact(childSessionID: string, entry: PendingDispatch): Binding {
 }
 
 /** Unknown: the local class, narrowed by every view to max ∩ local (I9) — never derived from a dispatch grant. */
-function unknown(childSessionID: string, cause: string): Binding {
+function unknown(childSessionID: string, cause: UnknownBindingCause, note: string): Binding {
   return {
     childSessionID,
     kind: "unknown",
-    grant: { actions: ordered(LOCAL_ACTIONS), notes: [BINDING_NOTES.unknown, cause], workRoot: null },
+    cause,
+    grant: { actions: ordered(LOCAL_ACTIONS), notes: [BINDING_NOTES.unknown, note], workRoot: null },
     candidates: [],
     decisionID: null,
     budget: null,
@@ -368,31 +373,34 @@ async function decide(childSessionID: string, getSession: SessionLookup): Promis
     session = undefined;
   }
   if (typeof session !== "object" || session === null) {
-    return { binding: unknown(childSessionID, BINDING_NOTES.lookupFailed), parentSessionID: undefined, agent: undefined, cacheable: false };
+    return { binding: unknown(childSessionID, "lookupFailed", BINDING_NOTES.lookupFailed), parentSessionID: undefined, agent: undefined, cacheable: false };
   }
   const parent = text(session.parentID);
   const agent = text(session.agent);
   if (parent === undefined || agent === undefined) {
-    return { binding: unknown(childSessionID, BINDING_NOTES.noParent), parentSessionID: parent, agent, cacheable: false };
+    return { binding: unknown(childSessionID, "noParent", BINDING_NOTES.noParent), parentSessionID: parent, agent, cacheable: false };
   }
   const out = (binding: Binding): Decision => ({ binding, parentSessionID: parent, agent, cacheable: true });
   const fromTitle = titleNonce(session.title);
   const fromPrompt = promptNonce(session.firstText);
   if (fromTitle !== undefined && fromPrompt !== undefined && fromTitle !== fromPrompt) {
-    return out(unknown(childSessionID, BINDING_NOTES.markers));
+    return out(unknown(childSessionID, "markers", BINDING_NOTES.markers));
   }
   const nonce = fromPrompt ?? fromTitle;
-  if (nonce === undefined) return out(unknown(childSessionID, BINDING_NOTES.noNonce));
+  if (nonce === undefined) return out(unknown(childSessionID, "noNonce", BINDING_NOTES.noNonce));
   const reg = registry();
   prune(reg, Date.now());
   // Live nonces are unique and never retired (registerPending refuses both), so a retired, unregistered or
   // forged nonce finds no slot.
   const slot = [...reg.pending.values()].find((s) => s.entry.nonce === nonce);
-  if (slot === undefined || slot.entry.parentSessionID !== parent || slot.entry.agent !== agent) {
-    return out(unknown(childSessionID, BINDING_NOTES.foreignNonce));
+  if (slot === undefined) {
+    return out(unknown(childSessionID, reg.retired.has(nonce) ? "retired" : "unregistered", BINDING_NOTES.foreignNonce));
+  }
+  if (slot.entry.parentSessionID !== parent || slot.entry.agent !== agent) {
+    return out(unknown(childSessionID, "foreign", BINDING_NOTES.foreignNonce));
   }
   if (slot.claimedBy !== undefined && slot.claimedBy !== childSessionID) {
-    return out(unknown(childSessionID, BINDING_NOTES.claimed));
+    return out(unknown(childSessionID, "claimed", BINDING_NOTES.claimed));
   }
   slot.claimedBy = childSessionID;
   return out(exact(childSessionID, slot.entry));

@@ -56,6 +56,7 @@ export const FINDING_IDS = [
   "role-budget-low",
   "role-range-clamped",
   "role-binding-unknown",
+  "role-child-stale-resume",
   "native-explore-aliased",
   "role-usage-share",
   "roles-none-enabled",
@@ -89,6 +90,7 @@ export const FINDING_TARGET: Readonly<Record<FindingId, FindingTarget>> = {
   "role-budget-low": "router",
   "role-range-clamped": "router",
   "role-binding-unknown": "router",
+  "role-child-stale-resume": "router",
   "native-explore-aliased": "router",
   "role-usage-share": "router",
   "roles-none-enabled": "router",
@@ -267,6 +269,10 @@ export interface AdvisorExtras {
   readonly roleStats?: RoleStatsTable | null;
   /** Dispatch rows WITHOUT a role in the same window (tier dispatches); with `roleStats` it gives the role usage share. */
   readonly tierDispatches?: number;
+  /** `countUnknownBindings` over the same decision-log window; absent = unknown. */
+  readonly unknownBindings?: Readonly<{ fresh: number; resumed: number }>;
+  /** Process-lifetime orphan actions, independent of the decision-log window. */
+  readonly orphanCounters?: Readonly<{ refused: number; lost: number }>;
 }
 
 /** A role whose budget ran out in at least this share of its dispatches (and at least {@link ROLE_STATS_MIN_DISPATCHES} of them) has a budget that is too low. */
@@ -758,12 +764,10 @@ const roleBudgetLow: Check = (input) => {
   return findings;
 };
 
-/** Child sessions that could not be bound to a role dispatch: their outcomes are not attributed. */
+/** Fresh child sessions that could not be bound to a role dispatch: their outcomes are not attributed. */
 const roleBindingUnknown: Check = (input) => {
-  const stats = input.extras.roleStats;
-  if (stats === undefined || stats === null || !rolesOnV2(input)) return [];
-  let total = stats.unattributed.unknownBindings;
-  for (const row of stats.byRoleTier) total += row.unknownBindings;
+  const total = input.extras.unknownBindings?.fresh ?? 0;
+  if (!rolesOnV2(input)) return [];
   if (total <= 0) return [];
   return [{
     id: "role-binding-unknown",
@@ -771,6 +775,21 @@ const roleBindingUnknown: Check = (input) => {
     subject: "",
     message: `${total} child session${total === 1 ? "" : "s"} could not be bound to the role dispatch that created ${total === 1 ? "it" : "them"} (binding: unknown), so ${total === 1 ? "its" : "their"} outcomes and authority are not attributed. If this keeps happening the host's child-session events do not carry the parent link the router needs.`,
     snippet: null,
+  }];
+};
+
+/** Historical unbound resumes and this process's refusals are informational, never notice-worthy. */
+const roleChildStaleResume: Check = (input) => {
+  if (!rolesOnV2(input)) return [];
+  const pending = input.extras.unknownBindings?.resumed ?? 0;
+  const cleaned = input.extras.orphanCounters?.refused ?? 0;
+  if (pending <= 0 && cleaned <= 0) return [];
+  return [{
+    id: "role-child-stale-resume",
+    severity: "info",
+    subject: "",
+    message: `Stale role-child resumes: ${pending} resumed unknown-binding row${pending === 1 ? "" : "s"} in the decision-log window (pending); ${cleaned} stale resume${cleaned === 1 ? "" : "s"} refused by this process (cleaned). Start a fresh role task instead of resuming a child whose dispatch binding was lost.`,
+    snippet: resolveRouting(input.cfg, "v2").orphans.resume === "allow" ? json({ routing: { orphans: { resume: "refuse" } } }) : null,
   }];
 };
 
@@ -809,6 +828,7 @@ const CHECKS: ReadonlyArray<readonly [string, Check]> = [
   ["native-explore", nativeExploreAliased],
   ["role-budget", roleBudgetLow],
   ["role-binding", roleBindingUnknown],
+  ["role-stale-resume", roleChildStaleResume],
   ["role-usage", roleUsageShare],
 ];
 

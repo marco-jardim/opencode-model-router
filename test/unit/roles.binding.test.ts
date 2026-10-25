@@ -28,6 +28,7 @@ import {
   type Binding,
   type PendingDispatch,
   type SessionLookup,
+  type UnknownBindingCause,
 } from "../../src/routing/roles/binding";
 import { grantFor, type DispatchGrant } from "../../src/routing/roles/policy";
 import type { RepoLocation } from "../../src/routing/roles/admission";
@@ -213,6 +214,7 @@ describe("bind: anchored marker nonces (P-2, R7)", () => {
     } satisfies Binding);
     const second = await bind("ses_impostor", lookup(marked(nz("call_A"))), OPTS);
     expect(second.kind).toBe("unknown");
+    expect(second.cause).toBe("claimed");
     expect(second.grant.notes).toEqual([BINDING_NOTES.unknown, BINDING_NOTES.claimed]);
   });
 
@@ -225,6 +227,7 @@ describe("bind: anchored marker nonces (P-2, R7)", () => {
     registerPending(pending("call_D"));
     const both = await bind("ses_both", lookup(marked(nz("call_D"), { title: `task${nonceTitleSuffix(nz("call_C"))}` })), OPTS);
     expect(both.kind).toBe("unknown");
+    expect(both.cause).toBe("markers");
     expect(both.grant.notes).toEqual([BINDING_NOTES.unknown, BINDING_NOTES.markers]);
   });
 
@@ -259,7 +262,11 @@ describe("bind: anchored marker nonces (P-2, R7)", () => {
   it("R7: no nonce → unknown, even with a single pending dispatch", async () => {
     registerPending(pending("call_A", { grant: grant([...LOCAL, "edit", "router_run"]) }));
     const b = await bind("ses_plain", lookup(), OPTS);
-    expect(b.kind).toBe("unknown");
+    expect(b).toEqual({
+      childSessionID: "ses_plain", kind: "unknown", cause: "noNonce",
+      grant: { actions: new Set(LOCAL), notes: [BINDING_NOTES.unknown, BINDING_NOTES.noNonce], workRoot: null },
+      candidates: [], decisionID: null, budget: null,
+    } satisfies Binding);
     expect(acts(b)).toEqual(LOCAL);
     expect(b.grant.notes).toEqual([BINDING_NOTES.unknown, BINDING_NOTES.noNonce]);
     expect((await bind("ses_untitled", lookup(session({ title: undefined, firstText: undefined })), OPTS)).kind).toBe("unknown");
@@ -271,10 +278,18 @@ describe("bind: anchored marker nonces (P-2, R7)", () => {
     registerPending(pending("call_B"));
     registerPending(pending("call_X", { parentSessionID: "ses_other" }));
     registerPending(pending("call_G", { agent: "general" }));
-    for (const id of ["call_A", "call_never", "call_X", "call_G"]) {
+    const cases: Array<[string, UnknownBindingCause]> = [
+      ["call_A", "retired"], ["call_never", "unregistered"], ["call_X", "foreign"], ["call_G", "foreign"],
+    ];
+    for (const [id, cause] of cases) {
       const b = await bind(`ses_${id}`, lookup(marked(nz(id))), OPTS);
       expect(b.kind, id).toBe("unknown");
+      expect(b.cause, id).toBe(cause);
       expect(b.grant.notes, id).toEqual([BINDING_NOTES.unknown, BINDING_NOTES.foreignNonce]);
+      expect(currentBinding(`ses_${id}`, OPTS), id).toEqual(b);
+      const retry = lookup();
+      expect(await bind(`ses_${id}`, retry, OPTS), id).toEqual(b);
+      expect(retry, id).not.toHaveBeenCalled();
     }
   });
 
@@ -350,15 +365,17 @@ describe("bind: the role max bounds every grant", () => {
 describe("bind: lookups", () => {
   it("a failed lookup or one without parent or agent → unknown, never cached: the next hook retries", async () => {
     registerPending(pending("call_A"));
-    const failures: SessionLookup[] = [
-      async () => { throw new Error("host down"); },
-      (() => { throw new Error("sync"); }) as unknown as SessionLookup,
-      async () => undefined,
-      async () => session({ parentID: undefined }),
-      async () => session({ agent: "" }),
+    const failures: Array<[SessionLookup, UnknownBindingCause]> = [
+      [async () => { throw new Error("host down"); }, "lookupFailed"],
+      [(() => { throw new Error("sync"); }) as unknown as SessionLookup, "lookupFailed"],
+      [async () => undefined, "lookupFailed"],
+      [async () => session({ parentID: undefined }), "noParent"],
+      [async () => session({ agent: "" }), "noParent"],
     ];
-    for (const failing of failures) {
-      expect((await bind("ses_child", failing, OPTS)).kind).toBe("unknown");
+    for (const [failing, cause] of failures) {
+      const b = await bind("ses_child", failing, OPTS);
+      expect(b.kind).toBe("unknown");
+      expect(b.cause).toBe(cause);
       expect(currentBinding("ses_child", OPTS)).toBeUndefined();
     }
     expect((await bind("ses_x", async () => undefined, OPTS)).grant).toEqual({
@@ -508,11 +525,17 @@ describe("lifetimes and eviction", () => {
     clock += PENDING_TTL_MS - 1;
     expect((await bind("ses_1", lookup(marked(nz("call_A"))), OPTS)).kind).toBe("exact");
     clock += 1;
-    expect((await bind("ses_2", lookup(marked(nz("call_A"))), OPTS)).kind).toBe("unknown");
+    const expired = await bind("ses_2", lookup(marked(nz("call_A"))), OPTS);
+    expect(expired.kind).toBe("unknown");
+    expect(expired.cause).toBe("retired");
     expect(bindingRegistrySize()).toEqual({ pending: 0, bound: 2, retired: 1, deleted: 0 }); // a foreign-nonce unknown is final
     clock += PENDING_TTL_MS;
     registerPending(pending("call_B"));
     expect(bindingRegistrySize()).toMatchObject({ pending: 1, retired: 0 });
+    expect((await bind("ses_3", lookup(marked(nz("call_A"))), OPTS)).cause).toBe("unregistered");
+    const retry = lookup();
+    expect(await bind("ses_2", retry, OPTS)).toEqual(expired);
+    expect(retry).not.toHaveBeenCalled();
   });
 
   it("a future registeredAt cannot extend the TTL; a non-finite one means now; an expired one is refused", async () => {

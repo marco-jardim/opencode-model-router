@@ -359,6 +359,8 @@ export const ROLE_REFUSALS = {
     `no model is available inside the tier window ${floor}..${ceiling} (${reasons.join(", ") || "window:no-candidates"}); the router never falls back to a tier agent — fix the preset, or dispatch a tier agent explicitly`,
   failed: (detail: string): string => `the router could not route it (${detail}); retry, or dispatch a tier agent explicitly`,
   session: (detail: string): string => `the dispatching session is unavailable (${detail}); retry`,
+  staleResume: (child: string): string =>
+    `resume refused: session ${child} belongs to a role dispatch this OpenCode process no longer tracks (lost in a restart, or already finished), so it would run unbound: local actions only, no work root. Dispatch a fresh task (same prompt and route line); do not resume this session.`,
 } as const;
 
 const UNTOUCHED: RouteOutcome = Object.freeze({ mode: "static" });
