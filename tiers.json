@@ -269,9 +269,9 @@
       },
       "medium": {
         "model": "openai/gpt-6.1-sol-fast",
-        "variant": "xhigh",
+        "variant": "high",
         "costRatio": 5,
-        "description": "GPT-6.1 Sol Fast (xhigh) for implementation and standard coding",
+        "description": "GPT-6.1 Sol Fast (high) for implementation and standard coding",
         "steps": 50,
         "whenToUse": [
           "Feature implementation",
@@ -282,10 +282,10 @@
       },
       "heavy": {
         "model": "anthropic/claude-opus-5-5",
-        "variant": "xhigh",
-        "effort": "xhigh",
+        "variant": "high",
+        "effort": "high",
         "costRatio": 20,
-        "description": "Claude Opus 5.5 xhigh for architecture, complex debugging, and security",
+        "description": "Claude Opus 5.5 high for architecture, complex debugging, and security",
         "steps": 120,
         "whenToUse": [
           "Architecture decisions",

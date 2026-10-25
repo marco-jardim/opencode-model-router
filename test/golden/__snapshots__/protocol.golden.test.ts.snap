@@ -191,7 +191,7 @@ exports[`protocol golden > protocol-hybrid > protocol-hybrid 1`] = `
 
 You are the orchestrator: route each task to the right tier and delegate it with \`Task(subagent_type="fast"|"medium"|"heavy", prompt="...")\`. Information-gathering (grep, read, glob, ls) is execution and goes to @fast by default; your one exception is an allowance of about 2 direct read-only calls per turn for lookups that settle a question outright, so dispatch @fast once you would exceed it. Synthesize the subagents' results and answer the user yourself.
 
-Preset: hybrid. Tiers: @fast=claude-haiku-5-5/medium(1x) @medium=gpt-6.1-sol-fast/xhigh(5x) @heavy=claude-opus-5-5/xhigh(20x).
+Preset: hybrid. Tiers: @fast=claude-haiku-5-5/medium(1x) @medium=gpt-6.1-sol-fast/high(5x) @heavy=claude-opus-5-5/high(20x).
 
 If you ARE @heavy, handle heavy-tier work yourself: never self-call @heavy.
 

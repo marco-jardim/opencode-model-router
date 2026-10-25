@@ -466,8 +466,8 @@ The plugin ships with six presets (switch with `/preset <name>`):
 | Tier | Model | Cost ratio |
 |------|-------|-----------|
 | @fast | `anthropic/claude-haiku-5-5` (variant/effort: medium) | 1x |
-| @medium | `openai/gpt-6.1-sol-fast` (xhigh) | 5x |
-| @heavy | `anthropic/claude-opus-5-5` (variant/effort: xhigh) | 20x |
+| @medium | `openai/gpt-6.1-sol-fast` (high) | 5x |
+| @heavy | `anthropic/claude-opus-5-5` (variant/effort: high) | 20x |
 
 > **Removed in 2.6.0:** the bundled `hybrid-2` and `fable-effort` presets, and the
 > previous `hybrid` values (OpenAI `gpt-6-luna-fast` / `gpt-6-astra-fast` for `@fast` / `@medium`).

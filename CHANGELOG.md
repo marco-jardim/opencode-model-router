@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`hybrid` preset: `medium` and `heavy` run at `high` instead of `xhigh`.** `openai/gpt-6.1-sol-fast` (variant)
+  and `anthropic/claude-opus-5-5` (variant and effort) drop one reasoning level to cut cost; models and cost ratios are
+  unchanged.
+
 ## [2.9.0] - 2026-10-25
 
 ### Added
