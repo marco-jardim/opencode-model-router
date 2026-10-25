@@ -81,8 +81,9 @@ What changes after the restart:
 - The tools `router_run` and `router_request_authority` (the latter only when a dynamic role is enabled) are
   registered, and `router_git_*` run in the dispatch's work root.
 - The orchestrator's system prompt carries `## Role Delegation Protocol (MANDATORY)` instead of the tier protocol: a
-  role menu, the route-line keys, "never set `model` or pick a tier; name the role", the resume rules (a resume keeps
-the dispatch's `[acceptance]` and `VERIFY:` lines; a new block replaces them). The tier agents `fast`,
+  role menu, the route-line keys, "never set `model` or pick a tier; name the role", a short "Cost:" paragraph on
+  [slicing for cost](#tier-floor), and the resume rules (a resume keeps the dispatch's `[acceptance]` and `VERIFY:`
+  lines; a new block replaces them). The tier agents `fast`,
   `medium` and `heavy` stay registered and callable (an explicit tier dispatch behaves as in tiers mode); the protocol
   just stops advertising them.
 
@@ -637,6 +638,17 @@ incomplete returns do not escalate.
 Tier-agent and delegate (non-role) paths stay strict. On OpenCode v1 the key is inert and uses the existing single
 “roles delegation requires OpenCode v2; using tiers” notice.
 
+**Slicing for cost.** The roles protocol tells the orchestrator to slice non-design implementation into one edit-only
+implementer dispatch per coherent change (one concern, a few files). Use `class=implement needs=edit d=deterministic`
+on the route line and an `[acceptance]` block with `check: testsPass` for each slice. With verification enabled but
+deferred, this backs effective `grader` detection and a `medium` authority floor even at `high` risk; without the
+`d=` claim, detection is `none` and high-risk edit-only work still gets `heavy`. Explicit `needs=edit` replaces text-inferred
+needs; `class=implement` alone can retain shell words from the task, and `class=debug` always implies run authority,
+even with `needs=edit`. Leave runs to the gate or the runner. If the slice must run commands, use `needs=edit,shell`,
+keep `d=deterministic` and a machine check, and add `VERIFY:required`: when the router gates that check at return,
+effective detection is `deterministic` and the authority floor is `medium` under either table, even at `high` risk.
+Deferred `testsPass` alone does not make write + exec deterministic. Other floors can still raise the tier.
+
 ## Dynamic authority and the ladder
 
 **Grant** = role max ∩ (base ∪ needs-derived actions ∪ actions widened on resume) for dynamic roles; the whole max for
@@ -652,6 +664,14 @@ actions, no `router_run`, no `external_directory`, a note telling the child that
 ("… authority is not widened for it: dispatch a fresh task"), a `note:binding:unknown` annotation row and the advisor
 finding `role-binding-unknown`. Ambiguity never widens authority: dispatch a fresh task instead of resuming.
 Errors fail closed: a context-hook error leaves the role child an empty tool catalog, a permission-hook error denies.
+
+On OpenCode v2, a resume of a **stale role child** whose nonce is unregistered or retired in this process (for example
+after a restart, or once its dispatch has finished) is refused before a new attempt starts: it would run unbound, with local actions only and no work
+root. Dispatch a fresh task with the same prompt and route line; do not resume that session. This also checks up to
+four literal resume targets in Code Mode `execute`. Exact bindings, other unknown-binding causes, plan children,
+live attempts and journaled dispatches awaiting recovery are not refused by this check. A failed host lookup warns
+and leaves the resume unchanged. `routing.orphans.resume: "allow"` skips the early check and keeps the old behaviour;
+the default is `"refuse"`.
 
 **The ladder** (dynamic roles only):
 
@@ -887,6 +907,8 @@ On OpenCode v1, `routing.delegation: "roles"`, `roleAgents`, `routing.exploratio
 `roles delegation requires OpenCode v2; using tiers`. No role agent, tool, hook or prompt change is registered; v1
 keeps the tier model. `routing.background` and `routing.leases` are likewise OpenCode v2 only: v1 has no background
 policy, held results or leases, and its protocol has no `Background dispatches` block.
+`routing.orphans.resume` is also inert on v1: the existing single v2-only-features notice names the configured key
+and **orphan cleanup**; no separate notice or resume check is added.
 
 ## Migration from `subagentTiers` and `agents`
 
@@ -907,9 +929,17 @@ policy, held results or leases, and its protocol has no `Background dispatches` 
 
 ## Observability
 
+- Stale role-resume refusals log one `[router] roles: …` warning per process; later refusals log at debug. A shared,
+  bounded in-memory orphan registry records refused resumes and lost role dispatches, with process-lifetime counters;
+  it does not delete, retitle or interrupt host sessions.
+- Binding session/first-message lookup failures share a separate once-per-process warning; subsequent failures log at debug.
 - `/router` lists the role table with ranges and authority, and the advisor findings `role-separation`,
-  `roles-on-legacy-host`, `role-budget-low`, `role-range-clamped`, `role-binding-unknown`, `native-explore-aliased`,
+  `roles-on-legacy-host`, `role-budget-low`, `role-range-clamped`, `role-binding-unknown`, `role-child-stale-resume`, `native-explore-aliased`,
   `roles-none-enabled` and `role-usage-share` ([cost doctor](./ROUTING_ENGINE.md#the-cost-doctor)).
+- `role-binding-unknown` warns only about **fresh** unknown bindings in the last 7 days. `role-child-stale-resume`
+  is **info**, never a cost-doctor notice: it reports resumed unknown-binding rows in that window (pending) and
+  process-lifetime stale-resume refusals (cleaned). It suggests `routing.orphans.resume: "refuse"` only when set to
+  `"allow"`. These counts do not change the unknown-binding totals in `/router stats`.
 - The **dispatch row** of a role dispatch (written unless the engine is `static`) carries `role`, `tier`, `grant`,
   `detection`, `boundsReasons`, `explore` and `propensity`; a resume also records the child's current `binding`.
 - **Annotation rows** come later and share the dispatch's `decisionID`; they are never counted as dispatches: a

@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **OpenCode v2: `routing.orphans.resume`**, `"refuse"` by default or `"allow"` to skip the early stale-role-resume check.
+  A bounded process-wide registry tracks refused resumes and lost role dispatches; the first refusal warns, later
+  ones log at debug. Binding-lookup failures share a separate process-once warning, then log at debug. Inert on v1,
+  where the existing v2-only-features notice also names orphan cleanup.
 - **OpenCode v2: role-dispatch decision rows record where their risk came from.** `trace.riskSources` lists the class
   base risk, the rules estimate, the route line's `risk=` claim, the merged facts, any inherited resume risk and the
   effective risk, plus an optional bounded vocabulary label (a single word or a table id, never prompt text). Routing
@@ -132,6 +136,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **OpenCode v2: the cost doctor separates fresh unknown bindings from stale role resumes.**
+  `role-binding-unknown` warns only for fresh children; the new `role-child-stale-resume` info finding reports
+  resumed unknown-binding rows over 7 days and this process's refused resumes, without a notice. It suggests
+  `routing.orphans.resume: "refuse"` only when set to `"allow"`; role-stats totals are unchanged.
+- **OpenCode v2: stale role-child resumes are refused before a new attempt starts.** An unregistered or retired
+  dispatch nonce would leave the child unbound (local actions only, no work root): dispatch a fresh task with the same
+  prompt and route line instead. Plan children, live/recovering attempts and other unknown-binding causes are unchanged.
+  A lost role-dispatch wake adds `Dispatch a fresh task: resuming it is refused.` only with live roles and resume mode
+  `"refuse"`. The refusal covers dispatches lost in a restart or already finished, and names the call's agent.
+- **OpenCode v2: roles protocol teaches slicing for cost within its existing byte budget.** Non-design work is split
+  into edit-only implementer dispatches (`class=implement needs=edit d=deterministic` + `testsPass` acceptance), keeping
+  the authority floor at most `medium` even at high risk when verification is enabled; a slice that must run commands
+  gets a machine check and `VERIFY:required`, avoiding the `heavy` write + exec authority floor when the router gates
+  it. Routing is unchanged.
 - **CI: pull requests are Linux-only; one Windows Node 22 typecheck + full-suite coverage job runs on master pushes
   and manual runs.** Linux e2e and Bun smoke stay blocking. Without Windows coverage, only `src/verify/exec.ts`
   and the `src/executor/` prefix are warn-only; with it, all coverage gates block (G-21).

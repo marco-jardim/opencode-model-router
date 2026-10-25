@@ -335,6 +335,11 @@ export interface LeasesConfig {
   run?: LeasesRunPolicy;
 }
 
+/** Stale role-child resumes (OpenCode v2 only). */
+export interface OrphansConfig {
+  resume?: "refuse" | "allow";
+}
+
 /**
  * `routing.executor` (OpenCode v2 only), as written: every field optional. The trusted keys
  * (`slotsDir`, `integrationChecks`, `phaseSuite`, `provision`, `python`) are global only (D18).
@@ -348,6 +353,7 @@ export type RoleFloorMode = "strict" | "gated";
 export interface RoutingConfig {
   background?: BackgroundConfig;
   leases?: LeasesConfig;
+  orphans?: OrphansConfig;
   /** OpenCode v2 only; v1 ignores the block (see configuredV2OnlyKeys). */
   executor?: ExecutorOverrides;
   engine?: RoutingEngine;
@@ -1902,6 +1908,20 @@ function sanitizeLeases(value: unknown): TolerantBlock<LeasesConfig> {
   return { value: out, issues };
 }
 
+/** `routing.orphans` (OpenCode v2 only); tolerant, see {@link sanitizeBackground}. */
+function sanitizeOrphans(value: unknown): TolerantBlock<OrphansConfig> {
+  const issues: string[] = [];
+  if (value === undefined) return { value: undefined, issues };
+  if (!isPlainObject(value)) {
+    issues.push(`routing.orphans must be an object (got ${showTolerant(value)}); ignored`);
+    return { value: undefined, issues };
+  }
+  const out: OrphansConfig = {};
+  const resume = tolerantEnum(value, "resume", "routing.orphans", ["refuse", "allow"] as const, ROUTING_DEFAULTS.orphans.resume, issues);
+  if (resume !== undefined) out.resume = resume;
+  return { value: out, issues };
+}
+
 const EXECUTOR_APPROVE_MODES = ["ask", "auto"] as const;
 const EXECUTOR_CROSS_PHASE_MODES = ["gate", "inferred"] as const;
 const EXECUTOR_LAND_MODES = ["ff-when-clean", "manual"] as const;
@@ -2126,10 +2146,14 @@ export function configuredV2OnlyKeys(raw: unknown): string[] {
   const candidates: ReadonlyArray<readonly [string, readonly string[]]> = [
     ["background", ["mode", "minPredictedMs"]],
     ["leases", ["mode", "run"]],
+    ["orphans", ["resume"]],
   ];
   for (const [block, children] of candidates) {
     const value = routing[block];
-    if (!isPlainObject(value)) continue;
+    if (!isPlainObject(value)) {
+      if (block === "orphans" && value !== undefined) keys.push("routing.orphans");
+      continue;
+    }
     for (const child of children) {
       if (Object.hasOwn(value, child) && value[child] !== undefined) keys.push(`routing.${block}.${child}`);
     }
@@ -2229,6 +2253,8 @@ function validateRouting(value: unknown): RoutingConfig | undefined {
   if (background !== undefined) out.background = background;
   const leases = sanitizeLeases(routing.leases).value;
   if (leases !== undefined) out.leases = leases;
+  const orphans = sanitizeOrphans(routing.orphans).value;
+  if (orphans !== undefined) out.orphans = orphans;
   const executor = sanitizeExecutor(routing.executor).value;
   if (executor !== undefined) out.executor = executor;
 
@@ -2974,10 +3000,12 @@ const ROUTING_KNOWN_KEYS: Readonly<Record<string, readonly string[]>> = {
     "repoApprovalDays",
     "background",
     "leases",
+    "orphans",
     "executor",
   ],
   background: ["mode", "minPredictedMs"],
   leases: ["mode", "run"],
+  orphans: ["resume"],
   executor: [
     "maxParallel",
     "slotsDir",
@@ -3020,7 +3048,7 @@ export function findUnknownRoutingKeys(routing: unknown): string[] {
     }
   };
   check(routing, ROUTING_KNOWN_KEYS.routing!, "routing");
-  for (const block of ["detection", "classifier", "outcomes", "sessionReuse", "advisor", "background", "leases"] as const) {
+  for (const block of ["detection", "classifier", "outcomes", "sessionReuse", "advisor", "background", "leases", "orphans"] as const) {
     const value = routing[block];
     if (isPlainObject(value)) check(value, ROUTING_KNOWN_KEYS[block]!, `routing.${block}`);
   }
@@ -3061,7 +3089,7 @@ export function collectRoutingNotices(rawRouting: unknown, cfg: RouterConfig): s
 }
 
 /** The v2-only `routing` blocks: a v1 host ignores them, and logs one notice naming their keys instead. */
-const V2_ONLY_ROUTING_BLOCKS = ["background", "leases", "executor"] as const;
+const V2_ONLY_ROUTING_BLOCKS = ["background", "leases", "orphans", "executor"] as const;
 
 /**
  * {@link collectRoutingNotices}, each message tagged `v2Only` when it is about a v2-only block
@@ -3083,6 +3111,7 @@ function collectTaggedRoutingNotices(rawRouting: unknown, cfg: RouterConfig): Ar
       ...sanitizeRoleFloor(rawRouting.roleFloor).issues,
       ...sanitizeBackground(rawRouting.background).issues,
       ...sanitizeLeases(rawRouting.leases).issues,
+      ...sanitizeOrphans(rawRouting.orphans).issues,
       // QA-62C-2: the plan executor is inert off Windows (G-16), so its values are not validated there.
       ...(executorPlatformSupported() ? sanitizeExecutor(rawRouting.executor).issues : []),
     ]) {
@@ -3678,9 +3707,10 @@ export const ROUTING_DEFAULTS = Object.freeze({
   outcomes: Object.freeze({ path: null, halfLifeDays: 14, maxEffectiveSamples: 50 }),
   sessionReuse: Object.freeze({ maxContextFraction: 0.6 }),
   advisor: Object.freeze({ enabled: true, noticeIntervalHours: 24, notify: true }),
-  // OpenCode v2 only; v1 ignores both blocks (see configuredV2OnlyKeys).
+  // OpenCode v2 only; v1 ignores these blocks (see configuredV2OnlyKeys).
   background: Object.freeze({ mode: "auto" as BackgroundMode, minPredictedMs: 45_000 }),
   leases: Object.freeze({ mode: "enforce" as LeasesMode, run: "annotate" as LeasesRunPolicy }),
+  orphans: Object.freeze({ resume: "refuse" as const }),
   // OpenCode v2 only (plan executor); v1 ignores the block (see configuredV2OnlyKeys). Ranges: EXECUTOR_LIMITS.
   executor: Object.freeze({
     maxParallel: 4,
@@ -3741,6 +3771,7 @@ export interface ResolvedRouting {
   readonly advisor: Readonly<Required<AdvisorConfig>>;
   readonly background: Readonly<Required<BackgroundConfig>>;
   readonly leases: Readonly<Required<LeasesConfig>>;
+  readonly orphans: Readonly<Required<OrphansConfig>>;
   /** Plan executor (v2 only); the defaults on v1, where the block is ignored. */
   readonly executor: Readonly<ExecutorConfig>;
   readonly applied: RoutingApplied;
@@ -3861,9 +3892,10 @@ export function resolveRouting(
   // routing.background / routing.leases: an invalid value warns once and the default applies.
   const sanitizedBackground = sanitizeBackground(r.background);
   const sanitizedLeases = sanitizeLeases(r.leases);
+  const sanitizedOrphans = sanitizeOrphans(host === "v2" ? r.orphans : undefined);
   const background = sanitizedBackground.value;
   const leases = sanitizedLeases.value;
-  for (const issue of [...sanitizedBackground.issues, ...sanitizedLeases.issues]) {
+  for (const issue of [...sanitizedBackground.issues, ...sanitizedLeases.issues, ...sanitizedOrphans.issues]) {
     if (warnedRoutingIssues.has(issue)) continue;
     warnedRoutingIssues.add(issue);
     if (logger) logger.warn(issue);
@@ -3925,6 +3957,7 @@ export function resolveRouting(
       mode: leases?.mode ?? d.leases.mode,
       run: leases?.run ?? d.leases.run,
     }),
+    orphans: Object.freeze({ resume: sanitizedOrphans.value?.resume ?? d.orphans.resume }),
     executor,
     applied: Object.freeze({ host, requestedEngine, engineCoerced, rolesSource }),
   });

@@ -15,6 +15,7 @@ import { resolveRoles } from "../../src/router/roles";
 import { ROLE_BUDGET_LOW_SHARE, runAdvisor, type AdvisorExtras, type Finding, type FindingId } from "../../src/routing/advisor";
 import { runStatsCommand } from "../../src/routing/commands/stats";
 import { createPersister, nodePersistDeps, renderMarkdown, runStatsCli, summarize, summarizeRoles } from "../../src/routing/outcomes";
+import { countUnknownBindings } from "../../src/routing/outcomes/stats";
 import { signalRow, type SignalObservation } from "../../src/routing/outcomes/signals";
 import {
   ANNOTATION_REASON,
@@ -291,8 +292,9 @@ describe("advisor role findings fire and clear", () => {
     const stats = summarizeRoles(null, MIXED, WINDOW);
     const violating = rolesCfg({ subagentTiers: { explore: "fast" }, agents: { implementer: { description: "x", model: "anthropic/claude-sonnet-5-5", allowTools: ["edit", "bash", "webfetch"] } } } as unknown as Partial<RouterConfig>);
     // The same config does fire with the host known to be v2 (so the silence is the host, not the fixture).
-    expect(findingIds(run(violating, { roleStats: stats, tierDispatches: 50 }))).toEqual(expect.arrayContaining(["role-separation", "native-explore-aliased", "role-binding-unknown"]));
-    for (const id of ROLE_IDS) expect(findingIds(runUnknownHost(violating, { roleStats: stats, tierDispatches: 50 }))).not.toContain(id);
+    const extras = { roleStats: stats, tierDispatches: 50, unknownBindings: countUnknownBindings(MIXED, WINDOW), orphanCounters: { refused: 1, lost: 0 } };
+    expect(findingIds(run(violating, extras))).toEqual(expect.arrayContaining(["role-separation", "native-explore-aliased", "role-binding-unknown", "role-child-stale-resume"]));
+    for (const id of ROLE_IDS) expect(findingIds(runUnknownHost(violating, extras))).not.toContain(id);
     expect(findingIds(runUnknownHost(rolesCfg({ roleAgents: ALL_DISABLED } as unknown as Partial<RouterConfig>)))).not.toContain("roles-none-enabled");
   });
 
@@ -314,11 +316,11 @@ describe("advisor role findings fire and clear", () => {
     expect(buildRoleLines(off).some((l) => l.includes("`explorer`"))).toBe(true);
   });
 
-  const ROLE_IDS: FindingId[] = ["role-separation", "roles-on-legacy-host", "role-budget-low", "role-range-clamped", "role-binding-unknown", "native-explore-aliased", "role-usage-share", "roles-none-enabled"];
+  const ROLE_IDS: FindingId[] = ["role-separation", "roles-on-legacy-host", "role-budget-low", "role-range-clamped", "role-binding-unknown", "role-child-stale-resume", "native-explore-aliased", "role-usage-share", "roles-none-enabled"];
 
   it("tiers mode: no role finding at all, whatever the statistics say", () => {
     const stats = summarizeRoles(null, MIXED, WINDOW);
-    const found = findingIds(run(tiersCfg(), { host: "v2", roleStats: stats, tierDispatches: 50 }));
+    const found = findingIds(run(tiersCfg(), { host: "v2", roleStats: stats, tierDispatches: 50, unknownBindings: countUnknownBindings(MIXED, WINDOW), orphanCounters: { refused: 1, lost: 0 } }));
     for (const id of ROLE_IDS) expect(found).not.toContain(id);
     expect(findingIds(run(tiersCfg()))).toEqual(findingIds(runAdvisor(tiersCfg(), null, null)));
   });
@@ -382,14 +384,15 @@ describe("advisor role findings fire and clear", () => {
     expect(findingIds(run(rolesCfg()))).not.toContain("role-budget-low");
   });
 
-  it("role-binding-unknown (warning) fires when unknown-binding rows exist and clears without them", () => {
+  it("role-binding-unknown (warning) fires when fresh unknown-binding rows exist and clears without them", () => {
     const withUnknown = summarizeRoles(null, MIXED, WINDOW);
-    const fired = run(rolesCfg(), { roleStats: withUnknown }).find((f) => f.id === "role-binding-unknown");
+    const unknownBindings = countUnknownBindings(MIXED, WINDOW);
+    const fired = run(rolesCfg(), { roleStats: withUnknown, unknownBindings }).find((f) => f.id === "role-binding-unknown");
     expect(fired?.severity).toBe("warning");
     expect(fired?.message).toContain("1 child session");
     const clean = summarizeRoles(null, [ROLE_A, ROLE_B], WINDOW);
-    expect(findingIds(run(rolesCfg(), { roleStats: clean }))).not.toContain("role-binding-unknown");
-    expect(findingIds(run(tiersCfg(), { roleStats: withUnknown }))).not.toContain("role-binding-unknown");
+    expect(findingIds(run(rolesCfg(), { roleStats: clean, unknownBindings: countUnknownBindings([ROLE_A, ROLE_B], WINDOW) }))).not.toContain("role-binding-unknown");
+    expect(findingIds(run(tiersCfg(), { roleStats: withUnknown, unknownBindings }))).not.toContain("role-binding-unknown");
   });
 
   it("role-usage-share (info) reports the share of role dispatches and clears when no tier is named or data is thin", () => {

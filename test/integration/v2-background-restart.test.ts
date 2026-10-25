@@ -23,6 +23,9 @@ import { basename, dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ADOPTION_RETRY_MS } from "../../src/compat/background";
 import { processToken } from "../../src/compat/v2-hooks";
+import { currentBinding, resetBindingRegistryForTests } from "../../src/routing/roles/binding";
+import { readRoleOrphans, resetRoleOrphansForTests } from "../../src/routing/roles/orphans";
+import { ROLE_REFUSALS } from "../../src/routing/wire/dispatch";
 import { AFTER_RESTART_WINDOW } from "../../src/verify/branch";
 import { CLAIM_STALE_MS, HEAD_LOST_REASON, PENDING_INSTANCES_DIRNAME, PERIMETER_LOST_REASON, unattributedRisk } from "../../src/verify/pending";
 import { bootBgHost, restoreEnv, type BgHost, type NativeSubagentStub, type SyntheticCall } from "../helpers/v2-bg-host";
@@ -33,6 +36,8 @@ afterEach(async () => {
   await host?.dispose();
   host = undefined;
   restoreEnv();
+  resetBindingRegistryForTests();
+  resetRoleOrphansForTests();
 });
 
 const ORCH = "orch";
@@ -58,6 +63,65 @@ function verdictPosts(h: BgHost): SyntheticCall[] {
 }
 
 describe("restart recovery of held results (QA-2.1-17)", () => {
+  it.each(["refuse", "allow"] as const)("recovers a lost role dispatch in %s mode, with matching wake and resume behaviour", async (resume) => {
+    const callID = `call-orphan-restart-${resume}`;
+    host = await bootBgHost({
+      overrides: { routing: { delegation: "roles", orphans: { resume }, background: { mode: "auto" }, leases: { mode: "off" } } },
+      sessions: { [ORCH]: {}, [CHILD]: { parentID: ORCH, agent: "explorer" } },
+      journalText: `${JSON.stringify({
+        v: 1, kind: "inflight", key: `${CHILD}\u0000${callID}`, callID, parentSessionID: ORCH, childSessionID: CHILD,
+        at: Date.now(), agent: "explorer", role: "explorer", description: "old work", verifying: false,
+        verificationMode: "none", hold: null, process: "previous-process",
+      })}\n`,
+    });
+    const h = host;
+    h.childContext.set(CHILD, [{ role: "user", content: [{ type: "text", text: "find a symbol\nOMR_NONCE=orphan-restart-12345678" }] }]);
+    // The parent's execute.before adopts its journaled records, even without an earlier context or event.
+    await h.before({ sessionID: ORCH, agent: "build", messageID: "m", id: "recover-before-resume", tool: "todowrite", input: {} });
+    await h.settled();
+    const wakes = h.synthetic.filter((s) => s.metadata?.router !== undefined && s.text.includes("was lost in a restart"));
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0]?.text.includes("Dispatch a fresh task: resuming it is refused.")).toBe(resume === "refuse");
+    expect(wakes[0]?.resume).toBe(true);
+    expect(readRoleOrphans().counters.lost).toBe(1);
+    const later = h.before({ sessionID: ORCH, agent: "build", messageID: "m", id: `later-stale-resume-${resume}`, tool: "subagent",
+      input: { agent: "explorer", sessionID: CHILD, description: "continue", prompt: "continue" } });
+    if (resume === "refuse") {
+      await expect(later).rejects.toThrow(ROLE_REFUSALS.staleResume(CHILD));
+      expect(currentBinding(CHILD, { maxOf: () => [] })?.cause).toBe("unregistered");
+    } else {
+      await expect(later).resolves.toBeDefined();
+      expect(currentBinding(CHILD, { maxOf: () => [] })).toBeUndefined();
+    }
+    await h.settled();
+    expect(h.synthetic.filter((s) => s.text.includes("was lost in a restart"))).toHaveLength(1);
+  }, 30_000);
+
+  it("keeps a same-process journaled role attempt live instead of refusing its Code Mode resume", async () => {
+    const callID = "call-orphan-live";
+    host = await bootBgHost({
+      overrides: { routing: { delegation: "roles", background: { mode: "auto" }, leases: { mode: "off" } } },
+      sessions: { [ORCH]: {}, [CHILD]: { parentID: ORCH, agent: "explorer" } },
+      journalText: `${JSON.stringify({
+        v: 1, kind: "inflight", key: `${CHILD}\u0000${callID}`, callID, parentSessionID: ORCH, childSessionID: CHILD,
+        at: Date.now(), agent: "explorer", role: "explorer", description: "live work", verifying: false,
+        verificationMode: "none", hold: null, process: processToken(),
+      })}\n`,
+    });
+    const h = host;
+    h.childContext.set(CHILD, [
+      { role: "user", content: [{ type: "text", text: "find a symbol\nOMR_NONCE=orphan-live-12345678" }] },
+      { role: "assistant", content: [{ type: "text", text: "half way" }], time: { created: 1 } },
+    ]);
+    adoptOrchestrator(h);
+    await h.settled();
+    await expect(h.before({ sessionID: ORCH, agent: "build", messageID: "m", id: "live-role-resume", tool: "execute",
+      input: { code: `await subagent({ task_id: "${CHILD}", prompt: "continue" })` } })).resolves.toBeDefined();
+    expect(currentBinding(CHILD, { maxOf: () => [] })).toBeUndefined();
+    expect(h.synthetic.filter((s) => s.text.includes("was lost in a restart"))).toHaveLength(0);
+    expect(readRoleOrphans().counters).toEqual({ refused: 0, lost: 0 });
+  }, 30_000);
+
   it("a restored hold with its child text but no restored entry ends UNVERIFIABLE: verification data lost in restart", async () => {
     const handle = `vrf_${"a".repeat(24)}`;
     const h = await boot([

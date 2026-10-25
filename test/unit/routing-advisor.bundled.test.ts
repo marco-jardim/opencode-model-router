@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { validateConfig } from "../../src/router/config";
 import type { RouterConfig } from "../../src/router/config";
-import { runAdvisor } from "../../src/routing/advisor";
+import { formatNotice, runAdvisor } from "../../src/routing/advisor";
 import type { AdvisorCatalogModel } from "../../src/routing/advisor";
 
 const seam = vi.hoisted(() => ({ shipped: null as string | null, reads: 0 }));
@@ -56,6 +56,52 @@ function configWith(shippedText: string, ratio: number | null): RouterConfig {
 }
 
 const effortOnMedium = (cfg: RouterConfig) => runAdvisor(cfg, { agents: [] }, CATALOG).find((f) => f.id === "variant-effort" && f.subject === "medium");
+
+describe("stale role resumes in the cost doctor", () => {
+  const config = (resume?: "allow" | "refuse") => validateConfig({
+    ...configWith(SHIPPED, null), routing: { delegation: "roles", ...(resume === undefined ? {} : { orphans: { resume } }) },
+  });
+
+  it.each(["allow", "refuse", undefined] as const)("reports pending and cleaned resumes as quiet info with resume=%s", (resume) => {
+    const findings = runAdvisor(config(resume), null, null, undefined, {
+      host: "v2", unknownBindings: { fresh: 0, resumed: 7 }, orphanCounters: { refused: 3, lost: 2 },
+    });
+    const stale = findings.find((f) => f.id === "role-child-stale-resume");
+    expect(stale).toMatchObject({ severity: "info", target: "router", notify: false, bundledTier: false });
+    expect(stale?.message).toContain("7 resumed unknown-binding rows in the decision-log window (pending)");
+    expect(stale?.message).toContain("3 stale resumes refused by this process (cleaned)");
+    expect(stale?.snippet).toBe(resume === "allow" ? '{"routing":{"orphans":{"resume":"refuse"}}}' : null);
+    expect(findings.some((f) => f.id === "role-binding-unknown")).toBe(false);
+    expect(formatNotice(findings)).toBeNull();
+  });
+
+  it("warns only about fresh bindings, without adding resumed rows to the warning", () => {
+    const findings = runAdvisor(config(), null, null, undefined, { host: "v2", unknownBindings: { fresh: 2, resumed: 9 } });
+    const fresh = findings.find((f) => f.id === "role-binding-unknown");
+    expect(fresh).toMatchObject({ severity: "warning", notify: true, snippet: null });
+    expect(fresh?.message).toMatch(/^2 child sessions could not be bound/);
+    expect(findings.find((f) => f.id === "role-child-stale-resume")).toMatchObject({ severity: "info", notify: false });
+    expect(formatNotice(findings)).toContain("1 finding worth a look (1 warning, 0 saving)");
+  });
+
+  it("reports refusals without log statistics, but not lost actions alone or absent data", () => {
+    const doctor = (orphanCounters?: { refused: number; lost: number }) => runAdvisor(config(), null, null, undefined, { host: "v2", orphanCounters });
+    expect(doctor({ refused: 1, lost: 0 }).find((f) => f.id === "role-child-stale-resume")?.message).toContain("0 resumed unknown-binding rows");
+    for (const findings of [doctor(), doctor({ refused: 0, lost: 4 })]) {
+      expect(findings.some((f) => f.id === "role-child-stale-resume" || f.id === "role-binding-unknown")).toBe(false);
+    }
+  });
+
+  it("keeps binding findings silent on v1, an unknown host, and in tiers mode", () => {
+    const counts = { unknownBindings: { fresh: 1, resumed: 2 }, orphanCounters: { refused: 3, lost: 4 } };
+    const findings = [
+      runAdvisor(config("allow"), null, null, undefined, { ...counts, host: "v1" }),
+      runAdvisor(config("allow"), null, null, undefined, counts),
+      runAdvisor(configWith(SHIPPED, null), null, null, undefined, { ...counts, host: "v2" }),
+    ];
+    for (const rows of findings) expect(rows.some((f) => f.id === "role-binding-unknown" || f.id === "role-child-stale-resume")).toBe(false);
+  });
+});
 
 describe("the advisor's copy of the shipped tiers.json (QA-2.4-R2-11)", () => {
   afterEach(() => {

@@ -7,6 +7,7 @@ import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   USAGE,
+  countUnknownBindings,
   d17Mode,
   parseStatsArgs,
   renderDurationsMarkdown,
@@ -17,7 +18,7 @@ import {
 import { createOutcomeStore } from "../../src/routing/outcomes/store";
 import { createPersister, nodePersistFs } from "../../src/routing/outcomes/persist";
 import { emptyTokenSample } from "../../src/routing/outcomes/cost";
-import { DECISIONS_MAX_GENERATIONS, FLOOR_LIFT_REASON, OUTCOMES_CORRUPT_PREFIX, OUTCOMES_FILE, STATS_EXIT, makeKey } from "../../src/routing/outcomes/types";
+import { ANNOTATION_REASON, DECISIONS_MAX_GENERATIONS, FLOOR_LIFT_REASON, OUTCOMES_CORRUPT_PREFIX, OUTCOMES_FILE, STATS_EXIT, makeKey } from "../../src/routing/outcomes/types";
 import type {
   DecisionRow,
   LoadResult,
@@ -153,6 +154,43 @@ function shuffled<T>(items: readonly T[], seed: number): T[] {
 // ---------------------------------------------------------------------------
 // summarize
 // ---------------------------------------------------------------------------
+
+describe("countUnknownBindings", () => {
+  const unknown = (id: string, resume = false, over: Partial<DecisionRow> = {}) => decision(id, SINCE, {
+    binding: "unknown", childSessionID: `c-${id}`, resume, reason: `${ANNOTATION_REASON}binding:unknown`, ...over,
+  });
+
+  it("splits fresh and resumed unknown bindings, including notes without a dispatch row", () => {
+    const rows = [
+      unknown("fresh"), unknown("resumed", true), unknown("resumed-2", true),
+      decision("no-binding", SINCE), unknown("bound", false, { binding: "exact" }),
+      verdict("fresh", SINCE, A, "pass"), refusal("resumed", SINCE, A),
+    ];
+    expect(countUnknownBindings(rows, WINDOW)).toEqual({ fresh: 1, resumed: 2 });
+    expect(countUnknownBindings([], NONE)).toEqual({ fresh: 0, resumed: 0 });
+  });
+
+  it("deduplicates by decision and child across dispatch rows, notes, attempts and repeated batches", () => {
+    const dispatch = unknown("fresh", false, { role: "implementer", reason: "kept", attemptID: "attempt-1" });
+    const note = unknown("fresh", false, { attemptID: "attempt-2" });
+    const rows = [dispatch, note, unknown("fresh", true, { childSessionID: "another-child" }), unknown("another-decision", true, { childSessionID: dispatch.childSessionID })];
+    const before = JSON.stringify(rows);
+    expect(countUnknownBindings([...rows, ...rows], WINDOW)).toEqual({ fresh: 1, resumed: 2 });
+    expect(JSON.stringify(rows)).toBe(before);
+    expect(countUnknownBindings([dispatch, { ...note, resume: true }], WINDOW)).toEqual({ fresh: 1, resumed: 0 });
+  });
+
+  it("windows before binding dedupe: since inclusive, until exclusive; invalid timestamps never count", () => {
+    const rows = [
+      unknown("same", false, { ts: "2026-10-05T23:59:59.999Z" }),
+      unknown("same", true), unknown("at-until", false, { ts: UNTIL }),
+      unknown("bad", true, { ts: "not a date" }),
+    ];
+    expect(countUnknownBindings(rows, WINDOW)).toEqual({ fresh: 0, resumed: 1 });
+    expect(countUnknownBindings(rows, NONE)).toEqual({ fresh: 2, resumed: 0 });
+    expect(countUnknownBindings(rows, { since: Number.NaN, until: Number.POSITIVE_INFINITY })).toEqual(countUnknownBindings(rows, NONE));
+  });
+});
 
 describe("markdown table cells (CodeQL js/incomplete-sanitization)", () => {
   it("escapes a backslash before the pipe, so a value ending in \\ cannot reopen a column", () => {

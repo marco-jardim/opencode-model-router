@@ -163,6 +163,7 @@ const V2_DEFAULTS = {
   advisor: { enabled: true, noticeIntervalHours: 24, notify: true },
   background: { mode: "auto", minPredictedMs: 45_000 },
   leases: { mode: "enforce", run: "annotate" },
+  orphans: { resume: "refuse" },
   executor: {
     maxParallel: 4,
     slotsDir: null,
@@ -391,6 +392,31 @@ describe("routing.background and routing.leases (Phase 2.1, OpenCode v2 only)", 
   });
 });
 
+describe("routing.orphans (OpenCode v2 only)", () => {
+  it.each(["refuse", "allow"] as const)("accepts %s, and v1 ignores it", (resume) => {
+    const cfg = cfgOf({ routing: { orphans: { resume } } });
+    expect(cfg.routing?.orphans).toEqual({ resume });
+    expect(resolveRouting(cfg, "v2").orphans).toEqual({ resume });
+    expect(resolveRouting(cfg, "v1").orphans).toEqual({ resume: "refuse" });
+  });
+
+  it.each([null, "allow", { resume: "maybe" }, { resume: false }])("tolerantly defaults invalid %j", (orphans) => {
+    const routing = { orphans };
+    const cfg = cfgOf({ routing });
+    expect(resolveRouting(cfg, "v2").orphans).toEqual({ resume: "refuse" });
+    expect(collectRoutingNotices(routing, cfg).join("\n")).toContain("routing.orphans");
+  });
+
+  it("knows the key, notices typos, and names even invalid values in the v1 notice", () => {
+    expect(ROUTING_DEFAULTS.orphans).toEqual({ resume: "refuse" });
+    expect(resolveRouting(cfgOf(), "v2").orphans).toEqual({ resume: "refuse" });
+    expect(findUnknownRoutingKeys({ orphans: { resume: "allow" } })).toEqual([]);
+    expect(findUnknownRoutingKeys({ orphans: { resumes: "allow" } })).toEqual(["routing.orphans.resumes"]);
+    expect(configuredV2OnlyKeys({ orphans: { resume: "maybe" } })).toEqual(["routing.orphans.resume"]);
+    expect(configuredV2OnlyKeys({ orphans: false })).toEqual(["routing.orphans"]);
+  });
+});
+
 describe("resolveRouting — configured values", () => {
   beforeEach(() => resetRoutingWarnings());
 
@@ -441,6 +467,7 @@ describe("resolveRouting — configured values", () => {
       advisor: { enabled: false, noticeIntervalHours: 24, notify: true },
       background: { mode: "auto", minPredictedMs: 45_000 },
       leases: { mode: "enforce", run: "annotate" },
+      orphans: { resume: "refuse" },
       executor: V2_DEFAULTS.executor,
       applied: { host: "v2", requestedEngine: "enforce", engineCoerced: false, rolesSource: "default" },
     });

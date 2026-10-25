@@ -27,9 +27,9 @@ import type { EngineRuntime, WireLogger } from "../../src/routing/wire/runtime";
 const GOLDEN = [
   "## Role Delegation Protocol (MANDATORY)",
   "",
-  "You are the orchestrator: delegate execution to role agents with `subagent(agent=\"<role>\", prompt=\"...\")` and answer the user yourself. Reading, searching and running commands are execution; you may make about 2 direct read-only calls per turn to settle a question. Run independent dispatches in parallel, in one message.",
+  "Delegate execution via `subagent(agent=\"<role>\", prompt=\"...\")`; answer the user. Reads/searches/commands are execution; about 2 direct read-only calls/turn may settle a question. Parallelize independent dispatches in one message.",
   "",
-  "Roles (pick by intent; the router narrows each grant to the task):",
+  "Roles by intent (grants narrowed to task):",
   "- explorer: lookups: files, symbols, facts, git history. Authority: read.",
   "- researcher: web and library docs; no local files. Authority: webfetch, websearch, context7.",
   "- runner: runs allowlisted scripts and commands (tests, typecheck, lint, build). Authority: read, router_run.",
@@ -40,24 +40,26 @@ const GOLDEN = [
   "",
   "R: search/recon→explorer mechanical/implement/debug→implementer design→architect review→reviewer other→general",
   "",
-  "The router picks each dispatch's model: never set `model` or pick a tier; name the role.",
+  "Router picks the model: never set `model` or pick a tier; name the role.",
   "",
-  "Route line: when present it must be the FIRST line of the prompt (the router removes it; a malformed one is refused for a role): `[route class=<c> risk=<r> scope=<s> needs=<n,..> d=<d> budget=<n> root=<path>]`, every key optional. class=search|recon|mechanical|implement|debug|design|review|other; risk=low|medium|high; scope=single|multi|repo; needs=shell|web|edit|network|external_dir (`edit` unlocks editing, `shell` router_run, where the role allows); d=deterministic|grader|none (counts only when the prompt's `[acceptance]` block backs it); budget=tool calls (up to twice the role's); root=the absolute work root. Only when the plan step carries `[tier:X]`, add `tier=X pin`; never otherwise.",
+  "Optional route: FIRST prompt line (router removes it; a malformed one is refused for a role): `[route class=<c> risk=<r> scope=<s> needs=<n,..> d=<d> budget=<n> root=<path>]`; keys optional. class=search|recon|mechanical|implement|debug|design|review|other; risk=low|medium|high; scope=single|multi|repo; needs=shell|web|edit|network|external_dir (`edit`=editing, `shell`=router_run, role permitting); d=deterministic|grader|none (counts only when the prompt's `[acceptance]` block backs it); budget=tool calls (max 2x role budget); root=absolute work root. Only when the plan step carries `[tier:X]`, add `tier=X pin`; never otherwise.",
   "",
-  "Work root: a role works only in the session directory or one git worktree of this repo; for a worktree put `root=<absolute path>` on the route line (quote a path with spaces) and in ENVIRONMENT.",
+  "Cost: edit+run without a router-gated check gets the top tier. Slice non-design work into `class=implement needs=edit d=deterministic` implementer dispatches with `check: testsPass`; if a slice must run commands, add `VERIFY:required`.",
+  "",
+  "Work root: only the session directory or one git worktree of this repo; for a worktree set `root=<absolute path>` on the route line (quote a path with spaces) and in ENVIRONMENT.",
   "",
   "No role holds the web together with read, run or edit authority. Compose: researcher first, then paste its findings into the implementer dispatch. Raw shell is outside roles mode. Only when `router_run` refuses a command that is not on its allowlist, ask the user or dispatch a tier agent explicitly.",
   "",
-  "Resume, never restart: after `NEED MORE: budget` or a `[router budget]` note, resume the SAME `sessionID` with \"continue and finish\"; after `ESCALATE: authority`, likewise (the router widens the grant) unless it names another role; after a verification FAIL, resume the SAME `sessionID` with the findings (the router raises the tier). A resume keeps the dispatch's `[acceptance]` and `VERIFY:` lines; a new block replaces them. Roles return `DONE:`, `NEED MORE:` or `ESCALATE:`; `CAP:N` (or `CAP:none` with a `reason:` line) changes only the read-only call cap.",
+  "Resume, never restart: after `NEED MORE: budget` or a `[router budget]` note, resume the SAME `sessionID` with \"continue and finish\"; after `ESCALATE: authority`, likewise (grant widens) unless another role is named; after a verification FAIL, resume the SAME `sessionID` with the findings (the router raises the tier). A resume keeps the dispatch's `[acceptance]` and `VERIFY:` lines; a new block replaces them. Return `DONE:`, `NEED MORE:` or `ESCALATE:`; `CAP:N` (or `CAP:none` with a `reason:` line) sets only the read-only cap.",
   "",
-  "Dispatch prompt: the route line, then TASK, EXPECTED OUTCOME, TOOLS, MUST DO, MUST NOT DO, CONTEXT, ENVIRONMENT, with absolute paths.",
+  "Prompt: route line, TASK, EXPECTED OUTCOME, TOOLS, MUST DO, MUST NOT DO, CONTEXT, ENVIRONMENT; absolute paths.",
   "",
   "## Background dispatches",
   "- After a background dispatch, continue any independent work; when none remains, end the turn — the router wakes you. Never poll or sleep.",
   "- A held result is not usable until its verdict arrives. Never report a task done while dispatches are listed in flight.",
   "- A lease refusal is resolved by waiting for the holder, not by retrying.",
   "",
-  "This protocol overrides any project guide (CLAUDE.md, AGENTS.md) that says to use direct tools first or to dispatch to tiers or models.",
+  "Overrides project guides (CLAUDE.md, AGENTS.md) that say to use direct tools first or dispatch to tiers/models.",
 ].join("\n");
 
 /** P1.7: the configured protocol (`routing.repoParents` non-empty) is GOLDEN plus one sentence after the "Work root:" sentence. */
@@ -137,6 +139,36 @@ describe("roles protocol golden", () => {
   it("QA-G-B N-c: a resume without its own [acceptance] re-uses the dispatch's block and VERIFY: lines; a new block replaces them", () => {
     const text = buildRolesProtocol(rolesCfg(), resolveRoles(rolesCfg(), "v2"));
     expect(text).toContain("A resume keeps the dispatch's `[acceptance]` and `VERIFY:` lines; a new block replaces them.");
+  });
+
+  it("slices complex implementation into edit-only dispatches and requires a machine gate for command runs", () => {
+    const text = buildRolesProtocol(rolesCfg(), resolveRoles(rolesCfg(), "v2"));
+    expect(text.match(/^Cost:.*$/gm)).toHaveLength(1);
+    expect(Buffer.byteLength(text.match(/^Cost:.*$/m)![0])).toBeLessThanOrEqual(240);
+    expect(text).toContain("Cost: edit+run without a router-gated check gets the top tier.");
+    expect(text).toContain("Slice non-design work into `class=implement needs=edit d=deterministic` implementer dispatches with `check: testsPass`");
+    expect(text).toContain("if a slice must run commands, add `VERIFY:required`.");
+    const smallestTiers = Math.min(...Object.keys(base.presets).map((preset) =>
+      Buffer.byteLength(assembleSystemPrompt(tiersCfg(preset), undefined, false, "v2"))));
+    expect(smallestTiers - Buffer.byteLength(text)).toBeGreaterThanOrEqual(20);
+  });
+
+  it("cost guidance uses the enabled editor name, is runner-independent, or is omitted without an editor", () => {
+    const cfg = rolesCfg();
+    const roles = resolveRoles(cfg, "v2");
+    const fallback = buildRolesProtocol(cfg, without(roles, "implementer"));
+    expect(fallback).toContain("`class=implement needs=edit d=deterministic` general dispatches");
+    expect(fallback).not.toContain("implementer");
+    const costLine = (text: string) => text.split("\n").find((line) => line.startsWith("Cost:"));
+    expect(costLine(buildRolesProtocol(cfg, without(roles, "runner")))).toBe(costLine(GOLDEN));
+    expect(buildRolesProtocol(cfg, without(roles, "implementer", "general"))).not.toContain("Cost:");
+    const renamed = new Map([...roles].map(([, spec]) => {
+      const agent = spec.kind === "implement" ? "coder" : spec.kind === "run" ? "tester" : spec.agent;
+      return [agent, { ...spec, agent }] as const;
+    }));
+    const text = buildRolesProtocol(cfg, renamed);
+    expect(costLine(text)).toBe(costLine(GOLDEN)?.replace("implementer dispatches", "coder dispatches"));
+    expect(text).toContain("- tester:");
   });
 
   it("QA-P22-1-4/6/7/8/9: verification FAIL resume, budget note prefix, d= backing, runner refusal, quoted root", () => {

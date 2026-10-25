@@ -513,7 +513,8 @@ The cost doctor looks for money and reliability problems **outside** the routing
 | `roles-on-legacy-host` | info | `routing.delegation: roles` on OpenCode v1, where it does nothing. |
 | `role-budget-low` | warning | Roles mode: a role ran out of budget in at least 20% of its dispatches (5+ dispatches). |
 | `role-range-clamped` | info | Roles mode: a role's tier range or budget was placed on the preset's tiers or clamped. |
-| `role-binding-unknown` | warning | Roles mode: child sessions that could not be bound to a role dispatch (`binding: unknown`). |
+| `role-binding-unknown` | warning | Roles mode on v2: **fresh** child sessions that could not be bound to a role dispatch (`binding: unknown`, `resume: false`) in the last 7 days; resumed rows do not warn. |
+| `role-child-stale-resume` | info | Roles mode on v2: resumed unknown-binding rows in the last 7 days (pending), or stale resumes refused by this process (cleaned, process-lifetime count). Suggests `{"routing":{"orphans":{"resume":"refuse"}}}` only when the setting is `"allow"`; otherwise no snippet. Never produces a cost-doctor notice. |
 | `native-explore-aliased` | info | Roles mode: the host's native `explore` is aliased to the `explorer` role. |
 | `roles-none-enabled` | info | Roles mode on v2 with no enabled role: the orchestrator gets the tier protocol. |
 | `role-usage-share` | info | Roles mode: share of role dispatches versus dispatches that named a tier directly. |

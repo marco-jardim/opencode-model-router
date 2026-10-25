@@ -543,6 +543,21 @@ export function summarizeRoles(store: OutcomeStoreView | null, rows: readonly Lo
   };
 }
 
+/** Unknown bindings in `since ≤ ts < until`, once per decision and child (the same identity as `summarizeRoles`). */
+export function countUnknownBindings(rows: readonly LogRow[], window: StatsWindow): { fresh: number; resumed: number } {
+  const counts = { fresh: 0, resumed: 0 };
+  const seen = new Set<string>();
+  for (const row of rows) {
+    if (row.kind !== "decision" || row.binding !== "unknown" || !rowInWindow(row.ts, window)) continue;
+    const id = JSON.stringify([row.decisionID, row.childSessionID]);
+    if (seen.has(id)) continue;
+    seen.add(id);
+    if (row.resume) counts.resumed += 1;
+    else counts.fresh += 1;
+  }
+  return counts;
+}
+
 // ---------------------------------------------------------------------------
 // renderMarkdown
 // ---------------------------------------------------------------------------

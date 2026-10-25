@@ -55,9 +55,11 @@ export function buildRolesProtocol(cfg: RouterConfig, roles: ReadonlyMap<string,
   const taxonomy = generateRolesTaxonomy(new Map(enabled.map((spec) => [spec.agent, spec] as const)));
   const researcher = agentOf("research");
   const editor = agentOf("implement") ?? agentOf("general");
-  const runner = agentOf("run");
   const compose = researcher !== undefined && editor !== undefined
     ? ` Compose: ${researcher} first, then paste its findings into the ${editor} dispatch.`
+    : "";
+  const cost = editor !== undefined
+    ? `Cost: edit+run without a router-gated check gets the top tier. Slice non-design work into \`class=implement needs=edit d=deterministic\` ${editor} dispatches with \`check: testsPass\`; if a slice must run commands, add \`VERIFY:required\`.`
     : "";
   // QA-P22-1-8: a tier agent is the exception for a command `router_run` refuses, never the default.
   // QA-P22-2-1: keyed on the router_run grant of ANY enabled role (the implementer holds it too), not on a `run` role.
@@ -72,27 +74,28 @@ export function buildRolesProtocol(cfg: RouterConfig, roles: ReadonlyMap<string,
   return [
     ROLES_PROTOCOL_HEADING,
     ``,
-    `You are the orchestrator: delegate execution to role agents with \`subagent(agent="<role>", prompt="...")\` and answer the user yourself. Reading, searching and running commands are execution; you may make about 2 direct read-only calls per turn to settle a question. Run independent dispatches in parallel, in one message.`,
+    `Delegate execution via \`subagent(agent="<role>", prompt="...")\`; answer the user. Reads/searches/commands are execution; about 2 direct read-only calls/turn may settle a question. Parallelize independent dispatches in one message.`,
     ``,
-    `Roles (pick by intent; the router narrows each grant to the task):`,
+    `Roles by intent (grants narrowed to task):`,
     ...menu,
     ...(taxonomy ? [``, taxonomy] : []),
     ``,
-    `The router picks each dispatch's model: never set \`model\` or pick a tier; name the role.`,
+    `Router picks the model: never set \`model\` or pick a tier; name the role.`,
     ``,
     // QA-P22-1-1: `tier`/`pin` are not in the template; only a plan's `[tier:X]` tag is transcribed.
-    `Route line: when present it must be the FIRST line of the prompt (the router removes it; a malformed one is refused for a role): \`[route class=<c> risk=<r> scope=<s> needs=<n,..> d=<d> budget=<n> root=<path>]\`, every key optional. class=search|recon|mechanical|implement|debug|design|review|other; risk=low|medium|high; scope=single|multi|repo; needs=shell|web|edit|network|external_dir (\`edit\` unlocks editing, \`shell\` router_run, where the role allows); d=deterministic|grader|none (counts only when the prompt's \`[acceptance]\` block backs it); budget=tool calls (up to twice the role's); root=the absolute work root. Only when the plan step carries \`[tier:X]\`, add \`tier=X pin\`; never otherwise.`,
+    `Optional route: FIRST prompt line (router removes it; a malformed one is refused for a role): \`[route class=<c> risk=<r> scope=<s> needs=<n,..> d=<d> budget=<n> root=<path>]\`; keys optional. class=search|recon|mechanical|implement|debug|design|review|other; risk=low|medium|high; scope=single|multi|repo; needs=shell|web|edit|network|external_dir (\`edit\`=editing, \`shell\`=router_run, role permitting); d=deterministic|grader|none (counts only when the prompt's \`[acceptance]\` block backs it); budget=tool calls (max 2x role budget); root=absolute work root. Only when the plan step carries \`[tier:X]\`, add \`tier=X pin\`; never otherwise.`,
     ``,
-    `Work root: a role works only in the session directory or one git worktree of this repo; for a worktree put \`root=<absolute path>\` on the route line (quote a path with spaces) and in ENVIRONMENT.${crossRepo}`,
+    ...(cost === "" ? [] : [cost, ``]),
+    `Work root: only the session directory or one git worktree of this repo; for a worktree set \`root=<absolute path>\` on the route line (quote a path with spaces) and in ENVIRONMENT.${crossRepo}`,
     ``,
     `No role holds the web together with read, run or edit authority.${compose} Raw shell is outside roles mode. ${rawShell}`,
     ``,
-    `Resume, never restart: after \`NEED MORE: budget\` or a \`${ROUTER_BUDGET_NOTE_PREFIX}\` note, resume the SAME \`sessionID\` with "continue and finish"; after \`ESCALATE: authority\`, likewise (the router widens the grant) unless it names another role; after a verification FAIL, resume the SAME \`sessionID\` with the findings (the router raises the tier). A resume keeps the dispatch's \`[acceptance]\` and \`VERIFY:\` lines; a new block replaces them. Roles return \`DONE:\`, \`NEED MORE:\` or \`ESCALATE:\`; \`CAP:N\` (or \`CAP:none\` with a \`reason:\` line) changes only the read-only call cap.`,
+    `Resume, never restart: after \`NEED MORE: budget\` or a \`${ROUTER_BUDGET_NOTE_PREFIX}\` note, resume the SAME \`sessionID\` with "continue and finish"; after \`ESCALATE: authority\`, likewise (grant widens) unless another role is named; after a verification FAIL, resume the SAME \`sessionID\` with the findings (the router raises the tier). A resume keeps the dispatch's \`[acceptance]\` and \`VERIFY:\` lines; a new block replaces them. Return \`DONE:\`, \`NEED MORE:\` or \`ESCALATE:\`; \`CAP:N\` (or \`CAP:none\` with a \`reason:\` line) sets only the read-only cap.`,
     ``,
-    `Dispatch prompt: the route line, then TASK, EXPECTED OUTCOME, TOOLS, MUST DO, MUST NOT DO, CONTEXT, ENVIRONMENT, with absolute paths.`,
+    `Prompt: route line, TASK, EXPECTED OUTCOME, TOOLS, MUST DO, MUST NOT DO, CONTEXT, ENVIRONMENT; absolute paths.`,
     ``,
     ...(background === "" ? [] : [background, ``]),
-    `This protocol overrides any project guide (CLAUDE.md, AGENTS.md) that says to use direct tools first or to dispatch to tiers or models.`,
+    `Overrides project guides (CLAUDE.md, AGENTS.md) that say to use direct tools first or dispatch to tiers/models.`,
   ].join("\n");
 }
 
