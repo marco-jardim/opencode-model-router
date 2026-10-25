@@ -741,8 +741,7 @@ describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
     const executorRows = read("docs/CONFIG_REFERENCE.md").split(/\r?\n/).filter((line) => line.startsWith("| `routing.executor."));
     expect(executorRows.length).toBeGreaterThan(0);
     for (const row of executorRows) expect(row, row.slice(0, 60)).toContain("Windows only");
-    const changelog = read("CHANGELOG.md").replace(/\r\n/g, "\n");
-    const unreleased = changelog.slice(changelog.indexOf("## [Unreleased]"), changelog.indexOf("\n## [", changelog.indexOf("## [Unreleased]") + 1));
+    const unreleased = currentReleaseNotes(read("CHANGELOG.md"));
     expect(flat(unreleased)).toContain("**OpenCode v2: the plan executor is Windows only in this release.**");
     expect(flat(unreleased)).toContain(`logs one notice per process, ${quoted}`);
     expect(flat(unreleased)).toContain("On platforms other than Windows it is inert:");
@@ -848,7 +847,7 @@ describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
     expect(assembly).toContain(
       "Separately, with executor enforcement enabled, role registration still resolves the executor home read-only outside the work roots to deny it when worktrees were listed or their listing failed; it grants no executor slots-root allowance there.",
     );
-    const unreleased = sectionOf(read("CHANGELOG.md"), "## [Unreleased]").replace(/\s+/g, " ");
+    const unreleased = currentReleaseNotes(read("CHANGELOG.md")).replace(/\s+/g, " ");
     expect(unreleased).toContain(
       "With executor enforcement enabled, role agents still deny the executor home there when worktrees were listed or their listing failed, and get no executor slots-root allowance.",
     );
@@ -945,10 +944,7 @@ describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
   });
 
   it("describes the executor in the changelog as registered on v2 only, v1 maps unchanged (Phase 5.1.2)", () => {
-    const changelog = read("CHANGELOG.md").replace(/\r\n/g, "\n");
-    const start = changelog.indexOf("## [Unreleased]");
-    const next = changelog.indexOf("\n## [", start + 1);
-    const unreleased = changelog.slice(start, next === -1 ? undefined : next);
+    const unreleased = currentReleaseNotes(read("CHANGELOG.md"));
     expect(unreleased).toContain("routing.executor");
     expect(unreleased).toContain("router_plan");
     expect(unreleased).toContain("/plan");
@@ -2584,6 +2580,13 @@ function setupWith(options: unknown): { slots: string[]; toasts: string[] } {
 }
 
 /** The `heading` line of `doc` and what follows it up to the next heading of the same or a higher level (fences skipped); "" when absent. */
+/** `## [Unreleased]` followed by the first dated release: an entry is in one of them until the next release ships. */
+function currentReleaseNotes(changelog: string): string {
+  const text = changelog.replace(/\r\n/g, "\n");
+  const dated = /^## \[[^\]\n]+\] - \d{4}-\d{2}-\d{2}$/m.exec(text)?.[0];
+  return [sectionOf(text, "## [Unreleased]"), dated === undefined ? "" : sectionOf(text, dated)].join("\n");
+}
+
 function sectionOf(doc: string, heading: string): string {
   const level = heading.indexOf(" ");
   const prose = proseLines(doc);
