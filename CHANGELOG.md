@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.9.1] - 2026-10-25
+
 ### Changed
 
 - **`hybrid` preset: `medium` and `heavy` run at `high` instead of `xhigh`.** `openai/gpt-6.1-sol-fast` (variant)
