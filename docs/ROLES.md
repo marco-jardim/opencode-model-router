@@ -81,8 +81,9 @@ What changes after the restart:
 - The tools `router_run` and `router_request_authority` (the latter only when a dynamic role is enabled) are
   registered, and `router_git_*` run in the dispatch's work root.
 - The orchestrator's system prompt carries `## Role Delegation Protocol (MANDATORY)` instead of the tier protocol: a
-  role menu, the route-line keys, "never set `model` or pick a tier; name the role", the resume rules (a resume keeps
-the dispatch's `[acceptance]` and `VERIFY:` lines; a new block replaces them). The tier agents `fast`,
+  role menu, the route-line keys, "never set `model` or pick a tier; name the role", a short "Cost:" paragraph on
+  [slicing for cost](#tier-floor), and the resume rules (a resume keeps the dispatch's `[acceptance]` and `VERIFY:`
+  lines; a new block replaces them). The tier agents `fast`,
   `medium` and `heavy` stay registered and callable (an explicit tier dispatch behaves as in tiers mode); the protocol
   just stops advertising them.
 
@@ -636,6 +637,17 @@ criterion), even when the result is accepted with a caveat. Strict children's UN
 incomplete returns do not escalate.
 Tier-agent and delegate (non-role) paths stay strict. On OpenCode v1 the key is inert and uses the existing single
 “roles delegation requires OpenCode v2; using tiers” notice.
+
+**Slicing for cost.** The roles protocol tells the orchestrator to slice non-design implementation into one edit-only
+implementer dispatch per coherent change (one concern, a few files). Use `class=implement needs=edit d=deterministic`
+on the route line and an `[acceptance]` block with `check: testsPass` for each slice. With verification enabled but
+deferred, this backs effective `grader` detection and a `medium` authority floor even at `high` risk; without the
+`d=` claim, detection is `none` and high-risk edit-only work still gets `heavy`. Explicit `needs=edit` replaces text-inferred
+needs; `class=implement` alone can retain shell words from the task, and `class=debug` always implies run authority,
+even with `needs=edit`. Leave runs to the gate or the runner. If the slice must run commands, use `needs=edit,shell`,
+keep `d=deterministic` and a machine check, and add `VERIFY:required`: when the router gates that check at return,
+effective detection is `deterministic` and the authority floor is `medium` under either table, even at `high` risk.
+Deferred `testsPass` alone does not make write + exec deterministic. Other floors can still raise the tier.
 
 ## Dynamic authority and the ladder
 

@@ -132,6 +132,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **OpenCode v2: roles protocol teaches slicing for cost within its existing byte budget.** Non-design work is split
+  into edit-only implementer dispatches (`class=implement needs=edit d=deterministic` + `testsPass` acceptance), keeping
+  the authority floor at most `medium` even at high risk when verification is enabled; a slice that must run commands
+  gets a machine check and `VERIFY:required`, avoiding the `heavy` write + exec authority floor when the router gates
+  it. Routing is unchanged.
 - **CI: pull requests are Linux-only; one Windows Node 22 typecheck + full-suite coverage job runs on master pushes
   and manual runs.** Linux e2e and Bun smoke stay blocking. Without Windows coverage, only `src/verify/exec.ts`
   and the `src/executor/` prefix are warn-only; with it, all coverage gates block (G-21).
