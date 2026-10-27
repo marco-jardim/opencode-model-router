@@ -234,27 +234,31 @@ async function checkBase(git: RuntimeDeps["git"], repo: LedgerV1["repo"]): Promi
   }
 }
 
-const processClaimKey = Symbol.for("omr.executor.claim.v1");
+const processClaimKey = Symbol.for("omr.executor.claim.v2");
 /**
  * QA-5.1-20: the retry callbacks of copies refused by the claim (a hot reload starts the new copy before the old one has
- * disposed). Kept beside the claim on the same global record, under its own key, so the claim's shape stays what every
- * loaded copy reads; a release calls each waiter once, and the waiters race for the claim through the same token check.
+ * disposed). Both maps are process-wide across module copies, keyed by the canonical executor home shared by linked
+ * worktrees. A release calls only that home's waiters; they race for its claim through the same token check.
+ * v2 keys keep older loaded copies from misreading the new map shapes.
  */
-const processClaimWaitersKey = Symbol.for("omr.executor.claim.waiters.v1");
+const processClaimWaitersKey = Symbol.for("omr.executor.claim.waiters.v2");
 const processClaims = globalThis as typeof globalThis & {
-  [processClaimKey]?: { token: symbol; toplevel: string };
-  [processClaimWaitersKey]?: Set<() => void>;
+  [processClaimKey]?: Map<string, { token: symbol; toplevel: string }>;
+  [processClaimWaitersKey]?: Map<string, Set<() => void>>;
 };
 
-function claimWaiters(): Set<() => void> {
-  return processClaims[processClaimWaitersKey] ??= new Set();
+function claimWaiters(home: string): Set<() => void> {
+  const waiters = processClaims[processClaimWaitersKey] ??= new Map();
+  let own = waiters.get(home);
+  if (own === undefined) { own = new Set(); waiters.set(home, own); }
+  return own;
 }
 
-/** Frees the claim `token` holds (no-op for another holder's), then tells every refused copy that it may retry. */
-function releaseClaim(token: symbol): void {
-  if (processClaims[processClaimKey]?.token !== token) return;
-  delete processClaims[processClaimKey];
-  for (const retry of [...claimWaiters()]) {
+/** Frees the home's claim `token` holds (no-op for another holder's), then tells its refused copies they may retry. */
+function releaseClaim(home: string, token: symbol): void {
+  if (processClaims[processClaimKey]?.get(home)?.token !== token) return;
+  processClaims[processClaimKey]?.delete(home);
+  for (const retry of [...(processClaims[processClaimWaitersKey]?.get(home) ?? [])]) {
     try { retry(); } catch { /* A waiter's failure is its own (it logs and clears its access). */ }
   }
 }
@@ -299,26 +303,27 @@ export function createExecutor(
 
 /**
  * QA-5.1-20: a copy refused only by the process claim keeps its inputs and retries the assembly once the claim is free: at
- * the release (the holder's dispose calls every waiter) or, failing that, the first time its `lateRuntime` is used. The
- * waiters race for the claim through the same token check, so one wins; the others stay waiters.
+ * the release (the holder's dispose calls that home's waiters) or, failing that, the first time its `lateRuntime` is used.
+ * The waiters race for the home's claim through the same token check, so one wins; the others stay waiters.
  * QA-5.1-26: the winner is handed to its adapter (`host.onExecutor`), which adopts it through the same path as an executor
  * built at start: it registers the executor's providers and hooks, starts it once (its recovery runs once) and disposes it in
  * the W7 order. A winner its adapter does not adopt (the adapter is already disposing) gets the safety dispose here.
  */
-function waitForClaim(context: { directory: string }, options: CreateExecutorOptions): void {
+function waitForClaim(home: string, context: { directory: string }, options: CreateExecutorOptions): void {
   const { access, host } = options;
   const lifetime = host.lifetime;
   if (access.deferRetry === undefined || lifetime.aborted) return;
-  const waiters = claimWaiters();
+  const waiters = claimWaiters(home);
   let spent = false;
   // A copy that ends while it waits stops waiting: no executor is ever assembled for a disposed copy.
   function forget(): void {
     spent = true;
     waiters.delete(retry);
+    if (waiters.size === 0) processClaims[processClaimWaitersKey]?.delete(home);
     access.deferRetry?.(null);
   }
   function retry(): void {
-    if (spent || lifetime.aborted || processClaims[processClaimKey] !== undefined) return;
+    if (spent || lifetime.aborted || processClaims[processClaimKey]?.has(home)) return;
     lifetime.removeEventListener("abort", forget);
     forget();
     const built = assembleExecutor(context, options);
@@ -362,14 +367,15 @@ function assembleExecutor(context: { directory: string }, options: CreateExecuto
   if (!prepared.ok) return absent(prepared.reason);
   if (host.leases === null) return absent("the lease registry is not available");
   if (host.runner === null) return absent("the child runner is not available");
-  if (processClaims[processClaimKey] !== undefined) {
+  const { toplevel, home } = prepared;
+  const claims = processClaims[processClaimKey] ??= new Map();
+  if (claims.has(home)) {
     // QA-5.1-20: refused only by the claim (a hot reload's new copy, while the old one disposes): wait for its release.
-    waitForClaim(context, options);
-    return absent("another plan executor already owns this process");
+    waitForClaim(home, context, options);
+    return absent("another plan executor already owns this repository in this process");
   }
   const claim = Symbol("plan executor");
-  const { toplevel, home } = prepared;
-  processClaims[processClaimKey] = { token: claim, toplevel };
+  claims.set(home, { token: claim, toplevel });
   const clock = createNodeClock();
   const fs = createNodeFileSystem();
   const spawner = nodeSpawner();
@@ -571,7 +577,7 @@ function assembleExecutor(context: { directory: string }, options: CreateExecuto
           try { await innerRuntime.dispose(); }
           finally {
             try { await planPools.closeAll(); }
-            finally { for (const timer of timers) clock.clearTimer(timer); timers.clear(); releaseClaim(claim); }
+            finally { for (const timer of timers) clock.clearTimer(timer); timers.clear(); releaseClaim(home, claim); }
           }
         })();
         return disposal;
@@ -583,7 +589,7 @@ function assembleExecutor(context: { directory: string }, options: CreateExecuto
     void pools?.closeAll();
     for (const timer of timers) clock.clearTimer(timer);
     const failed = absent(`assembly failed: ${error instanceof Error ? error.message : String(error)}`);
-    releaseClaim(claim);
+    releaseClaim(home, claim);
     return failed;
   }
 }

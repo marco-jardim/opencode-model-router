@@ -46,7 +46,9 @@ letting a half-finished task touch your checkout. This page describes what it do
   `--plan <planId>` names another plan.
 - **Landing is fast-forward only.** A finished plan lands on your branch by fast-forward, never by a merge commit, and
   only when the checkout is clean (`routing.executor.land`: `ff-when-clean`, or `manual` to leave it to you).
-- **One active plan per process.** A process runs one plan at a time. A plan is owned by the session that runs it; a
+- **One active plan per repository in a process.** Different repositories can run plans concurrently in the same process;
+  each repository's executor runs one plan at a time, including paused plans. Linked worktrees share one executor claim.
+  A plan is owned by the session that runs it; a
   plan owned by another session is refused, and `adopt` takes over a running or paused plan whose session is gone (a plan awaiting approval is never adopted: the user approves it in its own session, or it is compiled again).
 
 ## Safety model
@@ -93,7 +95,7 @@ Tiers mode registers neither surface; switching to roles requires a restart. The
 - `routing.delegation: "roles"` was selected **at start** (switching from tiers later needs a restart);
 - `routing.leases.mode: "enforce"` is set;
 - a plan-task verifier is available and `enforcement.verify.require` is **not** `"never"`;
-- the host supplies the lease registry and child runner, and no other executor owns the process.
+- the host supplies the lease registry and child runner, and no other executor owns this repository in the process.
 
 Repository discovery for plan-executor assembly runs only when the executor preconditions hold and the location is
 inside `routing.workRoots` (when configured); assembly does no executor discovery at an ineligible location.
@@ -113,16 +115,19 @@ In roles mode, when assembly is unavailable, the registered `/plan` and `router_
 | `not a git repository` | Start in a git repository. |
 | `the lease registry is not available` | The host's lease adapter is missing. |
 | `the child runner is not available` | The host's child runner is missing. |
-| `another plan executor already owns this process` | One executor already holds the process claim. |
+| `another plan executor already owns this repository in this process` | One executor already holds this repository's claim in the process, including across linked worktrees. |
 | `repository discovery failed: <error>` | Git common-directory/path discovery failed; the error follows the prefix. |
 | `assembly failed: <error>` | Assembly failed; the error follows the prefix. |
 
 Before initialization the reason is `not initialized`; after disposal it is `disposed`. There is **one executor per
-process**, across plugin instances, and one active plan at a time. The first plugin copy to assemble takes a
-process-wide claim and that location owns the executor until it disposes. A copy refused only by the claim (a hot reload
+repository in a process**, across plugin instances, and one running or paused plan per executor. Different repositories
+can run plans at the same time in one process. The claim is kept on `globalThis`, keyed by the executor home (the canonical
+git common directory plus `omr-executor`), so the main checkout and linked worktrees share it. The first plugin copy to
+assemble for that home owns its executor until it disposes. A copy refused only by the claim (a hot reload
 starts the new copy before the old one has disposed) waits: when the holder's disposal releases the claim, the waiting
-copy assembles its executor and starts it once (its recovery runs once), or, failing that, retries the first time one of
-its plan tools is used. If several copies wait, one takes the claim and the others keep waiting; a copy disposed while
+copy for that home assembles its executor and starts it once (its recovery runs once), or, failing that, retries the first
+time one of its plan tools is used. A release wakes only that home's waiters, never another repository's. If several
+copies wait for the same home, one takes the claim and the others keep waiting; a copy disposed while
 it waits never assembles. The handed-over executor is wired exactly like one assembled at start: the copy's adapter
 adopts it through the same path, so it gets the plan state and manual-ready line, the executor instructions, the host
 events of its plan children, the retry stop for those children and the launcher metrics. The adapter disposes it in the
@@ -151,7 +156,7 @@ tag gave up, or the tag exists elsewhere. A status change alone is not enough; p
 Disposal clears tool/command access first, then disposes the runtime (unsubscribes host events, clears runtime timers
 and verifier observations, cancels running plan-task verifications, aborts launcher-owned children, settles work already
 running, disposes each integration queue before closing its ledger writer). It then closes all slot pools, clears settle
-timers and releases the process claim. The adapter disposes runtime then launcher before its background processor;
+timers and releases this repository's claim in the process. The adapter disposes runtime then launcher before its background processor;
 launcher disposal is idempotent.
 A verification cut by disposal is re-verified at the next start, never treated as a pass.
 
