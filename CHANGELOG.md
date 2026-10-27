@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **OpenCode v2: plans in different repositories can run at the same time in one Claude Code process.** Executor
+  ownership is scoped to the repository's shared git common-directory home, not the whole process. A second plugin
+  copy for the same repository (including linked worktrees) still waits for the owner to dispose before taking over.
+
 ## [2.9.1] - 2026-10-25
 
 ### Changed

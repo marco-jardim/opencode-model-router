@@ -792,7 +792,7 @@ describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
     expect(reasons).toEqual([
       "routing.delegation must be roles at start", "routing.leases.mode must be enforce", "no plan-task verifier",
       "enforcement.verify.require is never", "the lease registry is not available", "the child runner is not available",
-      "another plan executor already owns this process", "not a git repository",
+      "another plan executor already owns this repository in this process", "not a git repository",
     ]);
     const setup = read("src/v2.ts");
     const setupReasons = [...setup.matchAll(/\?\s*"([^"\n]+)"|access\.clear\("([^"\n]+)"\)/g)].map((m) => (m[1] ?? m[2])!);

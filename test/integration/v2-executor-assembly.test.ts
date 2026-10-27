@@ -33,7 +33,7 @@ import * as pathsModule from "../../src/executor/paths";
 import * as platformModule from "../../src/executor/platform";
 import * as roleAgentsModule from "../../src/router/role-agents";
 
-// Every assembled instance must release the process-wide executor claim.
+// Every assembled instance must release its repository's executor claim.
 const executors: V2Executor[] = [];
 const plugins: Array<() => Promise<void>> = [];
 const roots: string[] = [];
@@ -311,6 +311,50 @@ it("launch fixtures have renderable routes, unlike the persistence builder's pro
 
 // executor is Windows-only (G-16): the real assembly needs drive-letter slots; the suite below drives the seam off Windows.
 describe.runIf(process.platform === "win32")("assembled executor through v2 registration", () => {
+  it("different repositories in one process have working executors and active plans concurrently", async () => {
+    const x = await repository(), y = await repository();
+    await configure(x.root, x.slotsRoot);
+    for (const [fixture, id] of [[x, "plan-x"], [y, "plan-y"]] as const) {
+      const value = plan(fixture, id, "paused");
+      value.tasks.T1 = assemblyTask("T1", { kind: "manual", state: "ready" });
+      await seed(fixture, value);
+    }
+    const a = await boot(x.repo), b = await boot(y.repo);
+    const first = built(a), second = built(b);
+    expect(first.runtime).not.toBe(second.runtime);
+    expect(first.deps.executorHome).not.toBe(second.deps.executorHome);
+    await vi.waitFor(() => {
+      expect(first.runtime.planLine("root")).toContain("plan plan-x:");
+      expect(second.runtime.planLine("root")).toContain("plan plan-y:");
+    }, { timeout: 10_000 });
+    const boards = await Promise.all([
+      a.call({ action: "status", planId: "plan-x" }),
+      b.call({ action: "status", planId: "plan-y" }),
+    ]);
+    expect(boards[0]).toContain("Plan plan-x [paused]");
+    expect(boards[1]).toContain("Plan plan-y [paused]");
+    await a.dispose();
+    expect(await b.call({ action: "status", planId: "plan-y" })).toContain("Plan plan-y [paused]");
+  }, 30_000);
+
+  it("linked worktrees share the repository claim and hand it over when the first copy disposes", async () => {
+    const fixture = await repository();
+    await configure(fixture.root, fixture.slotsRoot);
+    const linked = join(fixture.root, "linked");
+    git(fixture.repo, "worktree", "add", "-q", "-b", "linked", linked);
+    const first = await boot(fixture.repo), second = await boot(linked);
+    expect(first.prepared.ok).toBe(true);
+    expect(second.prepared).toEqual({ ...first.prepared, toplevel: realpathSync.native(linked) });
+    expect(first.state.executor).not.toBeNull();
+    expect(second.state.executor).toBeNull();
+    expect(second.access.unavailable()).toBe("the plan executor is not available: another plan executor already owns this repository in this process");
+    expect(second.access.runtime()).toBeNull();
+    await first.dispose();
+    expect(assembledDeps).toHaveLength(2);
+    expect(second.access.runtime(), second.access.unavailable()).not.toBeNull();
+    expect(await second.call({ action: "status" })).not.toContain("the plan executor is not available:");
+  }, 30_000);
+
   it("A1: registers both surfaces and renders executor instructions immediately after plan (order 61)", async () => {
     const fixture = await repository();
     await configure(fixture.root, fixture.slotsRoot);
@@ -373,7 +417,7 @@ describe.runIf(process.platform === "win32")("assembled executor through v2 regi
     expect(recover).toHaveBeenCalledOnce();
     const second = await boot(fixture.repo);
     expect(second.state.executor).toBeNull();
-    expect(second.access.unavailable()).toContain("another plan executor already owns this process");
+    expect(second.access.unavailable()).toContain("another plan executor already owns this repository in this process");
     expect(recover).toHaveBeenCalledOnce();
     await vi.waitFor(() => expect(planInputs.has("foreign")).toBe(true), { timeout: 10_000 });
     expect(await first.state.executor?.runtime.status("foreign", "root")).toContain("Foreign:");
@@ -413,7 +457,12 @@ describe.runIf(process.platform === "win32")("assembled executor through v2 regi
         dispose: async () => { try { await inner.dispose(); } finally { order.push(`runtime ${index} disposed`); } },
       };
     });
-    const claimHeld = () => Reflect.get(globalThis, Symbol.for("omr.executor.claim.v1")) !== undefined;
+    const prepared = await prepareExecutor(fixture.repo);
+    if (!prepared.ok) throw new Error(prepared.reason);
+    const claimHeld = () => {
+      const claims: unknown = Reflect.get(globalThis, Symbol.for("omr.executor.claim.v2"));
+      return claims instanceof Map && claims.has(prepared.home);
+    };
     const a = await boot(fixture.repo);
     expect(a.state.executor).not.toBeNull();
     await vi.waitFor(() => expect(recover).toHaveBeenCalledOnce(), { timeout: 10_000 });
@@ -436,7 +485,7 @@ describe.runIf(process.platform === "win32")("assembled executor through v2 regi
     child.runner.run = request => run({ ...request, onCreated: async id => { children.push(id); await request.onCreated(id); } });
     const b = await boot(fixture.repo, child.runner);
     expect(b.state.executor).toBeNull();
-    expect(b.access.unavailable()).toContain("another plan executor already owns this process");
+    expect(b.access.unavailable()).toContain("another plan executor already owns this repository in this process");
     expect(b.access.runtime()).toBeNull(); // the claim is still held: B keeps waiting
     expect(b.sessionHooks.retry).toBeUndefined(); // no executor yet: no retry hook (M3)
     const assembled = assembledDeps.length;
@@ -487,7 +536,7 @@ describe.runIf(process.platform === "win32")("assembled executor through v2 regi
     booting = "c";
     const c = await boot(fixture.repo);
     expect(c.state.executor).toBeNull();
-    expect(c.access.unavailable()).toContain("another plan executor already owns this process");
+    expect(c.access.unavailable()).toContain("another plan executor already owns this repository in this process");
     expect(c.access.runtime()).toBeNull();
     expect(assembledDeps).toHaveLength(assembled + 1);
     // C ends while waiting (its lifetime aborts): B's release assembles nothing for it.

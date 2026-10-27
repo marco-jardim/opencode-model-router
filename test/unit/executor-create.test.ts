@@ -378,11 +378,14 @@ describe("createExecutor assembly seams", () => {
     for (const root of roots.splice(0)) await removeDirWhenReleased(root);
   }, 30_000);
 
-  // QA-5.1-20: a copy refused by the claim waits on a process-wide set. Registered after this describe's other hooks, so it
+  // QA-5.1-20: copies refused by claims wait on process-wide sets per home. Registered after this describe's other hooks, so it
   // runs first: no waiter of one test assembles an executor when the next hook (or test) releases the claim.
   afterEach(() => {
-    const waiters: unknown = Reflect.get(globalThis, Symbol.for("omr.executor.claim.waiters.v1"));
-    if (waiters instanceof Set) waiters.clear();
+    const waiters: unknown = Reflect.get(globalThis, Symbol.for("omr.executor.claim.waiters.v2"));
+    if (waiters instanceof Map) {
+      for (const own of waiters.values()) if (own instanceof Set) own.clear();
+      waiters.clear();
+    }
   });
 
   function slotsDouble() {
@@ -1095,7 +1098,7 @@ describe("createExecutor assembly seams", () => {
     expect(assemble()).not.toBeNull();
   });
 
-  it("shares the process claim across module copies and releases it for a later copy", async () => {
+  it("shares the repository claim across module copies and releases it for a later copy", async () => {
     const first = capture().executor;
     vi.resetModules();
     const secondModule = await import("../../src/executor/create");
@@ -1105,7 +1108,7 @@ describe("createExecutor assembly seams", () => {
     const second = secondModule.createExecutor(context, { host: fakeHost(), prepared, access: secondAccess });
     if (second != null) built.push(second);
     expect(second).toBeNull();
-    expect(secondAccess.unavailable()).toBe("the plan executor is not available: another plan executor already owns this process");
+    expect(secondAccess.unavailable()).toBe("the plan executor is not available: another plan executor already owns this repository in this process");
 
     await first.runtime.dispose();
     // QA-5.1-20: the waiting copy (another module copy) took the released claim; its release frees it for a later copy.
@@ -1121,6 +1124,40 @@ describe("createExecutor assembly seams", () => {
     if (third != null) built.push(third);
     expect(third, thirdAccess.unavailable()).not.toBeNull();
   }, 15_000);
+
+  it("releases and wakes only its own home's waiters, leaving another repository's owner and waiter untouched", async () => {
+    const first = capture().executor;
+    const otherPrepared = { ...prepared, toplevel: "D:\\git\\other", home: "D:\\git\\other\\.git\\omr-executor" };
+    const otherContext = { ...context, directory: otherPrepared.toplevel };
+    const other = createExecutor(otherContext, { host: fakeHost(), prepared: otherPrepared, access: createExecutorAccess() });
+    if (other == null) throw new Error("another repository must get its own executor");
+    built.push(other);
+
+    const ownAccess = createExecutorAccess(), ownHost = fakeHost();
+    const otherAccess = createExecutorAccess(), otherHost = fakeHost();
+    // Observe a retry even if it returns early because its home is still claimed.
+    const otherAborted = vi.spyOn(otherHost.lifetime, "aborted", "get");
+    const adoptOwn = vi.fn((executor: V2Executor) => { built.push(executor); return true; });
+    const adoptOther = vi.fn((executor: V2Executor) => { built.push(executor); return true; });
+    ownHost.onExecutor = adoptOwn; otherHost.onExecutor = adoptOther;
+    expect(assemble(ownHost, ownAccess)).toBeNull();
+    expect(createExecutor(otherContext, { host: otherHost, prepared: otherPrepared, access: otherAccess })).toBeNull();
+    expect(ownAccess.unavailable()).toContain("another plan executor already owns this repository in this process");
+    expect(otherAccess.unavailable()).toContain("another plan executor already owns this repository in this process");
+    otherAborted.mockClear();
+
+    await first.runtime.dispose();
+    expect(adoptOwn).toHaveBeenCalledOnce();
+    expect(ownAccess.runtime()).toBe(adoptOwn.mock.calls[0]?.[0].runtime);
+    expect(otherAborted).not.toHaveBeenCalled();
+    expect(adoptOther).not.toHaveBeenCalled();
+
+    await other.runtime.dispose();
+    expect(otherAborted).toHaveBeenCalled();
+    expect(adoptOther).toHaveBeenCalledOnce();
+    expect(otherAccess.runtime()).toBe(adoptOther.mock.calls[0]?.[0].runtime);
+    expect(adoptOwn).toHaveBeenCalledOnce();
+  });
 
   it.each([
     ["leases", "the lease registry is not available"],
@@ -1164,24 +1201,24 @@ describe("createExecutor assembly seams", () => {
     expect(deps.durations).toBe(model);
   });
 
-  it("refuses a second process claim with its unavailable reason", async () => {
+  it("refuses a second repository claim with its unavailable reason", async () => {
     vi.spyOn(configModule, "loadConfig").mockReturnValue(executorConfig());
     const firstAccess = createExecutorAccess(), first = assemble(fakeHost(), firstAccess);
     if (first == null) throw new Error(firstAccess.unavailable());
     const secondAccess = createExecutorAccess();
     expect(assemble(fakeHost(), secondAccess)).toBeNull();
-    expect(secondAccess.unavailable()).toBe("the plan executor is not available: another plan executor already owns this process");
+    expect(secondAccess.unavailable()).toBe("the plan executor is not available: another plan executor already owns this repository in this process");
     expect(secondAccess.runtime()).toBeNull(); // still held: the refused copy keeps waiting
     await first.runtime.dispose();
     // QA-5.1-20: the release handed the claim to the waiting copy; a third copy is refused while it holds it.
     const retried = secondAccess.runtime();
     expect(retried, secondAccess.unavailable()).not.toBeNull();
     const thirdAccess = createExecutorAccess();
-    expect(assemble(fakeHost(), thirdAccess)).toBeNull();
-    expect(thirdAccess.unavailable()).toBe("the plan executor is not available: another plan executor already owns this process");
+    const thirdLifetime = new AbortController();
+    expect(assemble({ ...fakeHost(), lifetime: thirdLifetime.signal }, thirdAccess)).toBeNull();
+    expect(thirdAccess.unavailable()).toBe("the plan executor is not available: another plan executor already owns this repository in this process");
     // Once the third copy stops waiting, the retried runtime's release leaves the claim free for a fresh assembly.
-    const waiters: unknown = Reflect.get(globalThis, Symbol.for("omr.executor.claim.waiters.v1"));
-    if (waiters instanceof Set) waiters.clear();
+    thirdLifetime.abort();
     await retried?.dispose();
     expect(assemble()).not.toBeNull();
   });
