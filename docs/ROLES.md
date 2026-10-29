@@ -795,6 +795,11 @@ code. It never spawns a shell itself (fixed argv, `shell: false`).
   `["test", "typecheck", "lint", "build"]`), or a `routing.run.commands` entry; a command wins over a script of the
   same name. Scripts take no caller arguments. To run another script (say `test:unit`), list it by name or add a
   command entry such as `{ "argv": ["npm", "run", "test:unit"] }`.
+  A script call with arguments is refused with the configured argument-taking commands and their patterns, commands
+  running the same package script first: by default, `package.json scripts take no caller arguments; use script "test-files" (args: test/*, --maxWorkers=*)`.
+  Retry as `router_run({ script: "test-files", args: ["test/unit/x.test.ts"], cwd })`. If no command takes arguments,
+  the hint remains `declare a routing.run.commands entry with "args" for "test"`. The tool description lists up to
+  five argument-taking commands at registration, with long patterns truncated; refusals use the current config.
 - **Arguments.** Only for a command entry that declares `args`: each pattern is an exact string or a prefix ending in
   `*` (`test/*`); an option-like argument (leading `-`, `@` or `+`) matches only a pattern with the same leading
   character. Every argument must also match `^[A-Za-z0-9_./:=@+-]{1,200}$` (at most 50 arguments). Confinement always
