@@ -6,6 +6,7 @@ import { homedir, tmpdir } from "node:os";
 import { join, parse } from "node:path";
 import { gitEnvironment, gitExecutable, mainWorktree, nearestCheckout, spawnBounded, workRootGuards } from "../../src/router/git-tools";
 import type { RunConfig } from "../../src/router/roles";
+import { DEFAULT_RUN_COMMANDS, DEFAULT_RUN_SCRIPTS } from "../../src/router/roles-config";
 import {
   argAllowed, authorizeCwd, capRendered, dropLeadingPartial, escapesWorkRoot, isCredentialEnv, isFullPath, loadNpmIni, npmConfigPins, npmEnvReplace,
   npmHardeningFlags, optionLead, type WorkRootAnswer,
@@ -217,6 +218,58 @@ describe("router_run allowlist", () => {
 });
 
 describe("router_run arguments", () => {
+  it("points package-script callers to the default test-files command and its patterns without spawning", async () => {
+    const run = makeTool({ config: () => config({ scripts: DEFAULT_RUN_SCRIPTS, commands: DEFAULT_RUN_COMMANDS }) });
+    expect(await run({ script: "test", args: ["test/unit/x.test.ts"], cwd: root })).toBe(
+      '[router_run] error: refused: package.json scripts take no caller arguments; use script "test-files" (args: test/*, --maxWorkers=*)',
+    );
+    expect(childProcess.spawn).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["npm", "run", "test", "--"],
+    ["npm", "run-script", "test", "--"],
+    ["npm", "test", "--"],
+  ])("lists same-script commands first for %j", async (...argv) => {
+    const run = makeTool({ config: () => config({ commands: {
+      other: { argv: ["npm", "run", "build", "--"], args: ["src/*"] },
+      noArgs: { argv: ["npm", "run", "test", "--"] },
+      emptyArgs: { argv: ["npm", "test", "--"], args: [] },
+      scoped: { argv, args: ["test/*", "--maxWorkers=*"] },
+      node: { argv: ["node", "probe.js"], args: ["fixtures/*"] },
+    } }) });
+    expect(await run({ script: "test", args: ["test/unit/x.test.ts"], cwd: root })).toBe(
+      '[router_run] error: refused: package.json scripts take no caller arguments; use script "scoped" (args: test/*, --maxWorkers=*); or script "other" (args: src/*); or script "node" (args: fixtures/*)',
+    );
+    expect(childProcess.spawn).not.toHaveBeenCalled();
+  });
+
+  it("keeps the declaration hint when no configured commands take arguments", async () => {
+    const run = makeTool({ config: () => config({ commands: {
+      bare: { argv: ["node", "probe.js"] }, empty: { argv: ["node", "probe.js"], args: [] },
+    } }) });
+    expect(await run({ script: "test", args: ["test/unit/x.test.ts"], cwd: root })).toBe(
+      '[router_run] error: refused: package.json scripts take no caller arguments; declare a routing.run.commands entry with "args" for "test"',
+    );
+    expect(childProcess.spawn).not.toHaveBeenCalled();
+  });
+
+  it("describes argument-taking commands at registration, bounded to five commands and truncated patterns", () => {
+    const description = (cfg: RunConfig) => routerRunTool({ config: () => cfg, resolveWorkRoot: () => bind(root) }).description;
+    expect(description(config({ commands: DEFAULT_RUN_COMMANDS })))
+      .toContain(" Commands accepting arguments: test-files (args: test/*, --maxWorkers=*).");
+    expect(description(config())).not.toContain("Commands accepting arguments:");
+    const commands = Object.fromEntries(Array.from({ length: 6 }, (_, i) => [`files${i}`, {
+      argv: ["node", "probe.js"], args: ["test/*", "x".repeat(200), "hidden-pattern"],
+    }]));
+    const summary = description(config({ commands })).split(" Commands accepting arguments: ")[1]!;
+    expect(summary).toContain("files4 (args: test/*, ");
+    expect(summary).toMatch(/…\); …\.$/);
+    expect(summary).not.toContain("files5");
+    expect(summary).not.toContain("hidden-pattern");
+    expect(summary.length).toBeLessThan(900);
+  });
+
   const METACHARACTERS = [";", "|", "&", "\n", "`", "$(", "%PATH%", "^", "!", "\"", "<", ">", " ", "'", "(", ")", "\\", "*", "?", ",", "\r", "\0"];
   it("refuses every shell metacharacter, before anything is spawned", async () => {
     for (const meta of METACHARACTERS) expect(() => validateRunArgs([`a${meta}b`])).toThrow(/argument 1 refused/);

@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **OpenCode v2 / roles mode: `router_run` points script calls with arguments to configured commands.** Refusals
+  list argument patterns, with commands running the same package script first (such as the default `test-files`);
+  the tool description also includes a bounded list of commands accepting arguments. Argument acceptance is unchanged.
 - **Plan executor: recompiling a plan after abort and purge in the same process can be approved again.** A new plan
   reusing the same id gets fresh slot pools and collection state; stale slot handles from the purged plan remain fenced.
 

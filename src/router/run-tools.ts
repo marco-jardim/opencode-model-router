@@ -742,6 +742,35 @@ function pinnedProgram(program: string): "node" | "npm" | undefined {
   return match ? match[1]!.toLowerCase() as "node" | "npm" : undefined;
 }
 
+/** Discoverability only: this does not validate or authorise a command or its arguments. */
+function argumentCommands(config: RunConfig, script?: string) {
+  const sameScript = (argv: readonly string[]): boolean => {
+    const [program, command, name] = argv;
+    if (program === undefined || pinnedProgram(program) !== "npm") return false;
+    if (command === "run" || command === "run-script") return name === script && argv.slice(3).includes("--");
+    return script === "test" && command === "test" && argv.slice(2).includes("--");
+  };
+  return Object.entries(config.commands ?? {})
+    .filter(([, command]) => (command.args?.length ?? 0) > 0)
+    .sort(([, a], [, b]) => Number(sameScript(b.argv)) - Number(sameScript(a.argv)));
+}
+
+function scriptArgumentsHint(config: RunConfig, script: string): string {
+  const commands = argumentCommands(config, script);
+  return commands.length === 0
+    ? `declare a routing.run.commands entry with "args" for "${script}"`
+    : `use ${commands.map(([name, command]) => `script "${name}" (args: ${command.args!.join(", ")})`).join("; or ")}`;
+}
+
+/** Registration-time summary; execution still reads the current config on every call. */
+function argumentCommandsDescription(config: RunConfig): string {
+  const commands = argumentCommands(config);
+  if (commands.length === 0) return "";
+  const bounded = (text: string, max: number) => text.length <= max ? text : `${text.slice(0, max - 1)}…`;
+  const entries = commands.slice(0, 5).map(([name, command]) => `${bounded(name, 64)} (args: ${bounded(command.args!.join(", "), 100)})`);
+  return ` Commands accepting arguments: ${entries.join("; ")}${commands.length > 5 ? "; …" : ""}.`;
+}
+
 /**
  * The fixed npm argv of a `commands` entry (QA-P13-1-5): it starts with an allowed
  * script-running command (exact name), `run`/`run-script` name a script of the work
@@ -821,7 +850,7 @@ export function planRun(input: RunInput, root: string, config: RunConfig, host: 
       argv = [...fixed, ...args];
     }
   } else if (scriptAllowed(config.scripts ?? [], name)) {
-    if (args.length > 0) throw refuse(`package.json scripts take no caller arguments; declare a routing.run.commands entry with "args" for "${name}"`);
+    if (args.length > 0) throw refuse(`package.json scripts take no caller arguments; ${scriptArgumentsHint(config, name)}`);
     refuseUncForShell(root, host.platform);
     requireScript(packageScripts(root, host.platform), name);
     const launch = npmLaunch(root, host, guarded());
@@ -930,7 +959,8 @@ export function routerRunTool(deps: RunToolDeps) {
       + "No shell is spawned by the tool; arguments are accepted only when the entry declares them, each 1-200 characters of [A-Za-z0-9_./:=@+-], never a path outside the work root. "
       + "cwd must be the dispatch's work root. Output (stdout and stderr) is bounded to 64 KiB; URL credentials in it are redacted (best effort, not a secret scanner) "
       + "and credential-like environment variables are not passed to the run; agents and credential stores (ssh-agent, git credential helpers, "
-      + "cloud CLI caches in the home directory) stay reachable to scripts. The run is time-limited.",
+      + "cloud CLI caches in the home directory) stay reachable to scripts. The run is time-limited."
+      + argumentCommandsDescription(deps.config()),
     args: {
       script: tool.schema.string().describe("Entry name: a script listed in routing.run.scripts (e.g. test, typecheck) or a routing.run.commands entry"),
       args: tool.schema.array(tool.schema.string()).optional().describe("Arguments, only for command entries that declare them"),

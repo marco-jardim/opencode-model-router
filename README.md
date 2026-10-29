@@ -1226,6 +1226,7 @@ With `routing.delegation: "roles"` the orchestrator stops picking tiers: it disp
 | `general` | anything else; authority follows the task's needs | fast–heavy |
 
 - **Least privilege.** Each role has a fixed maximum authority, and no role holds the web together with reads, runs or edits. Commands run through `router_run` (allowlisted scripts and commands, fixed argv, no shell controlled by the caller; npm script bodies still run in npm's pinned script shell); raw shell stays with the tier agents.
+- **Scoped test runs.** Use `router_run` with `script: "test-files"` and `args: ["test/unit/x.test.ts"]` (plus the dispatch's `cwd`). Package-script calls with arguments are refused with configured command names and patterns, same-script commands first; argument acceptance is unchanged.
 - **Authority sets the floor.** Reading may use the cheapest tier; an edit goes below `medium` only when the router itself runs the acceptance checks on a low-risk, single-file change, and edit + run never goes below `medium` (`heavy` without those checks).
 - **Budgets per role.** A role that runs out of calls returns `NEED MORE: budget` and is resumed in the same session; that is never counted as a failure.
 - **Evidence from verification only.** Only verdicts move the routing evidence: the router's deterministic checks, and an independent LLM grader at half weight. Router-observed runs, incomplete returns and re-dispatches are recorded as routing statistics; a bare `DONE` counts for nothing.
