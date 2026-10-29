@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ownership is scoped to the repository's shared git common-directory home, not the whole process. A second plugin
   copy for the same repository (including linked worktrees) still waits for the owner to dispose before taking over.
 
+### Fixed
+
+- **Plan executor: recompiling a plan after abort and purge in the same process can be approved again.** A new plan
+  reusing the same id gets fresh slot pools and collection state; stale slot handles from the purged plan remain fenced.
+
 ## [2.9.1] - 2026-10-25
 
 ### Changed
