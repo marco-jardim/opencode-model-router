@@ -283,6 +283,27 @@ describe("PlanSlotPools lazy facades", () => {
     await expect(pool.of("finished").acquire("finished", "plan:finished:T1", "c".repeat(40))).rejects.toMatchObject({ code: "E_PLAN_STATE" });
   }, 15_000);
 
+  it("recreating a purged plan gets fresh slots while old views stay fenced", async () => {
+    const { pool, store, made } = await rig();
+    const old = pool.of("finished");
+    await old.list();
+    const live = made.get("finished")!;
+    await pool.purge("finished", async () => true);
+    await expect(old.acquire("finished", "plan:finished:T1", "c".repeat(40))).rejects.toMatchObject({ code: "E_PLAN_STATE" });
+    await store.remove("finished");
+    const writer = await store.create(buildDraft(0, "finished"), holderOf("root", process.pid, "pool-test"));
+    await writer.close();
+    pool.forget("finished");
+    const fresh = pool.of("finished");
+    expect(fresh).not.toBe(old);
+    await expect(fresh.acquire("finished", "plan:finished:T1", "c".repeat(40))).resolves.toMatchObject({ planId: "finished" });
+    expect(made.get("finished")).not.toBe(live);
+    expect(made.get("finished")?.open).toHaveBeenCalledExactlyOnceWith();
+    await expect(old.acquire("finished", "plan:finished:T1", "c".repeat(40))).rejects.toMatchObject({ code: "E_PLAN_STATE" });
+    pool.forget("finished"); // A live entry must never be replaced.
+    expect(pool.of("finished")).toBe(fresh);
+  }, 15_000);
+
   it("QA-5.1-22: purge with an invalid slotsDir skips the gc when the plan has no slot marker and refuses when it has some", async () => {
     const { store, factory, log } = await rig();
     factory.mockImplementation(() => { throw new ExecutorError("E_INVALID_INPUT", "invalid slotsDir C:/repo/slots: overlaps the repository"); });

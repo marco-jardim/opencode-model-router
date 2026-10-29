@@ -143,6 +143,11 @@ export class PlanSlotPools {
     return view;
   }
 
+  /** A newly created plan may reuse an id; old views retain their own closed entry and stay fenced. */
+  forget(planId: PlanId): void {
+    if (this.entries.get(planId)?.closed === true) this.entries.delete(planId);
+  }
+
   async gc(finished: Parameters<SlotPool["gc"]>[0], opts?: Parameters<SlotPool["gc"]>[1]): ReturnType<SlotPool["gc"]> {
     const removed: string[] = [], reported: string[] = [];
     for (const plan of await this.deps.store.list()) {
@@ -535,6 +540,7 @@ function assembleExecutor(context: { directory: string }, options: CreateExecuto
     runtime = createExecutorRuntime({ store, compiler, self, executorHome: home,
       observations: options.observations,
       slots: planPools.facade, slotsFor: (id) => planPools.of(id), purgeSlots: (id, finished) => planPools.purge(id, finished),
+      forgetSlots: (id) => planPools.forget(id),
       scheduler: createScheduler(), launcher: taskLauncher, routes, verifier: host.verifier, git, hosts: host.hosts, bindings: host.bindings, clock,
       leaseRegistry: { acquireWrite: (owner, writes) => {
           const result = leases.registry.acquireWrite(owner, writes);

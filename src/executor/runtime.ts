@@ -458,6 +458,8 @@ export interface RuntimeDeps {
    * directory and removes the plan's empty slots directory). Without it, purge runs `slotsFor(planId).gc`.
    */
   purgeSlots?(planId: PlanId, finished: Parameters<SlotPool["gc"]>[0]): ReturnType<SlotPool["gc"]>;
+  /** Drop a closed pool entry only after a new plan with this id has been created. */
+  forgetSlots?(planId: PlanId): void;
   /** Revalidate the fixed slots directory before approval has any side effects. */
   /** Approve-time validation of the resolved slots root; `planId` names the plan being approved (its ledger, its base). */
   checkSlotsDir?(slotsDir: string, toplevel: string, planId: PlanId): void | Promise<void>;
@@ -5454,6 +5456,13 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       });
       if (isForeign(r.draft.repo.toplevel)) throw new ExecutorError("E_INVALID_INPUT", "the plan belongs to another repository");
       const writer = await d.store.create(r.draft, d.holder(i.sessionID));
+      const planId = r.draft.planId;
+      d.forgetSlots?.(planId);
+      collected.delete(planId);
+      const timer = collectionTimers.get(planId);
+      if (timer !== undefined) d.clock.clearTimer(timer);
+      collectionTimers.delete(planId);
+      collectionDelays.delete(planId);
       await attach(writer, false);
       return { planId: r.draft.planId, summary: r.summary, residuePrompt: r.residueRequest?.prompt ?? null };
     },

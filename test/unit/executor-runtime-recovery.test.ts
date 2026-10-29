@@ -11,6 +11,7 @@ import type { Plugin } from "@opencode/plugin";
 import type { ToolContext } from "@opencode/plugin/promise/tool";
 import { createV2Runtime } from "../../src/compat/v2-client.js";
 import { createCapacityController } from "../../src/executor/capacity.js";
+import { PlanSlotPools } from "../../src/executor/create.js";
 import { createLedgerStore } from "../../src/executor/ledger.js";
 import { taskBranchName } from "../../src/executor/git.js";
 import { createTaskLauncher, type PlanBindInput, type PlanRoleBindings } from "../../src/executor/launch.js";
@@ -2613,6 +2614,58 @@ describe("QA-4.2-6: a rejected queue.resume()", () => {
     d.status = "awaiting-approval";
     return d;
   }
+
+  it("approves a recompiled plan with the same id after abort and purge in one runtime", async () => {
+    const h = await mk(awaitingApproval());
+    h.launcher.gateValue = DISPOSED_GATE; // Keep tasks idle so abort and collection settle without a live child.
+    const gc = vi.fn<SlotPool["gc"]>(async () => ({ removed: [], reported: [] }));
+    const pools = new PlanSlotPools({
+      store: h.store, toplevel: REPO,
+      makePool: () => Object.assign(new SlotPoolDouble(h.log), {
+        open: async () => {}, close: () => {}, gc,
+        acquireSpecial: async (planId: string, kind: "integration" | "ci") => ({
+          slot: kind, path: slotPathOf(kind), planId, owner: kind, commit: SHA,
+        }),
+      }),
+    });
+    h.deps.slots = pools.facade;
+    h.deps.purgeSlots = (id, finished) => pools.purge(id, finished);
+    h.deps.forgetSlots = id => pools.forget(id);
+    const collaborators = h.deps.collaborators;
+    h.deps.collaborators = input => {
+      const parts = collaborators(input);
+      const pool = pools.of(input.writer.planId);
+      const resume = parts.queue.resume.bind(parts.queue);
+      parts.queue.resume = async () => {
+        await pool.acquireSpecial(input.writer.planId, "integration");
+        return resume();
+      };
+      return parts;
+    };
+    try {
+      await h.begin();
+      await h.runtime.approve(PLAN_ID, ORCH);
+      await h.runtime.settled();
+      expect(h.parts().queue.resumes).toBe(1);
+      await h.runtime.abort(PLAN_ID, ORCH);
+      await h.runtime.settled();
+      expect(gc).toHaveBeenCalledTimes(1);
+      await h.runtime.purge(PLAN_ID, ORCH);
+      const compiled = await h.runtime.compile({ path: `${REPO}/PLAN.md`, sessionID: ORCH });
+      expect(compiled.planId).toBe(PLAN_ID);
+      await h.runtime.approve(PLAN_ID, ORCH);
+      await h.runtime.settled();
+      expect(h.ledger().inbox.filter(item => item.text.includes("could not resume"))).toEqual([]);
+      expect(h.ledger().status).toBe("running");
+      expect(h.parts().queue.resumes).toBe(1);
+      const before = gc.mock.calls.length;
+      await h.runtime.abort(PLAN_ID, ORCH);
+      await h.runtime.settled();
+      expect(gc).toHaveBeenCalledTimes(before + 1); // The old generation's `collected` flag must not suppress gc.
+    } finally {
+      await pools.closeAll();
+    }
+  });
 
   it("pauses the plan with one critical item and launches nothing; the user's resume retries it", async () => {
     const h = await mk(awaitingApproval());
