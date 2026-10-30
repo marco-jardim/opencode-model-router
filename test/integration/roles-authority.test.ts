@@ -1597,6 +1597,48 @@ describe("work roots (I3, P-13): the dispatch's own worktree only", () => {
       expect(norm(gated.inputs.at(-1)?.changedFiles)).toEqual(norm([join(wt1, "gen.ts")])); // judged on attempt 1's change
     }, 60_000);
 
+    it.skipIf(!hasGit()).each([false, true])("a duplicate held finish does not erase acceptance or edits (resumed=%s)", async (resumed) => {
+      const { wt1, sessions, v2, finish, resume, at, hooks } = await setup();
+      const prompt = `[route class=implement risk=medium scope=multi needs=edit root=${wt1}]\nVERIFY:required\nWrite the generator\n[acceptance]\ncheck: testsPass\n[/acceptance]`;
+      const first = await dispatch(v2, sessions, "change-bg1", "change-child", "implementer", prompt, wt1, "generator");
+      expect(await catalog(v2, "change-child", "implementer")).toContain("edit");
+      const callID = resumed ? "change-bg2" : "change-bg1";
+      let input = first;
+      if (resumed) {
+        await finish("change-bg1", "change-child", first, [join(wt1, "original.ts")], "DONE: original.ts:1");
+        input = await resume(callID, "change-child", "Continue and finish.");
+      }
+      const api = finishApiOf(hooks);
+      const posted: Array<{ verdict: string; reason?: string }> = [];
+      const attach = Reflect.get(hooks, SYNC1_FINISH_ATTACH) as Sync1FinishAttach;
+      attach({ host: "v2", held: { verdict: async (_handle, verdict) => { posted.push(verdict); } }, leaseGate: undefined });
+      expect(api.verificationFor(callID)).toEqual({ mode: "required", acceptance: { testsPass: true, buildPasses: false } });
+      const handle = api.reserveHeld("root", callID);
+      if (handle === undefined) throw new Error("no held handle reserved");
+      await acknowledge(v2, callID, "change-child", input);
+      expect(api.dispatchOf(callID)?.prompt).toContain("[acceptance]\ncheck: testsPass\n[/acceptance]");
+      const file = join(wt1, "gen.ts");
+      writeFileSync(file, "export const g = 1;\n");
+      await hooks["tool.execute.after"]({ tool: "write", sessionID: "change-child", callID: "change-write", args: { filePath: file } }, { title: "", output: "", metadata: {} });
+      const completion = { callID, parentSessionID: "root", childSessionID: "change-child", outputText: "DONE: gen.ts:1", status: "succeeded", mode: "background", heldHandle: handle, endedAt: Date.now() } as const;
+      gated.failNext = true;
+      // Concurrent finishes may both reach the awaited dispatch-head read before either registers its hold.
+      const concurrent = await Promise.all([api.finish(completion), api.finish(completion)]);
+      for (const result of concurrent) expect(result.verification).toEqual({ kind: "held", handle });
+      // A further trigger while the first gate still runs is a no-op too.
+      expect((await api.finish(completion)).verification).toEqual({ kind: "held", handle });
+      await api.idle();
+      expect(posted).toHaveLength(1);
+      expect(posted[0]?.verdict).toBe("FAIL");
+      expect(norm(gated.inputs.at(-1)?.changedFiles)).toContain(norm([file])[0]);
+      expect(api.dispatchOf(callID)).toBeUndefined(); // the first finish consumed its inputs
+      expect((await api.finish(completion)).verification).toEqual({ kind: "held", handle });
+      await api.idle();
+      expect(posted.map(verdict => verdict.reason)).not.toContain("not verified: read-only delegation: no files changed and no explicit acceptance to verify");
+      expect(posted).toHaveLength(1);
+      expect(at("prepare", callID)).toEqual([wt1]);
+    }, 60_000);
+
     it.skipIf(!hasGit())("(b) a budget stop's 'continue and finish' resume is judged on attempt 1's changes too", async () => {
       const { wt1, sessions, v2, finish, resume } = await setup();
       const prompt = `[route class=implement risk=low scope=single needs=edit root=${wt1}]\nVERIFY: required\nWrite the two modules\n[acceptance]\ncheck: testsPass\n[/acceptance]`;

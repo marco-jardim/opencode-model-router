@@ -158,14 +158,17 @@ describe("held background verdicts (QA-2.1-1)", () => {
 
   it("a gate that gives no verdict (read-only skip or deferral) posts UNVERIFIABLE with its reason, never PASS", async () => {
     process.env.MODEL_ROUTER_ENFORCE = "1";
-    const { api, posted } = await attach();
+    const { api, posted, hooks } = await attach();
+    await hooks["tool.execute.before"]?.({ tool: "task", sessionID: "ses_parent", callID: "call-skip" }, {
+      args: { subagent_type: "fast", prompt: "Explore the parser and explain its entry point." },
+    });
     const handle = await finishHeld(api, "call-skip");
     await vi.waitFor(() => expect(posted).toHaveLength(1), { timeout: 25_000 });
     expect(gate.parsed).toBeGreaterThan(0);
     expect(posted[0]).toMatchObject({ handle, verdict: "UNVERIFIABLE" });
     expect(posted[0].verdict).not.toBe("PASS");
-    expect(posted[0].reason).toMatch(/^(not verified: |verification unavailable: )/);
-    expect(posted[0].text).toMatch(/\[router\] UNVERIFIABLE — (not verified: |verification unavailable: )/);
+    expect(posted[0].reason).toBe("not verified: read-only delegation: no files changed and no explicit acceptance to verify");
+    expect(posted[0].text).toContain("[router] UNVERIFIABLE — not verified: read-only delegation");
   }, 30_000);
 });
 
@@ -251,6 +254,18 @@ describe("DF-1.1-1 a background completion's grader launches as the caller agent
       expect(launched.agent).toBe("build");
       expect(launched.sessionID).toBe(ORCH);
     }
+    // A fresh (non-resumed) attempt's end event plus a later completion element do not themselves call finish twice.
+    const parsed = gate.parsed;
+    const launches = stub.calls.length;
+    await h.context({
+      sessionID: ORCH, agent: "build", model: { providerID: "anthropic", id: "claude-opus-5-5" },
+      options: {}, system: [], tools: {},
+      messages: [{ id: "m-fresh-completion", role: "user", content: [{ type: "text", text: `<subagent sessionID="${CHILD}" state="completed">The parser starts in parse().</subagent>` }] }],
+    });
+    h.emit({ type: "session.execution.succeeded", id: `ev-end-${CHILD}-duplicate`, created: 3, data: { sessionID: CHILD } });
+    await h.settled();
+    expect(gate.parsed).toBe(parsed);
+    expect(stub.calls).toHaveLength(launches);
   }, 30_000);
 
   it("QA-PDF12-5/-9 under a caller `subagent: ask` rule, every prompt a grader launch raises carries the dispatch's real message and call ids, as the attempt's caller (not the parent's current agent)", async () => {
@@ -339,6 +354,26 @@ async function heldGraderRun(callID: string, answer: () => Promise<{ sessionID: 
 }
 
 describe("QA-DF1-16 a held gate verdict is settled as the gate reached it", () => {
+  it("a late duplicate after the pending entry was forgotten neither gates nor posts again", async () => {
+    const { api, handle, posted, hooks } = await heldGraderRun("call-forgotten-hold", async () => {
+      throw new Error("grader unavailable");
+    });
+    await api.idle();
+    const parsed = gate.parsed;
+    await hooks.event?.({ event: { type: "session.deleted", properties: { info: {
+      id: "ses_parent", projectID: "project", directory: home, title: "parent", version: "1", time: { created: 1, updated: 1 },
+    } } } });
+    expect(await routerVerify(hooks, handle)).toContain("unknown");
+    const result = await api.finish({
+      callID: "call-forgotten-hold", parentSessionID: "ses_parent", childSessionID: "ses_child_call-forgotten-hold",
+      outputText: "The parser starts in parse().", status: "succeeded", mode: "background", heldHandle: handle, endedAt: Date.now(),
+    });
+    await api.idle();
+    expect(result.verification).toEqual({ kind: "held", handle });
+    expect(gate.parsed).toBe(parsed);
+    expect(posted).toHaveLength(1); // this sink has no adapter-side deduplication
+  }, 30_000);
+
   it("QA-DF1-16 a checker result that could not be verified: the grader launches from the orchestrator; router_verify reports the gate's method and reason", async () => {
     const { handle, launched, posted, hooks } = await heldGraderRun("call-df116-a", async () => {
       throw new Error("Tool.Error: Subagent denied: model-router-grader");
@@ -540,7 +575,10 @@ describe("children that did not succeed (QA-2.1-5)", () => {
 
   it("a succeeded child under the same settings does run the gate (control)", async () => {
     process.env.MODEL_ROUTER_ENFORCE = "1";
-    const { api } = await attach();
+    const { api, hooks } = await attach();
+    await hooks["tool.execute.before"]?.({ tool: "task", sessionID: "ses_parent", callID: "call-ok" }, {
+      args: { subagent_type: "fast", prompt: "Explore the parser and explain its entry point." },
+    });
     await api.finish({
       callID: "call-ok",
       parentSessionID: "ses_parent",
@@ -552,4 +590,35 @@ describe("children that did not succeed (QA-2.1-5)", () => {
     });
     expect(gate.parsed).toBeGreaterThan(0);
   }, 30_000);
+
+  it.each([false, true])("lost dispatch inputs are explicitly UNVERIFIABLE, never read-only or a pass (held=%s)", async (held) => {
+    process.env.MODEL_ROUTER_ENFORCE = "1";
+    const { api, posted, hooks } = await attach();
+    const path = join(home, "lost-input-change.ts");
+    writeFileSync(path, "export const changed = true;\n");
+    await hooks["tool.execute.after"]?.({ tool: "write", sessionID: "ses_child_lost", callID: "lost-write", args: { filePath: path } },
+      { title: "", output: "written", metadata: {} });
+    expect(await api.captureDelta?.("lost-inputs", "ses_child_lost")).toMatchObject({ files: [{ path, status: "written" }] });
+    const handle = held ? api.reserveHeld("ses_parent", "lost-inputs") : undefined;
+    if (held && handle === undefined) throw new Error("no held handle reserved");
+    const result = await api.finish({
+      callID: "lost-inputs", parentSessionID: "ses_parent", childSessionID: "ses_child_lost",
+      outputText: "DONE: changed files", status: "succeeded", mode: "background", endedAt: Date.now(),
+      ...(handle === undefined ? {} : { heldHandle: handle }),
+    });
+    await api.idle();
+    expect(await api.captureDelta?.("lost-inputs", "ses_child_lost")).toMatchObject({ files: [] });
+    const reason = "dispatch inputs were lost; acceptance and changes could not be evaluated";
+    if (held) {
+      expect(result.verification).toEqual({ kind: "held", handle });
+      expect(posted).toHaveLength(1);
+      expect(posted[0]).toMatchObject({ handle, verdict: "UNVERIFIABLE", reason });
+      expect(posted[0].text).not.toContain("read-only delegation");
+    } else {
+      expect(result.verification).toEqual({ kind: "required", verdict: "UNVERIFIABLE" });
+      expect(result.outputText).toContain(reason);
+      expect(result.outputText).not.toContain("read-only delegation");
+    }
+    expect(gate.parsed).toBe(0);
+  });
 });
