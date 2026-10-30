@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **OpenCode v2: resumed background dispatches keep their own results and verification handles.** Historical completions
+  first scanned after a resume no longer supply the resumed attempt's result, and held placeholders retain their attempt's
+  announced handle instead of changing to the newest handle for the same child session.
 - **OpenCode v2 / roles mode: `router_run` points script calls with arguments to configured commands.** Refusals
   list argument patterns, with commands running the same package script first (such as the default `test-files`);
   the tool description also includes a bounded list of commands accepting arguments. Argument acceptance is unchanged.

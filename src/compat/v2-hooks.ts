@@ -59,7 +59,7 @@ import { canonicalAuthorityPath, insideWorkRoot } from "../routing/roles/work-ro
 import { appliedEffort, appliedThinkingBudget, createEffortStore, registerEffortChannel } from "../tui/effort-channel";
 import {
   acquireLeaseRegistry, ADOPTION_RETRY_MS, attemptLabel, COMPLETION_SETTLE_MS, createCompletionProcessor, createHeldResults, createInFlightRegistry,
-  isExecutorOwned,
+  isExecutorOwned, indexMessageIDs, precedesDispatch,
   createLeaseGuard, decideBackground, isAdoptionRefused, PENDING_GUARANTEES_TEXT, PROVIDER_ORDER, renderCompleted, renderHeld, renderInFlight,
   restoredDispatchOf, ROUTER_FINISH_ATTACH,
 } from "./background";
@@ -2216,7 +2216,7 @@ export async function registerV2Hooks(
             if (touched) messages[index] = Object.assign(Object.create(Object.getPrototypeOf(source)), source, { content: next });
           });
         }
-        const shaped = messages.map((source) => ({ source, parts: (source as { content?: unknown }).content }));
+        const shaped = messages.map((source) => ({ source, id: (source as { id?: unknown }).id, parts: (source as { content?: unknown }).content }));
         const result = heldRef.apply(String(event.sessionID), shaped);
         if (result === undefined) return;
         result.forEach((entry, index) => {
@@ -3084,7 +3084,7 @@ export async function registerV2Hooks(
       Object.assign(Object.create(Object.getPrototypeOf(source)), source, { content });
     /** The held-result matcher over context messages (copies; `undefined` = unchanged). */
     const applyHeldTo = (sid: string, messages: readonly ContextMessage[]): ContextMessage[] | undefined => {
-      const shaped = messages.map((source) => ({ source, parts: source.content }));
+      const shaped = messages.map((source) => ({ source, id: Reflect.get(source, "id"), parts: source.content }));
       const result = held.apply(sid, shaped);
       if (result === undefined) return undefined;
       return result.map((entry) => (entry.parts === entry.source.content ? entry.source : withContent(entry.source, entry.parts)));
@@ -3151,6 +3151,7 @@ export async function registerV2Hooks(
      */
     const scanCompletions = async (sid: string, messages: readonly ContextMessage[]): Promise<void> => {
       if (processor === undefined) return;
+      const messageIndices = indexMessageIDs(messages);
       const waits: string[] = [];
       const scanned: Array<{ child: string; signature: string }> = [];
       /** The children an element of this request started processing for. */
@@ -3176,6 +3177,11 @@ export async function registerV2Hooks(
             // state and body: a resumed turn's byte-identical answer is a new element.
             const signature = `${messageKey}\0${partIndex}\0${elementIndex}`;
             scanned.push({ child: element.child, signature });
+            // A first scan can happen only after resume: seen-element caches alone cannot establish attempt ownership.
+            if (precedesDispatch(messageIndices, messageIndex, attempt.callerMessageID)) {
+              noteCompletionElement(element.child, signature);
+              continue;
+            }
             const open = attempt.state === "acknowledged" || attempt.state === "child-ended";
             if (open && !noteCompletionElement(element.child, signature)) continue;
             if (!open && attempt.state !== "processing") noteCompletionElement(element.child, signature);
