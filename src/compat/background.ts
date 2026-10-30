@@ -497,6 +497,24 @@ export function attemptKey(childSessionID: string, callID: string): string {
   return `${childSessionID}\u0000${callID}`;
 }
 
+/** Index a history once; keep the first occurrence, as the boundary lookup's former `findIndex` did. */
+export function indexMessageIDs(messages: readonly unknown[]): ReadonlyMap<string, number> {
+  const indices = new Map<string, number>();
+  messages.forEach((message, index) => {
+    const id: unknown = message !== null && typeof message === "object" ? Reflect.get(message, "id") : undefined;
+    if (typeof id === "string" && !indices.has(id)) indices.set(id, index);
+  });
+  return indices;
+}
+
+/** A completion at or before the message dispatching an attempt belongs to an earlier turn, even if never scanned before. */
+export function precedesDispatch(messageIndices: ReadonlyMap<string, number>, index: number, callerMessageID: string | undefined): boolean {
+  if (callerMessageID === undefined) return false;
+  // An absent caller may have been compacted out before OR after these messages; its position cannot be inferred safely.
+  const caller = messageIndices.get(callerMessageID);
+  return caller !== undefined && caller >= index;
+}
+
 /** 3.1.7 W5: the record belongs to the plan executor (excluded from the ordinary completion and verification path). */
 export function isExecutorOwned(rec: CallRecord | undefined): boolean {
   return rec?.owner === "executor";
@@ -956,7 +974,7 @@ export function createHeldResults(deps: {
     byHandle.delete(entry.handle);
     const children = byParent.get(entry.parentSessionID);
     if (children === undefined) return;
-    if (children.get(entry.childSessionID) === entry) children.delete(entry.childSessionID);
+    children.delete(entry.handle);
     if (children.size === 0) byParent.delete(entry.parentSessionID);
   }
 
@@ -966,7 +984,8 @@ export function createHeldResults(deps: {
       children = new Map();
       byParent.set(entry.parentSessionID, children);
     }
-    children.set(entry.childSessionID, entry);
+    // Keep released attempts too: their historical completions must retain their own placeholders after a resume.
+    children.set(entry.handle, entry);
     byHandle.set(entry.handle, entry);
   }
 
@@ -991,18 +1010,22 @@ export function createHeldResults(deps: {
     return [...(byParent.get(sessionID)?.values() ?? [])];
   }
 
-  function applyText(sessionID: string, text: string): string {
+  function applyText(sessionID: string, text: string,
+    entries: ReadonlyMap<string, HoldEntry> = new Map(heldChildren(sessionID).map((entry) => [entry.childSessionID, entry]))): string {
     if (text.startsWith(VERDICT_PREFIX)) return text;
     let out = text;
-    for (const entry of heldChildren(sessionID)) {
+    // One attempt per child, selected by the containing message's dispatch boundary in `apply`.
+    const placeholders = heldChildren(sessionID).map((entry) => heldPlaceholder(entry.handle, entry.childSessionID));
+    for (const entry of entries.values()) {
       const marker = `<subagent sessionID="${entry.childSessionID}"`;
       const placeholder = heldPlaceholder(entry.handle, entry.childSessionID);
       let from = 0;
       for (;;) {
         const at = out.indexOf(marker, from);
         if (at < 0) break;
-        if (out.startsWith(placeholder, at)) {
-          from = at + placeholder.length;
+        const prior = placeholders.find((known) => out.startsWith(known, at));
+        if (prior !== undefined) {
+          from = at + prior.length;
           continue;
         }
         if (at === 0) {
@@ -1196,7 +1219,9 @@ export function createHeldResults(deps: {
     },
 
     isHeld(child) {
-      for (const children of byParent.values()) if (children.get(child)?.active === true) return true;
+      for (const children of byParent.values()) {
+        for (const entry of children.values()) if (entry.childSessionID === child && entry.active) return true;
+      }
       return false;
     },
 
@@ -1205,9 +1230,17 @@ export function createHeldResults(deps: {
 
     apply<M>(sessionID: string, messages: readonly M[]): M[] | undefined {
       if (!byParent.has(sessionID)) return undefined;
+      const messageIndices = indexMessageIDs(messages);
+      const entries = heldChildren(sessionID);
+      const fallback = new Map(entries.map((entry) => [entry.childSessionID, entry]));
       let changed = false;
-      const out = messages.map((message) => {
-        const next = redactMessage(message, (text) => applyText(sessionID, text));
+      const out = messages.map((message, index) => {
+        const selected = new Map(fallback);
+        // With a boundary, select the latest eligible attempt. Missing/compacted boundaries still redact fail-closed.
+        for (const entry of entries) {
+          if (!precedesDispatch(messageIndices, index, entry.callerMessageID)) selected.set(entry.childSessionID, entry);
+        }
+        const next = redactMessage(message, (text) => applyText(sessionID, text, selected));
         if (next === undefined) return message;
         changed = true;
         return next;

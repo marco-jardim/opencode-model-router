@@ -21,7 +21,7 @@ import { mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } fro
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ADOPTION_RETRY_MS } from "../../src/compat/background";
+import { ADOPTION_RETRY_MS, ROUTER_FINISH_ATTACH, type FinishAttach } from "../../src/compat/background";
 import { processToken } from "../../src/compat/v2-hooks";
 import { currentBinding, resetBindingRegistryForTests } from "../../src/routing/roles/binding";
 import { readRoleOrphans, resetRoleOrphansForTests } from "../../src/routing/roles/orphans";
@@ -185,6 +185,38 @@ describe("QA-SYNC1-3: a restored held entry is never re-gated with fewer checks 
     root: null, cwd: process.cwd(), state: "held", createdAt: Date.now(), dispatchedAt: Date.now(), ...over,
   });
   const prompt = "write src/c.ts\n[acceptance]\ncheck: testsPass\n[/acceptance]";
+
+  it("a restored held entry without dispatch posts UNVERIFIABLE promptly, not at the pending TTL", async () => {
+    const handle = `vrf_${"7".repeat(24)}`;
+    const callID = "call-missing-restored-dispatch";
+    const h = await boot([
+      heldEntry(handle, callID, { changedFiles: "unavailable" }),
+      { v: 1, kind: "hold", handle, parent: ORCH, child: CHILD, callID, at: Date.now() },
+      { v: 1, kind: "hold-text", handle, text: "DONE: wrote src/c.ts", status: "succeeded", at: Date.now() },
+    ]);
+    await h.settled(); // restore the pending entry, without adopting the adapter's hold yet
+    const attach: unknown = Reflect.get(h.hooks, ROUTER_FINISH_ATTACH);
+    if (typeof attach !== "function") throw new Error("no finish API");
+    const posts: Array<{ verdict: string; text: string }> = [];
+    const api = (attach as FinishAttach)({ host: "v2", held: { verdict: async (_handle, verdict) => { posts.push(verdict); } } });
+    if (api === undefined) throw new Error("finish API not attached");
+    // Exercise the recovery boundary when the optional dispatch is absent (restored: undefined), not `{}`.
+    await api.finish({ callID, parentSessionID: ORCH, childSessionID: CHILD, outputText: "DONE: wrote src/c.ts",
+      status: "succeeded", mode: "background", heldHandle: handle, endedAt: Date.now() });
+    await api.idle(); // no clock advance or TTL sweep
+    expect(posts).toHaveLength(1);
+    expect(posts[0]?.verdict).toBe("UNVERIFIABLE");
+    expect(posts[0]?.text).toContain("UNVERIFIABLE");
+    expect(posts[0]?.text).toContain("DONE: wrote src/c.ts");
+    expect(posts[0]?.text).not.toContain("read-only delegation");
+    expect(posts[0]?.text).not.toContain("PASS");
+    const verify = h.hooks.tool?.router_verify;
+    if (verify === undefined) throw new Error("no router_verify tool");
+    const context = { sessionID: ORCH, messageID: "m-missing-dispatch", agent: "build", abort: new AbortController().signal };
+    const report = await verify.execute({ handles: [handle] }, context as unknown as Parameters<typeof verify.execute>[1]);
+    expect(report).toContain("cached verdict; nothing was run");
+    expect(report).not.toContain("held background result");
+  });
 
   for (const [flag, reason] of [["hadPerimeter", PERIMETER_LOST_REASON], ["hadHead", HEAD_LOST_REASON]] as const) {
     it(`an entry journaled with ${flag} posts UNVERIFIABLE "${reason.slice(0, 40)}…", never PASS`, async () => {

@@ -512,6 +512,90 @@ describe("DF-1-4 a resumed background dispatch", () => {
   const say = (text: string) => ({ type: "assistant", content: [{ type: "text", text }], finish: "stop", time: { created: 1, completed: 2 } });
   const ask = (text: string) => ({ type: "user", content: [{ type: "text", text }] });
 
+  it("a historical completion first scanned after resume cannot supply the resumed result or change its announced handle", async () => {
+    const h = await boot("auto");
+    h.emit(created(CHILD, ORCH));
+    const first = await h.before(dispatch({ background: true }));
+    await h.after({ ...first, status: "completed", result: structuredClone(RUNNING) });
+    const caller = (call: ToolEvent) => ({ id: call.messageID, role: "assistant", content: [{ type: "text", text: "dispatch" }] });
+    const turnOne = completion(CHILD, "ESCALATE: authority — T1");
+    // End-event delivery need not scan the native completion in the parent's context.
+    h.childContext.set(CHILD, [ask("do the work"), say("ESCALATE: authority — T1")]);
+    h.emit({ type: "session.execution.succeeded", id: "ev-result-original", created: 2, data: { sessionID: CHILD } });
+    await h.settled();
+    expect(verdicts(h)).toHaveLength(1);
+    expect(verdicts(h)[0]).toContain("<task_result>\nESCALATE: authority — T1\n</task_result>");
+    const originalHandle = /handle="([^"]+)"/.exec(verdicts(h)[0])?.[1];
+    expect(originalHandle).toBeDefined();
+
+    const second = await h.before(dispatch({ background: true, sessionID: CHILD, prompt: "resume prompt" }));
+    await h.after({ ...second, status: "completed", result: structuredClone(RUNNING) });
+    const resumedHandle = h.heldSink.heldFor(ORCH).find(entry => entry.child === CHILD)?.handle;
+    expect(resumedHandle).toBeDefined();
+    h.childContext.set(CHILD, [ask("do the work"), say("ESCALATE: authority — T1"), ask("resume prompt")]);
+    const history = [user("start"), caller(first), turnOne, caller(second)];
+    const duringResume = await request(h, history);
+    await h.settled();
+    for (const verdict of verdicts(h).filter(text => text.includes(`handle="${resumedHandle}"`))) {
+      expect(verdict).toContain("DONE: T2");
+      expect(verdict).not.toContain("T1");
+    }
+    expect(verdicts(h).slice(1).join("\n")).not.toContain("ESCALATE: authority — T1");
+    expect(verdicts(h)).toHaveLength(1);
+    expect(allText(duringResume)).toContain(`held — verdict pending (${originalHandle})`);
+    expect(allText(duringResume)).not.toContain("ESCALATE: authority — T1");
+
+    const turnTwo = completion(CHILD, "DONE: T2");
+    const held = await request(h, [...history, turnTwo]);
+    expect(allText(held)).not.toContain("DONE: T2");
+    const handles = [...allText(held).matchAll(/held — verdict pending \((vrf_[0-9a-f]+)\)/g)].map(match => match[1]);
+    await h.settled();
+    expect(verdicts(h)).toHaveLength(2);
+    expect(verdicts(h)[1]).toContain("<task_result>\nDONE: T2\n</task_result>");
+    expect(verdicts(h)[1]).not.toContain("T1");
+    expect(verdicts(h)[1]).toContain(`handle="${resumedHandle}"`);
+    expect(resumedHandle).not.toBe(originalHandle);
+    expect(handles).toEqual([originalHandle, resumedHandle]);
+    const replay = await request(h, [...history, turnTwo]);
+    expect(allText(replay)).toContain(`held — verdict pending (${originalHandle})`);
+    expect(allText(replay)).toContain(`held — verdict pending (${resumedHandle})`);
+  }, 30_000);
+
+  it("each announced handle survives a fresh end-event result, historical replay and compaction", async () => {
+    const h = await boot("auto");
+    h.emit(created(CHILD, ORCH));
+    const first = await h.before(dispatch({ background: true }));
+    await h.after({ ...first, status: "completed", result: structuredClone(RUNNING) });
+    const caller = (call: ToolEvent) => ({ id: call.messageID, role: "assistant", content: [{ type: "text", text: "dispatch" }] });
+    const turnOne = completion(CHILD, "ESCALATE: T1");
+    const original = await request(h, [caller(first), turnOne]);
+    const originalNotice = allText(original).match(/held — verdict pending \((vrf_[0-9a-f]+)\)/)?.[1];
+    expect(originalNotice).toBeDefined();
+    await h.settled();
+    expect(verdicts(h)[0]).toContain("<task_result>\nESCALATE: T1\n</task_result>");
+    expect(verdicts(h)[0]).toContain(`handle="${originalNotice}"`);
+
+    const second = await h.before(dispatch({ background: true, sessionID: CHILD, prompt: "continue" }));
+    await h.after({ ...second, status: "completed", result: structuredClone(RUNNING) });
+    h.childContext.set(CHILD, [ask("do the work"), say("ESCALATE: T1"), ask("continue"), say("DONE: T2")]);
+    h.emit({ type: "session.execution.succeeded", id: "ev-result-resumed-fresh", created: 3, data: { sessionID: CHILD } });
+    await h.settled();
+    expect(verdicts(h)).toHaveLength(2);
+    expect(verdicts(h)[1]).toContain("<task_result>\nDONE: T2\n</task_result>");
+    expect(verdicts(h)[1]).not.toContain("T1");
+    const resumedHandle = /handle="([^"]+)"/.exec(verdicts(h)[1])?.[1];
+    const history = [caller(first), turnOne, caller(second), completion(CHILD, "DONE: T2")];
+    const replay = await request(h, history);
+    const handles = (text: string) => [...text.matchAll(/held — verdict pending \((vrf_[0-9a-f]+)\)/g)].map(match => match[1]);
+    expect(handles(allText(replay))).toEqual([originalNotice, resumedHandle]);
+    const compact = { sessionID: ORCH, messages: structuredClone(history) };
+    await h.sessionHooks.compaction(compact as never);
+    expect(handles(JSON.stringify(compact.messages))).toEqual([originalNotice, resumedHandle]);
+    // An already-redacted original must not be rewritten to the resumed handle either.
+    const redacted = await request(h, [...original.messages, caller(second)]);
+    expect(allText(redacted)).toContain(`held — verdict pending (${originalNotice})`);
+  }, 30_000);
+
   it("DF-1-4 the resume never takes the previous turn's completion element or answer; its own end delivers one verdict with its answer", async () => {
     const h = await boot("auto");
     h.emit(created(CHILD, ORCH));
@@ -554,6 +638,31 @@ describe("DF-1-4 a resumed background dispatch", () => {
 
 describe("held results across a restart (R20): placeholder, refusal, compaction", () => {
   const original = `<subagent sessionID="${CHILD}" state="completed">SECRET held output</subagent>`;
+
+  it("restores two journaled holds of the same child with their own historical handles", async () => {
+    const resumedHandle = "vrf_abcdef0123456789abcdef01";
+    const journalText = [
+      { v: 1, kind: "hold", handle: HANDLE, parent: ORCH, child: CHILD, callID: "call-original", callerMessageID: "m-original", at: 1 },
+      { v: 1, kind: "posted", handle: HANDLE, at: 2 },
+      { v: 1, kind: "hold", handle: resumedHandle, parent: ORCH, child: CHILD, callID: "call-resumed", callerMessageID: "m-resumed", at: 3 },
+      { v: 1, kind: "posted", handle: resumedHandle, at: 4 },
+    ].map(record => JSON.stringify(record)).join("\n") + "\n";
+    const h = await boot("auto", { journalText });
+    const messages = [
+      { ...user("dispatch original"), id: "m-original" }, completion(CHILD, "SECRET T1"),
+      { ...user("dispatch resumed"), id: "m-resumed" }, completion(CHILD, "SECRET T2"),
+    ];
+    const event = await request(h, messages);
+    await h.settled();
+    const handles = (text: string) => [...text.matchAll(/held — verdict pending \((vrf_[0-9a-f]+)\)/g)].map(match => match[1]);
+    expect(allText(event)).not.toContain("SECRET");
+    expect(handles(allText(event))).toEqual([HANDLE, resumedHandle]);
+    const compact = { sessionID: ORCH, messages: structuredClone(messages) };
+    await h.sessionHooks.compaction(compact as never);
+    expect(JSON.stringify(compact.messages)).not.toContain("SECRET");
+    expect(handles(JSON.stringify(compact.messages))).toEqual([HANDLE, resumedHandle]);
+    expect(h.synthetic.filter(post => post.text.startsWith("<router-verdict "))).toEqual([]);
+  });
 
   it("the placeholder replaces the held completion on the first request and is identical across 3 requests", async () => {
     const h = await boot("auto", { journalText: holdJournal(HANDLE, CHILD, "call-old") });

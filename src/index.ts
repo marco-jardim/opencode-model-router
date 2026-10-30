@@ -4231,6 +4231,16 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   const heldTexts = new Map<string, { readonly sessionID: string; readonly text: string; readonly post?: HeldPost }>();
   /** = MAX_HOLDS_GLOBAL (background.ts): there are never more live holds than this. */
   const MAX_HELD_TEXTS = 10_000;
+  // Live registrations only, never journal-restored entries. Keep bounded tombstones after pending-entry eviction so a late
+  // duplicate cannot gate or post again merely because its entry was forgotten. Oldest handles leave at the same global bound.
+  const registeredLiveHolds = new Set<string>();
+  function rememberLiveHold(handle: string): void {
+    registeredLiveHolds.add(handle);
+    if (registeredLiveHolds.size > MAX_HELD_TEXTS) {
+      const oldest = registeredLiveHolds.values().next();
+      if (!oldest.done) registeredLiveHolds.delete(oldest.value);
+    }
+  }
   function rememberHeldText(handle: string, sessionID: string, text: string, post?: HeldPost): void {
     heldTexts.delete(handle);
     heldTexts.set(handle, { sessionID, text, ...(post === undefined ? {} : { post }) });
@@ -4656,9 +4666,38 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
         forgetTaskArgs(fin.callID);
         return { outputText: fin.outputText, suffix: "", verification: { kind: "none" }, metadata: {} };
       }
-      if (fin.restored !== undefined) {
+      const priorHold = fin.heldHandle === undefined ? undefined : pending.get(fin.parentSessionID, fin.heldHandle);
+      // A journal-restored held entry can lack its optional dispatch. It is not a live registration of this instance and
+      // must settle through recovery, rather than silently joining a gate that this process never started.
+      const restoredWithoutDispatch = fin.heldHandle !== undefined && !registeredLiveHolds.has(fin.heldHandle)
+        && !taskArgsByCall.has(fin.callID) && priorHold?.kind === "found"
+        && priorHold.entry.dispatchID === fin.callID && priorHold.entry.producerSessionID === fin.childSessionID
+        && priorHold.entry.hold?.callID === fin.callID && priorHold.entry.hold.childSessionID === fin.childSessionID;
+      if (fin.restored !== undefined || restoredWithoutDispatch) {
         const restored = finishRestored(fin, args, scratch);
         if (restored !== undefined) return restored;
+      }
+      // A repeated live completion must not re-gate an already registered hold: its first gate owns the verdict, even while
+      // running. In particular, that gate may already have consumed the call's arguments and change-set records.
+      const existingLiveHold = (): FinishResult | undefined => {
+        if (fin.restored !== undefined || fin.heldHandle === undefined || !registeredLiveHolds.has(fin.heldHandle)) return undefined;
+        return { outputText: fin.outputText, suffix: "", verification: { kind: "held", handle: fin.heldHandle }, metadata: {} };
+      };
+      const existing = existingLiveHold();
+      if (existing !== undefined) return existing;
+      // No dispatch inputs is not evidence of a read-only delegation. Never infer acceptance (or a pass) from the empty
+      // fallback above when a live call's inputs were consumed or evicted. Restored calls retain their own fail-closed path.
+      if (fin.restored === undefined && !taskArgsByCall.has(fin.callID) && verificationModeOfArgs(args) !== "none") {
+        changedFileStore.clear(`task:${fin.parentSessionID}:${fin.callID}`);
+        changedFileStore.clear(fin.childSessionID);
+        const reason = "dispatch inputs were lost; acceptance and changes could not be evaluated";
+        const suffix = `\n\n[router] UNVERIFIABLE — ${reason}`;
+        if (fin.heldHandle !== undefined) {
+          trackHeldGate(postHeldDirect(fin.heldHandle, "UNVERIFIABLE", fin.outputText + suffix, reason));
+          pending.releaseHandle(fin.heldHandle);
+          return { outputText: fin.outputText, suffix: "", verification: { kind: "held", handle: fin.heldHandle }, metadata: {} };
+        }
+        return { outputText: fin.outputText + suffix, suffix, verification: { kind: "required", verdict: "UNVERIFIABLE" }, metadata: {} };
       }
       if (fin.heldHandle !== undefined) {
         const handle = fin.heldHandle;
@@ -4673,6 +4712,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
         const headRead = changedFileStore.baselineHead(dispatchKey);
         const startHead = headRead === undefined ? undefined
           : await withTimeout(headRead, HELD_HEAD_READ_MS, "dispatch head").catch(() => undefined);
+        // Another finish may have registered this hold while the head read yielded. Registration and gate launch below are
+        // synchronous, so only the first finish after this check owns them.
+        const registered = existingLiveHold();
+        if (registered !== undefined) return registered;
         // The head the gate compares the tree with (as prepareVerification: the head read, else the dispatch snapshot's head and
         // branch) is journaled as plain data, so the gate re-run after a restart runs the same branch check. A head reader whose
         // read gave nothing (the gate fails closed on it too) is journaled as the fact alone (`hadHead`, restored as headLost).
@@ -4706,6 +4749,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           ...(dispatchHead !== undefined ? { dispatchHead } : {}),
         });
         if (!reg.ok) logger.warn("[router] held dispatch not registered", { code: reg.code, detail: reg.detail });
+        else rememberLiveHold(handle);
         runHeldGate(fin, handle, callInput, scratch, delta === undefined ? undefined : { delta }, undefined);
         return { outputText: fin.outputText, suffix: "", verification: { kind: "held", handle }, metadata: {} };
       }

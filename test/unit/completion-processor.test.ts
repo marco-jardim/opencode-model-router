@@ -12,8 +12,10 @@ import {
   createHeldResults,
   createInFlightRegistry,
   heldPlaceholder,
+  indexMessageIDs,
   MAX_CLAIMS,
   MAX_PROCESS_CLAIMS,
+  precedesDispatch,
   renderCompleted,
   renderHeld,
   renderInFlight,
@@ -35,6 +37,33 @@ import {
   type Trigger,
   type VerificationMode,
 } from "../../src/compat/background";
+
+describe("completion dispatch boundaries", () => {
+  it("an unknown or missing caller ID supplies no boundary", () => {
+    const indices = indexMessageIDs([{ id: "element" }]);
+    expect(precedesDispatch(indices, 0, undefined)).toBe(false);
+    expect(precedesDispatch(indices, 0, "missing")).toBe(false);
+  });
+
+  it("a compacted caller cannot distinguish a history prefix from a suffix", () => {
+    const history = [{ id: "earlier" }, { id: "caller" }, { id: "later" }];
+    expect(precedesDispatch(indexMessageIDs(history.slice(0, 1)), 0, "caller")).toBe(false);
+    expect(precedesDispatch(indexMessageIDs(history.slice(2)), 0, "caller")).toBe(false);
+  });
+
+  it("an element in the caller's own message belongs to an earlier turn", () => {
+    const indices = indexMessageIDs([{ id: "earlier" }, { id: "caller" }, { id: "later" }]);
+    expect(precedesDispatch(indices, 0, "caller")).toBe(true);
+    expect(precedesDispatch(indices, 1, "caller")).toBe(true);
+    expect(precedesDispatch(indices, 2, "caller")).toBe(false);
+  });
+
+  it("indexes IDs once and preserves the first duplicate's position", () => {
+    const indices = indexMessageIDs([null, { id: 7 }, { id: "caller" }, { id: "caller" }]);
+    expect([...indices]).toEqual([["caller", 2]]);
+    expect(precedesDispatch(indices, 3, "caller")).toBe(false);
+  });
+});
 
 const PARENT = "ses_parent";
 const DECISION: BackgroundDecision = { background: true, hold: false, reason: "estimate" };
