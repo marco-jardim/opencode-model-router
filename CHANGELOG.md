@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Admission-gated local llama-server fast tier with an isolated patch-mode worktree (adaptiveRouting.local).** With `adaptiveRouting.local: true` in the global override and a valid `opencode-model-router.local.json` next to the router state, the managed unpinned fast tier of a task binds to the local `model.ref` at task start — GPU admission is checked twice per acquire (before the health probe and immediately before spawn; an UNKNOWN measurement always denies; boundaries inclusive), an already-live server on the port is used as-is and never spawned over or killed, a fresh server is polled for readiness and killed on timeout, and a repeat spawn kills the previous own child first (no orphaned VRAM holder). In a git project the local child works in a throwaway `router-local-*` worktree under the system temp dir — the working tree is never touched by a local model; the delegation's unified diff digest and changed files land on the dispatch attribution record (`localPatchDigest`, `localChangedFiles`), the patch is never auto-applied, and plugin dispose removes the worktree. Non-git projects, project pins, `local: false`, a missing or invalid config and any admission deny keep the cloud snapshot model; delegation never fails because of the local path. See [Adaptive Local Runtime](docs/ADAPTIVE_LOCAL_RUNTIME.md).
+
 ## [2.8.0] - 2026-10-13
 
 ### Added
