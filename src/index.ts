@@ -82,13 +82,23 @@ import { acceptanceScriptsOf, detectRedispatch, returnSignal, runSignal, parseRe
 import type { IngestSettings } from "./routing/outcomes/ingest";
 import { captureBudget } from "./guard/enforce";
 import { budgetClaimObserved, isIncompleteVerdict } from "./verify/checker";
-import { lookupDispatch } from "./router/sessions";
+import { annotateDispatchLocalPatch, lookupDispatch } from "./router/sessions";
 import { resolveEnforcementMode } from "./router/enforcement";
 import { createPluginLogger } from "./router/logger";
 import { createCatalogPricing, createIngest, ingestSettings } from "./routing/outcomes/ingest";
 import type { Ingest } from "./routing/outcomes/ingest";
 import { isAnnotationRow, verdictGraderOf, verdictOf, type LogRow } from "./routing/outcomes/types";
 import { createPersister, nodePersistDeps, summarizeRoles } from "./routing/outcomes";
+import { applyAdaptiveAssignments } from "./router/adaptive";
+import {
+  createLocalRuntimeSupervisor,
+  loadLocalRuntimeConfig,
+  type GpuSample,
+  type LocalRuntimeDeps,
+  type LocalRuntimeSupervisor,
+} from "./router/local-runtime";
+import { readAdaptiveView, runWeeklyAdaptiveReview } from "./router/adaptive-store";
+import { projectPinnedTiers } from "./router/config";
 import { roleAgentSteps } from "./router/role-agents";
 import type { HostBudgetObservation } from "./compat/v2-hooks";
 import { checkpointLine, formatStatsReply, runStatsCommand } from "./routing/commands/stats";
@@ -127,8 +137,10 @@ import { createTrajectoryStore } from "./telemetry/trajectory";
 import { createGuardStore } from "./guard/store";
 import { createIdleTtlSweeper } from "./router/idle-sweep";
 import { guardBeforeCall, guardAfterCall, guardRefusedCall, formatScorecard } from "./guard/enforce";
-import { mkdirSync, writeFileSync, existsSync, realpathSync, statSync } from "node:fs";
+import { mkdirSync, writeFileSync, existsSync, realpathSync, statSync, rmSync } from "node:fs";
+import { execFile as execFileCallback, spawn as spawnChildProcess } from "node:child_process";
 import { tmpdir } from "node:os";
+import { createHash } from "node:crypto";
 import { join, isAbsolute } from "node:path";
 import { access, readFile as fsReadFile } from "node:fs/promises";
 import { tool } from "@opencode-ai/plugin";
@@ -1182,6 +1194,141 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       });
   };
 
+  // Deferred passive weekly adaptive review (opt-in only). Mirrors the
+  // catalog pattern: a root turn only STARTS the review (fire-and-forget,
+  // never awaited on the chat.message hot path); the claim/due check and the
+  // discover/decide/CAS-commit chain run in the background and never touch a
+  // message the hook already returned. V2 only (ctx.routerChildRunner): on v1
+  // the accepted config stays inert and nothing is wired. No timers, no
+  // daemon: EVERY root turn re-checks against the LATEST config, so an opt-in
+  // that appears after turn 1 and next week's due review are both picked up
+  // without a restart. The store's due check runs under its lock, so nothing
+  // hits the network while the review is not due; the in-flight guard
+  // (released in finally) plus the store's lock keep one review per process
+  // (and per machine) at a time.
+  let adaptiveReviewInFlight = false;
+  const startAdaptiveReview = (): void => {
+    if (ctx.routerChildRunner === undefined) return; // v1: inert
+    if (adaptiveReviewInFlight) return;
+    let latest: typeof cfg;
+    try {
+      latest = loadConfig(projectDir);
+    } catch {
+      return; // no valid config to review against
+    }
+    if (latest.adaptiveRouting === undefined) return; // opt-in absent in the LATEST config: nothing, ever
+    adaptiveReviewInFlight = true;
+    void runWeeklyAdaptiveReview({
+      projectDir,
+      fetchImpl: fetch,
+      catalogRefs: async () => {
+        const catalog = await fetchCatalog();
+        if (catalog === null) return [];
+        return catalog.providers.flatMap((provider) => provider.models.map((model) => `${provider.id}/${model.id}`));
+      },
+      logger,
+    })
+      .catch((error: unknown) => {
+        logger.warn("[router] adaptive weekly review failed", { error: describeError(error) });
+      })
+      .finally(() => {
+        adaptiveReviewInFlight = false;
+      });
+  };
+
+  // P4 local contour: one supervisor per plugin instance, created lazily on
+  // first use. The seams come from ctx.routerLocalRuntime when the host (or a
+  // test) provides them; otherwise the production deps below drive a real
+  // llama-server (never reached while a test injects fakes).
+  let localRuntimeSupervisorInstance: LocalRuntimeSupervisor | undefined;
+  const localRuntimeSupervisor = (): LocalRuntimeSupervisor => {
+    localRuntimeSupervisorInstance ??= createLocalRuntimeSupervisor(ctx.routerLocalRuntime ?? productionLocalRuntimeDeps());
+    return localRuntimeSupervisorInstance;
+  };
+  /** Production local-runtime seams: compact, bounded, and fault-tolerant (any failure is a deny/down, never a throw). */
+  const productionLocalRuntimeDeps = (): LocalRuntimeDeps => ({
+    spawn: (exe, args) => {
+      const child = spawnChildProcess(exe, args, { stdio: "ignore", detached: false });
+      return {
+        pid: child.pid ?? -1,
+        kill: () =>
+          new Promise<void>((resolve) => {
+            const giveUp = setTimeout(() => resolve(), 5_000);
+            child.once("exit", () => {
+              clearTimeout(giveUp);
+              resolve();
+            });
+            child.kill();
+          }),
+      };
+    },
+    health: async (host, port) => {
+      try {
+        const res = await fetch(`http://${host}:${port}/health`, { signal: AbortSignal.timeout(5_000) });
+        return res.status === 200 ? "up" : "down";
+      } catch {
+        return "down";
+      }
+    },
+    sample: () =>
+      new Promise<GpuSample>((resolve) => {
+        execFileCallback(
+          "nvidia-smi",
+          ["--query-gpu=utilization.gpu,memory.free", "--format=csv,noheader,nounits"],
+          { timeout: 5_000 },
+          (error, stdout) => {
+            if (error) {
+              resolve({ gpuUtilPct: null, freeVramMiB: null });
+              return;
+            }
+            const parts = String(stdout).trim().split(",").map((value) => Number(value.trim()));
+            resolve(
+              parts.length >= 2 && Number.isFinite(parts[0]) && Number.isFinite(parts[1])
+                ? { gpuUtilPct: parts[0]!, freeVramMiB: parts[1]! }
+                : { gpuUtilPct: null, freeVramMiB: null },
+            );
+          },
+        );
+      }),
+    now: () => Date.now(),
+    sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
+  });
+
+  /** P5: one bounded child-process call; null on any failure (never throws). */
+  const runBounded = (exe: string, args: string[], cwd: string | undefined): Promise<{ stdout: string } | null> =>
+    new Promise((resolve) => {
+      execFileCallback(exe, args, { cwd, timeout: 15_000, windowsHide: true }, (error, stdout) => {
+        resolve(error === null ? { stdout: String(stdout) } : null);
+      });
+    });
+  /** P5: is the effective project inside a git work tree (bounded, no throw)? */
+  const isInsideGitWorkTree = async (dir: string): Promise<boolean> => {
+    const res = await runBounded("git", ["rev-parse", "--is-inside-work-tree"], dir);
+    return res !== null && res.stdout.trim() === "true";
+  };
+  /** P5 patch mode: candidate worktrees this plugin instance created; removed on dispose. */
+  const localCandidateWorktrees = new Set<string>();
+  let candidateWorktreeCounter = 0;
+  const createCandidateWorktree = async (dir: string): Promise<string> => {
+    const candidate = join(tmpdir(), `router-local-${process.pid}-${Date.now()}-${++candidateWorktreeCounter}`);
+    const added = await runBounded("git", ["worktree", "add", "--detach", candidate], dir);
+    if (added === null) throw new Error(`git worktree add failed for ${candidate}`);
+    localCandidateWorktrees.add(candidate);
+    return candidate;
+  };
+  const disposeCandidateWorktrees = async (): Promise<void> => {
+    for (const candidate of [...localCandidateWorktrees]) {
+      localCandidateWorktrees.delete(candidate);
+      await runBounded("git", ["worktree", "remove", "--force", candidate], projectDir ?? process.cwd());
+      await runBounded("git", ["worktree", "prune"], projectDir ?? process.cwd());
+      try {
+        rmSync(candidate, { recursive: true, force: true });
+      } catch {
+        // best-effort: git already removed it in the normal case
+      }
+    }
+  };
+
   const enableDelegateTool =
     cfg.experimental?.verifiedDelegateTool === true ||
     process.env.MODEL_ROUTER_VERIFIED_DELEGATE === "1";
@@ -1490,6 +1637,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     // that dispose is both called and awaited, so flushing here is enough.
     dispose: async () => {
       stopReferenceGc();
+      // P4 local contour: release the supervisor's own live runtime, if any.
+      await localRuntimeSupervisorInstance?.release();
+      // P5 patch mode: remove every candidate worktree this instance created.
+      await disposeCandidateWorktrees();
       // Stop new advisor work and finish state/claim writes and lock removal before teardown.
       await advisorNotifier?.dispose();
       // 2.4.5: abort a background run and drop its queue and notices before the registry goes.
@@ -1582,6 +1733,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             const trimmed = text.trimEnd();
             return trimmed ? `${trimmed}\n\n${depth.banner}` : depth.banner;
           };
+          // P5 patch mode: the candidate worktree of THIS delegation (undefined
+          // when the local path never activated); declared before the try so
+          // the finally below can read it on every exit path.
+          let localCandidateWorktree: string | undefined;
           try {
             let activeCfg = cfg;
             try {
@@ -1589,6 +1744,86 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               warnConfigIssues(activeCfg, logger);
             } catch {
               activeCfg = cfg;
+            }
+            // P5 pin fix: provenance (project pins, notices) is keyed by object
+            // identity — read it from the config loadConfig returned BEFORE any
+            // binding below replaces activeCfg with a task-local copy (a copy
+            // has EMPTY WeakMap provenance and would let a project pin lose to
+            // the local binding).
+            const pinnedTiers = projectPinnedTiers(activeCfg);
+            // Weekly adaptive overlay, bound ONCE at task start BEFORE the
+            // ladder plan is generated: every attempt (fresh or resumed), its
+            // attribution rows and the producer registration keep the models
+            // this task started with — a weekly snapshot that lands mid-task
+            // never reconfigures in-flight work, and the ladder's explicit
+            // tier/effort escalation still runs the escalated tier's own
+            // assignment. The effective config is a copy; the global config
+            // object (and loadConfig's cache) is never mutated.
+            if (ctx.routerChildRunner !== undefined && activeCfg.adaptiveRouting !== undefined) {
+              const adaptivePreset = resolvePresetName(activeCfg, activeCfg.activePreset);
+              if (adaptivePreset !== undefined) {
+                activeCfg = applyAdaptiveAssignments(
+                  activeCfg,
+                  adaptivePreset,
+                  readAdaptiveView(projectDir),
+                  projectPinnedTiers(activeCfg),
+                );
+              }
+            }
+            // P4/P5 local contour: when the global opt-in asks for local
+            // execution AND the project is a git work tree AND a valid local
+            // runtime config exists, the managed unpinned fast tier of THIS
+            // task binds to the local model ref at task start — the same
+            // one-immutable-binding semantics as the weekly overlay (a
+            // task-local copy of activeCfg; the global config and the
+            // snapshot are never mutated; medium/heavy keep the snapshot
+            // models). The local child then works in an isolated candidate
+            // worktree (patch mode): the working tree is never touched. Any
+            // deny or failure (admission, non-git project, worktree creation)
+            // leaves the snapshot cloud model and never breaks the delegation.
+            if (activeCfg.adaptiveRouting?.local === true) {
+              const localPreset = resolvePresetName(activeCfg, activeCfg.activePreset);
+              if (
+                localPreset !== undefined &&
+                (activeCfg.adaptiveRouting.managedTiers[localPreset] ?? []).includes("fast") &&
+                !pinnedTiers.has(`${localPreset}.fast`) &&
+                projectDir !== undefined &&
+                (await isInsideGitWorkTree(projectDir)) === true
+              ) {
+                const localCfg = loadLocalRuntimeConfig();
+                if (localCfg !== null) {
+                  try {
+                    const acquired = await localRuntimeSupervisor().acquire(localCfg);
+                    if (acquired.ok) {
+                      try {
+                        // Patch mode: an isolated candidate worktree under the
+                        // OS temp dir; a failure falls back to the cloud model.
+                        localCandidateWorktree = await createCandidateWorktree(projectDir);
+                        const presetTiers = activeCfg.presets[localPreset];
+                        const fastTier = presetTiers?.fast;
+                        if (fastTier !== undefined) {
+                          // Swap the MODEL only: the tier keeps its ladder
+                          // position (variant), so a top-variant fast tier stays
+                          // a single rung + retry and the explicit medium
+                          // escalation still runs the snapshot's cloud model.
+                          const localTier = { ...fastTier, model: localCfg.model.ref };
+                          activeCfg = {
+                            ...activeCfg,
+                            presets: { ...activeCfg.presets, [localPreset]: { ...(presetTiers ?? {}), fast: localTier } },
+                          };
+                        }
+                      } catch (error) {
+                        localCandidateWorktree = undefined;
+                        logger.warn("[router] local candidate worktree could not be created; the snapshot cloud model stays", { error: describeError(error) });
+                      }
+                    } else {
+                      logger.warn("[router] local runtime not admitted; the snapshot cloud model stays", { reason: acquired.reason });
+                    }
+                  } catch (error) {
+                    logger.warn("[router] local runtime acquisition failed; the snapshot cloud model stays", { error: describeError(error) });
+                  }
+                }
+              }
             }
             const initialTier =
               typeof args.tier === "string" && args.tier.trim()
@@ -1768,8 +2003,16 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                 const runChild = (resume: string | undefined) => ctx.routerChildRunner!.run({
                   parentSessionID: toolCtx?.sessionID,
                   agent: attemptPlan.agent,
+                  // The task-start binding (applyAdaptiveAssignments above) is
+                  // already IN the plan: fresh and resumed attempts alike run
+                  // the model this task started with.
                   model: attemptPlan.model,
                   prompt: taskText,
+                  // P5 patch mode: only the local fast attempts run in the
+                  // candidate worktree; cloud attempts keep the ordinary cwd.
+                  ...(attemptPlan.tier === "fast" && localCandidateWorktree !== undefined
+                    ? { cwd: localCandidateWorktree }
+                    : {}),
                   signal: childAbort!.signal,
                   ...(resume === undefined ? {} : { resumeSessionID: resume }),
                   onCreated: registerProducer,
@@ -2111,6 +2354,25 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           } catch {
             return withDepthBanner("[router] delegate failed (fail-closed): the delegation or verification could not complete.");
           } finally {
+            // P5 patch mode: the local candidate worktree's diff is the task's
+            // artefact — extracted once the delegation is over; the worktree
+            // itself stays until dispose (the working tree was never touched).
+            if (localCandidateWorktree !== undefined && baselineID !== undefined) {
+              try {
+                const patch = await runBounded("git", ["diff", "--no-color"], localCandidateWorktree);
+                const status = await runBounded("git", ["status", "--porcelain"], localCandidateWorktree);
+                if (patch !== null && status !== null) {
+                  const digest = createHash("sha256").update(patch.stdout).digest("hex");
+                  const changedFiles = status.stdout
+                    .split(/\r?\n/)
+                    .map((line) => line.slice(3).trim())
+                    .filter((name) => name !== "");
+                  annotateDispatchLocalPatch(baselineID, digest, changedFiles);
+                }
+              } catch (error) {
+                logger.warn("[router] local patch artefact extraction failed", { error: describeError(error) });
+              }
+            }
             // Safety net for every exit path an end-of-iteration dispose cannot
             // reach: accept/give-up returns, the safety-net return, and throws.
             // disposeChildSession is fail-soft, so re-disposing an already
@@ -2321,6 +2583,9 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               }
             }
           }
+          // Every root turn, cheaply (no network here): the review re-checks
+          // the LATEST config; the store's due check runs under its lock.
+          startAdaptiveReview();
         } catch {
           // best-effort: never disrupt a real session
         }

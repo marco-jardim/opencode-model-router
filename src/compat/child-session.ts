@@ -2,6 +2,7 @@ import type { PluginInput } from "@opencode-ai/plugin";
 import type { RunnerCatalogModel } from "../escalate/resume";
 import type { CatalogModel, Ingest } from "../routing/outcomes/ingest";
 import type { HostGenerate } from "../routing/classify/types";
+import type { LocalRuntimeDeps } from "../router/local-runtime";
 
 /** Marks the legacy tool.execute.before output bag when verification starts for
  * that task call. V1 hosts read only output.args, so this symbol is invisible. */
@@ -72,4 +73,6 @@ export type RouterPluginInput = PluginInput & {
   routerGenerate?: HostGenerate;
   /** Set only by src/v2.ts: receives this plugin instance's telemetry ingest, whose step events the v2 adapter feeds (QA-2.1-7). */
   routerOnIngest?: (ingest: Ingest) => void;
+  /** P4 local contour: local llama-runtime seams (spawn/health/sample/now/sleep); absent = the production deps in src/index.ts. */
+  routerLocalRuntime?: LocalRuntimeDeps;
 };

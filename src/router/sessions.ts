@@ -717,6 +717,10 @@ export interface DispatchRecord {
   readonly registeredAt: number;
   /** See `DispatchInput.verification`; present only on a role dispatch that carries one. */
   readonly verification?: CarriedVerification;
+  /** P5 patch mode: sha256 of the local candidate worktree's unified diff; present only on a local fast dispatch. */
+  readonly localPatchDigest?: string;
+  /** P5 patch mode: the candidate worktree's changed files (porcelain names); present only on a local fast dispatch. */
+  readonly localChangedFiles?: readonly string[];
 }
 
 interface DispatchSlot {
@@ -834,6 +838,17 @@ export function updateDispatchVerification(childSessionID: string, verification:
   const slot = dispatchRegistry.get(childSessionID);
   if (slot === undefined) return;
   slot.record = Object.freeze({ ...slot.record, verification: frozenVerification(verification) });
+}
+
+/**
+ * P5 patch mode: attach the local candidate-worktree artefact (unified-diff
+ * digest + changed files) to the child's CURRENT registration — the same
+ * attempt, nothing else moves. Nothing when the child is not registered.
+ */
+export function annotateDispatchLocalPatch(childSessionID: string, digest: string, changedFiles: readonly string[]): void {
+  const slot = dispatchRegistry.get(childSessionID);
+  if (slot === undefined) return;
+  slot.record = Object.freeze({ ...slot.record, localPatchDigest: digest, localChangedFiles: Object.freeze([...changedFiles]) });
 }
 
 /** The registered dispatch of a child session, or undefined (unknown, forgotten or swept). */

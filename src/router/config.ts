@@ -345,6 +345,16 @@ export interface RoutingConfig {
   repoApprovalDays?: number;
 }
 
+/**
+ * The accepted adaptiveRouting opt-in block. Preset names mapped to managed
+ * tiers; every listed tier must be one of fast|medium|heavy.
+ */
+export interface AdaptiveRoutingConfig {
+  managedTiers: Record<string, ("fast" | "medium" | "heavy")[]>;
+  /** Local execution opt-in; an omitted flag normalizes to false. */
+  local: boolean;
+}
+
 export interface RouterConfig {
   /**
    * Detect a delegate that hands a dispatch back having made zero tool calls
@@ -433,6 +443,16 @@ export interface RouterConfig {
   roleAgents?: Record<string, RoleAgentCustomisation>;
   /** Experimental, opt-in features. Off by default. */
   experimental?: { verifiedDelegateTool?: boolean };
+  /**
+   * Adaptive routing opt-in. Global override or tiers.json only; a project
+   * layer carrying it is ignored with a config notice, so a repository can
+   * neither enable the feature nor widen the global managedTiers/local
+   * policy. Absent = the feature is off and routing is unchanged. A malformed
+   * block is dropped with a notice, never taking the rest of the config down
+   * with it. Parsing alone activates nothing: until the engine lands, no v1
+   * or v2 routing behaviour reads this block.
+   */
+  adaptiveRouting?: AdaptiveRoutingConfig;
   /** Cost-aware routing engine (#74). Absent = today's static routing, byte for byte. */
   routing?: RoutingConfig;
 }
@@ -1893,6 +1913,73 @@ function validateRouting(value: unknown): RoutingConfig | undefined {
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// Adaptive routing config: tolerant validation, never throws. Absent = the
+// feature is off; malformed = the block is dropped with a config notice and
+// the rest of the config still loads. Unknown keys inside the block are
+// ignored, the same policy as every other block in this file.
+// ---------------------------------------------------------------------------
+
+/** Tier names `adaptiveRouting.managedTiers` may list. */
+const ADAPTIVE_ROUTING_TIERS = ["fast", "medium", "heavy"] as const;
+
+/**
+ * Validate a raw `adaptiveRouting` value. Returns the normalized block (an
+ * omitted `local` becomes false, fail-closed for local execution) or the
+ * reason the block is malformed; never throws, so a bad block cannot drop
+ * the layer that carried it.
+ */
+function sanitizeAdaptiveRouting(
+  value: unknown,
+): { config?: AdaptiveRoutingConfig; problem?: string } {
+  if (value === undefined) return {};
+  if (!isPlainObject(value)) {
+    return { problem: `must be an object (got ${describeValue(value)})` };
+  }
+  const managed = value.managedTiers;
+  if (!isPlainObject(managed) || Object.keys(managed).length === 0) {
+    return { problem: "managedTiers must be a non-empty object of preset name -> tier list" };
+  }
+  // Object.fromEntries defines own data properties, so a '__proto__' preset
+  // name stays an entry instead of hitting the prototype setter of {}.
+  const entries: Array<[string, ("fast" | "medium" | "heavy")[]]> = [];
+  for (const [presetName, tiers] of Object.entries(managed)) {
+    if (!Array.isArray(tiers)) {
+      return {
+        problem: `managedTiers.'${presetName}' must be an array of tier names: ${ADAPTIVE_ROUTING_TIERS.join("|")}`,
+      };
+    }
+    const names: ("fast" | "medium" | "heavy")[] = [];
+    for (const tier of tiers) {
+      const hit = pickEnum(ADAPTIVE_ROUTING_TIERS, tier);
+      if (hit === undefined) {
+        return {
+          problem: `managedTiers.'${presetName}' must be an array of tier names: ${ADAPTIVE_ROUTING_TIERS.join("|")}`,
+        };
+      }
+      names.push(hit);
+    }
+    entries.push([presetName, names]);
+  }
+  const managedTiers: Record<string, ("fast" | "medium" | "heavy")[]> = Object.fromEntries(entries);
+  const local = value.local === undefined ? false : value.local;
+  if (typeof local !== "boolean") {
+    return { problem: `local must be a boolean (got ${describeValue(local)})` };
+  }
+  return { config: { managedTiers, local } };
+}
+
+/**
+ * The notice for a raw `adaptiveRouting` block that did not survive load, or
+ * undefined when the block is absent or valid. Recomputed from the raw value,
+ * the same way {@link collectRoutingNotices} works.
+ */
+function collectAdaptiveRoutingNotice(raw: unknown, cfg: RouterConfig): string | undefined {
+  if (raw === undefined || cfg.adaptiveRouting !== undefined) return undefined;
+  const { problem } = sanitizeAdaptiveRouting(raw);
+  return `dropping adaptiveRouting: ${problem ?? "the block did not validate"}`;
+}
+
 /** A `candidates` entry after validation (every key optional, see {@link TierCandidate}). */
 type CandidateSpec = TierCandidate;
 
@@ -2110,11 +2197,12 @@ export function validateConfig(raw: unknown): RouterConfig {
   validateTaskPromptRepair(obj);
   validateFalseRefusalDetection(obj);
   const routing = validateRouting(obj.routing);
+  const adaptiveRouting = sanitizeAdaptiveRouting(obj.adaptiveRouting).config;
   // Never throws: a bad entry is dropped, and buildConfig reports it as a notice.
   const roleAgents = sanitizeRoleAgents(obj.roleAgents).value;
 
   const cfg = raw as RouterConfig;
-  return withValidatedSnapshots(cfg, { enforcement, routing, roleAgents });
+  return withValidatedSnapshots(cfg, { enforcement, routing, roleAgents, adaptiveRouting });
 }
 
 /**
@@ -2288,13 +2376,15 @@ function collectOverrideLayers(
   dir: string,
   failures?: SourceFailure[],
   notices?: ConfigNotice[],
+  includeProject = true,
 ): OverrideLayer[] {
   const layers: OverrideLayer[] = [];
   // Lowest priority first: global, then project-local (found by upward search
-  // from the project directory).
+  // from the project directory). `includeProject: false` is the GLOBAL
+  // projection the weekly adaptive review builds its baseline from.
   const sources = [
     { path: overridePath(), project: false },
-    { path: walkForProjectOverride(dir), project: true },
+    ...(includeProject ? [{ path: walkForProjectOverride(dir), project: true }] : []),
   ];
   for (const { path: p, project } of sources) {
     if (!p) continue;
@@ -2326,14 +2416,62 @@ function collectOverrideLayers(
           message: `ignoring agents from ${p}: only tiers.json or the global override may define agents (A18)`,
         });
       }
+      // Global-only opt-in: a repository must not enable adaptive routing or
+      // widen the global managedTiers/local policy; the global block stands.
+      if (Object.hasOwn(data, "adaptiveRouting")) {
+        delete data.adaptiveRouting;
+        notices?.push({
+          source: p,
+          message: `ignoring adaptiveRouting from ${p}: only the global override may set it`,
+        });
+      }
     }
     layers.push({ path: p, data, project });
   }
   return layers;
 }
 
+/**
+ * Record which tiers accepted project layers pinned: an own `model` or
+ * `variant` under `presets.<preset>.<tier>` in a project override file. Runs
+ * on the config this build created, never on a caller's object.
+ */
+function recordProjectPinnedTiers(cfg: RouterConfig, layers: readonly OverrideLayer[]): void {
+  const pinned = new Set<string>();
+  for (const layer of layers) {
+    if (!layer.project) continue;
+    const presets = layer.data.presets;
+    if (!isPlainObject(presets)) continue;
+    for (const [presetName, preset] of Object.entries(presets)) {
+      if (!isPlainObject(preset)) continue;
+      for (const [tierName, tier] of Object.entries(preset)) {
+        if (isPlainObject(tier) && (Object.hasOwn(tier, "model") || Object.hasOwn(tier, "variant"))) {
+          pinned.add(`${presetName}.${tierName}`);
+        }
+      }
+    }
+  }
+  projectPinnedByConfig.set(cfg, pinned);
+}
+
 /** The notices of the build that produced each config object (the cache hands the same object back until a reload). */
 const noticesByConfig = new WeakMap<RouterConfig, readonly ConfigNotice[]>();
+
+const EMPTY_PINNED_TIERS: ReadonlySet<string> = new Set<string>();
+
+/**
+ * Tiers an accepted PROJECT layer pinned (`presets.<preset>.<tier>` carrying
+ * an own `model` or `variant`), keyed `${preset}.${tier}`. Private build
+ * provenance: a project model/variant keeps manual priority over the weekly
+ * adaptive overlay; global presets (tiers.json, global override) are a
+ * fallback for managed roles, never a pin.
+ */
+const projectPinnedByConfig = new WeakMap<RouterConfig, ReadonlySet<string>>();
+
+/** Tiers pinned by accepted project layers of the build that produced `cfg` (empty when none). */
+export function projectPinnedTiers(cfg: RouterConfig): ReadonlySet<string> {
+  return projectPinnedByConfig.get(cfg) ?? EMPTY_PINNED_TIERS;
+}
 
 /** Notice texts already logged in this process (bounded); see {@link warnConfigNotices}. */
 const loggedNoticeTexts = new Set<string>();
@@ -2420,6 +2558,23 @@ function sourcePaths(dir: string): Array<string | undefined> {
  * `error:<code>`, a distinct marker, so losing access to a file is never
  * fingerprinted — or reloaded — as if it had been deleted.
  */
+/**
+ * The GLOBAL adaptive policy fingerprint: the sources a weekly review decides
+ * against (bundled config, global override, global preset/budget state). The
+ * adaptive snapshot is a GLOBAL artifact (one file next to the manual router
+ * state), so project override files are deliberately ABSENT here: a
+ * per-project model/variant pin must not invalidate the shared snapshot for
+ * every other project — pins apply consumer-side (projectPinnedTiers +
+ * resolveAdaptiveAssignment). The loadConfig cache fingerprint is a different,
+ * private thing and still accounts for project files.
+ */
+export function configSourcesFingerprint(dir?: string): string {
+  // `dir` stays in the signature (callers pass their project); the global
+  // policy sources cannot depend on it.
+  void dir;
+  return sourceFingerprint([configPath(), overridePath(), statePath()]);
+}
+
 function sourceFingerprint(paths: Array<string | undefined>): string {
   return paths
     .map((p) => {
@@ -2499,6 +2654,21 @@ export function loadConfig(dir?: string): RouterConfig {
   entry.notices = notices;
   noticesByConfig.set(cfg, notices);
   return cfg;
+}
+
+/**
+ * The GLOBAL adaptive-review config: the same buildConfig pipeline (bundled
+ * tiers.json + the global override + the global preset/budget state) with the
+ * PROJECT override layer deliberately excluded — the weekly review decides the
+ * one shared policy, so a project pin must not become its baseline (consumer
+ * pins still win per project through resolveAdaptiveAssignment). Uncached by
+ * design: one call per weekly review. The project cache, sourceFingerprint and
+ * the reload/last-valid fallback of loadConfig stay project-aware and intact.
+ */
+export function loadGlobalConfig(): RouterConfig {
+  const failures: SourceFailure[] = [];
+  const notices: ConfigNotice[] = [];
+  return buildConfig("", failures, notices, false);
 }
 
 /**
@@ -2687,9 +2857,10 @@ function buildConfig(
   dir: string,
   failures: SourceFailure[],
   notices: ConfigNotice[],
+  includeProjectLayer = true,
 ): RouterConfig {
   const base = JSON.parse(readFileSync(configPath(), "utf-8"));
-  const layers = collectOverrideLayers(dir, failures, notices);
+  const layers = collectOverrideLayers(dir, failures, notices, includeProjectLayer);
 
   // Bundled config must be valid on its own — throw otherwise (unchanged
   // behaviour). Override layers are then applied on top.
@@ -2790,9 +2961,13 @@ function buildConfig(
   applyTierDefaults(cfg);
   const rawRouting = isPlainObject(rawUsed) ? rawUsed.routing : undefined;
   for (const message of collectRoutingNotices(rawRouting, cfg)) notices.push({ message });
+  const rawAdaptiveRouting = isPlainObject(rawUsed) ? rawUsed.adaptiveRouting : undefined;
+  const adaptiveNotice = collectAdaptiveRoutingNotice(rawAdaptiveRouting, cfg);
+  if (adaptiveNotice !== undefined) notices.push({ message: adaptiveNotice });
   const rawRoleAgents = isPlainObject(rawUsed) ? rawUsed.roleAgents : undefined;
   for (const issue of collectRolesIssues(rawRouting, rawRoleAgents)) notices.push({ message: issue.message });
   dropIgnoredCandidates(cfg);
+  recordProjectPinnedTiers(cfg, layers);
   applyPluginAgents(cfg, layers, notices);
   applyRoleNotices(cfg, notices);
   return cfg;

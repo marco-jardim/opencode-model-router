@@ -9,7 +9,9 @@ import { V2_GRADER_AGENT } from "./v2-client";
 import { DEPTH_BANNER, TASK_VERIFICATION } from "./child-session";
 import { realpathSync, statSync } from "node:fs";
 import { basename, isAbsolute, join, posix, resolve, win32 } from "node:path";
-import { loadConfig, resolveRolesRouting } from "../router/config";
+import { loadConfig, projectPinnedTiers, resolvePresetName, resolveRolesRouting } from "../router/config";
+import { formatAssignmentRef, resolveAdaptiveAssignment } from "../router/adaptive";
+import { readAdaptiveView } from "../router/adaptive-store";
 import { getActiveTiers } from "../router/protocol";
 import { DEFER_MISSING_SUBAGENT_NOTICE, HOST_SEED_AGENTS, resolveSubagentOverrides } from "../router/subagents";
 import { warnAgentOptionsEffortOnce } from "../router/agent-options";
@@ -1799,6 +1801,24 @@ export async function registerV2Hooks(
         if (routed.role !== undefined) roleForeground = true;
         if (routed.agent !== undefined) { args.agent = routed.agent; args.subagent_type = routed.agent; }
         if (routed.model !== undefined) args.model = routed.model;
+        // Weekly adaptive overlay (opt-in, this host is v2 by construction):
+        // fill a managed tier's model from the current snapshot. An explicit
+        // args.model above keeps its priority; a project-pinned tier, or a
+        // stale/absent snapshot, leaves the model untouched.
+        if (args.model === undefined && cfg.adaptiveRouting !== undefined) {
+          const presetName = resolvePresetName(cfg, cfg.activePreset);
+          const managedTier = cfg.subagentTiers?.[args.agent];
+          if (presetName !== undefined && typeof managedTier === "string") {
+            const assignment = resolveAdaptiveAssignment(
+              cfg,
+              presetName,
+              managedTier,
+              readAdaptiveView(ctx.location.directory),
+              projectPinnedTiers(cfg),
+            );
+            if (assignment !== undefined) args.model = formatAssignmentRef(assignment);
+          }
+        }
         if (args.model === undefined && tierModel !== undefined) args.model = tierModel;
       }
       // After routing: the prompt the legacy hook starts from is the one the engine left (a stripped route line is not "added" text).
