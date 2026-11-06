@@ -124,6 +124,28 @@ describe("OpenCode 2 hook adapter", () => {
     expect(f.tools["context7_query-docs"].options.codemode).toBe(!configured);
   });
 
+  it("promotes plugin-agent allowTools to direct tools outside Code Mode (#81)", async () => {
+    const home = mkdtempSync(join(tmpdir(), "router-v2-direct-"));
+    vi.stubEnv("HOME", home); vi.stubEnv("USERPROFILE", home);
+    mkdirSync(dirname(overridePath()), { recursive: true });
+    writeFileSync(overridePath(), JSON.stringify({ agents: { "memory-reader": {
+      tier: "fast", description: "read-only memory lookups", readOnly: true,
+      allowTools: ["forge-flow-memory_memory_manifest", "forge-flow-memory_memory_search"],
+    } } }));
+    invalidateConfigCache();
+    const f = fixture();
+    for (const name of ["forge-flow-memory_memory_manifest", "forge-flow-memory_memory_search", "forge-flow-memory_memory_add"])
+      f.tools[name] = { options: { namespace: "forge-flow-memory", codemode: true } };
+    Object.assign(f.editors.tool, { update: (id: string, update: (definition: { options?: { namespace?: string; codemode?: boolean } }) => void) => {
+      if (f.tools[id]) update(f.tools[id]);
+    } });
+    await f.start({ config: async () => {} });
+    expect(f.tools["forge-flow-memory_memory_manifest"].options.codemode).toBe(false);
+    expect(f.tools["forge-flow-memory_memory_search"].options.codemode).toBe(false);
+    // memory_add is not in allowTools: the permission stays denied and Code Mode placement is untouched.
+    expect(f.tools["forge-flow-memory_memory_add"].options.codemode).toBe(true);
+  });
+
   it("prepends read-only policy before explicit host rules, without changing other tiers", async () => {
     const f = fixture();
     f.agents.fast = { id: "fast", mode: "subagent", permissions: [...Agent.Info.default(Agent.ID.make("fast")).permissions,

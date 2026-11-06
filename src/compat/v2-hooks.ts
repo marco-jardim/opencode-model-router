@@ -1506,7 +1506,13 @@ export async function registerV2Hooks(
     registrations.push(await ctx.tool.transform((editor) => {
       // execute is denied for read-only tiers. Keep the explicitly allowed docs
       // lookups directly callable rather than stranding them in Code Mode.
-      if (config.mcp?.context7) for (const name of CONTEXT7_DOC_TOOLS) editor.update(name, definition => {
+      // Plugin agents (#81) hit the same trap: allowTools grants the call, but the
+      // tool itself stays in Code Mode a read-only agent cannot execute. Promote
+      // exactly the granted names; permissions still gate every promoted tool.
+      const directMcp = new Set(config.mcp?.context7 ? CONTEXT7_DOC_TOOLS : []);
+      for (const agent of Object.values(loadConfig(ctx.location.directory).agents ?? {}))
+        for (const name of agent.allowTools ?? []) directMcp.add(name);
+      for (const name of directMcp) editor.update(name, definition => {
         const { pinned: _pinned, ...options } = definition.options ?? {};
         definition.options = { ...options, codemode: false };
       });
