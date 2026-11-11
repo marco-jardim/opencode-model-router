@@ -459,7 +459,7 @@ function answeredHandles(items: readonly HandleReport[]): string[] {
   const handles: string[] = [];
   for (const item of items) {
     if (item.kind === "verdict" || item.kind === "expired") handles.push(item.handle);
-    else if (item.kind === "unknown" || item.kind === "no-session") handles.push(item.input);
+    else if (item.kind === "unknown" || item.kind === "no-session" || item.kind === "refused") handles.push(item.input);
   }
   return handles;
 }
@@ -1212,6 +1212,9 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     ...(pendingFile === undefined ? {} : {
       pending: { persist: pendingFile, onVerdict: (entry: PendingEntry, result: SettledVerification) => postHeldVerdict(entry, result) },
       pendingRestore: pendingFile.load(),
+      // R2: the journal is shared with the other plugin instance; re-read it before answering "unknown"
+      // so a handle issued there after our one-shot restore is still redeemable.
+      pendingReload: () => pendingFile.load(),
       // v2 only. Delegating: the guard arrives with the adapter's attach; until then (or without `leases: enforce`) nothing waits.
       leaseGate: {
         waitTreeFree: async (tree, owner, deadlineMs, signal) => {

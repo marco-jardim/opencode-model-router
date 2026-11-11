@@ -653,6 +653,8 @@ export type HandleReport =
   | { readonly kind: "unknown"; readonly input: string }
   /** R6: a well-formed handle, but the call carried no session context, so no handle can be verified. */
   | { readonly kind: "no-session"; readonly input: string }
+  /** R2/R6: this session already asked about this handle too many times; nothing runs and nothing changes. */
+  | { readonly kind: "refused"; readonly input: string }
   | { readonly kind: "expired"; readonly handle: string }
   /** Joined another call's run, which outlived this call's deadline (R8). */
   | { readonly kind: "elsewhere"; readonly handle: string; readonly description: string }
@@ -674,6 +676,15 @@ export const ROUTER_VERIFY_NO_PENDING_TEXT = "[router] router_verify: no unverif
  * Handles are scoped to the session that dispatched them, so the caller must stop rather than retry.
  */
 export const NO_SESSION_CONTEXT_TEXT = "no session context; a handle can only be verified from the session that dispatched it";
+/**
+ * R2: the terminal answer once this session has already been told MAX_UNANSWERED_ATTEMPTS times that a
+ * handle cannot be resolved. Nothing was run and nothing changed, so re-sending the same call can only
+ * burn another turn: the caller must re-dispatch instead. This is the structural guard against a
+ * retry loop, independent of how the earlier answer was worded.
+ */
+export const ALREADY_ANSWERED_TEXT = "already answered; refusing to check again (nothing changed, nothing was run) — re-dispatch the work if it is still unverified";
+/** R2: how many unresolved answers for one handle in one session before router_verify refuses further calls. */
+export const MAX_UNANSWERED_ATTEMPTS = 3;
 export const ROUTER_VERIFY_NO_RETRY_TEXT = "[router] Nothing was retried or escalated; whether to re-dispatch is your call.";
 /** Section 1.5-18. The run always uses the current tree. */
 export const DRIFT_NOTICE = "tree drifted since delegation; verdict reflects current state";
@@ -818,6 +829,10 @@ export function formatVerifyReport(
       blocks.push(`- ${sanitizeDescription(item.input)} \u00b7 ${NO_SESSION_CONTEXT_TEXT}`);
       continue;
     }
+    if (item.kind === "refused") {
+      blocks.push(`- ${sanitizeDescription(item.input)} \u00b7 ${ALREADY_ANSWERED_TEXT}`);
+      continue;
+    }
     if (item.kind === "expired") {
       blocks.push(`- ${item.handle} \u00b7 ${EXPIRED_HANDLE_TEXT}`);
       continue;
@@ -883,7 +898,7 @@ export function backgroundOutcomes(items: readonly HandleReport[]): BackgroundOu
         : { kind: "reported", handle: item.handle };
     }
     if (item.kind === "elsewhere" || item.kind === "held") return { kind: "reported", handle: item.handle };
-    return { kind: "gone", handle: item.kind === "unknown" || item.kind === "no-session" ? item.input : item.handle };
+    return { kind: "gone", handle: item.kind === "unknown" || item.kind === "no-session" || item.kind === "refused" ? item.input : item.handle };
   });
 }
 
@@ -1223,6 +1238,13 @@ export function createVerificationWiring(deps: {
    */
   pendingRestore?: Promise<readonly PendingRecord[]>;
   /**
+   * Phase 2.1, v2 only: re-read pending.jsonl when a handle is not in this instance's registry. Two plugin
+   * instances share one journal (QA-2.1-15), and start-up restore is a one-shot read, so a handle issued by
+   * the other instance after this one restored is invisible here — permanently. Reading the journal before
+   * answering "unknown" makes it visible instead of unredeemable.
+   */
+  pendingReload?: () => Promise<readonly PendingRecord[]>;
+  /**
    * Phase 2.1.5: the lease guard's wait (v2 only; absent on v1 and when `routing.leases.mode` is "off").
    * Plugin verification runs in a tree wait for its holders first.
    */
@@ -1260,6 +1282,8 @@ export function createVerificationWiring(deps: {
     onEvict: (entry, cause) => logger.debug?.("[verify] pending delegation evicted", { handle: entry.handle, cause }),
   });
   const pendingNow = deps.pending?.now ?? Date.now;
+  /** R2: unresolved answers per session+handle. A caller cannot loop past this, whatever the wording. */
+  const unansweredAttempts = new Map<string, number>();
   /** Phase 2.1 (v2 only): resolves once pending.jsonl is folded in and its reference dirs are kept; never rejects. */
   const restoreDone: Promise<void> | undefined = deps.pendingRestore === undefined ? undefined : deps.pendingRestore.then(
     records => {
@@ -3524,6 +3548,19 @@ export function createVerificationWiring(deps: {
         await untilAborted(background.preempt(), owned.signal, () => undefined);
       }
 
+      // 2b. R2: a handle this instance does not know may have been issued by the other plugin instance
+      // after start-up restore. Re-read the shared journal once, then fold it in, before answering.
+      if (sessionID !== "" && targets.some(t => t.handle !== undefined && pending.get(sessionID, t.handle).kind === "unknown")) {
+        const reload = deps.pendingReload;
+        if (reload !== undefined) {
+          try {
+            pending.restore(await reload(), { now: pendingNow() });
+          } catch (err: unknown) {
+            logger.warn("[verify] pending.jsonl could not be re-read", { error: errorText(err) });
+          }
+        }
+      }
+
       // 3. Claims (R8: synchronous, so two calls for one handle make one "claimed").
       type Claimed = Extract<ReturnType<PendingRegistry["markVerifying"]>, { kind: "claimed" }>;
       const claims: Claimed[] = [];
@@ -3546,13 +3583,22 @@ export function createVerificationWiring(deps: {
           // gate claims and settles the entry in one step when it ends, so a live held entry is never joined; only a gate
           // re-run after a restart claims first (state "verifying"), and the claim below joins that run. A settled entry
           // reports the cached verdict. A held entry starts in state "held" (pending.ts); "verified" is its verdict.
+          const attemptKey = `${sessionID}\u0000${t.handle}`;
+          if ((unansweredAttempts.get(attemptKey) ?? 0) >= MAX_UNANSWERED_ATTEMPTS) {
+            slots.push({ kind: "refused", input: t.handle });
+            continue;
+          }
           const looked = pending.get(sessionID, t.handle);
+          if (looked.kind === "found") unansweredAttempts.delete(attemptKey);
           if (looked.kind === "found" && looked.entry.hold !== undefined && looked.entry.state !== "verifying" && looked.entry.state !== "verified") {
             slots.push({ kind: "held", handle: looked.entry.handle, description: looked.entry.description });
             continue;
           }
           const c = pending.markVerifying(sessionID, t.handle);
-          if (c.kind === "unknown") slots.push({ kind: "unknown", input: t.handle });
+          if (c.kind === "unknown") {
+            unansweredAttempts.set(attemptKey, (unansweredAttempts.get(attemptKey) ?? 0) + 1);
+            slots.push({ kind: "unknown", input: t.handle });
+          }
           else if (c.kind === "expired") slots.push({ kind: "expired", handle: c.handle });
           else if (c.kind === "settled") {
             slots.push({ kind: "verdict", handle: c.entry.handle, description: c.entry.description, producerTier: c.entry.producerTier, via: "cached", result: c.result });

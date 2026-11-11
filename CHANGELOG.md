@@ -21,6 +21,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   be verified from the session that dispatched it`. Both are final: they no longer look retryable, so a
   caller stops re-polling an unknown handle. A `pending: true` call with no session context now gives the
   same terminal no-session answer instead of claiming the session has no unverified delegations.
+- **`router_verify` refuses a handle it has already answered as unresolvable.** After three unresolved
+  answers for the same handle in the same session, further calls return "already answered; refusing to
+  check again" without running anything. A wording change alone cannot guarantee that a caller stops, so
+  the retry loop is now bounded in code: at most three calls per handle, never hundreds.
+- **A handle issued by the other plugin instance is recoverable.** Both instances share `pending.jsonl`,
+  but start-up restore is a one-shot read, so a handle issued after it stayed invisible and could never be
+  redeemed. `router_verify` now re-reads the shared journal when a handle is not in this instance's
+  registry, so cross-instance handles resolve instead of looping as unknown.
 - **OpenCode v2: resumed background dispatches keep their own results and verification handles.** Historical completions
   first scanned after a resume no longer supply the resumed attempt's result, and held placeholders retain their attempt's
   announced handle instead of changing to the newest handle for the same child session.

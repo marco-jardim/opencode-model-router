@@ -30,6 +30,8 @@ import {
   DRIFT_UNCHECKED_NOTICE,
   isRetryableVerdict,
   parseRouterVerifyArgs,
+  ALREADY_ANSWERED_TEXT,
+  MAX_UNANSWERED_ATTEMPTS,
   NO_SESSION_CONTEXT_TEXT,
   ROUTER_VERIFY_ARGS_TEXT,
   ROUTER_VERIFY_NO_PENDING_TEXT,
@@ -45,6 +47,7 @@ import {
   MAX_HANDLES_PER_CALL,
   UNKNOWN_HANDLE_TEXT,
   type BackgroundQueue,
+  type PendingRecord,
   type PendingRegistration,
   type PendingRegistry,
 } from "../../src/verify/pending";
@@ -368,6 +371,7 @@ function makeWiring(
   pendingSeams: Parameters<typeof createVerificationWiring>[0]["pending"] = undefined,
   backgroundSeams: Parameters<typeof createVerificationWiring>[0]["background"] = undefined,
   observations?: V2Observations,
+  pendingReload?: () => Promise<readonly PendingRecord[]>,
 ) {
   const cfg = config(verify);
   const client = { session: { create: vi.fn(async () => ({ data: { id: "never" } })), abort: vi.fn(async () => ({})), delete: vi.fn(async () => ({})) } };
@@ -380,6 +384,7 @@ function makeWiring(
     batch: { maxBatchSize: 5 },
     ...(pendingSeams !== undefined ? { pending: pendingSeams } : {}),
     ...(backgroundSeams !== undefined ? { background: backgroundSeams } : {}),
+    ...(pendingReload !== undefined ? { pendingReload } : {}),
   });
   return { wiring, client, cfg };
 }
@@ -838,6 +843,37 @@ describe("verifyHandles (2.4.3a)", () => {
     expect(report.items).toEqual([{ kind: "no-session", input: "pending: true" }]);
     expect(report.text).toContain(NO_SESSION_CONTEXT_TEXT);
     expect(report.text).not.toContain(ROUTER_VERIFY_NO_PENDING_TEXT);
+  });
+
+  it("refuses a handle after repeated unresolved answers instead of allowing a poll loop", async () => {
+    const { wiring } = makeWiring();
+    const h = await register(wiring.pending, "a");
+    for (let i = 0; i < MAX_UNANSWERED_ATTEMPTS; i++) {
+      const r = await wiring.verifyHandles("other", { kind: "handles", handles: [h] });
+      expect(r.items).toEqual([{ kind: "unknown", input: h }]);
+    }
+    const refused = await wiring.verifyHandles("other", { kind: "handles", handles: [h] });
+    expect(refused.items).toEqual([{ kind: "refused", input: h }]);
+    expect(refused.text).toContain(ALREADY_ANSWERED_TEXT);
+    // Nothing runs for a refused call, and the registry is untouched.
+    expect(state.runs).toEqual([]);
+    expect(wiring.pending.get("other", h)).toMatchObject({ kind: "unknown" });
+    // A resolvable call from the owning session still works: the refusal is per session+handle.
+    expect((await wiring.verifyHandles("orch", { kind: "handles", handles: [h] })).items[0]?.kind).toBe("verdict");
+  });
+
+  it("re-reads the shared journal before calling a handle unknown", async () => {
+    let reloads = 0;
+    const { wiring } = makeWiring({}, undefined, undefined, undefined, async () => {
+      reloads += 1;
+      return [] as readonly PendingRecord[];
+    });
+    const h = await register(wiring.pending, "a");
+    await wiring.verifyHandles("other", { kind: "handles", handles: [h] });
+    expect(reloads).toBe(1);
+    // A handle this instance already knows never triggers a journal read.
+    await wiring.verifyHandles("orch", { kind: "handles", handles: [h] });
+    expect(reloads).toBe(1);
   });
 
   it("a session higher in the tree cannot resolve a descendant's handle (current behavior)", async () => {
