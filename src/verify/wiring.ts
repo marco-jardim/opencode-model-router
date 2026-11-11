@@ -3589,8 +3589,15 @@ export function createVerificationWiring(deps: {
             continue;
           }
           const looked = pending.get(sessionID, t.handle);
-          if (looked.kind === "found") unansweredAttempts.delete(attemptKey);
+          // R2: a settled entry answers with its verdict, so the bound resets. Merely being "found"
+          // (a held entry, say) is still an answer without a verdict and keeps counting.
+          if (looked.kind === "found" && (looked.entry.state === "verified" || looked.entry.result !== undefined)) {
+            unansweredAttempts.delete(attemptKey);
+          }
           if (looked.kind === "found" && looked.entry.hold !== undefined && looked.entry.state !== "verifying" && looked.entry.state !== "verified") {
+            // R2: "held" is also an answer without a verdict. The background gate posts it to the parent,
+            // so re-asking cannot speed it up; it counts toward the same bound as an unknown handle.
+            unansweredAttempts.set(attemptKey, (unansweredAttempts.get(attemptKey) ?? 0) + 1);
             slots.push({ kind: "held", handle: looked.entry.handle, description: looked.entry.description });
             continue;
           }

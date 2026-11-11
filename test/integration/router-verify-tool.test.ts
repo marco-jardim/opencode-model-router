@@ -862,6 +862,18 @@ describe("verifyHandles (2.4.3a)", () => {
     expect((await wiring.verifyHandles("orch", { kind: "handles", handles: [h] })).items[0]?.kind).toBe("verdict");
   });
 
+  it("bounds repeated held answers too", async () => {
+    const { wiring } = makeWiring();
+    const h = await register(wiring.pending, "a", { hold: { childSessionID: "child-a", callID: "task:orch:a" } });
+    for (let i = 0; i < MAX_UNANSWERED_ATTEMPTS; i++) {
+      const r = await wiring.verifyHandles("orch", { kind: "handles", handles: [h] });
+      expect(r.items[0]?.kind).toBe("held");
+    }
+    const refused = await wiring.verifyHandles("orch", { kind: "handles", handles: [h] });
+    expect(refused.items).toEqual([{ kind: "refused", input: h }]);
+    expect(refused.text).toContain(ALREADY_ANSWERED_TEXT);
+  });
+
   it("re-reads the shared journal before calling a handle unknown", async () => {
     let reloads = 0;
     const { wiring } = makeWiring({}, undefined, undefined, undefined, async () => {
