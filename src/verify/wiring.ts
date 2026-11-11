@@ -3485,8 +3485,14 @@ export function createVerificationWiring(deps: {
       // 1. Targets: normalized, deduped, capped (R2). `pending` = listOpen, so in-flight runs join.
       let targets: Array<{ readonly input: string; readonly handle: string | undefined }> = [];
       if (target.kind === "pending") {
+        // R6: with no session there is nothing to list. Saying "no unverified delegations in this
+        // session" would be false and reads as "nothing ready yet", so it is answered terminally.
+        if (sessionID === "") {
+          const item: HandleReport = { kind: "no-session", input: "pending: true" };
+          return { items: [item], excess: 0, text: formatVerifyReport([item], 0, false) };
+        }
         // QA-2.4-3: listPending adds the background verdicts not yet replayed (a cached replay, no run).
-        if (sessionID !== "") targets = pending.listPending(sessionID, { verifying: true }).map(e => ({ input: e.handle, handle: e.handle }));
+        targets = pending.listPending(sessionID, { verifying: true }).map(e => ({ input: e.handle, handle: e.handle }));
         if (targets.length === 0) return { items: [], excess: 0, text: ROUTER_VERIFY_NO_PENDING_TEXT };
       } else {
         const seen = new Set<string>();

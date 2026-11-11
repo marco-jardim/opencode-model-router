@@ -832,6 +832,29 @@ describe("verifyHandles (2.4.3a)", () => {
     expect(await wiring.verifyHandles("other", { kind: "pending" })).toMatchObject({ items: [], text: ROUTER_VERIFY_NO_PENDING_TEXT });
   });
 
+  it("pending with no session context answers terminally instead of claiming nothing is pending", async () => {
+    const { wiring } = makeWiring();
+    const report = await wiring.verifyHandles("", { kind: "pending" });
+    expect(report.items).toEqual([{ kind: "no-session", input: "pending: true" }]);
+    expect(report.text).toContain(NO_SESSION_CONTEXT_TEXT);
+    expect(report.text).not.toContain(ROUTER_VERIFY_NO_PENDING_TEXT);
+  });
+
+  it("a session higher in the tree cannot resolve a descendant's handle (current behavior)", async () => {
+    const { wiring } = makeWiring();
+    const h = await register(wiring.pending, "a", {
+      orchestratorSessionID: "child",
+      producerSessionID: "grandchild",
+      dispatchID: "task:child:a",
+    });
+    // The handle is owned by the dispatching session ...
+    expect(wiring.pending.get("child", h)).toMatchObject({ kind: "found" });
+    // ... and the session that started the tree gets the same non-terminal answer as a stranger.
+    const fromRoot = await wiring.verifyHandles("root", { kind: "handles", handles: [h] });
+    expect(fromRoot.items).toEqual([{ kind: "unknown", input: h }]);
+    expect(fromRoot.text).toContain(`- ${h} \u00b7 ${UNKNOWN_HANDLE_TEXT}`);
+  });
+
   it("an expired handle (TTL) gets the expired text in its own session, unknown elsewhere", async () => {
     let clock = 1_000;
     const { wiring } = makeWiring({}, { now: () => clock });
