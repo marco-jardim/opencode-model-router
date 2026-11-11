@@ -451,14 +451,15 @@ function createLateBuffer(): LateBuffer {
 }
 
 /**
- * The handles a router_verify report answers: a verdict, an unknown input, an expired handle. A run that outlived the call
+ * The handles a router_verify report answers: a verdict, an unknown input, a handle with no session
+ * context, an expired handle. A run that outlived the call
  * ("elsewhere") and a held background result ("held", QA-2.1-9: its own gate posts the verdict) have no verdict yet.
  */
 function answeredHandles(items: readonly HandleReport[]): string[] {
   const handles: string[] = [];
   for (const item of items) {
     if (item.kind === "verdict" || item.kind === "expired") handles.push(item.handle);
-    else if (item.kind === "unknown") handles.push(item.input);
+    else if (item.kind === "unknown" || item.kind === "no-session") handles.push(item.input);
   }
   return handles;
 }

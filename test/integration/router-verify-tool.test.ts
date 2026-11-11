@@ -30,6 +30,7 @@ import {
   DRIFT_UNCHECKED_NOTICE,
   isRetryableVerdict,
   parseRouterVerifyArgs,
+  NO_SESSION_CONTEXT_TEXT,
   ROUTER_VERIFY_ARGS_TEXT,
   ROUTER_VERIFY_NO_PENDING_TEXT,
   ROUTER_VERIFY_NO_RETRY_TEXT,
@@ -814,11 +815,16 @@ describe("verifyHandles (2.4.3a)", () => {
   it("scoping (R6): another session, the producer's session and malformed input are all unknown; nothing runs", async () => {
     const { wiring } = makeWiring();
     const h = await register(wiring.pending, "a");
-    for (const sid of ["other", "child-a", ""]) {
+    for (const sid of ["other", "child-a"]) {
       const report = await wiring.verifyHandles(sid, { kind: "handles", handles: [h] });
       expect(report.items).toEqual([{ kind: "unknown", input: h }]);
       expect(report.text).toContain(`- ${h} \u00b7 ${UNKNOWN_HANDLE_TEXT}`);
     }
+    // R6: a call with no session context cannot resolve any handle, and says so distinctly.
+    const noSession = await wiring.verifyHandles("", { kind: "handles", handles: [h] });
+    expect(noSession.items).toEqual([{ kind: "no-session", input: h }]);
+    expect(noSession.text).toContain(`- ${h} \u00b7 ${NO_SESSION_CONTEXT_TEXT}`);
+    expect(noSession.text).not.toContain(UNKNOWN_HANDLE_TEXT);
     const malformed = await wiring.verifyHandles("orch", { kind: "handles", handles: ["vrf_nothex", 42] });
     expect(malformed.items.map(i => i.kind)).toEqual(["unknown", "unknown"]);
     expect(state.runs).toEqual([]);
@@ -1476,15 +1482,67 @@ describe("the router_verify tool (2.4.3b)", () => {
     const { hooks, created } = await makePlugin();
     const t = routerVerify(hooks);
     const h = await register(registry(), "a");
-    for (const sessionID of ["other", "child-a", undefined]) {
-      const out = await t.execute({ handles: [h] }, sessionID === undefined ? {} : { sessionID });
+    for (const sessionID of ["other", "child-a"]) {
+      const out = await t.execute({ handles: [h] }, { sessionID });
       expect(out).toContain(`- ${h} \u00b7 ${UNKNOWN_HANDLE_TEXT}`);
     }
+    const noSession = await t.execute({ handles: [h] }, {});
+    expect(noSession).toContain(`- ${h} \u00b7 ${NO_SESSION_CONTEXT_TEXT}`);
+    expect(noSession).not.toContain(UNKNOWN_HANDLE_TEXT);
     expect(state.runs).toEqual([]);
     const out = await t.execute({ handles: [h] }, { sessionID: "orch" });
     expect(out).toContain(`- ${h} \u00b7 work a \u00b7 pass`);
     // No session was created: nothing retried, escalated or graded.
     expect(created).toEqual([]);
+  });
+
+  it("an unknown handle is terminal: the report tells the caller to stop polling", async () => {
+    const { hooks } = await makePlugin();
+    const unknown = `vrf_${"0".repeat(24)}`;
+    const out = await routerVerify(hooks).execute({ handles: [unknown] }, { sessionID: "orch" });
+    expect(out).toContain(`- ${unknown} \u00b7 ${UNKNOWN_HANDLE_TEXT}`);
+    expect(out).toContain("stop polling");
+    expect(state.runs).toEqual([]);
+  });
+
+  it("an unknown handle says the same thing on a repeated call and changes no state", async () => {
+    const { hooks } = await makePlugin();
+    const t = routerVerify(hooks);
+    const unknown = `vrf_${"1".repeat(24)}`;
+    const first = await t.execute({ handles: [unknown] }, { sessionID: "orch" });
+    const second = await t.execute({ handles: [unknown] }, { sessionID: "orch" });
+    expect(second).toBe(first);
+    expect(first).toContain("stop polling");
+    expect(registry().stats().entries).toBe(0);
+    expect(registry().stats().tombstones).toBe(0);
+    expect(state.runs).toEqual([]);
+  });
+
+  it("a valid handle with no session context gets the no-session text, never \"unknown handle\"", async () => {
+    const { hooks } = await makePlugin();
+    const t = routerVerify(hooks);
+    const h = await register(registry(), "a");
+    const out = await t.execute({ handles: [h] }, {});
+    expect(out).toContain(`- ${h} \u00b7 ${NO_SESSION_CONTEXT_TEXT}`);
+    expect(out).not.toContain(UNKNOWN_HANDLE_TEXT);
+    // A malformed input still gets the unknown-handle wording: it is not a session-context problem.
+    const malformed = await t.execute({ handles: ["vrf_nothex"] }, { sessionID: "orch" });
+    expect(malformed).toContain(UNKNOWN_HANDLE_TEXT);
+    expect(state.runs).toEqual([]);
+  });
+
+  it("a handle valid in one session stays unknown from another, before and after its verdict", async () => {
+    const { hooks } = await makePlugin();
+    const t = routerVerify(hooks);
+    const h = await register(registry(), "a");
+    const before = await t.execute({ handles: [h] }, { sessionID: "other" });
+    expect(before).toContain(`- ${h} \u00b7 ${UNKNOWN_HANDLE_TEXT}`);
+    expect(registry().get("orch", h)).toMatchObject({ kind: "found", entry: { state: "unverified" } });
+    const own = await t.execute({ handles: [h] }, { sessionID: "orch" });
+    expect(own).toContain(`- ${h} \u00b7 work a \u00b7 pass`);
+    const after = await t.execute({ handles: [h] }, { sessionID: "other" });
+    expect(after).toBe(before);
+    expect(registry().get("other", h).kind).toBe("unknown");
   });
 
   it("end to end: a deferred native task's footer handle verifies through the tool", async () => {

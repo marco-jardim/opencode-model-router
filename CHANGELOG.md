@@ -15,6 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`router_verify` now answers an unresolvable handle terminally.** A handle that this session cannot
+  resolve reads `unknown handle: not registered in this session; stop polling, retrying will not
+  resolve it`, and a handle sent without session context reads `no session context; a handle can only
+  be verified from the session that dispatched it`. Both are final: they no longer look retryable, so a
+  caller stops re-polling an unknown handle.
 - **OpenCode v2: resumed background dispatches keep their own results and verification handles.** Historical completions
   first scanned after a resume no longer supply the resumed attempt's result, and held placeholders retain their attempt's
   announced handle instead of changing to the newest handle for the same child session.

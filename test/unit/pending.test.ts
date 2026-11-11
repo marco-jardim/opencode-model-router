@@ -608,7 +608,8 @@ describe("scoping (R6)", () => {
   });
 
   it("exports the stable phrases", () => {
-    expect(UNKNOWN_HANDLE_TEXT).toBe("unknown handle");
+    expect(UNKNOWN_HANDLE_TEXT).toBe("unknown handle: not registered in this session; stop polling, retrying will not resolve it");
+    expect(UNKNOWN_HANDLE_TEXT).toContain("stop polling");
     expect(EXPIRED_HANDLE_TEXT).toBe("expired handle: older than pendingTtlMs or evicted; it can no longer be verified");
     expect(VERIFYING_ELSEWHERE_TEXT).toBe(
       "still being verified by another router_verify call; call again for its verdict",

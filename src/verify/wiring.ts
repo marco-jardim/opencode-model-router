@@ -651,6 +651,8 @@ export type HandleReport =
     }
   /** Malformed, never issued, or issued to another session (R6): nothing distinguishes them. */
   | { readonly kind: "unknown"; readonly input: string }
+  /** R6: a well-formed handle, but the call carried no session context, so no handle can be verified. */
+  | { readonly kind: "no-session"; readonly input: string }
   | { readonly kind: "expired"; readonly handle: string }
   /** Joined another call's run, which outlived this call's deadline (R8). */
   | { readonly kind: "elsewhere"; readonly handle: string; readonly description: string }
@@ -667,6 +669,11 @@ export interface VerifyReport {
 export const ROUTER_VERIFY_ARGS_TEXT =
   "[router] router_verify: pass exactly one of `handles` (a non-empty list of vrf_ handles) or `pending: true`; nothing was run.";
 export const ROUTER_VERIFY_NO_PENDING_TEXT = "[router] router_verify: no unverified delegations in this session; nothing was run.";
+/**
+ * R6: the terminal answer when the call carries no session context (the host passed no sessionID).
+ * Handles are scoped to the session that dispatched them, so the caller must stop rather than retry.
+ */
+export const NO_SESSION_CONTEXT_TEXT = "no session context; a handle can only be verified from the session that dispatched it";
 export const ROUTER_VERIFY_NO_RETRY_TEXT = "[router] Nothing was retried or escalated; whether to re-dispatch is your call.";
 /** Section 1.5-18. The run always uses the current tree. */
 export const DRIFT_NOTICE = "tree drifted since delegation; verdict reflects current state";
@@ -807,6 +814,10 @@ export function formatVerifyReport(
       blocks.push(`- ${sanitizeDescription(item.input)} \u00b7 ${UNKNOWN_HANDLE_TEXT}`);
       continue;
     }
+    if (item.kind === "no-session") {
+      blocks.push(`- ${sanitizeDescription(item.input)} \u00b7 ${NO_SESSION_CONTEXT_TEXT}`);
+      continue;
+    }
     if (item.kind === "expired") {
       blocks.push(`- ${item.handle} \u00b7 ${EXPIRED_HANDLE_TEXT}`);
       continue;
@@ -872,7 +883,7 @@ export function backgroundOutcomes(items: readonly HandleReport[]): BackgroundOu
         : { kind: "reported", handle: item.handle };
     }
     if (item.kind === "elsewhere" || item.kind === "held") return { kind: "reported", handle: item.handle };
-    return { kind: "gone", handle: item.kind === "unknown" ? item.input : item.handle };
+    return { kind: "gone", handle: item.kind === "unknown" || item.kind === "no-session" ? item.input : item.handle };
   });
 }
 
@@ -3514,8 +3525,14 @@ export function createVerificationWiring(deps: {
       const cwds = new Map<string, string>();
       try {
         for (const t of targets) {
-          if (t.handle === undefined || sessionID === "") {
-            slots.push({ kind: "unknown", input: t.handle ?? t.input });
+          if (t.handle === undefined) {
+            slots.push({ kind: "unknown", input: t.input });
+            continue;
+          }
+          // R6: with no session context nothing can be resolved, and saying "unknown handle" would
+          // suggest that retrying (or re-sending the same call) could. Terminal, distinct text.
+          if (sessionID === "") {
+            slots.push({ kind: "no-session", input: t.handle });
             continue;
           }
           // QA-2.1-9 (phase 2.1, v2 only): a held entry is verified by its background gate, which posts the verdict to the
