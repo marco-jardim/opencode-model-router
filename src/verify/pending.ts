@@ -421,7 +421,12 @@ export const PENDING_LIST_LIMIT = 5;
 export const FOOTER_MAX_REASONS = 3;
 export const LATE_NOTICE_MAX_IDS = 10;
 
-export const UNKNOWN_HANDLE_TEXT = "unknown handle";
+/**
+ * R2, R6: the terminal answer for a handle this session cannot resolve (malformed, never issued, or
+ * issued to another session). It says so explicitly: a caller must not re-poll, because a handle is
+ * a capability token scoped to the session that dispatched it and no retry can change the result.
+ */
+export const UNKNOWN_HANDLE_TEXT = "unknown handle: not registered in this session; stop polling, retrying will not resolve it";
 export const EXPIRED_HANDLE_TEXT = "expired handle: older than pendingTtlMs or evicted; it can no longer be verified";
 export const VERIFYING_ELSEWHERE_TEXT =
   "still being verified by another router_verify call; call again for its verdict";

@@ -30,6 +30,9 @@ import {
   DRIFT_UNCHECKED_NOTICE,
   isRetryableVerdict,
   parseRouterVerifyArgs,
+  ALREADY_ANSWERED_TEXT,
+  MAX_UNANSWERED_ATTEMPTS,
+  NO_SESSION_CONTEXT_TEXT,
   ROUTER_VERIFY_ARGS_TEXT,
   ROUTER_VERIFY_NO_PENDING_TEXT,
   ROUTER_VERIFY_NO_RETRY_TEXT,
@@ -44,6 +47,7 @@ import {
   MAX_HANDLES_PER_CALL,
   UNKNOWN_HANDLE_TEXT,
   type BackgroundQueue,
+  type PendingRecord,
   type PendingRegistration,
   type PendingRegistry,
 } from "../../src/verify/pending";
@@ -367,6 +371,7 @@ function makeWiring(
   pendingSeams: Parameters<typeof createVerificationWiring>[0]["pending"] = undefined,
   backgroundSeams: Parameters<typeof createVerificationWiring>[0]["background"] = undefined,
   observations?: V2Observations,
+  pendingReload?: () => Promise<readonly PendingRecord[]>,
 ) {
   const cfg = config(verify);
   const client = { session: { create: vi.fn(async () => ({ data: { id: "never" } })), abort: vi.fn(async () => ({})), delete: vi.fn(async () => ({})) } };
@@ -379,6 +384,7 @@ function makeWiring(
     batch: { maxBatchSize: 5 },
     ...(pendingSeams !== undefined ? { pending: pendingSeams } : {}),
     ...(backgroundSeams !== undefined ? { background: backgroundSeams } : {}),
+    ...(pendingReload !== undefined ? { pendingReload } : {}),
   });
   return { wiring, client, cfg };
 }
@@ -814,16 +820,87 @@ describe("verifyHandles (2.4.3a)", () => {
   it("scoping (R6): another session, the producer's session and malformed input are all unknown; nothing runs", async () => {
     const { wiring } = makeWiring();
     const h = await register(wiring.pending, "a");
-    for (const sid of ["other", "child-a", ""]) {
+    for (const sid of ["other", "child-a"]) {
       const report = await wiring.verifyHandles(sid, { kind: "handles", handles: [h] });
       expect(report.items).toEqual([{ kind: "unknown", input: h }]);
       expect(report.text).toContain(`- ${h} \u00b7 ${UNKNOWN_HANDLE_TEXT}`);
     }
+    // R6: a call with no session context cannot resolve any handle, and says so distinctly.
+    const noSession = await wiring.verifyHandles("", { kind: "handles", handles: [h] });
+    expect(noSession.items).toEqual([{ kind: "no-session", input: h }]);
+    expect(noSession.text).toContain(`- ${h} \u00b7 ${NO_SESSION_CONTEXT_TEXT}`);
+    expect(noSession.text).not.toContain(UNKNOWN_HANDLE_TEXT);
     const malformed = await wiring.verifyHandles("orch", { kind: "handles", handles: ["vrf_nothex", 42] });
     expect(malformed.items.map(i => i.kind)).toEqual(["unknown", "unknown"]);
     expect(state.runs).toEqual([]);
     expect(wiring.pending.get("orch", h)).toMatchObject({ kind: "found", entry: { state: "unverified" } });
     expect(await wiring.verifyHandles("other", { kind: "pending" })).toMatchObject({ items: [], text: ROUTER_VERIFY_NO_PENDING_TEXT });
+  });
+
+  it("pending with no session context answers terminally instead of claiming nothing is pending", async () => {
+    const { wiring } = makeWiring();
+    const report = await wiring.verifyHandles("", { kind: "pending" });
+    expect(report.items).toEqual([{ kind: "no-session", input: "pending: true" }]);
+    expect(report.text).toContain(NO_SESSION_CONTEXT_TEXT);
+    expect(report.text).not.toContain(ROUTER_VERIFY_NO_PENDING_TEXT);
+  });
+
+  it("refuses a handle after repeated unresolved answers instead of allowing a poll loop", async () => {
+    const { wiring } = makeWiring();
+    const h = await register(wiring.pending, "a");
+    for (let i = 0; i < MAX_UNANSWERED_ATTEMPTS; i++) {
+      const r = await wiring.verifyHandles("other", { kind: "handles", handles: [h] });
+      expect(r.items).toEqual([{ kind: "unknown", input: h }]);
+    }
+    const refused = await wiring.verifyHandles("other", { kind: "handles", handles: [h] });
+    expect(refused.items).toEqual([{ kind: "refused", input: h }]);
+    expect(refused.text).toContain(ALREADY_ANSWERED_TEXT);
+    // Nothing runs for a refused call, and the registry is untouched.
+    expect(state.runs).toEqual([]);
+    expect(wiring.pending.get("other", h)).toMatchObject({ kind: "unknown" });
+    // A resolvable call from the owning session still works: the refusal is per session+handle.
+    expect((await wiring.verifyHandles("orch", { kind: "handles", handles: [h] })).items[0]?.kind).toBe("verdict");
+  });
+
+  it("bounds repeated held answers too", async () => {
+    const { wiring } = makeWiring();
+    const h = await register(wiring.pending, "a", { hold: { childSessionID: "child-a", callID: "task:orch:a" } });
+    for (let i = 0; i < MAX_UNANSWERED_ATTEMPTS; i++) {
+      const r = await wiring.verifyHandles("orch", { kind: "handles", handles: [h] });
+      expect(r.items[0]?.kind).toBe("held");
+    }
+    const refused = await wiring.verifyHandles("orch", { kind: "handles", handles: [h] });
+    expect(refused.items).toEqual([{ kind: "refused", input: h }]);
+    expect(refused.text).toContain(ALREADY_ANSWERED_TEXT);
+  });
+
+  it("re-reads the shared journal before calling a handle unknown", async () => {
+    let reloads = 0;
+    const { wiring } = makeWiring({}, undefined, undefined, undefined, async () => {
+      reloads += 1;
+      return [] as readonly PendingRecord[];
+    });
+    const h = await register(wiring.pending, "a");
+    await wiring.verifyHandles("other", { kind: "handles", handles: [h] });
+    expect(reloads).toBe(1);
+    // A handle this instance already knows never triggers a journal read.
+    await wiring.verifyHandles("orch", { kind: "handles", handles: [h] });
+    expect(reloads).toBe(1);
+  });
+
+  it("a session higher in the tree cannot resolve a descendant's handle (current behavior)", async () => {
+    const { wiring } = makeWiring();
+    const h = await register(wiring.pending, "a", {
+      orchestratorSessionID: "child",
+      producerSessionID: "grandchild",
+      dispatchID: "task:child:a",
+    });
+    // The handle is owned by the dispatching session ...
+    expect(wiring.pending.get("child", h)).toMatchObject({ kind: "found" });
+    // ... and the session that started the tree gets the same non-terminal answer as a stranger.
+    const fromRoot = await wiring.verifyHandles("root", { kind: "handles", handles: [h] });
+    expect(fromRoot.items).toEqual([{ kind: "unknown", input: h }]);
+    expect(fromRoot.text).toContain(`- ${h} \u00b7 ${UNKNOWN_HANDLE_TEXT}`);
   });
 
   it("an expired handle (TTL) gets the expired text in its own session, unknown elsewhere", async () => {
@@ -1476,15 +1553,67 @@ describe("the router_verify tool (2.4.3b)", () => {
     const { hooks, created } = await makePlugin();
     const t = routerVerify(hooks);
     const h = await register(registry(), "a");
-    for (const sessionID of ["other", "child-a", undefined]) {
-      const out = await t.execute({ handles: [h] }, sessionID === undefined ? {} : { sessionID });
+    for (const sessionID of ["other", "child-a"]) {
+      const out = await t.execute({ handles: [h] }, { sessionID });
       expect(out).toContain(`- ${h} \u00b7 ${UNKNOWN_HANDLE_TEXT}`);
     }
+    const noSession = await t.execute({ handles: [h] }, {});
+    expect(noSession).toContain(`- ${h} \u00b7 ${NO_SESSION_CONTEXT_TEXT}`);
+    expect(noSession).not.toContain(UNKNOWN_HANDLE_TEXT);
     expect(state.runs).toEqual([]);
     const out = await t.execute({ handles: [h] }, { sessionID: "orch" });
     expect(out).toContain(`- ${h} \u00b7 work a \u00b7 pass`);
     // No session was created: nothing retried, escalated or graded.
     expect(created).toEqual([]);
+  });
+
+  it("an unknown handle is terminal: the report tells the caller to stop polling", async () => {
+    const { hooks } = await makePlugin();
+    const unknown = `vrf_${"0".repeat(24)}`;
+    const out = await routerVerify(hooks).execute({ handles: [unknown] }, { sessionID: "orch" });
+    expect(out).toContain(`- ${unknown} \u00b7 ${UNKNOWN_HANDLE_TEXT}`);
+    expect(out).toContain("stop polling");
+    expect(state.runs).toEqual([]);
+  });
+
+  it("an unknown handle says the same thing on a repeated call and changes no state", async () => {
+    const { hooks } = await makePlugin();
+    const t = routerVerify(hooks);
+    const unknown = `vrf_${"1".repeat(24)}`;
+    const first = await t.execute({ handles: [unknown] }, { sessionID: "orch" });
+    const second = await t.execute({ handles: [unknown] }, { sessionID: "orch" });
+    expect(second).toBe(first);
+    expect(first).toContain("stop polling");
+    expect(registry().stats().entries).toBe(0);
+    expect(registry().stats().tombstones).toBe(0);
+    expect(state.runs).toEqual([]);
+  });
+
+  it("a valid handle with no session context gets the no-session text, never \"unknown handle\"", async () => {
+    const { hooks } = await makePlugin();
+    const t = routerVerify(hooks);
+    const h = await register(registry(), "a");
+    const out = await t.execute({ handles: [h] }, {});
+    expect(out).toContain(`- ${h} \u00b7 ${NO_SESSION_CONTEXT_TEXT}`);
+    expect(out).not.toContain(UNKNOWN_HANDLE_TEXT);
+    // A malformed input still gets the unknown-handle wording: it is not a session-context problem.
+    const malformed = await t.execute({ handles: ["vrf_nothex"] }, { sessionID: "orch" });
+    expect(malformed).toContain(UNKNOWN_HANDLE_TEXT);
+    expect(state.runs).toEqual([]);
+  });
+
+  it("a handle valid in one session stays unknown from another, before and after its verdict", async () => {
+    const { hooks } = await makePlugin();
+    const t = routerVerify(hooks);
+    const h = await register(registry(), "a");
+    const before = await t.execute({ handles: [h] }, { sessionID: "other" });
+    expect(before).toContain(`- ${h} \u00b7 ${UNKNOWN_HANDLE_TEXT}`);
+    expect(registry().get("orch", h)).toMatchObject({ kind: "found", entry: { state: "unverified" } });
+    const own = await t.execute({ handles: [h] }, { sessionID: "orch" });
+    expect(own).toContain(`- ${h} \u00b7 work a \u00b7 pass`);
+    const after = await t.execute({ handles: [h] }, { sessionID: "other" });
+    expect(after).toBe(before);
+    expect(registry().get("other", h).kind).toBe("unknown");
   });
 
   it("end to end: a deferred native task's footer handle verifies through the tool", async () => {
