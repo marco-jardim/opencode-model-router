@@ -31,8 +31,11 @@ import {
   resolveVariantSteps,
   statePath,
   validateConfig,
+  BACKGROUND_ENV,
+  backgroundModeFromEnv,
   type RouterConfig,
 } from "../../src/router/config";
+import { buildBackgroundDispatchesBlock } from "../../src/router/protocol";
 import {
   buildInfo,
   formatRouterLine,
@@ -318,6 +321,52 @@ describe("routing.background and routing.leases (Phase 2.1, OpenCode v2 only)", 
   it.each(["annotate", "refuse"] as const)("accepts leases.run %s", (run) => {
     const resolved = resolveRouting(cfgOf({ routing: { leases: { run } } }), "v2");
     expect(resolved.leases).toEqual({ mode: "enforce", run });
+  });
+
+  describe(`${BACKGROUND_ENV} (one-shot runs)`, () => {
+    it.each([["off", "off"], ["OFF", "off"], [" model ", "model"], ["auto", "auto"]] as const)("%j overrides the configured mode with %s", (raw, mode) => {
+      const log = logger();
+      const cfg = cfgOf({ routing: { background: { mode: mode === "auto" ? "off" : "auto", minPredictedMs: 1_000 } } });
+      expect(resolveRouting(cfg, "v2", log, { [BACKGROUND_ENV]: raw }).background).toEqual({ mode, minPredictedMs: 1_000 });
+      expect(log.warn).not.toHaveBeenCalled();
+    });
+
+    it("unset or empty: the configured mode applies, no warning", () => {
+      const log = logger();
+      const cfg = cfgOf({ routing: { background: { mode: "model" } } });
+      expect(resolveRouting(cfg, "v2", log, {}).background.mode).toBe("model");
+      expect(resolveRouting(cfg, "v2", log, { [BACKGROUND_ENV]: "  " }).background.mode).toBe("model");
+      expect(log.warn).not.toHaveBeenCalled();
+    });
+
+    it("an unknown value is ignored with one warning: the configured mode applies", () => {
+      const log = logger();
+      const cfg = cfgOf({ routing: { background: { mode: "model" } } });
+      for (let i = 0; i < 2; i++) expect(resolveRouting(cfg, "v2", log, { [BACKGROUND_ENV]: "foreground" }).background.mode).toBe("model");
+      expect(log.warn).toHaveBeenCalledTimes(1);
+      expect(log.warn.mock.calls[0]?.[0]).toBe(`${BACKGROUND_ENV}="foreground" is not one of auto|model|off; ignored, routing.background.mode applies`);
+    });
+
+    it("off removes the background protocol block", () => {
+      const cfg = cfgOf();
+      const previous = process.env[BACKGROUND_ENV];
+      try {
+        process.env[BACKGROUND_ENV] = "off";
+        expect(buildBackgroundDispatchesBlock(cfg)).toBe("");
+        delete process.env[BACKGROUND_ENV];
+        expect(buildBackgroundDispatchesBlock(cfg)).toContain("end the turn");
+      } finally {
+        if (previous === undefined) delete process.env[BACKGROUND_ENV];
+        else process.env[BACKGROUND_ENV] = previous;
+      }
+    });
+
+    it("backgroundModeFromEnv: unset, valid and invalid values", () => {
+      expect(backgroundModeFromEnv(undefined)).toEqual({});
+      expect(backgroundModeFromEnv("")).toEqual({});
+      expect(backgroundModeFromEnv("Off")).toEqual({ mode: "off" });
+      expect(backgroundModeFromEnv("0").issue).toContain(BACKGROUND_ENV);
+    });
   });
 
   it("an invalid value is dropped by validation (no throw) and reported as a notice", () => {
