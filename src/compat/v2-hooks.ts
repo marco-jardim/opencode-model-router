@@ -70,7 +70,7 @@ import { homedir, tmpdir } from "node:os";
 import { installGitSearchFilter, nearestRepository, repositoryIdentity } from "../router/git-tools";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { resolveRouting } from "../router/config";
+import { BACKGROUND_ENV, resolveRouting } from "../router/config";
 
 /** 2.1.5.f: the plugin-root notice is logged once per process. */
 let pluginRootLogged = false;
@@ -2668,6 +2668,16 @@ export async function registerV2Hooks(
   const cleanup = async () => {
     if (disposed) return;
     disposed = true;
+    // A background child still running ends with this process: nothing below waits for it (the drains cover the work
+    // after a child's end). Say so, with the fix: a one-shot run (`opencode run`, CI) exits as soon as the orchestrator
+    // ends its turn, which the background protocol tells it to do after a background dispatch.
+    const lost = inflight.list().filter((attempt) => attempt.state === "acknowledged");
+    if (lost.length > 0) {
+      ingestLogger.warn(
+        `[router] background: ${lost.length} dispatch${lost.length === 1 ? "" : "es"} still running ended with the process and ${lost.length === 1 ? "was" : "were"} lost. A one-shot run (opencode run, CI, scripts) exits when the orchestrator ends its turn: set ${BACKGROUND_ENV}=off or routing.background.mode "off" to keep dispatches in the foreground.`,
+        { dispatches: lost.map((attempt) => ({ agent: attempt.agent, description: attempt.description, child: attempt.childSessionID })) },
+      );
+    }
     abort.abort();
     // QA-2.1-8: verdict posts, recoveries and reloads in flight finish (bounded) before anything they write to is torn down.
     if (inFlightWork.size > 0) {

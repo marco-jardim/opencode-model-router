@@ -157,6 +157,48 @@ describe("off: byte-identical dispatch arguments", () => {
   });
 });
 
+describe("one-shot runs: MODEL_ROUTER_BACKGROUND and background dispatches lost on exit", () => {
+  it("MODEL_ROUTER_BACKGROUND=off wins over routing.background.mode auto: an explicit true stays foreground", async () => {
+    process.env.MODEL_ROUTER_BACKGROUND = "off";
+    const h = await boot("auto");
+    h.emit(created(CHILD, ORCH));
+    const call = await h.before(dispatch({ background: true }));
+    expect(inputOf(call).background).toBe(false);
+    const ack = await h.after({ ...call, status: "completed", result: structuredClone(RUNNING) });
+    expect(JSON.stringify(ack.result)).not.toContain("Running in the background");
+  });
+
+  it("a background child still running at dispose is reported as lost, with the fix", async () => {
+    const warn = vi.spyOn(console, "warn");
+    const h = await boot("auto");
+    h.emit(created(CHILD, ORCH));
+    const call = await h.before(dispatch({ background: true }));
+    await h.after({ ...call, status: "completed", result: structuredClone(RUNNING) });
+    await h.dispose();
+    host = undefined;
+    const lost = warn.mock.calls.map((args) => args.map(String).join(" ")).filter((line) => line.includes("still running ended with the process"));
+    expect(lost).toHaveLength(1);
+    expect(lost[0]).toContain("1 dispatch still running ended with the process and was lost");
+    expect(lost[0]).toContain("MODEL_ROUTER_BACKGROUND=off");
+    warn.mockRestore();
+  });
+
+  it("no warning when the background child ended before dispose", async () => {
+    const warn = vi.spyOn(console, "warn");
+    const h = await boot("auto");
+    h.emit(created(CHILD, ORCH));
+    const call = await h.before(dispatch({ background: true }));
+    await h.after({ ...call, status: "completed", result: structuredClone(RUNNING) });
+    childSays(h, CHILD, "all done");
+    h.emit(ended(CHILD));
+    await h.settled();
+    await h.dispose();
+    host = undefined;
+    expect(warn.mock.calls.some((args) => args.map(String).join(" ").includes("still running ended with the process"))).toBe(false);
+    warn.mockRestore();
+  });
+});
+
 describe("auto with a thin store", () => {
   it("an explicit background:false stays false", async () => {
     const h = await boot("auto");

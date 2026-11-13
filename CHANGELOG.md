@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **OpenCode v2: `MODEL_ROUTER_BACKGROUND` overrides `routing.background.mode` at runtime.** `off`, `model` or
+  `auto` (case-insensitive); an unknown value warns once and the configured mode applies. For one-shot runs
+  (`opencode run`, CI, scripts), which exit when the orchestrator ends its turn: a background dispatch was lost with
+  the process. `MODEL_ROUTER_BACKGROUND=off` keeps every dispatch in the foreground without editing the config.
+- **OpenCode v2: a background dispatch still running at dispose is reported.** One warning names the lost dispatches
+  (agent, description, child session) and the fix, instead of the work disappearing silently.
+
 ### Changed
 
 - **OpenCode v2: plans in different repositories can run at the same time in one Claude Code process.** Executor
