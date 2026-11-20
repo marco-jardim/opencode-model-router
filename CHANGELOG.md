@@ -26,6 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the tool description also includes a bounded list of commands accepting arguments. Argument acceptance is unchanged.
 - **Plan executor: recompiling a plan after abort and purge in the same process can be approved again.** A new plan
   reusing the same id gets fresh slot pools and collection state; stale slot handles from the purged plan remain fenced.
+- **OpenCode v2: read-only tiers recognise the host 2.0.31 default permissions.** Host 2.0.31 dropped the
+  `external_directory * ask` default, so its defaults were treated as explicit rules: the host's `.env` read rules were
+  re-appended after the tier policy and `host default permissions not recognised` was logged. Both the 2.0.22 and the
+  2.0.31 default sequences are now recognised (longest match); unknown sequences still fail closed. The v2 adapter now
+  typechecks against `@opencode/plugin` 2.0.31.
 
 ## [2.9.1] - 2026-10-25
 

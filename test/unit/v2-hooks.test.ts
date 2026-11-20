@@ -245,6 +245,31 @@ describe("OpenCode 2 hook adapter", () => {
     expect(f.agents.medium.permissions).toBeUndefined();
     expect(f.agents.explore).toEqual(before);
   });
+  it("prepends read-only policy before explicit host rules on the host 2.0.22 default shape", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const f = fixture();
+    // Literal host 2.0.22 Agent.Info.default permissions (the SDK above is newer).
+    f.agents.fast = { id: "fast", mode: "subagent", permissions: [
+      { action: "*", resource: "*", effect: "allow" },
+      { action: "external_directory", resource: "*", effect: "ask" },
+      { action: "read", resource: "*.env", effect: "ask" },
+      { action: "read", resource: "*.env.*", effect: "ask" },
+      { action: "read", resource: "*.env.example", effect: "allow" },
+      { action: "external_directory", resource: "*", effect: "deny" },
+    ], request: {} };
+    try {
+      await f.start({ config: async (cfg: { agent: Record<string, unknown> }) => {
+        cfg.agent.fast = { mode: "subagent", permission: { "*": "deny", read: "allow", router_git_status: "allow" } };
+      } });
+      expect(f.agents.fast.permissions).toEqual([
+        { action: "*", resource: "*", effect: "deny" },
+        { action: "read", resource: "*", effect: "allow" },
+        { action: "router_git_status", resource: "*", effect: "allow" },
+        { action: "external_directory", resource: "*", effect: "deny" },
+      ]);
+      expect(warn.mock.calls.filter(args => String(args[0]).includes("host default permissions not recognised"))).toHaveLength(0);
+    } finally { warn.mockRestore(); }
+  });
 
   it("leaves user permissions intact when the tier policy is opted out", async () => {
     const f = fixture();

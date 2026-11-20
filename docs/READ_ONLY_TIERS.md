@@ -50,8 +50,9 @@ left at the baseline's earlier position.
 
 V2's config-agent transform runs before external plugins. The host initializes
 agents with `Agent.Info.default`'s permissive rules, then appends configured rules.
-The router recognises a reviewed, hard-coded leading default sequence, not the
-bundled SDK's assertion about the running host. Unknown sequences fail closed:
+The router recognises reviewed, hard-coded leading default sequences (hosts
+2.0.22 and 2.0.31; the longest that matches wins), not the bundled SDK's
+assertion about the running host. Unknown sequences fail closed:
 inherited denies survive, while asks are projected onto permitted actions and
 allows require explicitly permitted actions. No inherited ask or allow can add
 a new action. Broad allows are dropped rather than projected onto `read`, where
