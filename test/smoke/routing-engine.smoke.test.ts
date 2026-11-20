@@ -40,6 +40,27 @@ const BASE_COMMIT = "71815eb";
  * these paths byte-identical; new #84 smoke files (roles, role spikes), the v2 harness and this file are outside the guarded set.
  */
 const V1_BASE_COMMIT = "bd1ecd1";
+/**
+ * Commit of the #68 / #95 item 2 fix (env isolation of the v1 deferred-catalog smoke). BUMP this one line to that commit's id
+ * once it is committed; until then it is not a commit id and scenario 6 fails, so the reviewed change cannot pass unpinned.
+ */
+const V1_ENV_ISOLATION_COMMIT = "2a14ded";
+/**
+ * Reviewed changes to guarded v1 paths after V1_BASE_COMMIT. The v1 freeze (AGENTS.md, host support policy) still allows
+ * regression and security fixes and keeping the v1 tests green; such a change is listed here with its reason, and its path is
+ * then pinned byte-identical to the reviewed commit instead of V1_BASE_COMMIT. Every other guarded path stays on V1_BASE_COMMIT,
+ * and a later edit to a listed path fails the scenario again until it is reviewed and repinned.
+ *
+ * #68 / #95 item 2 (test-only, no v1 plugin behaviour): the deferred-catalog smoke host inherited the caller's environment
+ * (provider keys, OPENCODE_*, XDG_*, APPDATA) and searched its log under HOME while an inherited XDG_DATA_HOME sent it
+ * elsewhere. It now gets an allow-listed environment with private XDG/APPDATA/LOCALAPPDATA/TEMP from the new v1 helper
+ * `helpers/v1-isolated-env.ts` (guarded from now on) and reads the log from the isolated XDG_DATA_HOME. An earlier, narrower
+ * fix of the same leak (`46dac26`, QA-0.P-17) was reverted in `9943abe` because this file is pinned.
+ */
+const V1_REVIEWED_BASES: Readonly<Record<string, { base: string; reason: string }>> = {
+  "test/smoke/deferred-catalog.smoke.test.ts": { base: V1_ENV_ISOLATION_COMMIT, reason: "#68/#95: allow-listed host env, private XDG/APPDATA/LOCALAPPDATA/TEMP, log read from the isolated XDG_DATA_HOME" },
+  "test/smoke/helpers/v1-isolated-env.ts": { base: V1_ENV_ISOLATION_COMMIT, reason: "#68/#95: new v1 helper, the env builder of that fix" },
+};
 /** `RESUME_END_WAIT_MS` of `src/index.ts`: the longest the delegate runner waits for a child's execution end after the child returned. */
 const RUNNER_END_WAIT_MS = 1_000;
 const d = RUN ? describe : describe.skip;
@@ -551,26 +572,29 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
       expect(teardown.hostPortClosed && teardown.providerStopped && teardown.rootRemoved).toBe(true);
     }
   }, 300_000);
-  it("6 v1 untouched: the v1 smoke suite, its config, its preflight and the smoke:keyless / smoke:v1 scripts are byte-identical to the v1 base (V1_BASE_COMMIT)", async () => {
-    await runScenario("6-v1-untouched", `The v1 entry points are unchanged since ${V1_BASE_COMMIT} (a commit on the #84 rta line, parent 66dcdff; for every guarded path it equals master before #84, eeab36b, except the FAST_MODEL literal of subagent-tiers.smoke.test.ts aligned with #83's Haiku fast tier — see V1_BASE_COMMIT): the v1 suite smoke:keyless runs (registration, subagent-tiers, deferred-catalog, depth-effort, the scripted-provider helper and its test, fetch-safe-port), vitest.smoke.config.ts, its temp guard test/setup/smoke-tmp-guard.ts, scripts/smoke-v1-preflight.mjs, and the package.json scripts smoke:keyless and smoke:v1 (the alias of smoke:keyless behind a preflight that fails clearly when \`opencode\` on PATH is not 1.x, QA-3.2-11, QA-3.2-R2-2). Repinned by #84 P3.1 from the stale Phase 3.2 base ${BASE_COMMIT}. Every other test/smoke change since the v1 base is recorded, not asserted.`, async s => {
+  it("6 v1 untouched: the v1 smoke suite, its config, its preflight and the smoke:keyless / smoke:v1 scripts are byte-identical to the v1 base (V1_BASE_COMMIT) or to their reviewed base (V1_REVIEWED_BASES)", async () => {
+    await runScenario("6-v1-untouched", `The v1 entry points are unchanged since ${V1_BASE_COMMIT} (a commit on the #84 rta line, parent 66dcdff; for every guarded path it equals master before #84, eeab36b, except the FAST_MODEL literal of subagent-tiers.smoke.test.ts aligned with #83's Haiku fast tier — see V1_BASE_COMMIT): the v1 suite smoke:keyless runs (registration, subagent-tiers, deferred-catalog, depth-effort, the scripted-provider helper and its test, fetch-safe-port, v1-isolated-env), vitest.smoke.config.ts, its temp guard test/setup/smoke-tmp-guard.ts, scripts/smoke-v1-preflight.mjs, and the package.json scripts smoke:keyless and smoke:v1 (the alias of smoke:keyless behind a preflight that fails clearly when \`opencode\` on PATH is not 1.x, QA-3.2-11, QA-3.2-R2-2). Repinned by #84 P3.1 from the stale Phase 3.2 base ${BASE_COMMIT}. A path listed in V1_REVIEWED_BASES (a reviewed v1 fix: #68/#95 env isolation of deferred-catalog and its helper v1-isolated-env) is pinned byte-identical to its own reviewed commit instead, and fails while that commit is not set. Every other test/smoke change since the v1 base is recorded, not asserted.`, async s => {
       const git = (...args: string[]) => execFileSync("git", args, { cwd: ROOT, encoding: "utf8", windowsHide: true }).trim();
-      const v1Files = ["registration.smoke.test.ts", "subagent-tiers.smoke.test.ts", "deferred-catalog.smoke.test.ts", "depth-effort.smoke.test.ts", "helpers/scripted-provider.ts", "helpers/scripted-provider.test.ts", "helpers/fetch-safe-port.ts"];
+      const v1Files = ["registration.smoke.test.ts", "subagent-tiers.smoke.test.ts", "deferred-catalog.smoke.test.ts", "depth-effort.smoke.test.ts", "helpers/scripted-provider.ts", "helpers/scripted-provider.test.ts", "helpers/fetch-safe-port.ts", "helpers/v1-isolated-env.ts"];
       const v1Paths = [...v1Files.map(file => `test/smoke/${file}`), "vitest.smoke.config.ts", "test/setup/smoke-tmp-guard.ts", "scripts/smoke-v1-preflight.mjs"];
-      const changedV1 = v1Paths.filter(file => git("diff", "--name-only", V1_BASE_COMMIT, "--", file) !== "");
+      const baseOf = (file: string): string => V1_REVIEWED_BASES[file]?.base ?? V1_BASE_COMMIT;
+      const unpinned = v1Paths.filter(file => !/^[0-9a-f]{7,40}$/.test(baseOf(file)));
+      const changedV1 = v1Paths.filter(file => !unpinned.includes(file) && git("diff", "--name-only", baseOf(file), "--", file) !== "");
       const scriptsOf = (json: string): Record<string, unknown> => (JSON.parse(json) as { scripts?: Record<string, unknown> }).scripts ?? {};
       const baseScripts = scriptsOf(git("show", `${V1_BASE_COMMIT}:package.json`));
       const nowScripts = scriptsOf(await readFile(path.join(ROOT, "package.json"), "utf8"));
       const v1Scripts = ["smoke:keyless", "smoke:v1"].map(name => ({ name, base: baseScripts[name], now: nowScripts[name] }));
       s.observed.v1BaseCommit = V1_BASE_COMMIT;
       s.observed.phase32BaseCommit = BASE_COMMIT;
-      s.observed.v1Paths = v1Paths.map(file => ({ file, changed: changedV1.includes(file) }));
+      s.observed.v1ReviewedBases = V1_REVIEWED_BASES;
+      s.observed.v1Paths = v1Paths.map(file => ({ file, base: baseOf(file), changed: changedV1.includes(file), unpinned: unpinned.includes(file) }));
       s.observed.v1Scripts = v1Scripts;
       s.observed.otherSmokeChangesSinceV1Base = git("diff", "--name-status", V1_BASE_COMMIT, "--", "test/smoke").split(/\r?\n/).filter(Boolean);
       s.observed.externalRun = "npm run smoke:v1 (= preflight + smoke:keyless) with OpenCode 1.18.35 first on PATH: exit 0 (#84 P3.1, docs/qa/role-tier/phase-p31.md); earlier: smoke:keyless with OpenCode 1.18.34, 5 files passed (phase-3.2.md)";
       const scriptsKept = v1Scripts.every(x => typeof x.base === "string" && x.base === x.now)
         && nowScripts["smoke:v1"] === "node scripts/smoke-v1-preflight.mjs && npm run smoke:keyless";
-      const ok = changedV1.length === 0 && scriptsKept;
-      s.verdict(ok, `v1 paths changed since ${V1_BASE_COMMIT}: ${changedV1.length === 0 ? "none" : changedV1.join(", ")}; smoke:keyless/smoke:v1 unchanged: ${scriptsKept}`);
+      const ok = unpinned.length === 0 && changedV1.length === 0 && scriptsKept;
+      s.verdict(ok, `v1 paths changed since their base (${V1_BASE_COMMIT} unless reviewed): ${changedV1.length === 0 ? "none" : changedV1.join(", ")}; reviewed bases not pinned to a commit: ${unpinned.length === 0 ? "none" : unpinned.join(", ")}; smoke:keyless/smoke:v1 unchanged: ${scriptsKept}`);
     });
   }, 60_000);
   it("7 openai responses: effort delivery of a same-model variant change on the OpenAI Responses route (A7 / QA-0P-26)", async () => {

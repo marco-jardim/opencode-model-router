@@ -29,6 +29,7 @@ import {
   DRIFT_NOTICE,
   DRIFT_UNCHECKED_NOTICE,
   isRetryableVerdict,
+  NO_SESSION_TEXT,
   parseRouterVerifyArgs,
   ROUTER_VERIFY_ARGS_TEXT,
   ROUTER_VERIFY_NO_PENDING_TEXT,
@@ -814,7 +815,7 @@ describe("verifyHandles (2.4.3a)", () => {
   it("scoping (R6): another session, the producer's session and malformed input are all unknown; nothing runs", async () => {
     const { wiring } = makeWiring();
     const h = await register(wiring.pending, "a");
-    for (const sid of ["other", "child-a", ""]) {
+    for (const sid of ["other", "child-a"]) {
       const report = await wiring.verifyHandles(sid, { kind: "handles", handles: [h] });
       expect(report.items).toEqual([{ kind: "unknown", input: h }]);
       expect(report.text).toContain(`- ${h} \u00b7 ${UNKNOWN_HANDLE_TEXT}`);
@@ -1476,10 +1477,15 @@ describe("the router_verify tool (2.4.3b)", () => {
     const { hooks, created } = await makePlugin();
     const t = routerVerify(hooks);
     const h = await register(registry(), "a");
-    for (const sessionID of ["other", "child-a", undefined]) {
-      const out = await t.execute({ handles: [h] }, sessionID === undefined ? {} : { sessionID });
+    for (const sessionID of ["other", "child-a"]) {
+      const out = await t.execute({ handles: [h] }, { sessionID });
       expect(out).toContain(`- ${h} \u00b7 ${UNKNOWN_HANDLE_TEXT}`);
     }
+    // No session id at all: answered explicitly, not as an unknown handle.
+    const noSession = await t.execute({ handles: [h] }, {});
+    expect(noSession).toContain(`- ${h} \u00b7 ${NO_SESSION_TEXT}`);
+    expect(noSession).not.toContain(UNKNOWN_HANDLE_TEXT);
+    expect(await t.execute({ pending: true }, {})).toContain(NO_SESSION_TEXT);
     expect(state.runs).toEqual([]);
     const out = await t.execute({ handles: [h] }, { sessionID: "orch" });
     expect(out).toContain(`- ${h} \u00b7 work a \u00b7 pass`);

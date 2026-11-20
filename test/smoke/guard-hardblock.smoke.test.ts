@@ -20,6 +20,7 @@ import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { keyedSmokeEnv } from "../setup/smoke-tmp-guard";
+import { smokeTierOverride } from "./helpers/tier-override";
 
 const RUN = process.env.RUN_OC_SMOKE === "1";
 const d = RUN ? describe : describe.skip;
@@ -62,47 +63,24 @@ const OVERRIDES_FILE = path.join(
 );
 
 /**
- * Point every tier of the ACTIVE preset at SMOKE_MODEL.
+ * Point every tier at SMOKE_MODEL with a dedicated preset (see
+ * {@link smokeTierOverride} for why not a patch with `variant: ""`).
  *
  * Returns a restore function that is safe to call unconditionally.  When
  * MODEL_ROUTER_SMOKE_MODEL is unset this writes NOTHING and touches NOTHING,
  * so the Anthropic path is completely unaffected.
- *
- * `variant: ""` matters: the bundled anthropic preset sets a `variant` on
- * medium/heavy, the loader deep-merges (siblings survive, keys cannot be
- * deleted), and src/index.ts applies `variant` with a truthiness check — so an
- * empty string is the only way to stop an Anthropic-only knob from riding
- * along to a non-Anthropic model.
  */
 function installTierOverrides(): () => void {
   if (!MODEL_OVERRIDDEN) return () => {};
-
-  const tiers = JSON.parse(
-    fs.readFileSync(path.join(REPO_ROOT, "tiers.json"), "utf8")
-  ) as { activePreset?: string };
-  const preset = tiers.activePreset ?? "anthropic";
 
   fs.mkdirSync(OVERRIDES_DIR, { recursive: true });
   const previous = fs.existsSync(OVERRIDES_FILE)
     ? fs.readFileSync(OVERRIDES_FILE, "utf8")
     : null;
 
-  const tierOverride = { model: SMOKE_MODEL, variant: "" };
   fs.writeFileSync(
     OVERRIDES_FILE,
-    JSON.stringify(
-      {
-        presets: {
-          [preset]: {
-            fast: tierOverride,
-            medium: tierOverride,
-            heavy: tierOverride,
-          },
-        },
-      },
-      null,
-      2
-    ),
+    JSON.stringify(smokeTierOverride(SMOKE_MODEL), null, 2),
     "utf8"
   );
 

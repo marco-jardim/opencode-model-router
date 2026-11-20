@@ -37,12 +37,21 @@ describe("read-only tier policy", () => {
     { action: "read", resource: "*.env.*", effect: "ask" },
     { action: "read", resource: "*.env.example", effect: "allow" },
   ];
+  // Host 2.0.31 dropped the external_directory default.
+  const host2031: PermissionRule[] = [
+    { action: "*", resource: "*", effect: "allow" },
+    { action: "read", resource: "*.env", effect: "ask" },
+    { action: "read", resource: "*.env.*", effect: "ask" },
+    { action: "read", resource: "*.env.example", effect: "allow" },
+  ];
   const drift: Record<string, PermissionRule[]> = {
     identical: host,
+    "identical-2.0.31": host2031,
     "appended-allow": [...host, { action: "websearch", resource: "*", effect: "allow" }],
     "inserted-mid": [host[0]!, { action: "question", resource: "*", effect: "allow" }, ...host.slice(1)],
     respelled: [host[0]!, host[1]!, { action: "read", resource: "**/*.env", effect: "ask" }, ...host.slice(3)],
-    dropped: [host[0]!, ...host.slice(2)],
+    dropped: [...host.slice(0, 2), ...host.slice(3)],
+    "dropped-2.0.31": [host2031[0]!, ...host2031.slice(2)],
   };
   it.each(Object.entries(drift))("fails closed for hard-coded host sequence: %s", (name, inherited) => {
     const warn = vi.fn();
@@ -51,8 +60,10 @@ describe("read-only tier policy", () => {
     expect(evaluatePermission(rules, "read", "src/a.ts")).toBe("allow");
     expect(evaluatePermission(rules, "read", ".env")).toBe("ask");
     expect(rules).not.toContainEqual({ action: "*", resource: "*", effect: "allow" });
-    if (name === "identical") expect(warn).not.toHaveBeenCalled();
-    else if (name === "appended-allow") {
+    if (name === "identical" || name === "identical-2.0.31") {
+      expect(warn).not.toHaveBeenCalled();
+      expect(rules).toEqual(permissionRules(readOnlyPermissions()));
+    } else if (name === "appended-allow") {
       expect(warn).toHaveBeenCalledWith("inherited grant dropped for fast");
       expect(warn).not.toHaveBeenCalledWith("host default permissions not recognised for fast");
     } else expect(warn).toHaveBeenCalledWith("host default permissions not recognised for fast");

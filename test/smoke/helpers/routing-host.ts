@@ -881,7 +881,8 @@ export class RoutingHost {
     child.stdout!.on("data", chunk => { this.output += chunk; });
     child.stderr!.on("data", chunk => { this.output += chunk; });
     this.baseUrl = await waitFor("host to listen", () => {
-      if (child.exitCode !== null) throw new Error(`OpenCode 2 exited early:\n${this.output}`);
+      // A signal-terminated child (SIGTERM/SIGKILL on POSIX) has exitCode null and signalCode set; both mean it is gone.
+      if (child.exitCode !== null || child.signalCode !== null) throw new Error(`OpenCode 2 exited early:\n${this.output}`);
       return /server listening on (http:\/\/127\.0\.0\.1:\d+)/.exec(this.output.slice(outputFrom))?.[1];
     }, 40_000);
     timing?.mark("host.listening.observed", { launch });

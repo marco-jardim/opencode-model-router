@@ -15,6 +15,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **OpenCode v2: `router_verify` on a background handle whose child is still running answers `held`, not `unknown handle`.**
+  The handle is reserved and listed every turn from the background ack but registered only when the child finishes, so
+  until then the registry did not know it and an orchestrator that polled it got `unknown handle` again and again. The
+  session the handle was issued to now gets the held answer, and the verdict is replayed once it settles. Another
+  session's reserved handle still reads as unknown, and a reservation is released when the held entry cannot be
+  registered, so the handle is not answered `held` for hours after the gate posted its verdict directly.
+- **`router_verify` answers an unknown handle terminally, and a call without a session id explicitly.** `unknown handle`
+  now says the session has no record of it (never issued here, issued to another session, or no longer tracked after a restart,
+  eviction or a failed background run) and that retrying will not change the answer. A call with no session id, for handles or `pending: true`,
+  is answered `no session` instead of `unknown handle` or "no unverified delegations in this session". Wording only on
+  OpenCode v1.
 - **OpenCode v2: resumed background dispatches keep their own results and verification handles.** Historical completions
   first scanned after a resume no longer supply the resumed attempt's result, and held placeholders retain their attempt's
   announced handle instead of changing to the newest handle for the same child session.
@@ -29,6 +40,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **OpenCode v2 / roles mode: each parallel tool call of a role agent is checked against its own arguments (#86).** The
   `execute.before` authority check now reads the call's tool and input when the hook is invoked, not after its awaits,
   so a refusal no longer names another parallel call's path when the host reuses or rewrites a pending call's event.
+- **OpenCode v2: read-only tiers recognise the host 2.0.31 default permissions.** Host 2.0.31 dropped the
+  `external_directory * ask` default, so its defaults were treated as explicit rules: the host's `.env` read rules were
+  re-appended after the tier policy and `host default permissions not recognised` was logged. Both the 2.0.22 and the
+  2.0.31 default sequences are now recognised (longest match); unknown sequences still fail closed. The v2 adapter now
+  typechecks against `@opencode/plugin` 2.0.31.
 
 ## [2.9.1] - 2026-10-25
 

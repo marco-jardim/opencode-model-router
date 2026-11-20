@@ -608,7 +608,9 @@ describe("scoping (R6)", () => {
   });
 
   it("exports the stable phrases", () => {
-    expect(UNKNOWN_HANDLE_TEXT).toBe("unknown handle");
+    expect(UNKNOWN_HANDLE_TEXT).toBe(
+      "unknown handle: this session has no record of it (never issued here, issued to another session, or no longer tracked after a restart, eviction or a failed background run); retrying will not change the answer",
+    );
     expect(EXPIRED_HANDLE_TEXT).toBe("expired handle: older than pendingTtlMs or evicted; it can no longer be verified");
     expect(VERIFYING_ELSEWHERE_TEXT).toBe(
       "still being verified by another router_verify call; call again for its verdict",
@@ -1004,6 +1006,18 @@ describe("held entries, idempotent register and persistence (phase 2.1)", () => 
     expect(registry.reserveHandle("orch")).toBeUndefined();
     registry.releaseHandle(handle ?? "");
     expect(registry.reserveHandle("orch")).toBeDefined();
+  });
+
+  it("reservedBy names the reserving session until the handle is registered or released", () => {
+    const registry = createPendingRegistry(options);
+    const handle = registry.reserveHandle("orch") ?? "";
+    expect(registry.reservedBy(handle)).toBe("orch");
+    expect(registry.reservedBy("vrf_000000000000000000000000")).toBeUndefined();
+    registry.register(reg({ dispatchID: "call-r", producerSessionID: "child", handle, hold: { childSessionID: "child", callID: "call-r" } }));
+    expect(registry.reservedBy(handle)).toBeUndefined();
+    const other = registry.reserveHandle("orch") ?? "";
+    registry.releaseHandle(other);
+    expect(registry.reservedBy(other)).toBeUndefined();
   });
 
   it("persists entries and state, and restore rebuilds the held entry (held past the TTL ends unverifiable)", async () => {
