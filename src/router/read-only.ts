@@ -7,20 +7,44 @@ export type PermissionEffect = "allow" | "deny" | "ask";
 export type PermissionMap = Record<string, PermissionEffect | Record<string, PermissionEffect>>;
 export interface PermissionRule { action: string; resource: string; effect: PermissionEffect }
 
-/** Reviewed host shape, not a call into the plugin's bundled SDK pretending to
- * describe the running host. Unknown shapes take the conservative branch. */
-const KNOWN_HOST_DEFAULTS: readonly PermissionRule[] = [
-  { action: "*", resource: "*", effect: "allow" },
-  { action: "external_directory", resource: "*", effect: "ask" },
-  { action: "read", resource: "*.env", effect: "ask" },
-  { action: "read", resource: "*.env.*", effect: "ask" },
-  { action: "read", resource: "*.env.example", effect: "allow" },
+/** Reviewed host shapes of `Agent.Info.default(id).permissions`, not a call into
+ * the plugin's bundled SDK pretending to describe the running host. The longest
+ * shape that prefixes the inherited rules is the host default; unknown shapes
+ * take the conservative branch. */
+const KNOWN_HOST_DEFAULTS: readonly (readonly PermissionRule[])[] = [
+  // Host 2.0.22.
+  [
+    { action: "*", resource: "*", effect: "allow" },
+    { action: "external_directory", resource: "*", effect: "ask" },
+    { action: "read", resource: "*.env", effect: "ask" },
+    { action: "read", resource: "*.env.*", effect: "ask" },
+    { action: "read", resource: "*.env.example", effect: "allow" },
+  ],
+  // Host 2.0.31: the external_directory default is gone.
+  [
+    { action: "*", resource: "*", effect: "allow" },
+    { action: "read", resource: "*.env", effect: "ask" },
+    { action: "read", resource: "*.env.*", effect: "ask" },
+    { action: "read", resource: "*.env.example", effect: "allow" },
+  ],
 ];
+
+/** Length of the longest known host default prefixing `inherited`, or undefined. */
+function knownHostDefaultsLength(inherited: readonly PermissionRule[]): number | undefined {
+  let longest: number | undefined;
+  for (const shape of KNOWN_HOST_DEFAULTS) {
+    if (shape.length > (longest ?? -1) && shape.every((rule, i) => inherited[i]?.action === rule.action
+      && inherited[i]?.resource === rule.resource && inherited[i]?.effect === rule.effect)) longest = shape.length;
+  }
+  return longest;
+}
 export const READ_ONLY_CANARIES = ["shell", "bash", "edit", "write", "patch", "execute", "subagent", "task", "webfetch", "websearch", "browser",
   `router_readonly_canary_${randomUUID()}`];
 
-/** Mirrors host v2.0.22 Permission.evaluate + util/wildcard.ts: last match,
- * slash normalization, ? and *, dotall, Windows case folding, default ask. */
+/** Mirrors host Permission.evaluate + util/wildcard.ts as reviewed at v2.0.22
+ * (host core, not shipped in the @opencode/* packages; their Permission.Rule
+ * schema is unchanged in 2.0.31): last match, slash normalization, ? and *,
+ * dotall, Windows case folding, default ask. */
 export function permissionMatches(input: string, pattern: string): boolean {
   let escaped = pattern.replaceAll("\\", "/").replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".");
   if (escaped.endsWith(" .*")) escaped = escaped.slice(0, -3) + "( .*)?";
@@ -81,9 +105,9 @@ function publishPluginPermissions(name: string, policy: readonly PermissionRule[
 export function publishReadOnlyPermissions(name: string, policy: readonly PermissionRule[], inherited: readonly PermissionRule[], warn: (message: string) => void, opts: { plugin?: boolean } = {}): PermissionRule[] {
   if (opts.plugin === true) return publishPluginPermissions(name, policy, inherited, warn);
   const canaries = READ_ONLY_CANARIES;
-  const recognised = KNOWN_HOST_DEFAULTS.every((rule, i) => inherited[i]?.action === rule.action
-    && inherited[i]?.resource === rule.resource && inherited[i]?.effect === rule.effect);
-  const tail = inherited.slice(recognised ? KNOWN_HOST_DEFAULTS.length : 0);
+  const defaults = knownHostDefaultsLength(inherited);
+  const recognised = defaults !== undefined;
+  const tail = inherited.slice(defaults ?? 0);
   const allowed = new Set(policy.filter(rule => rule.effect === "allow" && rule.action !== "*").map(rule => rule.action));
   // Keep P1's rejection of non-explicit allows: projecting a drifted host's
   // '* allow' onto read would overwrite the policy's sensitive-path asks.
