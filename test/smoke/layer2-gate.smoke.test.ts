@@ -28,6 +28,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { keyedSmokeEnv } from "../setup/smoke-tmp-guard";
+import { effectiveTierModels, smokeTierOverride } from "./helpers/tier-override";
 import {
   prepareFixtureRepo,
   type FixtureRepo,
@@ -85,41 +86,23 @@ const OVERRIDES_FILE = path.join(
  * Returns a restore function that is safe to call unconditionally.  When
  * MODEL_ROUTER_SMOKE_MODEL is unset this writes NOTHING and touches NOTHING.
  *
- * `variant: ""` matters: the bundled anthropic preset sets a `variant` on
- * medium/heavy, the loader deep-merges (siblings survive, keys cannot be
- * deleted), and src/index.ts applies `variant` with a truthiness check — so an
- * empty string is the only way to stop an Anthropic-only knob from riding
- * along to a non-Anthropic model.
+ * Uses a dedicated model-only preset (see {@link smokeTierOverride}): the loader
+ * deep-merges, so patching the bundled anthropic preset would carry its
+ * Anthropic-only `variant`/`effort` along, and `variant: ""` is rejected by the
+ * tier validator, which drops the whole overrides layer (the tiers then silently
+ * stay on the bundled Anthropic models).
  */
 function installTierOverrides(): () => void {
   if (!MODEL_OVERRIDDEN) return () => {};
-
-  const tiers = JSON.parse(
-    fs.readFileSync(path.join(REPO_ROOT, "tiers.json"), "utf8"),
-  ) as { activePreset?: string };
-  const preset = tiers.activePreset ?? "anthropic";
 
   fs.mkdirSync(OVERRIDES_DIR, { recursive: true });
   const previous = fs.existsSync(OVERRIDES_FILE)
     ? fs.readFileSync(OVERRIDES_FILE, "utf8")
     : null;
 
-  const tierOverride = { model: SMOKE_MODEL, variant: "" };
   fs.writeFileSync(
     OVERRIDES_FILE,
-    JSON.stringify(
-      {
-        presets: {
-          [preset]: {
-            fast: tierOverride,
-            medium: tierOverride,
-            heavy: tierOverride,
-          },
-        },
-      },
-      null,
-      2,
-    ),
+    JSON.stringify(smokeTierOverride(SMOKE_MODEL), null, 2),
     "utf8",
   );
 
@@ -391,21 +374,35 @@ async function prepareVerifyProject(): Promise<VerifyProject> {
 /** Same tier override as installTierOverrides, written into the project dir. */
 function writeProjectTierOverrides(dir: string): void {
   if (!MODEL_OVERRIDDEN) return;
-  const tiers = JSON.parse(
-    fs.readFileSync(path.join(REPO_ROOT, "tiers.json"), "utf8"),
-  ) as { activePreset?: string };
-  const preset = tiers.activePreset ?? "anthropic";
-  const tierOverride = { model: SMOKE_MODEL, variant: "" };
   fs.mkdirSync(path.join(dir, ".opencode"), { recursive: true });
   fs.writeFileSync(
     path.join(dir, ".opencode", "opencode-model-router.overrides.jsonc"),
-    JSON.stringify(
-      { presets: { [preset]: { fast: tierOverride, medium: tierOverride, heavy: tierOverride } } },
-      null,
-      2,
-    ),
+    JSON.stringify(smokeTierOverride(SMOKE_MODEL), null, 2),
     "utf8",
   );
+  assertOverrideTakesEffect(dir);
+}
+
+/**
+ * Fail fast, and by name, when the override written for `dir` would not move
+ * every tier to SMOKE_MODEL for the host that `runOpencode` spawns (same
+ * private home, same project directory). Without this a dropped layer, or a
+ * `/preset` state file in the private home that outranks `activePreset`, only
+ * shows up after a multi-minute run as `Model not found: anthropic/...`.
+ */
+function assertOverrideTakesEffect(dir: string): void {
+  const home = keyedSmokeEnv().HOME;
+  if (!home) throw new Error("keyedSmokeEnv() returned no HOME");
+  const seen = effectiveTierModels(dir, home);
+  const wrong = Object.entries(seen.models).filter(([, model]) => model !== SMOKE_MODEL);
+  if (wrong.length > 0) {
+    throw new Error(
+      `tier override not effective for ${dir} (home ${home}): active preset '${seen.activePreset}', ` +
+        `tiers ${JSON.stringify(seen.models)}, expected every tier on ${SMOKE_MODEL}. ` +
+        `Loader warnings: ${JSON.stringify(seen.warnings)}. ` +
+        `State file in the private home: ${fs.existsSync(path.join(home, ".config", "opencode", "opencode-model-router.state.json"))}.`,
+    );
+  }
 }
 
 interface OcRun {
