@@ -7,7 +7,8 @@
  * routes `launch()` reads (`GET /api/agent`, `GET /api/plugin`, both behind the host's Basic password). It is started through a
  * `vi.mock` of `node:child_process` that maps the absolute `OPENCODE_V2_BIN` path onto `node <stub>`: a `.cmd` wrapper cannot be
  * spawned without a shell on win32, and `RoutingHost` (unchanged by this file) spawns without one. Everything else (the isolated root,
- * opencode.json, the logs, the provider, the front, the client, taskkill) is the real harness.
+ * opencode.json, the logs, the provider, the front, the client, the process-table reads and taskkill) is the real harness; the mock
+ * only records each taskkill's arguments (`spawnSync` for the pid-only restart, `execFile` for the win32 tree kill of #95).
  */
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { SpawnOptions, SpawnSyncOptions } from "node:child_process";
@@ -16,17 +17,26 @@ import { appendFile, mkdtemp, readFile, stat, writeFile } from "node:fs/promises
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { pidAlive, removeDirWhenReleased, waitUntil } from "../../helpers/remove-dir";
-import { EVIDENCE_DIR, OPENAI_PROVIDER, ROOT, RoutingHost, arr, evidenceDir, jsonl, obj, str, waitFor, type HostOptions, type Obj } from "./routing-host";
+import { EVIDENCE_DIR, OPENAI_PROVIDER, ROOT, RoutingHost, TREE_KILL_METHOD, arr, evidenceDir, jsonl, obj, str, waitFor, type HostOptions, type Obj, type Teardown } from "./routing-host";
+import type { KillRecord, ProcessRow } from "./process-tree";
 import { CpxTimings } from "./cpx-timing";
 import { collectObservationFiles } from "./cpx-idle-oracle";
 
 const redirect = vi.hoisted(() => ({ executable: "", script: "", taskkills: [] as string[][] }));
 vi.mock("node:child_process", async importOriginal => {
   const actual = await importOriginal<typeof import("node:child_process")>();
+  const { promisify } = await import("node:util");
   const target = (file: string, args: readonly string[]): [string, readonly string[]] =>
     redirect.executable !== "" && file === redirect.executable ? [process.execPath, [redirect.script, ...args]] : [file, args];
+  const recordTaskkill = (file: string, args: unknown) => { if (file === "taskkill") redirect.taskkills.push(Array.isArray(args) ? args.map(String) : []); };
+  // process-tree.ts (the win32 stop() kill) runs taskkill through promisify(execFile): keep promisify's custom form and record it too.
+  const execFileAsync = promisify(actual.execFile);
+  const execFile = Object.assign((file: string, ...rest: unknown[]): unknown => { recordTaskkill(file, rest[0]); return Reflect.apply(actual.execFile, undefined, [file, ...rest]); }, {
+    [promisify.custom]: (file: string, args: readonly string[], options: unknown) => { recordTaskkill(file, args); return execFileAsync(file, args, options as never); },
+  });
   return {
     ...actual,
+    execFile,
     spawn: (file: string, args: readonly string[], options: SpawnOptions) => { const [f, a] = target(file, args); return actual.spawn(f, a, options); },
     spawnSync: (file: string, args: readonly string[], options: SpawnSyncOptions) => {
       if (file === "taskkill") redirect.taskkills.push([...args]);
@@ -105,6 +115,29 @@ const anthropicBaseURL = (config: Obj): string | undefined => str(obj(obj(obj(co
 const ask = JSON.stringify({ model: "fixture", stream: false, messages: [{ role: "user", content: "ok" }] });
 const post = (baseURL: string) => fetch(`${baseURL}/messages`, { method: "POST", body: ask });
 const get = (host: RoutingHost, authorization: string) => fetch(new URL("/api/agent", host.baseUrl), { headers: { authorization } });
+/**
+ * #95, win32 stop(): `taskkills` (the calls stop() made) are exactly one `/F /PID <pid>` per killed/failed record, never `/T`;
+ * every record is a tree member; the root is killed in round 1 and is last in each round it appears in, and last overall.
+ */
+function expectSafeTreeKill(teardown: Teardown, taskkills: readonly string[][], rootPid: number): void {
+  expect(teardown.method).toBe(TREE_KILL_METHOD);
+  const record = obj(teardown.taskkill);
+  const kills = arr(record.kills) as KillRecord[];
+  const members = new Set((arr(record.tree) as ProcessRow[]).map(p => p.ProcessId));
+  expect(kills.length).toBeGreaterThan(0);
+  expect(taskkills.flat()).not.toContain("/T");
+  expect(taskkills).toEqual(kills.filter(k => k.action === "killed" || k.action === "failed").map(k => ["/F", "/PID", String(k.pid)]));
+  expect(kills.every(k => members.has(k.pid))).toBe(true);
+  expect(kills.find(k => k.role === "root")).toMatchObject({ pid: rootPid, action: "killed", round: 1 });
+  for (const round of new Set(kills.map(k => k.round))) {
+    const inRound = kills.filter(k => k.round === round);
+    const rootAt = inRound.findIndex(k => k.role === "root");
+    if (rootAt >= 0) expect(rootAt).toBe(inRound.length - 1);
+  }
+  expect(taskkills.at(-1)).toEqual(["/F", "/PID", String(rootPid)]);
+  expect(arr(record.survivors)).toEqual([]);
+  expect(arr(record.errors)).toEqual([]);
+}
 
 // ------------------------------------------------------------ extraPlugins ----
 it("enables observations only by opt-in in a per-host directory outside project/worktrees, never inherited", async () => {
@@ -296,16 +329,45 @@ it("restart({ tree: false, serverPid }) kills only that pid, leaves a descendant
     expect(await host.hostConfigOnDisk()).toEqual(before.config);
     expect(await host.rawEvents()).toEqual([{ type: "before-server-only-kill" }]);
     expect((await post(anthropicBaseURL(before.config)!)).status).toBe(200);
-    expect((await host.stop()).rootRemoved).toBe(true);
-    if (process.platform === "win32") expect(redirect.taskkills[1]).toEqual(["/PID", String(runs[1]!.pid), "/T", "/F"]);
+    const teardown = await host.stop();
+    expect(teardown.rootRemoved).toBe(true);
+    if (process.platform === "win32") expectSafeTreeKill(teardown, redirect.taskkills.slice(1), runs[1]!.pid);
     expect(await waitUntil(() => !pidAlive(runs[1]!.pid), 5_000)).toBe(true);
     expect(pidAlive(first!.descendantPid!)).toBe(true);
+    // The orphaned descendant of the first child shares no live parent with the second tree: never a member, never killed.
+    if (process.platform === "win32") {
+      expect((arr(obj(teardown.taskkill).tree) as ProcessRow[]).map(p => p.ProcessId)).not.toContain(first!.descendantPid);
+      expect(redirect.taskkills).not.toContainEqual(["/F", "/PID", String(first!.descendantPid)]);
+    }
   } finally {
     // The descendant deliberately survives both restart and stop, so the test owns its cleanup even on assertion/boot failure.
     for (const run of await launches()) if (run.descendantPid !== undefined && pidAlive(run.descendantPid)) {
       process.kill(run.descendantPid);
       expect(await waitUntil(() => !pidAlive(run.descendantPid!), 5_000)).toBe(true);
     }
+  }
+}, 60_000);
+
+it.runIf(process.platform === "win32")("stop() kills the host's own descendant first and the root last, each by pid, never with taskkill /T (#95)", async () => {
+  await writeFile(modeFile, JSON.stringify({ descendant: true }));
+  try {
+    const host = await startHost("stop-tree");
+    const [run] = await launches();
+    expect(run!.descendantPid).toBeDefined();
+    expect(pidAlive(run!.descendantPid!)).toBe(true);
+    const teardown = await host.stop();
+    expect(teardown.rootRemoved).toBe(true);
+    expectSafeTreeKill(teardown, redirect.taskkills, run!.pid);
+    // The detached descendant is reached by parent pid + creation time (it survived the pid-only kill above), and before the root.
+    expect((arr(obj(teardown.taskkill).kills) as KillRecord[]).find(k => k.pid === run!.descendantPid)).toMatchObject({ role: "child", action: "killed", round: 1 });
+    const at = (pid: number) => redirect.taskkills.findIndex(args => args[2] === String(pid));
+    expect(at(run!.descendantPid!)).toBeGreaterThanOrEqual(0);
+    expect(at(run!.descendantPid!)).toBeLessThan(at(run!.pid));
+    expect(await waitUntil(() => !pidAlive(run!.descendantPid!), 5_000)).toBe(true);
+    expect(await waitUntil(() => !pidAlive(run!.pid), 5_000)).toBe(true);
+  } finally {
+    // On failure the descendant may survive; the test owns its cleanup.
+    for (const run of await launches()) if (run.descendantPid !== undefined && pidAlive(run.descendantPid)) process.kill(run.descendantPid);
   }
 }, 60_000);
 
