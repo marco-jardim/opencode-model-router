@@ -14,6 +14,10 @@ import type { RouterConfig } from "../../src/router/config";
 import type { DoD } from "../../src/verify/dod";
 import type { DispatchReference } from "../../src/verify/reference";
 import type { TestsPassRequest } from "../../src/verify/types";
+import * as gitTools from "../../src/router/git-tools";
+
+/** #141: how the wiring runs git in a work root `root`: the router's executable chosen outside its guards, then hardeningArgs(). */
+const hardenedGit = (root: string): string => [gitTools.gitExecutable(gitTools.workRootGuards(root)), ...gitTools.hardeningArgs()].join(" ");
 
 const state = vi.hoisted(() => ({
   snapshot: undefined as TreeSnapshot | undefined,
@@ -314,7 +318,7 @@ describe("commits made since dispatch, against a real git repository (QA-2.1-12)
       // Only the spawns rooted at this test's repository: a timed-out earlier test's gate can still
       // record into the shared state after beforeEach reset it.
       const ours = state.commands.map((command, i) => ({ command, opts: state.execOpts[i] })).filter(c => c.opts?.cwd === repo);
-      expect(ours.map(c => c.command)).toEqual([`git --no-optional-locks -C ${repo} diff --name-status -z -M ${head} HEAD`]);
+      expect(ours.map(c => c.command)).toEqual([`${hardenedGit(repo)} -C ${repo} diff --name-status -z -M ${head} HEAD`]);
       expect(ours[0].opts).toMatchObject({ cwd: repo, timeoutMs: COMMIT_DIFF_TIMEOUT_MS, lowPriority: resolveVerifyBudget(harness().cfg).lowPriority });
     });
   });
@@ -363,13 +367,33 @@ describe("commits made since dispatch, failure paths (QA-2.1-12)", () => {
   it("a failing, timed-out or unspawnable diff makes the change set unavailable", async () => {
     state.argvImpl = async () => ({ code: 128, stdout: "", stderr: "fatal: bad object", timedOut: false });
     expect((await moved(A, B)).changeBaseline).toBe("unavailable");
-    expect(state.commands).toEqual([`git --no-optional-locks -C ${cwd} diff --name-status -z -M ${A} HEAD`]);
+    expect(state.commands).toEqual([`${hardenedGit(cwd)} -C ${cwd} diff --name-status -z -M ${A} HEAD`]);
     state.argvImpl = async () => ({ code: 0, stdout: `M\0src/x.js\0`, stderr: "", timedOut: true });
     expect((await moved(A, B)).changeBaseline).toBe("unavailable");
     state.argvImpl = async () => { throw new Error("spawn ENOENT"); };
     expect((await moved(A, B)).changeBaseline).toBe("unavailable");
     state.argvImpl = async () => ({ code: 0, stdout: `R100\0src/x.js\0`, stderr: "", timedOut: false }); // malformed
     expect((await moved(A, B)).changeBaseline).toBe("unavailable");
+  });
+
+  it("#141: the diff runs the router's git, chosen outside the root's work-root guards, with hardeningArgs(); a refused one spawns nothing", async () => {
+    const guards = vi.spyOn(gitTools, "workRootGuards").mockReturnValue(["D:/guarded"]);
+    const executable = vi.spyOn(gitTools, "gitExecutable").mockReturnValue("D:/outside/git.exe");
+    try {
+      state.argvImpl = async () => ({ code: 0, stdout: `M\0src/x.js\0`, stderr: "", timedOut: false });
+      expect((await moved(A, B)).changeBaseline).toBe("available");
+      expect(state.commands).toEqual([["D:/outside/git.exe", ...gitTools.hardeningArgs(), "-C", cwd, "diff", "--name-status", "-z", "-M", A, "HEAD"].join(" ")]);
+      expect(guards.mock.calls).toEqual([[cwd]]);
+      expect(executable.mock.calls).toEqual([[["D:/guarded"]]]);
+      // A planted git inside the guards (or none at all): never a bare `git` looked up in the work root.
+      state.commands.length = 0;
+      executable.mockImplementation(() => { throw new Error("Refusing git executable inside the session repository: D:/w/git.exe"); });
+      expect((await moved(A, B)).changeBaseline).toBe("unavailable");
+      expect(state.commands).toEqual([]);
+    } finally {
+      guards.mockRestore();
+      executable.mockRestore();
+    }
   });
 
   it("a successful diff adds the committed files", async () => {
@@ -789,7 +813,7 @@ describe("gate seams", () => {
     it("findByName lists tracked and untracked files through git ls-files", async () => {
       const s = search(); reply(0, "a.test.ts\0sub/b.test.ts\0");
       expect(await s.findByName(root, ["a.test.ts", "b.test.ts"])).toEqual([resolve(root, "a.test.ts"), resolve(root, "sub/b.test.ts")]);
-      expect(state.commands).toEqual([`git --no-optional-locks -C ${root} ls-files -z --cached --others --exclude-standard -- :(glob)**/a.test.ts :(glob)**/b.test.ts`]);
+      expect(state.commands).toEqual([`${hardenedGit(root)} -C ${root} ls-files -z --cached --others --exclude-standard -- :(glob)**/a.test.ts :(glob)**/b.test.ts`]);
       expect(state.execOpts[0]).toMatchObject({ cwd: root, timeoutMs: TEST_SEARCH_TIMEOUT_MS });
       expect(state.execOpts[0].signal).toBeUndefined();
       reply(0, "");
@@ -806,7 +830,7 @@ describe("gate seams", () => {
       const s = search();
       reply(0, "a.test.ts\0");
       expect(await s.findByContent(root, "needle", ["*.test.ts"])).toEqual([resolve(root, "a.test.ts")]);
-      expect(state.commands[0]).toBe(`git --no-optional-locks -C ${root} grep -l -z -F --untracked -e needle -- *.test.ts`);
+      expect(state.commands[0]).toBe(`${hardenedGit(root)} -C ${root} grep -l -z -F --untracked -e needle -- *.test.ts`);
       reply(1); expect(await s.findByContent(root, "needle", ["*.test.ts"])).toEqual([]);
       reply(2); expect(await s.findByContent(root, "needle", ["*.test.ts"])).toBeUndefined();
       reply(1, "", true); expect(await s.findByContent(root, "needle", ["*.test.ts"])).toBeUndefined();
@@ -817,9 +841,9 @@ describe("gate seams", () => {
       const s = search();
       reply(0, "tests/test_mod02_1.py\0");
       expect(await s.findByContent(root, "mod02", [":(glob)**/test_*.py", ":(glob)**/conftest.py"], { word: true })).toEqual([resolve(root, "tests/test_mod02_1.py")]);
-      expect(state.commands[0]).toBe(`git --no-optional-locks -C ${root} grep -l -z -F -w --untracked -e mod02 -- :(glob)**/test_*.py :(glob)**/conftest.py`);
+      expect(state.commands[0]).toBe(`${hardenedGit(root)} -C ${root} grep -l -z -F -w --untracked -e mod02 -- :(glob)**/test_*.py :(glob)**/conftest.py`);
       reply(1); expect(await s.findByContent(root, "mod02", ["*.py"], { word: false })).toEqual([]);
-      expect(state.commands[1]).toBe(`git --no-optional-locks -C ${root} grep -l -z -F --untracked -e mod02 -- *.py`);
+      expect(state.commands[1]).toBe(`${hardenedGit(root)} -C ${root} grep -l -z -F --untracked -e mod02 -- *.py`);
     });
     it("QA-G-10: real git grep -F -w finds every wrapped, continued and CRLF import of mod02, not mod020", async () => {
       const dir = mkdtempSync(join(tmpdir(), "omr-qag10-"));
@@ -858,7 +882,7 @@ describe("gate seams", () => {
       reply(0, "");
       await s.findByName(root, ["test_mod0[1-2]_[1-3].py", "test_*?.py", "a\\b.py"]);
       expect(state.commands[0]).toBe(
-        `git --no-optional-locks -C ${root} ls-files -z --cached --others --exclude-standard -- :(glob)**/test_mod0[[]1-2[]]_[[]1-3[]].py :(glob)**/test_[*][?].py :(glob)**/a[\\\\]b.py`,
+        `${hardenedGit(root)} -C ${root} ls-files -z --cached --others --exclude-standard -- :(glob)**/test_mod0[[]1-2[]]_[[]1-3[]].py :(glob)**/test_[*][?].py :(glob)**/a[\\\\]b.py`,
       );
     });
     it("QA-G-3: real git ls-files finds only the literal bracketed name", async () => {
@@ -908,6 +932,36 @@ describe("gate seams", () => {
       ctl.abort();
       expect(await search(fakeDeadline(2_500, ctl)).findByContent(root, "needle", ["*.ts"])).toBeUndefined();
       expect(state.commands).toHaveLength(1);
+    });
+    it("#141: every search runs the router's git, chosen outside the root's work-root guards, with hardeningArgs() first", async () => {
+      const guards = vi.spyOn(gitTools, "workRootGuards").mockReturnValue(["D:/guarded"]);
+      const executable = vi.spyOn(gitTools, "gitExecutable").mockReturnValue("D:/outside/git.exe");
+      try {
+        const s = search(); reply(0, "a.test.ts\0");
+        expect(await s.findByName(root, ["a.test.ts"])).toEqual([resolve(root, "a.test.ts")]);
+        expect(await s.findByContent(root, "needle", ["*.ts"])).toEqual([resolve(root, "a.test.ts")]);
+        expect(guards.mock.calls).toEqual([[root], [root]]);
+        expect(executable.mock.calls).toEqual([[["D:/guarded"]], [["D:/guarded"]]]);
+        const prefix = ["D:/outside/git.exe", ...gitTools.hardeningArgs(), "-C", root].join(" ");
+        expect(state.commands).toHaveLength(2);
+        for (const command of state.commands) expect(command.startsWith(`${prefix} `)).toBe(true);
+      } finally {
+        guards.mockRestore();
+        executable.mockRestore();
+      }
+    });
+    it("#141: a refused executable (a planted git in the work root) spawns nothing and is no answer, never \"no match\"", async () => {
+      const executable = vi.spyOn(gitTools, "gitExecutable").mockImplementation(() => {
+        throw new Error("Refusing git executable inside the session repository: D:/w/git.exe");
+      });
+      try {
+        const s = search(); reply(0, "a.test.ts\0");
+        expect(await s.findByName(root, ["a.test.ts"])).toBeUndefined();
+        expect(await s.findByContent(root, "needle", ["*.ts"])).toBeUndefined();
+        expect(state.commands).toEqual([]);
+      } finally {
+        executable.mockRestore();
+      }
     });
   });
 

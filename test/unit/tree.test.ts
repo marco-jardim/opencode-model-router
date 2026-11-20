@@ -64,6 +64,11 @@ const HARDENED = vi.hoisted(() => ({
   inheritedCalls: [] as { executable: string; root: string; base: string[] }[],
   env: { GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "NUL" },
   executable: "C:/Program Files/Git/cmd/git.exe",
+  /** #141: the directories workRootGuards was asked for, and the guards gitExecutable was given, in call order. */
+  guardRoots: [] as string[],
+  executableGuards: [] as string[][],
+  /** #141: when set, gitExecutable refuses (a planted git inside the guards, or none found) by throwing this. */
+  refuse: undefined as string | undefined,
 }));
 vi.mock("../../src/router/git-tools", async importOriginal => ({
   ...(await importOriginal<typeof import("../../src/router/git-tools")>()),
@@ -74,9 +79,17 @@ vi.mock("../../src/router/git-tools", async importOriginal => ({
     return [...HARDENED.inherited];
   },
   gitEnvironment: () => ({ ...HARDENED.env }),
-  gitExecutable: () => HARDENED.executable,
-  workRootGuards: (root: string) => [root],
+  gitExecutable: (guards: readonly string[] = []) => {
+    HARDENED.executableGuards.push([...guards]);
+    if (HARDENED.refuse !== undefined) throw new Error(HARDENED.refuse);
+    return HARDENED.executable;
+  },
+  workRootGuards: (root: string) => {
+    HARDENED.guardRoots.push(root);
+    return [root, `${root}/.guard`];
+  },
 }));
+beforeEach(() => Object.assign(HARDENED, { guardRoots: [], executableGuards: [], refuse: undefined }));
 beforeEach(() => Object.assign(state, {
   head: "head1", status: "", diff: "", index: "", untracked: "", content: "", stage: "", error: false,
   branchRef: "refs/heads/main",
@@ -238,7 +251,8 @@ describe("Git tree fingerprint adapter", () => {
     expect(HARDENED.inheritedCalls).toEqual([{
       executable: HARDENED.executable, root: process.cwd(), base: [...HARDENED.prefix, ...HARDENED.trusted],
     }]);
-    // Default (W's snapshot): `--no-pager` first, the process's own environment, git by name, as before.
+    // Default (W's snapshot): `--no-pager` first, the process's own environment, as before; #141: the seam's default
+    // executable is still the router's git outside the work-root guards, never a bare `git`.
     seen.length = 0;
     state.binaries = [];
     expect(await snapshotTree(process.cwd(), signal, { git })).toBeDefined();
@@ -248,8 +262,35 @@ describe("Git tree fingerprint adapter", () => {
       expect(args).not.toContain("core.fsmonitor=false");
       expect("env" in opts || "executable" in opts).toBe(false);
     }
-    expect(state.binaries).toEqual(Array(7).fill("git"));
+    expect(state.binaries).toEqual(Array(7).fill(HARDENED.executable));
     expect(HARDENED.inheritedCalls).toHaveLength(1);
+  });
+  it("#141: the default seam runs git by absolute path from outside the work-root guards of its cwd, never a bare `git`", async () => {
+    const cwd = resolve("packages/app");
+    expect(await snapshotTree(cwd, new AbortController().signal)).toBeDefined();
+    expect(state.binaries).toHaveLength(7);
+    expect(state.binaries).toEqual(Array(7).fill(HARDENED.executable));
+    expect(state.binaries).not.toContain("git");
+    // Each process asks for the guards of the directory it runs in (the first one in cwd, the rest at the toplevel)
+    // and takes the executable chosen outside them.
+    expect(HARDENED.guardRoots).toEqual(state.directories);
+    expect(HARDENED.guardRoots[0]).toBe(cwd);
+    expect(HARDENED.executableGuards).toEqual(state.directories.map(dir => [dir, `${dir}/.guard`]));
+    // An explicit executable (the hardened snapshot's) is used as given: no second lookup.
+    state.binaries = []; HARDENED.guardRoots = []; HARDENED.executableGuards = [];
+    const opts = { cwd, signal: new AbortController().signal, timeoutMs: 30_000, maxBuffer: 1024, lowPriority: false };
+    expect(await execGit(["--no-pager", "rev-parse", "HEAD"], { ...opts, executable: "D:/elsewhere/git.exe" })).toBe("head1");
+    expect(state.binaries).toEqual(["D:/elsewhere/git.exe"]);
+    expect(HARDENED.executableGuards).toEqual([]);
+    // A refused executable (a planted git inside the guards, or none at all) rejects like a spawn error, with nothing spawned.
+    state.binaries = [];
+    HARDENED.refuse = "Refusing git executable inside the session repository: D:/w/git.exe";
+    await expect(execGit(["--no-pager", "rev-parse", "HEAD"], opts)).rejects.toThrow(/Refusing git executable/);
+    expect(state.binaries).toEqual([]);
+    const onError = vi.fn();
+    expect(await snapshotTree(cwd, new AbortController().signal, { onError })).toBeUndefined();
+    expect(onError).toHaveBeenCalledWith(expect.stringMatching(/^root: Refusing git executable/));
+    expect(state.binaries).toEqual([]);
   });
   it("QA-3.1-8: the default git seam lowers the process's priority as exec.ts does", async () => {
     // Generous timeout: this test is about priority, and a 5 ms timer could fire on a slow
@@ -257,8 +298,8 @@ describe("Git tree fingerprint adapter", () => {
     const opts = { cwd: process.cwd(), signal: new AbortController().signal, timeoutMs: 30_000, maxBuffer: 5, lowPriority: true };
     expect(await execGit(["--no-pager", "rev-parse", "HEAD"], opts)).toBe("head1");
     if (process.platform === "win32") {
-      // The child is spawned as git and lowered right after the spawn.
-      expect(state.binaries).toEqual(["git"]);
+      // The child is spawned as git (#141: by absolute path) and lowered right after the spawn.
+      expect(state.binaries).toEqual([HARDENED.executable]);
       expect(state.priorities).toEqual([[4242, osConstants.priority.PRIORITY_BELOW_NORMAL]]);
       // A child that already exited cannot be lowered: the run itself is unaffected.
       state.priorityThrows = true;
@@ -271,7 +312,7 @@ describe("Git tree fingerprint adapter", () => {
     // Normal priority: plain git, nothing lowered.
     state.binaries = []; state.priorities = [];
     expect(await execGit(["--no-pager", "rev-parse", "HEAD"], { ...opts, lowPriority: false })).toBe("head1");
-    expect(state.binaries).toEqual(["git"]);
+    expect(state.binaries).toEqual([HARDENED.executable]);
     expect(state.priorities).toEqual([]);
   });
 

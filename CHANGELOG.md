@@ -42,6 +42,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   re-appended after the tier policy and `host default permissions not recognised` was logged. Both the 2.0.22 and the
   2.0.31 default sequences are now recognised (longest match); unknown sequences still fail closed. The v2 adapter now
   typechecks against `@opencode/plugin` 2.0.31.
+- **Verification never runs a `git` found in the work root (#141).** The verification's git calls in a work root (the
+  commits-since-dispatch diff, the test searches, the HEAD and reflog reads, the tree snapshot and the failure-recheck
+  reference) ran a bare `git`, which Windows can resolve from the working directory, so a model could plant a `git.exe`
+  there. They now run git by absolute path from outside the work root, as the router's git tools do, and refuse to run
+  when the only git is inside it. The diff, the test searches and the HEAD reads also pass the router's hardening
+  options (no hooks, fsmonitor, pager or signature programs, no optional locks). A security fix, on OpenCode v1 and v2.
 
 ## [2.9.1] - 2026-10-25
 
