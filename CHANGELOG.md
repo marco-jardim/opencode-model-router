@@ -26,6 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the tool description also includes a bounded list of commands accepting arguments. Argument acceptance is unchanged.
 - **Plan executor: recompiling a plan after abort and purge in the same process can be approved again.** A new plan
   reusing the same id gets fresh slot pools and collection state; stale slot handles from the purged plan remain fenced.
+- **OpenCode v2 / roles mode: each parallel tool call of a role agent is checked against its own arguments (#86).** The
+  `execute.before` authority check now reads the call's tool and input when the hook is invoked, not after its awaits,
+  so a refusal no longer names another parallel call's path when the host reuses or rewrites a pending call's event.
 
 ## [2.9.1] - 2026-10-25
 
