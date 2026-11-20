@@ -23,7 +23,10 @@ export interface SnapshotGitOptions {
   readonly lowPriority: boolean;
   /** Cross-repo QA-1 F4 (SnapshotOptions.hardened): the environment git runs with. Absent: the process's own (unchanged). */
   readonly env?: NodeJS.ProcessEnv;
-  /** Cross-repo QA-1 F4: the git executable, by absolute path. Absent: `git`, looked up as before. */
+  /**
+   * Cross-repo QA-1 F4: the git executable, by absolute path. Absent (#141, #77 G4): the router's git outside the work-root
+   * guards of `cwd` (`gitExecutable(workRootGuards(cwd))`), never a bare `git` that Windows may resolve from `cwd`.
+   */
   readonly executable?: string;
 }
 
@@ -98,9 +101,10 @@ export const execGit: SnapshotGit = (args, opts) => new Promise<string>((ok, fai
     return;
   }
   const nice = opts.lowPriority && !isWin;
-  const git = opts.executable ?? "git";
   let child: ChildProcess;
   try {
+    // #141: a refused or missing executable throws here and rejects like a spawn error, with nothing spawned.
+    const git = opts.executable ?? tools.gitExecutable(tools.workRootGuards(opts.cwd));
     child = spawn(nice ? "nice" : git, nice ? ["-n", "10", "--", git, ...args] : [...args], {
       cwd: opts.cwd, windowsHide: true, detached: !isWin, stdio: ["ignore", "pipe", "ignore"],
       ...(opts.env !== undefined ? { env: opts.env } : {}),

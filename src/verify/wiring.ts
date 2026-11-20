@@ -64,6 +64,7 @@ import {
 import { assessRisk, FULL_SCOPE_PLAN, type FullScopePlan, type RiskAssessment } from "./risk";
 import { resolveBaseDir } from "./paths";
 import { DEFAULT_IDLE_TTL_MS } from "../router/idle-sweep";
+import { gitExecutable, hardeningArgs, workRootGuards } from "../router/git-tools";
 import {
   buildAcceptedSuffix,
   buildForcingNote,
@@ -1394,7 +1395,9 @@ export function createVerificationWiring(deps: {
     const timeoutMs = deadline ? deadline.bound(COMMIT_DIFF_TIMEOUT_MS) : COMMIT_DIFF_TIMEOUT_MS;
     if (timeoutMs <= 0 || deadline?.signal.aborted) return "unavailable";
     try {
-      const r = await argvSeam("git", ["--no-optional-locks", "-C", root, "diff", "--name-status", "-z", "-M", before.head, "HEAD"], {
+      // #141 (#77 G4): git by absolute path from outside the work root, never looked up in it; hardeningArgs() carries
+      // --no-optional-locks. A refused or missing executable throws here: "unavailable", as a failed spawn.
+      const r = await argvSeam(gitExecutable(workRootGuards(root)), [...hardeningArgs(), "-C", root, "diff", "--name-status", "-z", "-M", before.head, "HEAD"], {
         cwd: root,
         timeoutMs,
         lowPriority: resolveVerifyBudget(getConfig()).lowPriority,
@@ -1407,13 +1410,16 @@ export function createVerificationWiring(deps: {
     }
   };
 
-  /** T9 1.3: the planners' git searches through the argv seam; no shell, no optional locks. */
+  /**
+   * T9 1.3: the planners' git searches through the argv seam; no shell, no optional locks. #141: git by absolute path from
+   * outside the work root (`gitExecutable(workRootGuards(root))`) with `hardeningArgs()`, as the router's git tools.
+   */
   const testSearch = (budget: VerifyBudget, deadline: Deadline | undefined): TestSearchSeam => {
     const git = async (root: string, args: readonly string[]): Promise<SeamResult | undefined> => {
       const timeoutMs = deadline ? deadline.bound(TEST_SEARCH_TIMEOUT_MS) : TEST_SEARCH_TIMEOUT_MS;
       if (timeoutMs <= 0 || deadline?.signal.aborted) return undefined;
       try {
-        const r = await argvSeam("git", ["--no-optional-locks", "-C", root, ...args], {
+        const r = await argvSeam(gitExecutable(workRootGuards(root)), [...hardeningArgs(), "-C", root, ...args], {
           cwd: root,
           timeoutMs,
           lowPriority: budget.lowPriority,

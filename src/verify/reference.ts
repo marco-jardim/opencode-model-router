@@ -735,6 +735,7 @@ import { gitTopOf, perimeterKey } from "./git-top";
 // Type-only: pin.ts imports perimeter.ts, which imports this module; samePin is loaded lazily in step 7.
 import type { LinkPin, PinWhy } from "./pin";
 import type { PluginLogger } from "../router/logger";
+import { gitExecutable, workRootGuards } from "../router/git-tools";
 
 // --- Seams --------------------------------------------------------------------
 
@@ -1349,6 +1350,9 @@ function stdoutTruncated(result: ExecResult): boolean {
  * A truncated stdout (QA-1.5-21) comes back as a failed call (code -1): the
  * seam's trailing stdout note in stderr (stdoutTruncated), or a non-empty
  * `-z` output that does not end in NUL. Every caller parses stdout only after `code === 0`.
+ * #141 (#77 G4): git by absolute path from outside the work-root guards of `run.cwd`, never a
+ * bare `git` that Windows may resolve from the (model-writable) cwd; a refused or missing
+ * executable is a failed call (code -1), with nothing spawned.
  */
 async function runGit(argv: ArgvSeam, args: readonly string[], run: GitRun): Promise<ExecResult | undefined> {
   if (run.timeoutMs <= 0 || run.signal?.aborted) return undefined;
@@ -1358,7 +1362,7 @@ async function runGit(argv: ArgvSeam, args: readonly string[], run: GitRun): Pro
   // means; git reads them as booleans, so "0" neutralises them whatever the plugin inherited.
   opts.env = { ...PATHSPEC_ENV_RESET, ...run.env };
   try {
-    const result = await argv("git", ["--no-optional-locks", ...args], opts);
+    const result = await argv(gitExecutable(workRootGuards(run.cwd)), ["--no-optional-locks", ...args], opts);
     if (result.timedOut || run.signal?.aborted) return undefined;
     // QA-1.5-21: the p12 seam keeps exit code 0 when it cuts stdout at maxBuffer.
     const cut =

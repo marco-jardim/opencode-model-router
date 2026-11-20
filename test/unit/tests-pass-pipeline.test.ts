@@ -1461,10 +1461,13 @@ describe("scope.rechecker under 8.3 short paths (E2E-2)", { timeout: 60_000 }, (
       }
     },
   };
-  /** git runs for real (capture, materialize, GC, dispose); any other file is recorded, not spawned. */
+  /**
+   * git runs for real (capture, materialize, GC, dispose); any other file is recorded, not spawned. #141: reference.ts
+   * passes git by absolute path (gitExecutable), the fixture's own calls pass `git`.
+   */
   const reruns: { file: string; args: readonly string[]; cwd: string | undefined }[] = [];
   const argv: ArgvSeam = (file, args, opts) => {
-    if (file !== "git") {
+    if (!/(^|[\\/])git(\.exe)?$/i.test(file)) {
       reruns.push({ file, args, cwd: opts?.cwd });
       return Promise.resolve({ code: 1, stdout: "", stderr: "" });
     }

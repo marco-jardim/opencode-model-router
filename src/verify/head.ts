@@ -1,6 +1,7 @@
 // Impure, cheap HEAD reader: where a working tree is checked out, and how many HEAD reflog entries it has.
 // Kept apart from tree.ts on purpose: several tests mock that module with `snapshotTree` alone.
 import { realpath } from "node:fs/promises";
+import { hardeningArgs } from "../router/git-tools";
 import { execGit, gitExitCode } from "./tree";
 
 /** What the branch-switch rule reads of a working tree (see branch.ts `treeMove`). */
@@ -25,9 +26,13 @@ const DEFAULT_TIMEOUT_MS = 5000;
 const MAX_BUFFER = 1024 * 1024;
 const MAX_WINDOW = 1000;
 
+/**
+ * #141: read-only git in the work root, as the router's git tools run it: `hardeningArgs()` (no pager, no optional locks, no
+ * fsmonitor, hooks or signature programs) and, through execGit's default, git by absolute path from outside the work root.
+ */
 function runner(cwd: string, opts: HeadReadOptions | undefined): (args: readonly string[]) => Promise<string> {
   const signal = opts?.signal ?? new AbortController().signal;
-  return (args) => execGit(["--no-pager", "--no-optional-locks", ...args], {
+  return (args) => execGit([...hardeningArgs(), ...args], {
     cwd, signal, timeoutMs: opts?.timeoutMs ?? DEFAULT_TIMEOUT_MS, maxBuffer: MAX_BUFFER, lowPriority: opts?.lowPriority === true,
   });
 }

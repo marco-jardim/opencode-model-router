@@ -114,7 +114,8 @@ vi.mock("../../src/verify/exec", () => ({
     return { code: 0, stdout: "", stderr: "", timedOut: false };
   },
   runArgv: async (file: string, args: readonly string[], opts?: { signal?: AbortSignal; lowPriority?: boolean }): Promise<ExecOut> => {
-    if (file === "git") {
+    // #141: the verification's git runs by absolute path (gitExecutable), never as a bare `git`.
+    if (/(^|[\\/])git(\.exe)?$/i.test(file)) {
       state.git++;
       return { code: 0, stdout: "", stderr: "", timedOut: false };
     }
