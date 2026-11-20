@@ -28,7 +28,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { keyedSmokeEnv } from "../setup/smoke-tmp-guard";
-import { smokeTierOverride } from "./helpers/tier-override";
+import { effectiveTierModels, smokeTierOverride } from "./helpers/tier-override";
 import {
   prepareFixtureRepo,
   type FixtureRepo,
@@ -380,6 +380,29 @@ function writeProjectTierOverrides(dir: string): void {
     JSON.stringify(smokeTierOverride(SMOKE_MODEL), null, 2),
     "utf8",
   );
+  assertOverrideTakesEffect(dir);
+}
+
+/**
+ * Fail fast, and by name, when the override written for `dir` would not move
+ * every tier to SMOKE_MODEL for the host that `runOpencode` spawns (same
+ * private home, same project directory). Without this a dropped layer, or a
+ * `/preset` state file in the private home that outranks `activePreset`, only
+ * shows up after a multi-minute run as `Model not found: anthropic/...`.
+ */
+function assertOverrideTakesEffect(dir: string): void {
+  const home = keyedSmokeEnv().HOME;
+  if (!home) throw new Error("keyedSmokeEnv() returned no HOME");
+  const seen = effectiveTierModels(dir, home);
+  const wrong = Object.entries(seen.models).filter(([, model]) => model !== SMOKE_MODEL);
+  if (wrong.length > 0) {
+    throw new Error(
+      `tier override not effective for ${dir} (home ${home}): active preset '${seen.activePreset}', ` +
+        `tiers ${JSON.stringify(seen.models)}, expected every tier on ${SMOKE_MODEL}. ` +
+        `Loader warnings: ${JSON.stringify(seen.warnings)}. ` +
+        `State file in the private home: ${fs.existsSync(path.join(home, ".config", "opencode", "opencode-model-router.state.json"))}.`,
+    );
+  }
 }
 
 interface OcRun {
