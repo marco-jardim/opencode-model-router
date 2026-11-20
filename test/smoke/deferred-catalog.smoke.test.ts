@@ -24,10 +24,14 @@
  * settled, flips `catalogWarned` and emits the warnings. A single message
  * would prove nothing.
  *
- * Determinism: HOME/USERPROFILE are repointed at a temp dir so the
- * developer's global opencode config and state cannot bleed in — which also
- * puts opencode's log under <homeDir>/.local/share/opencode/log, where this
- * test reads it.
+ * Determinism (#68, #95): opencode gets an ALLOWLISTED environment
+ * (helpers/v1-isolated-env.ts) — only a few system variables of the caller,
+ * so no provider key and no OPENCODE_* variable reaches it — plus
+ * HOME/USERPROFILE, XDG_CONFIG/DATA/CACHE/STATE_HOME, APPDATA, LOCALAPPDATA
+ * and TEMP/TMP/TMPDIR repointed under a temp home, so the developer's global
+ * opencode config, data, cache and state cannot bleed in. opencode writes its
+ * log under $XDG_DATA_HOME/opencode/log, and this test reads it from that
+ * isolated XDG_DATA_HOME.
  *
  * GATED: runs in the keyless lane (RUN_OC_SMOKE_KEYLESS=1) and in the full
  * lane (RUN_OC_SMOKE=1), invoked with the smoke config:
@@ -40,6 +44,7 @@ import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
+import { isolatedEnv, opencodeLogDir } from "./helpers/v1-isolated-env";
 
 const RUN =
   process.env.RUN_OC_SMOKE_KEYLESS === "1" || process.env.RUN_OC_SMOKE === "1";
@@ -59,6 +64,7 @@ const SMOKE_TIMEOUT_MS = 125_000;
 
 let projectDir = "";
 let homeDir = "";
+let logDir = "";
 let server: ChildProcess | undefined;
 let stdout = "";
 let stderr = "";
@@ -99,12 +105,11 @@ async function waitFor(
   }
 }
 
-/** Concatenates every file opencode wrote under the isolated HOME's log dir. */
+/** Concatenates every file opencode wrote under the isolated XDG_DATA_HOME's log dir. */
 function readLog(): string {
-  const dir = path.join(homeDir, ".local", "share", "opencode", "log");
   let names: string[];
   try {
-    names = fs.readdirSync(dir);
+    names = fs.readdirSync(logDir);
   } catch {
     return "";
   }
@@ -113,7 +118,7 @@ function readLog(): string {
     try {
       // Read contents, never statSync().size — the reported size can still be
       // 0 while the file already holds the line we are waiting for.
-      out += fs.readFileSync(path.join(dir, name), "utf8");
+      out += fs.readFileSync(path.join(logDir, name), "utf8");
     } catch {
       // a log file can be rotated out from under us mid-read; ignore it
     }
@@ -189,12 +194,15 @@ beforeAll(async () => {
     ),
   );
 
+  const env = isolatedEnv(homeDir);
+  logDir = opencodeLogDir(env);
+
   port = await freePort();
   server = spawn("opencode", ["serve", "--port", String(port)], {
     cwd: projectDir,
     // NO --print-logs: it redirects the log to stderr, which would destroy
     // the stderr assertion below.
-    env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir },
+    env,
     stdio: ["ignore", "pipe", "pipe"],
   });
   server.stdout?.setEncoding("utf8");
@@ -269,7 +277,8 @@ d("deferred catalog warning smoke", () => {
       //
       // It asserted 200 originally and passed locally, on a false premise: on
       // Windows opencode caches provider metadata under AppData\Roaming,
-      // OUTSIDE the HOME this test repoints, so the dev host still had a
+      // OUTSIDE the HOME this test then repointed (APPDATA is repointed too
+      // since #95), so the dev host still had a
       // resolvable provider and the isolation was weaker than it looked. The
       // first cold-container run came back 500 and failed. The lane caught a
       // bad assumption inside its own test on its first real outing, which is
