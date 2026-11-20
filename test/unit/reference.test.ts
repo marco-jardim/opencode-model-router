@@ -19,6 +19,7 @@ import {
   type ReferenceDeps,
 } from "../../src/verify/reference";
 import type { LinkPin } from "../../src/verify/pin";
+import * as gitTools from "../../src/router/git-tools";
 
 const isWin = process.platform === "win32";
 const linkType = isWin ? "junction" : "dir";
@@ -417,6 +418,53 @@ describe("captureReference", { timeout: 60_000 }, () => {
       });
     }
     expect(envs.some((env) => typeof env?.GIT_INDEX_FILE === "string" && env.GIT_INDEX_FILE !== "")).toBe(true);
+  });
+
+  it("#141: every git call runs the router's git, chosen outside the work-root guards of its cwd, never a bare `git`", async () => {
+    // Call-through spies: the real guards and the real executable choice, recorded.
+    const guards = vi.spyOn(gitTools, "workRootGuards");
+    const executable = vi.spyOn(gitTools, "gitExecutable");
+    try {
+      const calls: { file: string; cwd: string | undefined }[] = [];
+      const recording: CaptureDeps["argv"] = (file, args, opts) => {
+        calls.push({ file, cwd: opts?.cwd });
+        return argv(file, args, opts);
+      };
+      const ref = await captureReference(repo, new AbortController().signal, captureDeps({ argv: recording }));
+      expect(ref).toBeDefined();
+      if (!ref) return;
+      const handle = await mat(ref, { argv: recording });
+      await handle.dispose();
+      expect(calls.length).toBeGreaterThan(5);
+      // The work root and the reference worktree in tmp alike.
+      expect(new Set(calls.map((c) => c.cwd)).size).toBeGreaterThan(1);
+      expect(guards.mock.calls.map(([dir]) => dir)).toEqual(calls.map((c) => c.cwd));
+      expect(guards.mock.calls.map(([dir]) => dir)[0]).toBe(repo);
+      expect(executable.mock.calls.map(([given]) => given)).toEqual(guards.mock.results.map((r) => r.value));
+      expect(calls.map((c) => c.file)).toEqual(executable.mock.results.map((r) => r.value));
+      for (const { file } of calls) expect(file).not.toBe("git");
+    } finally {
+      guards.mockRestore();
+      executable.mockRestore();
+    }
+  });
+
+  it("#141: a refused git executable (a planted git in the work root) spawns nothing and captures nothing", async () => {
+    const executable = vi.spyOn(gitTools, "gitExecutable").mockImplementation(() => {
+      throw new Error("Refusing git executable inside the session repository: D:/w/git.exe");
+    });
+    try {
+      const files: string[] = [];
+      const recording: CaptureDeps["argv"] = (file, args, opts) => {
+        files.push(file);
+        return argv(file, args, opts);
+      };
+      expect(await captureReference(repo, new AbortController().signal, captureDeps({ argv: recording }))).toBeUndefined();
+      expect(executable).toHaveBeenCalled();
+      expect(files).toEqual([]);
+    } finally {
+      executable.mockRestore();
+    }
   });
 });
 

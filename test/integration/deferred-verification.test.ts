@@ -123,7 +123,8 @@ vi.mock("../../src/verify/exec", () => ({
     return { code: 0, stdout: "", stderr: "", timedOut: false };
   },
   runArgv: async (file: string, args: readonly string[]) => {
-    state.commands.push([file, ...args].join(" "));
+    // #141: git runs by absolute path (gitExecutable); recorded as `git …` so the filters below still tell it apart.
+    state.commands.push([/(^|[\\/])git(\.exe)?$/i.test(file) ? "git" : file, ...args].join(" "));
     return { code: 0, stdout: "", stderr: "", timedOut: false };
   },
 }));

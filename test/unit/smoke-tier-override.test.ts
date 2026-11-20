@@ -3,7 +3,7 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { configPath, getConfigNotices, invalidateConfigCache, loadConfig, OVERRIDE_FILENAME } from "../../src/router/config";
-import { SMOKE_PRESET, smokeTierOverride } from "../smoke/helpers/tier-override";
+import { effectiveTierModels, SMOKE_PRESET, smokeTierOverride } from "../smoke/helpers/tier-override";
 
 // guard-hardblock.smoke.test.ts writes this overrides file when MODEL_ROUTER_SMOKE_MODEL is set, then asserts the
 // subagent ran on that model. An override the loader drops keeps the bundled tiers, which only the weekly credentialed
@@ -53,6 +53,26 @@ describe("smoke tier override (MODEL_ROUTER_SMOKE_MODEL)", () => {
       expect(tier?.variant, name).toBeUndefined();
       expect(tier?.effort, name).toBeUndefined();
     }
+  });
+
+  // layer2-gate.smoke.test.ts runs the host in a throwaway git project with a private home and calls
+  // effectiveTierModels first, so a non-effective override fails by name instead of after a live run.
+  it("effectiveTierModels: a git project under a private home resolves every tier to the smoke model", () => {
+    const dir = project(smokeTierOverride(model));
+    const seen = effectiveTierModels(dir, join(root, "home"));
+    expect(seen.warnings).toEqual([]);
+    expect(seen.activePreset).toBe(SMOKE_PRESET);
+    expect(seen.models).toEqual({ fast: model, medium: model, heavy: model });
+  });
+
+  it("effectiveTierModels: a /preset state file in the home outranks the override's activePreset and is reported", () => {
+    const dir = project(smokeTierOverride(model));
+    const stateDir = join(root, "home", ".config", "opencode");
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(join(stateDir, "opencode-model-router.state.json"), JSON.stringify({ activePreset: "anthropic" }), "utf8");
+    const seen = effectiveTierModels(dir, join(root, "home"));
+    expect(seen.activePreset).toBe("anthropic");
+    expect(seen.models.fast).not.toBe(model);
   });
 
   it("the former fixture (the bundled preset patched with variant \"\") loses only `variant` (#80): the bundled variant still rides along", () => {
