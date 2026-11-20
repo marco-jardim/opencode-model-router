@@ -89,18 +89,20 @@ export default {id:'depth-effort-observer',async setup(ctx){
     return this;
   }
 
-  async project(name: string, override: object, observe = true) {
+  /** `router: false` loads only the observer: the host's own behaviour, for comparison. */
+  async project(name: string, override: object, observe = true, router = true) {
     const project = path.join(this.root, name);
     await mkdir(path.join(project, ".opencode"), { recursive: true });
     const settings = { baseURL: this.baseURL, apiKey: "keyless-smoke-fake" };
+    const routerPlugin = router ? [ROOT] : [];
     const config = this.host.version === "v1" ? {
       model: MODEL, subagent_depth: 4,
-      plugin: [ROOT, ...(observe ? [pathToFileURL(path.join(this.root, "observer-v1.mjs")).href] : [])],
+      plugin: [...routerPlugin, ...(observe ? [pathToFileURL(path.join(this.root, "observer-v1.mjs")).href] : [])],
       provider: { anthropic: { options: settings } },
       agent: { general: { model: MODEL, permission: { task: "allow" } } },
     } : {
       model: MODEL, experimental: { subagent_depth: 4 },
-      plugins: [ROOT, ...(observe ? [path.join(this.root, "observer-v2")] : [])],
+      plugins: [...routerPlugin, ...(observe ? [path.join(this.root, "observer-v2")] : [])],
       providers: { anthropic: { settings } },
       agents: { general: { model: MODEL, permissions: [{ action: "subagent", resource: "*", effect: "allow" }] } },
     };
@@ -150,6 +152,25 @@ async function fixture(host: typeof hosts[number]) {
   const f = new Fixture(host, await mkdtemp(path.join(tmpdir(), "omr-depth-effort-")));
   fixtures.push(f);
   return f.init();
+}
+
+/**
+ * The effort of the host's OWN session-title request: same host, model and provider, router not loaded.
+ * Title generation is the host's request, never a producer's, so with the router loaded it must carry
+ * exactly this. Hosts differ here: under opencode-ai 1.18.19 it carries no effort, under 1.19.5 the one
+ * title request of the bump test carried "low" (scheduled smoke-upstream run 43819462941). An effort the
+ * router caused would be missing from this baseline, so the comparison still fails on it.
+ */
+async function hostTitleEffort(host: typeof hosts[number]): Promise<string | undefined> {
+  const f = await fixture(host);
+  // A subagent round trip keeps the run alive well past the root's first step, where the host
+  // starts its title request; a one-reply run could exit before that request is sent.
+  await f.run(await f.project("title-baseline", {}, true, false), "ROOT_SETUP");
+  const titles = f.provider.captures.filter(c => c.role === "title");
+  expect(titles.length, "the host must make a title request without the router").toBeGreaterThan(0);
+  const efforts = [...new Set(titles.map(c => c.body.output_config?.effort))];
+  expect(efforts, "the host's own title requests must agree on one effort").toHaveLength(1);
+  return efforts[0];
 }
 
 afterEach(async () => {
@@ -398,10 +419,16 @@ for (const host of hosts) {
         // Parented delegate producers do not generate a same-session title on
         // these hosts. This checks cross-session isolation, not the A3 identity
         // gate; same-session title/model exclusions are integration/unit proof.
+        // The router adds no effort to any of these: grader and orchestrator carry
+        // none, and the title request carries exactly what the host sends without
+        // the router (its own choice, which differs between host versions).
+        const titleEffort = await hostTitleEffort(host);
         for (const role of ["title", "grader", "orchestrator"] as const) {
           const requests = f.provider.captures.filter(c => c.role === role);
           expect(requests.length, `${role} must actually be exercised`).toBeGreaterThan(0);
-          expect(requests.map(c => c.body.output_config?.effort)).toEqual(requests.map(() => undefined));
+          const expected = role === "title" ? titleEffort : undefined;
+          const seen = JSON.stringify(requests.map(c => ({ session: c.session, agent: c.agent, model: c.body.model })));
+          expect(requests.map(c => c.body.output_config?.effort), `${role} requests ${seen}`).toEqual(requests.map(() => expected));
         }
         expect(f.provider.replies.filter(r => r.role === "grader").map(r => JSON.parse(r.text).pass)).toEqual([false, true]);
         expect(run.stdout).toContain("[router ✓ verified: checker]");
