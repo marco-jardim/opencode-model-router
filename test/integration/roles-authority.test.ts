@@ -1029,6 +1029,57 @@ describe("binding (I5, I9)", () => {
   });
 });
 
+describe("parallel refusals (#86): each of two parallel out-of-root reads is refused with its own path", () => {
+  /** An explorer child bound to its dispatch, two paths outside its work root, and the adapter's `execute.before`. */
+  async function setup() {
+    const { dir, cfg } = home(ROLES);
+    const hooks = await plugin(dir);
+    const sessions: Sessions = {};
+    const v2 = host(dir, cfg, sessions);
+    await v2.start(hooks);
+    await dispatch(v2, sessions, "e1", "x1", "explorer", "find the parser", dir);
+    expect(await catalog(v2, "x1", "explorer")).toContain("read");
+    const outside = temp("omr-86-outside-");
+    const first = join(outside, "win.ini");
+    const second = join(outside, "hosts");
+    const before = v2.toolHooks["execute.before"]!;
+    const call = (id: string, input: unknown) => before({ sessionID: "x1", agent: "explorer", messageID: "m", id, tool: "read", input });
+    /** The first line of each call's refusal ("allowed" when it passed), in call order. */
+    const outcomes = async (calls: Array<Promise<void>>): Promise<string[]> =>
+      (await Promise.allSettled(calls)).map((r) => (r.status === "rejected" ? String((r.reason as Error).message).split("\n")[0]! : "allowed"));
+    const refusalOf = (path: string) => `[router] Refused for role agent explorer in this dispatch: read: ${path} is outside this dispatch's work root`;
+    const expectOwnPaths = (lines: string[]) => {
+      expect(lines).toHaveLength(2);
+      expect(lines[0]).toContain(refusalOf(first));
+      expect(lines[0]).not.toContain(second);
+      expect(lines[1]).toContain(refusalOf(second));
+      expect(lines[1]).not.toContain(first);
+    };
+    // Control: separate events, nothing rewritten.
+    expectOwnPaths(await outcomes([call("control-0", { path: first }), call("control-1", { path: second })]));
+    return { first, second, before, call, outcomes, expectOwnPaths };
+  }
+
+  it("when the host rewrites the second call's input record with the first call's arguments while its hook is pending (the live symptom)", async () => {
+    const { first, second, call, outcomes, expectOwnPaths } = await setup();
+    const secondInput: Record<string, unknown> = { path: second };
+    const pending = [call("rewritten-0", { path: first }), call("rewritten-1", secondInput)];
+    secondInput.path = first;
+    expectOwnPaths(await outcomes(pending));
+  });
+
+  it("when the host reuses one event object for a message's parallel calls", async () => {
+    const { first, second, before, outcomes, expectOwnPaths } = await setup();
+    const shared: Record<string, unknown> = { sessionID: "x1", agent: "explorer", messageID: "m", tool: "read" };
+    const pending = [first, second].map((path, index) => {
+      shared.id = `reused-${index}`;
+      shared.input = { path };
+      return before(shared);
+    });
+    expectOwnPaths(await outcomes(pending));
+  });
+});
+
 describe("inherited grants and other sessions (I3, #77 P2 lesson)", () => {
   it("an allow-all parent cannot re-open anything; sibling and non-role sessions are untouched; Code Mode execute is absent", async () => {
     const { dir, cfg } = home(ROLES);

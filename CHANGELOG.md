@@ -37,6 +37,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the tool description also includes a bounded list of commands accepting arguments. Argument acceptance is unchanged.
 - **Plan executor: recompiling a plan after abort and purge in the same process can be approved again.** A new plan
   reusing the same id gets fresh slot pools and collection state; stale slot handles from the purged plan remain fenced.
+- **OpenCode v2 / roles mode: each parallel tool call of a role agent is checked against its own arguments (#86).** The
+  `execute.before` authority check now reads the call's tool and input when the hook is invoked, not after its awaits,
+  so a refusal no longer names another parallel call's path when the host reuses or rewrites a pending call's event.
 - **OpenCode v2: read-only tiers recognise the host 2.0.31 default permissions.** Host 2.0.31 dropped the
   `external_directory * ask` default, so its defaults were treated as explicit rules: the host's `.env` read rules were
   re-appended after the tier policy and `host default permissions not recognised` was logged. Both the 2.0.22 and the
