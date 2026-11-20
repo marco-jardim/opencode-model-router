@@ -4231,9 +4231,24 @@ export async function registerV2Hooks(
           try {
             const hold = verifyingCalls.has(event.id) && rec.verificationMode === "required" && held.available && !reloadFailed && finishApi?.canHold(parent) === true;
             const handle = hold ? finishApi?.reserveHeld(parent, event.id) : undefined;
-            const attempt = inflight.acknowledge(event.id, resultChild, {
-              userBackgrounded: rec.decision.background !== true, ...(handle === undefined ? {} : { hold: { handle } }),
-            });
+            // QA-2.1-3: a reserved handle that no hold will use goes back at once; left behind, it keeps a pending slot of the
+            // session (and router_verify answers "held" for it) until HELD_RESERVATION_TTL_MS.
+            const releaseReserved = (reserved: string): void => {
+              try {
+                finishApi?.releaseHeld?.(reserved);
+              } catch (error) {
+                ingestLogger.warn("[router] background: the reserved handle could not be released", { error: String(error) });
+              }
+            };
+            let attempt: Attempt | undefined;
+            try {
+              attempt = inflight.acknowledge(event.id, resultChild, {
+                userBackgrounded: rec.decision.background !== true, ...(handle === undefined ? {} : { hold: { handle } }),
+              });
+            } finally {
+              // The acknowledgement registered no attempt (it returned nothing or threw): nothing carries the handle.
+              if (attempt === undefined && handle !== undefined) releaseReserved(handle);
+            }
             if (attempt !== undefined) {
               const notRunning = `[router] Running in the background (${resultChild}).`;
               const unheldText = verifyingCalls.has(event.id) || handle !== undefined
@@ -4278,11 +4293,7 @@ export async function registerV2Hooks(
               if (handle !== undefined && !holding) {
                 // QA-2.1-3: no hold exists, so nothing may say "held": the attempt is a plain verifying one and the handle goes back.
                 delete attempt.hold;
-                try {
-                  finishApi?.releaseHeld?.(handle);
-                } catch (error) {
-                  ingestLogger.warn("[router] background: the reserved handle could not be released", { error: String(error) });
-                }
+                releaseReserved(handle);
               }
               // QA-2.1-3: the acknowledgement text is chosen only after both writes settled.
               ackText = holding ? `${notRunning} Its result is held until verification finishes.` : unheldText;
