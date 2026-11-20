@@ -15,6 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **OpenCode v2: a background dispatch whose acknowledgement fails gives its reserved held handle back at once.** The
+  handle reserved for the hold just before the in-flight attempt is registered was released only once an attempt
+  existed: when the registration returned nothing or threw, the reservation stayed for `HELD_RESERVATION_TTL_MS`
+  (7 h), took one of the session's pending slots and made `router_verify` answer `held` for a dispatch that is not held.
+  It is now released on both failure paths.
 - **OpenCode v2: `router_verify` on a background handle whose child is still running answers `held`, not `unknown handle`.**
   The handle is reserved and listed every turn from the background ack but registered only when the child finishes, so
   until then the registry did not know it and an orchestrator that polled it got `unknown handle` again and again. The
