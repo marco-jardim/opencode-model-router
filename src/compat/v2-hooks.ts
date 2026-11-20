@@ -3409,10 +3409,18 @@ export async function registerV2Hooks(
 
     // 3.1.7 W4: the host's retry hook is registered with the executor below (W1), only when the factory built one (M3).
     registrations.push(await ctx.tool.hook("execute.before", async (event) => {
+      // #86: the call as the host handed it, taken before the first await (a shallow copy of its input record). The checks below
+      // resume after awaits; a host that reuses or rewrites the event, or the input record, of a parallel call meanwhile must not
+      // make this call's arguments, authority decision or refusal text those of the other call.
+      const handed: unknown = event.input;
+      const call = {
+        sessionID: event.sessionID, tool: event.tool,
+        input: handed !== null && typeof handed === "object" && !Array.isArray(handed) ? { ...(handed as Record<string, unknown>) } : handed,
+      };
       // 3.1.7 M41 (always on): a plan child without its plan binding is refused every tool call (fail closed). The context hook
       // checks a session's first user message; a first tool call that comes before that hook performs the same check here.
       await planChildGuard.assertToolAllowed(String(event.sessionID));
-      const args = await scopedArgs(event);
+      const args = await scopedArgs(call);
       // #84 P2.1 (P-2, handoffs 11/32/33): a role child binds to its dispatch before its tool runs, so `router_run` and
       // `router_git_*` resolve the bound work root and the guard reads the dispatch budget. Tiers mode: no role table, no call.
       const callerRoles = rolesOf(loadConfig(ctx.location.directory));
@@ -3429,7 +3437,7 @@ export async function registerV2Hooks(
       // QA-G-A3-2: a refusal here is thrown before the legacy hook (and its guard) sees the call: the plugin counts it on the
       // child's guard state, and the guard's stop (denied_cap) or advisory banner is added to the refusal the child sees.
       const refused = (message: string, agent: string | undefined): Error => {
-        const guard = options.recordRefusal?.(String(event.sessionID), agent, event.tool, args);
+        const guard = options.recordRefusal?.(String(event.sessionID), agent, call.tool, args);
         return new Error(guard === undefined ? message : `${message}\n${guard}`);
       };
       if (typeof event.agent !== "string" || event.agent === "") {
@@ -3440,7 +3448,7 @@ export async function registerV2Hooks(
       if (callerRole !== undefined) {
         let refusal: string | undefined;
         try {
-          refusal = await roleToolRefusal(event, args, callerRole);
+          refusal = await roleToolRefusal(call, args, callerRole);
         } catch {
           refusal = "the router could not check this dispatch's authority (fail closed)";
         }
@@ -4223,9 +4231,24 @@ export async function registerV2Hooks(
           try {
             const hold = verifyingCalls.has(event.id) && rec.verificationMode === "required" && held.available && !reloadFailed && finishApi?.canHold(parent) === true;
             const handle = hold ? finishApi?.reserveHeld(parent, event.id) : undefined;
-            const attempt = inflight.acknowledge(event.id, resultChild, {
-              userBackgrounded: rec.decision.background !== true, ...(handle === undefined ? {} : { hold: { handle } }),
-            });
+            // QA-2.1-3: a reserved handle that no hold will use goes back at once; left behind, it keeps a pending slot of the
+            // session (and router_verify answers "held" for it) until HELD_RESERVATION_TTL_MS.
+            const releaseReserved = (reserved: string): void => {
+              try {
+                finishApi?.releaseHeld?.(reserved);
+              } catch (error) {
+                ingestLogger.warn("[router] background: the reserved handle could not be released", { error: String(error) });
+              }
+            };
+            let attempt: Attempt | undefined;
+            try {
+              attempt = inflight.acknowledge(event.id, resultChild, {
+                userBackgrounded: rec.decision.background !== true, ...(handle === undefined ? {} : { hold: { handle } }),
+              });
+            } finally {
+              // The acknowledgement registered no attempt (it returned nothing or threw): nothing carries the handle.
+              if (attempt === undefined && handle !== undefined) releaseReserved(handle);
+            }
             if (attempt !== undefined) {
               const notRunning = `[router] Running in the background (${resultChild}).`;
               const unheldText = verifyingCalls.has(event.id) || handle !== undefined
@@ -4270,11 +4293,7 @@ export async function registerV2Hooks(
               if (handle !== undefined && !holding) {
                 // QA-2.1-3: no hold exists, so nothing may say "held": the attempt is a plain verifying one and the handle goes back.
                 delete attempt.hold;
-                try {
-                  finishApi?.releaseHeld?.(handle);
-                } catch (error) {
-                  ingestLogger.warn("[router] background: the reserved handle could not be released", { error: String(error) });
-                }
+                releaseReserved(handle);
               }
               // QA-2.1-3: the acknowledgement text is chosen only after both writes settled.
               ackText = holding ? `${notRunning} Its result is held until verification finishes.` : unheldText;

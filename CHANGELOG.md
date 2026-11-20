@@ -23,6 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `router: config notice: …`), and the rest of the file applies. The global override is still settled before the
   project-local one, so a conflicting project key is the one dropped (QA-4.1-21). A file none of whose top-level keys
   can be kept is dropped as a whole, as before. Valid configs load unchanged. OpenCode v1 and v2.
+- **OpenCode v2: a background dispatch whose acknowledgement fails gives its reserved held handle back at once.** The
+  handle reserved for the hold just before the in-flight attempt is registered was released only once an attempt
+  existed: when the registration returned nothing or threw, the reservation stayed for `HELD_RESERVATION_TTL_MS`
+  (7 h), took one of the session's pending slots and made `router_verify` answer `held` for a dispatch that is not held.
+  It is now released on both failure paths.
 - **OpenCode v2: `router_verify` on a background handle whose child is still running answers `held`, not `unknown handle`.**
   The handle is reserved and listed every turn from the background ack but registered only when the child finishes, so
   until then the registry did not know it and an orchestrator that polled it got `unknown handle` again and again. The
@@ -45,6 +50,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the tool description also includes a bounded list of commands accepting arguments. Argument acceptance is unchanged.
 - **Plan executor: recompiling a plan after abort and purge in the same process can be approved again.** A new plan
   reusing the same id gets fresh slot pools and collection state; stale slot handles from the purged plan remain fenced.
+- **OpenCode v2 / roles mode: each parallel tool call of a role agent is checked against its own arguments (#86).** The
+  `execute.before` authority check now reads the call's tool and input when the hook is invoked, not after its awaits,
+  so a refusal no longer names another parallel call's path when the host reuses or rewrites a pending call's event.
 - **OpenCode v2: read-only tiers recognise the host 2.0.31 default permissions.** Host 2.0.31 dropped the
   `external_directory * ask` default, so its defaults were treated as explicit rules: the host's `.env` read rules were
   re-appended after the tier policy and `host default permissions not recognised` was logged. Both the 2.0.22 and the

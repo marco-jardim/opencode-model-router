@@ -10,7 +10,8 @@
  *
  * Isolation (§0.6.9 / task rules): the host receives an allow-listed environment (no provider credentials, no
  * MODEL_ROUTER_* / OPENCODE_* variable of the caller), a private HOME/USERPROFILE/XDG/APPDATA/LOCALAPPDATA/TEMP, an
- * explicit `routing.outcomes.path` and a random port; its process tree is killed with taskkill and the port asserted closed.
+ * explicit `routing.outcomes.path` and a random port; its process tree is killed (on win32 member by member, never with
+ * `taskkill /T`: see `process-tree.ts`, #95) and the port asserted closed.
  */
 import { execFileSync, spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
@@ -24,6 +25,7 @@ import { pathToFileURL } from "node:url";
 import { CpxFront, type CpxProviderOptions } from "./cpx-scripted-provider";
 import { listenOnFetchSafePort, pickFetchSafePort } from "./fetch-safe-port";
 import type { CpxTimings } from "./cpx-timing";
+import { ProcessTree, processInfo, processTable, stopTree, type ProcessRow } from "./process-tree";
 import { DEFAULT_OUTCOME_TUNING, acquireOutcomes, type OutcomeKey } from "../../../src/routing/outcomes";
 import type { DecisionRow, LogRow, OutcomeEntrySnapshot } from "../../../src/routing/outcomes/types";
 
@@ -719,7 +721,12 @@ export interface HostOptions {
   };
 }
 export interface Seed { readonly key: OutcomeKey; readonly pass: number; readonly fail: number }
+/** `taskkill` (win32 tree kill only): `{ rounds, tree, kills, survivors, strays, errors }` of `stopTree` (`process-tree.ts`). */
 export interface Teardown { pid?: number; method: string; taskkill?: Obj; exitCode: number | null | undefined; hostPort: number; hostPortClosed: boolean; providerStopped: boolean; rootRemoved: boolean }
+/** `Teardown.method` of the win32 tree kill. */
+export const TREE_KILL_METHOD = "taskkill /F /PID <pid> per tree member, children first, the root last (no /T)";
+/** The image name Win32_Process reports for a spawned file: its base name, `.exe` added when it has no extension (libuv's search). */
+const imageName = (file: string): string => path.extname(file) === "" ? `${path.basename(file)}.exe` : path.basename(file);
 
 const liveHosts = new Set<RoutingHost>();
 /** Every session id any isolated host of this run held (roots and children), kept so the live-store check can show none of them reached the user's store. */
@@ -742,6 +749,8 @@ export class RoutingHost {
   readonly logs: { hooks: string; events: string; dump: string };
   readonly configHome: string;
   private child?: ChildProcess;
+  /** win32: the current child's tree (#95), its root registered by `launch()` once the host listens. */
+  private tree?: ProcessTree;
   private output = "";
   private teardown?: Promise<Teardown>;
   private launches = 0;
@@ -874,9 +883,14 @@ export class RoutingHost {
     if (leaked.length > 0) throw new Error(`credential-shaped variable(s) would reach the host: ${leaked.join(",")}`);
     this.port = await pickFetchSafePort();
     const outputFrom = this.output.length; // `output` accumulates across children: only this child's lines can announce its address
+    // #95: on win32 the kill follows this child's own tree (process-tree.ts); its baseline is the process table BEFORE the spawn.
+    const tree = process.platform === "win32" ? new ProcessTree(await processTable(), Date.now()) : undefined; // throws on an empty baseline
     timing?.mark("host.spawn.start", { launch });
     const child = spawn(executable, ["serve", "--hostname", "127.0.0.1", "--port", String(this.port), "--print-logs"], { cwd: this.project, env, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
     this.child = child;
+    this.tree = tree;
+    // Read at once, judged only after the listening line: an early exit still reports "exited early".
+    const rootRow = tree && child.pid !== undefined ? processInfo(child.pid) : undefined;
     timing?.mark("host.spawn.returned", { launch, pid: child.pid });
     child.stdout!.on("data", chunk => { this.output += chunk; });
     child.stderr!.on("data", chunk => { this.output += chunk; });
@@ -886,6 +900,7 @@ export class RoutingHost {
       return /server listening on (http:\/\/127\.0\.0\.1:\d+)/.exec(this.output.slice(outputFrom))?.[1];
     }, 40_000);
     timing?.mark("host.listening.observed", { launch });
+    if (tree) this.registerRoot(child, tree, await rootRow);
     this.authorization = basic("opencode", password);
     timing?.mark("host.client.start", { launch });
     this.client = await loadClient(this.baseUrl, this.authorization);
@@ -931,7 +946,24 @@ export class RoutingHost {
     await this.launch();
   }
 
-  /** Kills the current host process tree (taskkill on win32, SIGTERM elsewhere) and waits (bounded) for it to close. */
+  /**
+   * #95: registers the spawned child as its tree's root (name, created after the spawn, not in the baseline: `ProcessTree.setRoot`).
+   * `row` was read while the child had not exited (checked here): until its exit is processed Node holds the child's handle, so
+   * the pid could not have been reused by another process during that read.
+   */
+  private registerRoot(child: ChildProcess, tree: ProcessTree, row: ProcessRow | undefined): void {
+    if (child.exitCode !== null || child.signalCode !== null) throw new Error(`OpenCode 2 exited early:\n${this.output}`);
+    if (row === undefined) throw new Error(`spawned pid ${child.pid} is not in the process table`);
+    tree.setRoot(row, imageName(child.spawnfile));
+  }
+
+  /**
+   * Kills the current host process and waits (bounded) for it to close. win32: `stopTree` (process-tree.ts, shared with
+   * tui-pty.ts) — the tree's members collected by parent pid AND creation time, each re-read and then killed with
+   * `taskkill /F /PID` (never `/T`, which with pid reuse can reach unrelated processes), children first, the root last, then
+   * `ChildProcess.kill()` (handle-based, so pid-safe). Without a registered root (a launch that failed first) only that handle
+   * kill runs. Elsewhere: SIGTERM.
+   */
   private async killChild(): Promise<{ method: string; taskkill?: Obj }> {
     const child = this.child;
     const pid = child?.pid;
@@ -939,11 +971,14 @@ export class RoutingHost {
     let taskkill: Obj | undefined;
     if (child && child.exitCode === null && child.signalCode === null) {
       const closed = new Promise<void>(resolve => child.once("close", () => resolve()));
-      if (process.platform === "win32" && pid !== undefined) {
-        const result = spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], { encoding: "utf8", windowsHide: true });
-        method = "taskkill /PID <pid> /T /F";
-        taskkill = { status: result.status, killedPids: [...new Set([...(result.stdout ?? "").matchAll(/PID\D*(\d+)/g)].map(m => Number(m[1])))], stderr: result.stderr?.trim() };
-      } else { child.kill(); method = "SIGTERM"; }
+      const killByHandle = () => { if (child.exitCode === null && child.signalCode === null) try { child.kill(); } catch { /* already gone */ } };
+      const tree = this.tree;
+      if (process.platform === "win32" && pid !== undefined && tree?.root?.ProcessId === pid) {
+        const result = await stopTree(tree, killByHandle);
+        method = TREE_KILL_METHOD;
+        taskkill = { ...result, tree: [...tree.members.values()], kills: [...tree.kills] };
+      } else if (process.platform === "win32") { killByHandle(); method = "ChildProcess.kill() of the root only (no tracked tree)"; }
+      else { child.kill(); method = "SIGTERM"; }
       await Promise.race([closed, delay(10_000)]);
     }
     return { method, taskkill };
