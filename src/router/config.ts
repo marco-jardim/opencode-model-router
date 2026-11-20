@@ -3295,6 +3295,100 @@ function boundProjectClassifier(merged: Record<string, unknown>, lower: unknown,
   return { ...merged, routing: { ...merged.routing, classifier: bounded } };
 }
 
+/** A key path dropped from an override layer (#80), with the validation error that kept it out. */
+interface DroppedKeyPath {
+  path: readonly string[];
+  reason: string;
+}
+
+/**
+ * #80: the dropped key paths split further before giving up on them: `presets`, one preset, one
+ * preset tier. Every other top-level key is kept or dropped as a whole.
+ */
+function refinableKeyPath(path: readonly string[], value: unknown): value is Record<string, unknown> {
+  return path[0] === "presets" && path.length <= 3 && isPlainObject(value) && Object.keys(value).length > 0;
+}
+
+/** The value at `path` in `obj` (own keys only), or `undefined`. */
+function valueAtKeyPath(obj: unknown, path: readonly string[]): unknown {
+  let current = obj;
+  for (const key of path) {
+    if (!isPlainObject(current) || !Object.hasOwn(current, key)) return undefined;
+    current = current[key];
+  }
+  return current;
+}
+
+/**
+ * `obj` without the key at `path`. An object the removal leaves empty goes too, so dropping every
+ * key of a block is the same as dropping the block. Copies along `path` only; never mutates `obj`.
+ */
+function withoutKeyPath(obj: Record<string, unknown>, path: readonly string[]): Record<string, unknown> {
+  const [head, ...rest] = path;
+  if (head === undefined || !Object.hasOwn(obj, head)) return obj;
+  let replacement: Record<string, unknown> | undefined; // undefined: the key goes
+  if (rest.length > 0) {
+    const value = obj[head];
+    if (!isPlainObject(value)) return obj;
+    const pruned = withoutKeyPath(value, rest);
+    if (pruned === value) return obj;
+    replacement = Object.keys(pruned).length > 0 ? pruned : undefined;
+  }
+  // Object.fromEntries defines each key, so an own `__proto__` key stays a key and reparents nothing.
+  return Object.fromEntries(
+    Object.entries(obj).flatMap(([key, value]): Array<[string, unknown]> => {
+      if (key !== head) return [[key, value]];
+      return replacement === undefined ? [] : [[key, replacement]];
+    }),
+  );
+}
+
+/**
+ * #80: the key paths of an override layer to drop so that the config validates, instead of the
+ * whole layer. `errorWith(data)` validates the config with the layer's data replaced by `data` and
+ * returns the error message, or `undefined` when it is valid; the caller has checked that the
+ * layer's absence (`{}`) is valid. Deterministic, in file order: every top-level key starts out
+ * dropped and comes back when the config still validates with it; a `presets` block that cannot
+ * come back is split into its presets, a preset into its tiers, a tier into its keys, each restored
+ * the same way; a last pass restores a key that only failed because of one dropped later (an
+ * `activePreset` naming a preset whose bad tier key came out after it). One validation per key
+ * tried, plus that pass.
+ */
+function isolateInvalidKeys(
+  data: Record<string, unknown>,
+  errorWith: (pruned: Record<string, unknown>) => string | undefined,
+): { data: Record<string, unknown>; dropped: DroppedKeyPath[] } {
+  let dropped: DroppedKeyPath[] = Object.keys(data).map((key) => ({ path: [key], reason: "" }));
+  const pruned = (entries: readonly DroppedKeyPath[]): Record<string, unknown> =>
+    entries.reduce((acc, entry) => withoutKeyPath(acc, entry.path), data);
+  /** Restore `entry` when the config validates with it; otherwise record why it stays dropped. */
+  const tryRestore = (entry: DroppedKeyPath): boolean => {
+    const rest = dropped.filter((other) => other !== entry);
+    const error = errorWith(pruned(rest));
+    if (error === undefined) {
+      dropped = rest;
+      return true;
+    }
+    entry.reason = error;
+    return false;
+  };
+  for (const entry of [...dropped]) tryRestore(entry);
+  for (let i = 0; i < dropped.length; i++) {
+    const entry = dropped[i]!;
+    const value = valueAtKeyPath(data, entry.path);
+    if (!refinableKeyPath(entry.path, value)) continue;
+    const children = Object.keys(value).map((key) => ({ path: [...entry.path, key], reason: entry.reason }));
+    dropped.splice(i, 1, ...children);
+    for (const child of children) tryRestore(child);
+    i--; // position i now holds the first child still dropped, or the next entry: visit it
+  }
+  for (let restored = true; restored;) {
+    restored = false;
+    for (const entry of [...dropped]) if (tryRestore(entry)) restored = true;
+  }
+  return { data: pruned(dropped), dropped };
+}
+
 /**
  * Build a fresh config from tiers.json + override layers + persisted state.
  * Throws only when tiers.json itself is unreadable/invalid. Override and state
@@ -3329,14 +3423,17 @@ function buildConfig(
       rawUsed = merged;
       notices.push(...attemptNotices);
     } catch (err) {
-      // A bad override must never brick startup, and one broken file must not
-      // discard a good one. Fall back to one layer that validates on its own,
-      // else the bundled defaults. QA-4.1-21: the global layer is tried first, so
-      // a project file cannot force a conflict with a value valid on its own and
-      // so drop the user's whole global layer; a broken global file still lets a
-      // project file apply.
+      // A bad override must never brick startup, and one bad value must not discard the
+      // rest of its file, let alone a good file (#80). The layers are settled one at a
+      // time, each on top of those already settled. QA-4.1-21: the global layer goes
+      // first, so a project file cannot force a conflict with a value valid on its own
+      // and so drop the user's global keys; a broken global file still lets a project
+      // file apply. A layer that validates whole is kept whole. Otherwise only the key
+      // paths that keep it from validating are dropped, each with a notice
+      // (isolateInvalidKeys); when every top-level key of the layer has to go, the layer
+      // is dropped as a whole, with the log lines it always had.
       console.warn(
-        `[model-router] combined overrides are invalid (${(err as Error).message}); dropping conflicting layer(s)`,
+        `[model-router] combined overrides are invalid (${(err as Error).message}); dropping the invalid keys or layer(s)`,
       );
       const layerPaths = layers.map((l) => l.path).join(" + ");
       failures.push({
@@ -3347,31 +3444,63 @@ function buildConfig(
         ...layers.map((_, i) => i).filter((i) => !layers[i]!.project).reverse(),
         ...layers.map((_, i) => i).filter((i) => layers[i]!.project === true).reverse(),
       ];
-      for (const i of order) {
+      /** The layers settled so far, in priority order, with layer `i` as `layer`. */
+      const settledWith = (kept: ReadonlyArray<OverrideLayer | undefined>, i: number, layer: OverrideLayer): OverrideLayer[] =>
+        kept.map((l, j) => (j === i ? layer : l)).filter((l): l is OverrideLayer => l !== undefined);
+      const validationError = (raw: unknown): string | undefined => {
         try {
-          const attemptNotices: ConfigNotice[] = [];
-          const single = merge([layers[i]!], attemptNotices);
-          cfg = validateConfig(single);
-          rawUsed = single;
-          notices.push(...attemptNotices);
-          for (let j = 0; j < layers.length; j++) {
-            if (j !== i) {
-              console.warn(`[model-router] dropped override layer ${layers[j]!.path}`);
-            }
+          validateConfig(raw);
+          return undefined;
+        } catch (validationErr) {
+          return (validationErr as Error).message;
+        }
+      };
+      // The merge notices (A18 clamps) of a trial merge are not reported: only the final merge's are.
+      const errorWith = (kept: ReadonlyArray<OverrideLayer | undefined>, i: number, layer: OverrideLayer): string | undefined =>
+        validationError(merge(settledWith(kept, i, layer), []));
+      const kept: Array<OverrideLayer | undefined> = layers.map(() => undefined);
+      const droppedWhole: number[] = [];
+      for (const i of order) {
+        const layer = layers[i]!;
+        if (errorWith(kept, i, layer) === undefined) {
+          kept[i] = layer;
+          continue;
+        }
+        const isolated = isolateInvalidKeys(layer.data, (data) => errorWith(kept, i, { ...layer, data }));
+        const keptSomeKey = Object.keys(layer.data).some(
+          (key) => !isolated.dropped.some((d) => d.path.length === 1 && d.path[0] === key),
+        );
+        if (keptSomeKey && errorWith(kept, i, { ...layer, data: isolated.data }) === undefined) {
+          kept[i] = { ...layer, data: isolated.data };
+          for (const { path, reason } of isolated.dropped) {
+            const keyPath = path.join(".");
+            console.warn(`[model-router] ignoring ${keyPath} from ${layer.path}: ${reason}`);
+            notices.push({
+              source: layer.path,
+              message: `ignoring ${keyPath} from ${layer.path}: ${reason}; the rest of the file applies`,
+            });
           }
-          break;
-        } catch (singleErr) {
-          console.warn(
-            `[model-router] ignoring ${layers[i]!.path}: ${(singleErr as Error).message}`,
-          );
-          failures.push({
-            source: layers[i]!.path,
-            message: `${layers[i]!.path}: ${(singleErr as Error).message}`,
-          });
-          cfg = validateConfig(base);
-          rawUsed = base;
+          continue;
+        }
+        // Not isolated: the layer goes as a whole, as before #80.
+        droppedWhole.push(i);
+        const aloneError = validationError(merge([layer], []));
+        if (aloneError !== undefined) {
+          console.warn(`[model-router] ignoring ${layer.path}: ${aloneError}`);
+          failures.push({ source: layer.path, message: `${layer.path}: ${aloneError}` });
         }
       }
+      if (kept.some((l) => l !== undefined)) {
+        for (const i of droppedWhole.sort((a, b) => a - b)) {
+          console.warn(`[model-router] dropped override layer ${layers[i]!.path}`);
+        }
+      }
+      const used = kept.filter((l): l is OverrideLayer => l !== undefined);
+      const attemptNotices: ConfigNotice[] = [];
+      const settled = used.length > 0 ? merge(used, attemptNotices) : base;
+      cfg = validateConfig(settled);
+      rawUsed = settled;
+      notices.push(...attemptNotices);
     }
   }
 

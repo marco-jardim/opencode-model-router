@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { configPath, invalidateConfigCache, loadConfig, OVERRIDE_FILENAME } from "../../src/router/config";
+import { configPath, getConfigNotices, invalidateConfigCache, loadConfig, OVERRIDE_FILENAME } from "../../src/router/config";
 import { SMOKE_PRESET, smokeTierOverride } from "../smoke/helpers/tier-override";
 
 // guard-hardblock.smoke.test.ts writes this overrides file when MODEL_ROUTER_SMOKE_MODEL is set, then asserts the
@@ -55,15 +55,25 @@ describe("smoke tier override (MODEL_ROUTER_SMOKE_MODEL)", () => {
     }
   });
 
-  it("the former fixture (the bundled preset patched with variant \"\") is dropped whole: fast stays on the bundled model", () => {
+  it("the former fixture (the bundled preset patched with variant \"\") loses only `variant` (#80): the bundled variant still rides along", () => {
     const bundled = JSON.parse(readFileSync(configPath(), "utf8")) as {
       activePreset: string;
-      presets: Record<string, Record<string, { model: string }>>;
+      presets: Record<string, Record<string, { model: string; variant?: string }>>;
     };
     const tier = { model, variant: "" };
-    const cfg = loadConfig(project({ presets: { [bundled.activePreset]: { fast: tier, medium: tier, heavy: tier } } }));
-    expect(cfg.presets[cfg.activePreset]?.fast?.model).toBe(bundled.presets[bundled.activePreset]?.fast?.model);
-    expect(cfg.presets[cfg.activePreset]?.fast?.model).not.toBe(model);
+    const dir = project({ presets: { [bundled.activePreset]: { fast: tier, medium: tier, heavy: tier } } });
+    const cfg = loadConfig(dir);
+    for (const name of ["fast", "medium", "heavy"]) {
+      const loaded = cfg.presets[cfg.activePreset]?.[name];
+      expect(loaded?.model, name).toBe(model);
+      // `""` is dropped, so the bundled Anthropic variant is not suppressed: why the smoke uses its own preset.
+      expect(loaded?.variant, name).toBe(bundled.presets[bundled.activePreset]?.[name]?.variant);
+    }
     expect(warn.mock.calls.flat().join("\n")).toMatch(/fast\.variant' must be a non-empty string/);
+    expect(getConfigNotices(dir).map((n) => n.message).filter((m) => m.startsWith("ignoring "))).toEqual(
+      ["fast", "medium", "heavy"].map((name) =>
+        expect.stringMatching(new RegExp(`^ignoring presets\\.${bundled.activePreset}\\.${name}\\.variant from .*: .*must be a non-empty string`)),
+      ),
+    );
   });
 });

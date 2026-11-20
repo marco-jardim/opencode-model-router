@@ -15,6 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **One invalid value in an overrides file no longer drops the whole file (#80).** A bad tier `effort`, an
+  `activePreset` naming no preset or an out-of-range `routing` key used to discard every other key of that file too,
+  `routing` included. Now only the offending key path goes: the top-level key it sits under, or inside `presets` the
+  narrowest of preset, tier and tier key (`presets.anthropic.fast.effort`). Each dropped path adds one config notice,
+  `ignoring <path> from <file>: <reason>; the rest of the file applies` (`/router` lists it as
+  `router: config notice: …`), and the rest of the file applies. The global override is still settled before the
+  project-local one, so a conflicting project key is the one dropped (QA-4.1-21). A file none of whose top-level keys
+  can be kept is dropped as a whole, as before. Valid configs load unchanged. OpenCode v1 and v2.
 - **OpenCode v2: `router_verify` on a background handle whose child is still running answers `held`, not `unknown handle`.**
   The handle is reserved and listed every turn from the background ack but registered only when the child finishes, so
   until then the registry did not know it and an orchestrator that polled it got `unknown handle` again and again. The
