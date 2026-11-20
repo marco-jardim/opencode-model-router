@@ -421,7 +421,12 @@ export const PENDING_LIST_LIMIT = 5;
 export const FOOTER_MAX_REASONS = 3;
 export const LATE_NOTICE_MAX_IDS = 10;
 
-export const UNKNOWN_HANDLE_TEXT = "unknown handle";
+/**
+ * Terminal and cause-neutral (R6): the registry cannot tell a handle that was never issued here, one issued to another
+ * session, and one lost to a restart or an eviction. Re-asking cannot change the answer, and the text says so.
+ */
+export const UNKNOWN_HANDLE_TEXT =
+  "unknown handle: this session has no record of it (never issued here, issued to another session, or no longer tracked after a restart, eviction or a failed background run); retrying will not change the answer";
 export const EXPIRED_HANDLE_TEXT = "expired handle: older than pendingTtlMs or evicted; it can no longer be verified";
 export const VERIFYING_ELSEWHERE_TEXT =
   "still being verified by another router_verify call; call again for its verdict";
@@ -803,6 +808,11 @@ export interface PendingRegistry {
   reserveHandle(sessionID: string): string | undefined;
   /** Gives a reserved handle back (the ack failed, or the dispatch is not held after all). */
   releaseHandle(handle: string): void;
+  /**
+   * The session a handle is reserved for (drawn by `reserveHandle`, not yet registered or released), else undefined. Callers
+   * must compare it with the calling session: another session's reservation is never revealed (R6).
+   */
+  reservedBy(handle: string): string | undefined;
   /** The entry registered under `dispatchID` (callID), if still stored. */
   findByDispatch(dispatchID: string): PendingEntry | undefined;
   /** The session's "held" entries, newest first (they are never listed by listPending). */
@@ -2982,6 +2992,9 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
     reserveHandle,
     releaseHandle(handle) {
       unreserve(handle);
+    },
+    reservedBy(handle) {
+      return reserved.get(handle);
     },
     hasSlot,
     findByDispatch(dispatchID) {

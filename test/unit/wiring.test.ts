@@ -7,6 +7,7 @@ import {
   createVerificationWiring,
   extractAssistantText,
   HELD_RESULT_TEXT,
+  NO_SESSION_TEXT,
   noChangeGateSpawnsNothing,
 } from "../../src/verify/wiring";
 import { buildDelegationDoD, buildForcingNote, createChangedFileStore, type DispatchDelta } from "../../src/verify/dispatch";
@@ -15,7 +16,7 @@ import type { TestsPassRequest } from "../../src/verify/types";
 import { preemptBackgroundVerification } from "../../src/verify/wiring";
 import type { GateResult } from "../../src/verify/gate";
 import type { RouterConfig } from "../../src/router/config";
-import { HEAD_LOST_REASON, unattributedRisk } from "../../src/verify/pending";
+import { HEAD_LOST_REASON, UNKNOWN_HANDLE_TEXT, unattributedRisk } from "../../src/verify/pending";
 import type { CheckPlacement } from "../../src/verify/types";
 
 // Phase 2.1: the reference GC test below records the order of keepReferences and gcStaleReferences; both pass through to the real
@@ -250,6 +251,84 @@ describe("router_verify and a held background result (QA-2.1-9)", () => {
     expect(report.items[0]).toMatchObject({ kind: "verdict", handle, via: "joined" });
     const again = await w.verifyHandles(session, { kind: "handles", handles: [handle] });
     expect(again.items[0]).toMatchObject({ kind: "verdict", handle, via: "cached" });
+  });
+
+  it("answers held for a handle reserved at the ack but not registered yet, then replays the verdict once it settles", async () => {
+    const w = createVerificationWiring({ client: fakeClient(), directory: process.cwd(), getConfig: () => cfg(), logger: { warn: () => undefined } });
+    const handle = w.pending.reserveHandle(session);
+    if (handle === undefined) throw new Error("no handle reserved");
+    // The child is still running: the handle is rendered to the orchestrator, but no entry exists yet.
+    expect(w.pending.get(session, handle).kind).toBe("unknown");
+    expect(w.pending.reservedBy(handle)).toBe(session);
+    const early = await w.verifyHandles(session, { kind: "handles", handles: [handle] });
+    expect(early.items).toEqual([{ kind: "held", handle }]);
+    expect(early.text).toContain(`- ${handle} \u00b7 ${HELD_RESULT_TEXT}`);
+    expect(early.text).not.toContain(UNKNOWN_HANDLE_TEXT);
+    // The reservation is untouched by the question, and nothing was registered.
+    expect(w.pending.reservedBy(handle)).toBe(session);
+    expect(w.pending.get(session, handle).kind).toBe("unknown");
+
+    // The child finishes: the same handle is registered (held), its gate claims and settles it.
+    const reg = w.pending.register({
+      orchestratorSessionID: session,
+      dispatchID: "call-reserved-1",
+      producerSessionID: "ses_child_call-reserved-1",
+      producerTier: "fast",
+      description: "reserved dispatch",
+      cwd: process.cwd(),
+      root: undefined,
+      dispatchedAt: Date.now(),
+      dod: buildDelegationDoD({ prompt: "Refactor the parser.\n[acceptance]\ncheck: testsPass\n[/acceptance]" }),
+      reference: Promise.resolve({ kind: "none", reason: "held dispatch: the required gate captures its own reference" }),
+      changedFiles: [],
+      risk: unattributedRisk(),
+      handle,
+      hold: { childSessionID: "ses_child_call-reserved-1", callID: "call-reserved-1" },
+    });
+    if (!reg.ok) throw new Error(`held entry not registered: ${reg.code} ${reg.detail}`);
+    expect(reg.handle).toBe(handle);
+    expect(w.pending.reservedBy(handle)).toBeUndefined();
+    const registered = await w.verifyHandles(session, { kind: "handles", handles: [handle] });
+    expect(registered.items).toEqual([{ kind: "held", handle, description: "reserved dispatch" }]);
+    const claim = w.pending.markVerifying(session, handle);
+    if (claim.kind !== "claimed") throw new Error(`expected the gate's claim, got ${claim.kind}`);
+    expect(claim.settle(passed)).toBe(true);
+    const replay = await w.verifyHandles(session, { kind: "handles", handles: [handle] });
+    expect(replay.items[0]).toMatchObject({ kind: "verdict", handle, via: "cached" });
+  });
+
+  it("does not reveal another session's reserved handle (R6): it stays unknown", async () => {
+    const w = createVerificationWiring({ client: fakeClient(), directory: process.cwd(), getConfig: () => cfg(), logger: { warn: () => undefined } });
+    const handle = w.pending.reserveHandle(session);
+    if (handle === undefined) throw new Error("no handle reserved");
+    const foreign = await w.verifyHandles("ses_other", { kind: "handles", handles: [handle] });
+    expect(foreign.items).toEqual([{ kind: "unknown", input: handle }]);
+    expect(foreign.text).toContain(`- ${handle} \u00b7 ${UNKNOWN_HANDLE_TEXT}`);
+    expect(foreign.text).not.toContain(HELD_RESULT_TEXT);
+    // A released reservation (ack failed) is unknown for its own session again.
+    w.pending.releaseHandle(handle);
+    expect(w.pending.reservedBy(handle)).toBeUndefined();
+    const released = await w.verifyHandles(session, { kind: "handles", handles: [handle] });
+    expect(released.items).toEqual([{ kind: "unknown", input: handle }]);
+  });
+
+  it("answers a call without a session id as no-session, for handles and for pending", async () => {
+    const w = createVerificationWiring({ client: fakeClient(), directory: process.cwd(), getConfig: () => cfg(), logger: { warn: () => undefined } });
+    const handle = w.pending.reserveHandle(session);
+    if (handle === undefined) throw new Error("no handle reserved");
+    const byHandle = await w.verifyHandles("", { kind: "handles", handles: [handle, 42] });
+    expect(byHandle.items).toEqual([{ kind: "no-session", input: handle }, { kind: "no-session", input: "(not a string)" }]);
+    expect(byHandle.text).toContain(`- ${handle} \u00b7 ${NO_SESSION_TEXT}`);
+    expect(byHandle.text).not.toContain(UNKNOWN_HANDLE_TEXT);
+    const byPending = await w.verifyHandles("", { kind: "pending" });
+    expect(byPending.items).toEqual([{ kind: "no-session", input: "pending: true" }]);
+    expect(byPending.text).toContain(NO_SESSION_TEXT);
+    expect(byPending.text).not.toContain("no unverified delegations");
+    // Nothing is left "for another call" when every handle gets the same answer: no excess line.
+    const many = Array.from({ length: 40 }, (_, i) => `vrf_${i.toString(16).padStart(24, "0")}`);
+    const overflow = await w.verifyHandles("", { kind: "handles", handles: many });
+    expect(overflow.excess).toBe(0);
+    expect(overflow.text).not.toContain("call `router_verify` again with the rest");
   });
 });
 
