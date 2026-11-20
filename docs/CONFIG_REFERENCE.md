@@ -54,7 +54,7 @@ This changes the default capabilities even when an existing config has neither
 
 | Key | Type | Bundled value | Notes |
 |---|---|---|---|
-| `activePreset` | `string` | `"anthropic"` | Names the entry of `presets` the router routes with. `validateConfig` rejects a name that is not a defined preset; matching is case-insensitive and trimmed. `/router preset <name>` rewrites it at runtime and persists the choice to the router's state file. A saved choice that no layer defines (for example the removed `hybrid-2` or `fable-effort`) adds one config notice, `the preset '<name>' chosen with /preset is not defined (defined: …); using '<active>'`, and the router keeps the configured `activePreset`; an overrides layer whose own `activePreset` names an undefined preset is dropped as a whole. Read by `getActiveTiers` in `src/router/protocol.ts`, which falls back to the first defined preset, and by the fallback-chain builder. |
+| `activePreset` | `string` | `"anthropic"` | Names the entry of `presets` the router routes with. `validateConfig` rejects a name that is not a defined preset; matching is case-insensitive and trimmed. `/router preset <name>` rewrites it at runtime and persists the choice to the router's state file. A saved choice that no layer defines (for example the removed `hybrid-2` or `fable-effort`) adds one config notice, `the preset '<name>' chosen with /preset is not defined (defined: …); using '<active>'`, and the router keeps the configured `activePreset`; an overrides file whose own `activePreset` names an undefined preset loses that key, with a config notice, and its other keys still apply (#80). Read by `getActiveTiers` in `src/router/protocol.ts`, which falls back to the first defined preset, and by the fallback-chain builder. |
 | `activeMode` | `string` (optional) | `"normal"` | Names the entry of `modes` layered over the preset. Omit it — or point it at nothing — and no mode is applied. `/router mode <name>` rewrites it at runtime, rejecting a name that `modes` does not define, and persists it. Read by `getActiveMode` in `src/router/protocol.ts`. |
 | `presets` | `Record<string, Preset>` | six presets: `anthropic`, `openai`, `github-copilot`, `google`, `hybrid`, `zai` | Each preset maps a tier name (`fast`/`medium`/`heavy`) to its `TierConfig` — `model`, `costRatio`, `steps`, `effort`, and the optional per-tier `prompt`. |
 | `rules` | `string[]` | 10 rules | The numbered routing rules rendered verbatim into the `Rules:` line of the delegation protocol. Order is significant: they are emitted `1.`…`N.` in array order. |
@@ -971,7 +971,7 @@ Fully resolved defaults on **OpenCode v2** (this block is parsed by a test and c
 }
 ```
 
-**Unknown keys** inside `routing` (and its blocks) are ignored, not rejected, like every other block of this file, so a config written for a newer release still loads. They are not silent, though: the path of each one (`routing.margn`, `routing.classifier.bakend`, …) is logged once per process (per message text) through the plugin logger as `ignoring unknown routing keys: …` and listed under the marker in the bare `/router` view as `router: config notice: …`. Only the prototype-reparenting keys `__proto__`, `constructor` and `prototype` are refused. A value of the wrong type or outside its range throws for the classic keys (`engine` through `advisor`); in an overrides file that drops the layer with a warning, and a reload that turns invalid keeps serving the last valid config and logs why. The v2-only blocks `background`, `leases` and `executor` (and the roles keys) are tolerant instead: an invalid entry logs one warning and its default applies.
+**Unknown keys** inside `routing` (and its blocks) are ignored, not rejected, like every other block of this file, so a config written for a newer release still loads. They are not silent, though: the path of each one (`routing.margn`, `routing.classifier.bakend`, …) is logged once per process (per message text) through the plugin logger as `ignoring unknown routing keys: …` and listed under the marker in the bare `/router` view as `router: config notice: …`. Only the prototype-reparenting keys `__proto__`, `constructor` and `prototype` are refused. A value of the wrong type or outside its range throws for the classic keys (`engine` through `advisor`); in an overrides file that drops the file's whole `routing` block with a warning and a config notice (#80; the file's other top-level keys still apply), and a reload that turns invalid keeps serving the last valid config and logs why. The v2-only blocks `background`, `leases` and `executor` (and the roles keys) are tolerant instead: an invalid entry logs one warning and its default applies.
 
 ### Trust: which file may set what
 
@@ -981,7 +981,7 @@ Fully resolved defaults on **OpenCode v2** (this block is parsed by a test and c
 
 **A35 (A18 budget protection):** a project override may only tighten `routing.classifier.maxStateChars`, `routing.classifier.samples` and `routing.classifier.timeoutMs`. Each effective value is `min(lower-layer value or default, project value)`, with an A18 notice when clamped. A project may still set `routing.engine`, `routing.profile` and `routing.margin`: they choose among the user's configured tiers, and the D9 never-down guards hold in every mode. Other allowed keys still apply normally.
 
-**Conflicting layers (QA-4.1-21):** when the global and the project-local override are each valid but invalid together (for example a global `routing.detection.grader: 0.5` and a project `routing.detection.none: 0.6` break `deterministic >= grader >= none`), the global override is kept and the project-local one is dropped as a whole, with the log lines `combined overrides are invalid (…)` and `dropped override layer <project path>`. A global override that is invalid on its own still lets a valid project-local one apply.
+**Conflicting layers (QA-4.1-21):** when the global and the project-local override are each valid but invalid together (for example a global `routing.detection.grader: 0.5` and a project `routing.detection.none: 0.6` break `deterministic >= grader >= none`), the global override is kept and the conflicting key path of the project-local one is dropped (#80, here its `routing` block), with the log line `combined overrides are invalid (…)` and one `ignoring routing from <project path>: …` notice; the project file's other keys still apply. A project file with nothing else is dropped as a whole, logged as `dropped override layer <project path>`. A global override with an invalid value loses only that key path, and a valid project-local one still applies on top of the rest.
 
 ### Engine modes
 
@@ -1259,8 +1259,22 @@ and every unknown key, for example
 | A tier's `candidates` (when present) must be an array of objects; `model` (when present) must be `provider/model`, `variant` a non-empty string without whitespace or `#`, `costRatio` a number > 0; no two entries may share an effective `(model, variant)`; the effective `costRatio` must not decrease along the list; within a preset one `(model, variant)` has one `costRatio` (pairs involving a candidates entry). A tier's own `variant` must be a non-empty string without whitespace or `#`. (A list that lacks the tier's own rung, or states another `costRatio` for it, is **not** an error: it is ignored with a notice.) |
 | `routing` must be an object; every key of the [`routing` table](#keys) must be of its type and within its range, and a classifier backend other than `rules` needs a `provider/model[#variant]` model (plus an `http(s)` `baseUrl` for `openai-compatible` and `typesafe`) — for the top level and for every `classifier.presets` entry. `roles` classes must be one of `search|recon|mechanical|implement|debug|design|review|other`, agent ids must match `^[A-Za-z0-9][A-Za-z0-9_./-]*$` without `.`/`..`/empty segments or a trailing `/` or `.`, and each class is an array (empty allowed). |
 
-An invalid value in the bundled `tiers.json` throws at load; the same value in an
-overrides file is reported via `console.warn` and that override layer is dropped.
+An invalid value in the bundled `tiers.json` throws at load. The same value in an
+overrides file drops only its key path, and the rest of the file applies (#80). The path is
+the top-level key the value sits under (`routing`, `enforcement`, `activePreset`, …); inside
+`presets` it is the narrowest of preset, tier and tier key, for example
+`presets.anthropic.fast.effort` (the tier keeps its other keys). Each dropped path is logged via
+`console.warn` and adds one config notice, `ignoring <path> from <file>: <reason>; the rest of
+the file applies`, which the bare `/router` view lists as `router: config notice: …`. The
+search runs only when the merged layers do not validate, so a valid config is unchanged; it is
+deterministic and goes in file order: each key comes back if the config validates with it, and a
+key that only failed because of another bad key (an `activePreset` naming a preset with a bad
+tier key) comes back once that key is out. The global override is settled before the
+project-local one (see **Conflicting layers** under [`routing`](#routing--cost-aware-routing-engine-74)). When every top-level
+key of a file has to go, the file is dropped as a whole, as before #80 and without key-path
+notices: `ignoring <file>: <reason>` when it is invalid on its own, and `dropped override layer
+<file>` when another overrides file still applies. A reload that makes an overrides file invalid
+keeps serving the last valid config and logs why.
 
 ---
 

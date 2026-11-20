@@ -99,20 +99,26 @@ describe("a config naming a preset 2.6.0 removed", () => {
     expect(getConfigNotices(project)).toEqual([]);
   });
 
-  it("an override whose activePreset names a removed preset is dropped as a whole layer (unchanged behaviour)", () => {
-    // `tierCaps` stands for every other key the same file sets: it goes with the layer.
+  it("#80: an override whose activePreset names a removed preset loses that key only, with a notice; its other keys apply", () => {
+    // `tierCaps` stands for every other key the same file sets: before #80 it went with the layer.
     writeOverride({ activePreset: "fable-effort", tierCaps: { fast: 2 } });
 
     const cfg = loadConfig(project);
 
     expect(cfg.activePreset).toBe(BUNDLED.activePreset);
     expect(cfg.presets).not.toHaveProperty("fable-effort");
-    expect(cfg.tierCaps?.fast).not.toBe(2);
+    expect(cfg.tierCaps?.fast).toBe(2);
     const warnings = warnSpy.mock.calls.map((call: unknown[]) => String(call[0]));
     const reason = `tiers.json: 'activePreset' is 'fable-effort', which is not a defined preset (defined: ${Object.keys(BUNDLED.presets).join(", ")})`;
     expect(warnings).toEqual([
-      `[model-router] combined overrides are invalid (${reason}); dropping conflicting layer(s)`,
-      `[model-router] ignoring ${overridePath()}: ${reason}`,
+      `[model-router] combined overrides are invalid (${reason}); dropping the invalid keys or layer(s)`,
+      `[model-router] ignoring activePreset from ${overridePath()}: ${reason}`,
+    ]);
+    expect(getConfigNotices(project)).toEqual([
+      {
+        source: overridePath(),
+        message: `ignoring activePreset from ${overridePath()}: ${reason}; the rest of the file applies`,
+      },
     ]);
   });
 

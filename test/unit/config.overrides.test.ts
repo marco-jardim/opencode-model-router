@@ -14,6 +14,8 @@ import {
   configPath,
   statePath,
   getConfigReloadError,
+  getConfigNotices,
+  routerStatusLines,
 } from "../../src/router/config";
 
 // Switch used by the "cannot be read" test below to make exactly one path fail
@@ -864,6 +866,158 @@ describe("loadConfig — global + project override hierarchy", () => {
     expect(dropped).toHaveLength(1);
     expect(dropped[0]).toContain(join(".opencode", "opencode-model-router.overrides.jsonc"));
     expect(dropped[0]).not.toContain(overridePath());
+  });
+
+  describe("#80: an invalid value drops its key path, not the layer", () => {
+    const BUNDLED_ANTHROPIC = JSON.parse(readFileSync(join(__dirname, "../../tiers.json"), "utf-8")).presets
+      .anthropic as Record<string, { model: string; effort?: string; promptStyle?: string }>;
+    const warnings = (): string[] => (warnSpy.mock.calls as unknown[][]).map((call) => String(call[0]));
+    /** The key-path notices (#80); other notices are not under test here. */
+    const keyNotices = () => getConfigNotices().filter((n) => n.message.startsWith("ignoring "));
+
+    it("a bad leaf in the global layer drops that leaf only: the global routing block and other keys still apply", () => {
+      writeGlobal({
+        presets: {
+          anthropic: {
+            fast: { model: "anthropic/global-fast", effort: "bogus" },
+            heavy: { model: "anthropic/global-heavy" },
+          },
+        },
+        routing: { margin: 0.1 },
+        tierCaps: { fast: 2 },
+      });
+      invalidateConfigCache();
+      const cfg = loadConfig();
+      expect(cfg.presets.anthropic!.fast!.model).toBe("anthropic/global-fast");
+      expect(cfg.presets.anthropic!.fast!.effort).toBe(BUNDLED_ANTHROPIC.fast!.effort); // the bad value never applied
+      expect(cfg.presets.anthropic!.heavy!.model).toBe("anthropic/global-heavy");
+      expect(cfg.routing?.margin).toBe(0.1);
+      expect(cfg.tierCaps?.fast).toBe(2);
+      expect(keyNotices()).toEqual([
+        {
+          source: overridePath(),
+          message: `ignoring presets.anthropic.fast.effort from ${overridePath()}: tiers.json: preset 'anthropic' tier 'fast': effort must be one of low, medium, high, xhigh, max; the rest of the file applies`,
+        },
+      ]);
+      expect(warnings()).toContainEqual(expect.stringContaining("combined overrides are invalid"));
+      expect(warnings()).toContainEqual(`[model-router] ignoring presets.anthropic.fast.effort from ${overridePath()}: tiers.json: preset 'anthropic' tier 'fast': effort must be one of low, medium, high, xhigh, max`);
+      expect(warnings().filter((line) => line.includes("dropped override layer"))).toEqual([]);
+    });
+
+    it("a bad leaf in the project layer drops that leaf only: the other project keys and the global layer apply", () => {
+      writeGlobal({ presets: { anthropic: { fast: { model: "anthropic/global-fast" } } } });
+      writeLocal({
+        presets: { anthropic: { medium: { model: "anthropic/project-medium", promptStyle: "nope" } } },
+        routing: { margin: 0.2 },
+        tierCaps: { fast: 3 },
+      });
+      invalidateConfigCache();
+      const cfg = loadConfig();
+      const projectFile = findProjectOverride()!;
+      expect(cfg.presets.anthropic!.fast!.model).toBe("anthropic/global-fast");
+      expect(cfg.presets.anthropic!.medium!.model).toBe("anthropic/project-medium");
+      expect(cfg.presets.anthropic!.medium!.promptStyle).toBe(BUNDLED_ANTHROPIC.medium!.promptStyle);
+      expect(cfg.routing?.margin).toBe(0.2);
+      expect(cfg.tierCaps?.fast).toBe(3);
+      expect(keyNotices()).toEqual([
+        {
+          source: projectFile,
+          message: `ignoring presets.anthropic.medium.promptStyle from ${projectFile}: tiers.json: preset 'anthropic' tier 'medium': promptStyle must be one of prescriptive|goal-oriented|auto; the rest of the file applies`,
+        },
+      ]);
+      expect(warnings().filter((line) => line.includes("dropped override layer"))).toEqual([]);
+    });
+
+    it("a project value that conflicts with the global layer drops that project key only; the global layer wins (QA-4.1-21)", () => {
+      writeGlobal({ routing: { detection: { grader: 0.5 } } });
+      writeLocal({ routing: { detection: { none: 0.6 } }, tierCaps: { fast: 3 } });
+      invalidateConfigCache();
+      const cfg = loadConfig();
+      const projectFile = findProjectOverride()!;
+      expect(cfg.routing?.detection?.grader).toBe(0.5);
+      expect(cfg.routing?.detection?.none).toBeUndefined();
+      expect(cfg.tierCaps?.fast).toBe(3);
+      expect(keyNotices().map((n) => n.message)).toEqual([
+        expect.stringMatching(new RegExp(`^ignoring routing from ${projectFile.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&")}: .+; the rest of the file applies$`)),
+      ]);
+    });
+
+    it("two bad keys in different blocks are each dropped with their own notice, in file order; the rest applies", () => {
+      writeGlobal({
+        enforcement: { mode: "bogus" },
+        presets: { anthropic: { heavy: { model: "anthropic/global-heavy", effort: "bogus" } } },
+        routing: { margin: 0.1 },
+        tierCaps: { fast: 2 },
+      });
+      invalidateConfigCache();
+      const bundledMode = (JSON.parse(readFileSync(join(__dirname, "../../tiers.json"), "utf-8")) as { enforcement?: { mode?: string } }).enforcement?.mode;
+      const cfg = loadConfig();
+      expect(cfg.enforcement?.mode).toBe(bundledMode);
+      expect(cfg.presets.anthropic!.heavy!.model).toBe("anthropic/global-heavy");
+      expect(cfg.presets.anthropic!.heavy!.effort).toBe(BUNDLED_ANTHROPIC.heavy!.effort);
+      expect(cfg.routing?.margin).toBe(0.1);
+      expect(cfg.tierCaps?.fast).toBe(2);
+      expect(keyNotices().map((n) => n.message)).toEqual([
+        `ignoring enforcement from ${overridePath()}: tiers.json: enforcement.mode must be one of off|advisory|enforced; the rest of the file applies`,
+        `ignoring presets.anthropic.heavy.effort from ${overridePath()}: tiers.json: preset 'anthropic' tier 'heavy': effort must be one of low, medium, high, xhigh, max; the rest of the file applies`,
+      ]);
+    });
+
+    it("the notice reaches /router as `router: config notice:` naming the key path and the file", () => {
+      writeGlobal({ presets: { anthropic: { fast: { effort: "bogus" } } }, routing: { margin: 0.1 } });
+      invalidateConfigCache();
+      const cfg = loadConfig();
+      const lines = routerStatusLines(cfg, "v2").filter((line) => line.startsWith("router: config notice: ignoring "));
+      expect(lines).toEqual([
+        `router: config notice: ignoring presets.anthropic.fast.effort from ${overridePath()}: tiers.json: preset 'anthropic' tier 'fast': effort must be one of low, medium, high, xhigh, max; the rest of the file applies`,
+      ]);
+    });
+
+    it("a key that only failed because of a later bad key comes back (activePreset naming a preset with a bad tier key)", () => {
+      writeGlobal({
+        activePreset: "mine",
+        presets: { mine: { fast: { model: "anthropic/mine-fast", effort: "bogus" }, medium: { model: "anthropic/mine-medium" } } },
+      });
+      invalidateConfigCache();
+      const cfg = loadConfig();
+      expect(cfg.activePreset).toBe("mine");
+      expect(cfg.presets.mine!.fast!.model).toBe("anthropic/mine-fast");
+      expect(cfg.presets.mine!.fast!.effort).toBeUndefined();
+      expect(cfg.presets.mine!.medium!.model).toBe("anthropic/mine-medium");
+      expect(keyNotices().map((n) => n.message)).toEqual([
+        expect.stringMatching(/^ignoring presets\.mine\.fast\.effort from .+: .*effort must be one of/),
+      ]);
+    });
+
+    it("a layer none of whose top-level keys can be kept is still dropped as a whole, as before, with no key-path notice", () => {
+      writeGlobal({ activePreset: "no-such-preset", enforcement: { mode: "bogus" } });
+      writeLocal({ tierCaps: { fast: 3 } });
+      invalidateConfigCache();
+      const cfg = loadConfig();
+      const bundled = JSON.parse(readFileSync(join(__dirname, "../../tiers.json"), "utf-8")) as { activePreset: string; enforcement?: { mode?: string } };
+      expect(cfg.activePreset).toBe(bundled.activePreset);
+      expect(cfg.enforcement?.mode).toBe(bundled.enforcement?.mode);
+      expect(cfg.tierCaps?.fast).toBe(3); // the valid project layer still applies
+      expect(keyNotices()).toEqual([]);
+      const lines = warnings();
+      expect(lines).toContainEqual(expect.stringContaining("combined overrides are invalid"));
+      expect(lines).toContainEqual(expect.stringMatching(new RegExp(`^\\[model-router\\] ignoring ${overridePath().replace(/[\\^$.*+?()[\]{}|]/g, "\\$&")}: tiers\\.json: 'activePreset'`)));
+      expect(lines.filter((line) => line.includes("dropped override layer"))).toEqual([`[model-router] dropped override layer ${overridePath()}`]);
+      expect(lines.filter((line) => /ignoring (activePreset|enforcement) from /.test(line))).toEqual([]);
+    });
+
+    it("valid layers are unchanged: no warning, no key-path notice", () => {
+      writeGlobal({ presets: { anthropic: { fast: { model: "anthropic/global-fast", effort: "low" } } }, routing: { margin: 0.1 } });
+      writeLocal({ tierCaps: { fast: 3 } });
+      invalidateConfigCache();
+      const cfg = loadConfig();
+      expect(cfg.presets.anthropic!.fast!.model).toBe("anthropic/global-fast");
+      expect(cfg.presets.anthropic!.fast!.effort).toBe("low");
+      expect(cfg.routing?.margin).toBe(0.1);
+      expect(cfg.tierCaps?.fast).toBe(3);
+      expect(keyNotices()).toEqual([]);
+      expect(warnSpy).not.toHaveBeenCalled();
+    });
   });
 });
 
