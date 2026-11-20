@@ -44,7 +44,7 @@ const V1_BASE_COMMIT = "bd1ecd1";
  * Commit of the #68 / #95 item 2 fix (env isolation of the v1 deferred-catalog smoke). BUMP this one line to that commit's id
  * once it is committed; until then it is not a commit id and scenario 6 fails, so the reviewed change cannot pass unpinned.
  */
-const V1_ENV_ISOLATION_COMMIT = "";
+const V1_ENV_ISOLATION_COMMIT = "2a14ded";
 /**
  * Reviewed changes to guarded v1 paths after V1_BASE_COMMIT. The v1 freeze (AGENTS.md, host support policy) still allows
  * regression and security fixes and keeping the v1 tests green; such a change is listed here with its reason, and its path is
