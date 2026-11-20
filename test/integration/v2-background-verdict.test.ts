@@ -18,6 +18,7 @@ import type { Hooks } from "@opencode-ai/plugin";
 import ModelRouterPlugin from "../../src/index";
 import { ROUTER_FINISH_ATTACH, type FinishApi, type HeldSink } from "../../src/compat/background";
 import { invalidateConfigCache } from "../../src/router/config";
+import { UNKNOWN_HANDLE_TEXT } from "../../src/verify/pending";
 import { backgroundOutcomes, formatVerifyReport, HELD_RESULT_TEXT, waitTreeFreeExcept } from "../../src/verify/wiring";
 import { removeDirWhenReleased } from "../helpers/remove-dir";
 import { bootBgHost, restoreEnv, type BgHost, type NativeSubagentStub } from "../helpers/v2-bg-host";
@@ -320,7 +321,12 @@ function writeRouterConfig(overrides: Record<string, unknown>): void {
 }
 
 /** QA-DF1-16: a held background dispatch through the real before hook and finish API; the grader answers through `answer`. */
-async function heldGraderRun(callID: string, answer: () => Promise<{ sessionID: string; text: string }>) {
+async function heldGraderRun(
+  callID: string,
+  answer: () => Promise<{ sessionID: string; text: string }>,
+  /** Runs between the background ack (the handle is reserved) and the child's finish. */
+  whileReserved?: (handle: string, hooks: Hooks) => Promise<void>,
+) {
   process.env.MODEL_ROUTER_ENFORCE = "1";
   execFileSync("git", ["init", "-q"], { cwd: home }); // a work tree the gate can prepare its verification in
   const launched: Launched[] = [];
@@ -338,6 +344,7 @@ async function heldGraderRun(callID: string, answer: () => Promise<{ sessionID: 
     .catch(() => undefined);
   const handle = api.reserveHeld("ses_parent", callID);
   if (handle === undefined) throw new Error("no handle reserved");
+  await whileReserved?.(handle, hooks);
   const result = await api.finish({
     callID,
     parentSessionID: "ses_parent",
@@ -352,6 +359,57 @@ async function heldGraderRun(callID: string, answer: () => Promise<{ sessionID: 
   await vi.waitFor(() => expect(posted).toHaveLength(1), { timeout: 25_000 });
   return { api, handle, launched, posted, hooks };
 }
+
+describe("router_verify between the background ack and the verdict", () => {
+  it("answers held from the reservation (before the child finishes), then replays the cached verdict once the gate settled", async () => {
+    const asked: string[] = [];
+    const { handle, launched, posted, hooks } = await heldGraderRun("call-reserved-e2e", async () => ({
+      sessionID: "ses_grader_reserved_e2e",
+      text: JSON.stringify({ pass: true, reasons: ["the explanation names parse()"] }),
+    }), async (reserved, host) => {
+      asked.push(await routerVerify(host, reserved));
+    });
+    expect(asked).toHaveLength(1);
+    expect(asked[0]).toContain(`- ${handle} \u00b7 ${HELD_RESULT_TEXT}`);
+    expect(asked[0]).not.toContain(UNKNOWN_HANDLE_TEXT);
+    expect(launched.length).toBeGreaterThan(0); // only the held gate ran its grader; router_verify ran nothing
+    expect(posted[0]).toMatchObject({ handle, verdict: "PASS" });
+    const text = await routerVerify(hooks, handle);
+    expect(text).toContain(`- ${handle} \u00b7 `);
+    expect(text).toContain(" (cached verdict; nothing was run)");
+    expect(text).not.toContain(HELD_RESULT_TEXT);
+    expect(text).not.toContain(UNKNOWN_HANDLE_TEXT);
+  }, 30_000);
+
+  it("a held dispatch that cannot be registered gives its reservation back: router_verify then answers unknown, not held", async () => {
+    process.env.MODEL_ROUTER_ENFORCE = "1"; // router_verify is registered only when verification is on
+    const { api, posted, hooks } = await attach();
+    await hooks["tool.execute.before"]?.({ tool: "task", sessionID: "ses_other", callID: "call-noreg" }, {
+      args: { subagent_type: "fast", prompt: "Explore the parser and explain its entry point." },
+    });
+    const handle = api.reserveHeld("ses_parent", "call-noreg");
+    if (handle === undefined) throw new Error("no handle reserved");
+    expect(await routerVerify(hooks, handle)).toContain(HELD_RESULT_TEXT);
+    // The finish names another parent than the reservation's: the registration collides with the reservation and fails
+    // (handle-collision), so the gate posts its verdict directly and no entry will ever settle for this handle.
+    const result = await api.finish({
+      callID: "call-noreg",
+      parentSessionID: "ses_other",
+      childSessionID: "ses_child_call-noreg",
+      outputText: "Looked around; nothing to change.",
+      status: "succeeded",
+      mode: "background",
+      heldHandle: handle,
+      endedAt: Date.now(),
+    });
+    expect(result.verification).toEqual({ kind: "held", handle });
+    await vi.waitFor(() => expect(posted).toHaveLength(1), { timeout: 10_000 });
+    await api.idle();
+    const text = await routerVerify(hooks, handle);
+    expect(text).toContain(`- ${handle} \u00b7 ${UNKNOWN_HANDLE_TEXT}`);
+    expect(text).not.toContain(HELD_RESULT_TEXT);
+  }, 30_000);
+});
 
 describe("QA-DF1-16 a held gate verdict is settled as the gate reached it", () => {
   it("a late duplicate after the pending entry was forgotten neither gates nor posts again", async () => {

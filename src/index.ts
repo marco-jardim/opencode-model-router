@@ -2614,7 +2614,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           try {
             const target = parseRouterVerifyArgs(args);
             if ("error" in target) return target.error;
-            // R6: handles are scoped by the calling session; without one, every handle is unknown.
+            // R6: handles are scoped by the calling session; without one, the call is answered "no session".
             const sessionID = typeof toolCtx?.sessionID === "string" ? toolCtx.sessionID : "";
             const report = await verifyHandles(sessionID, target, toolCtx?.abort !== undefined ? { signal: toolCtx.abort } : {});
             // Phase 1.2 (v2 only): the late notices this report answers stop being retained for the turn-state tail.
@@ -4748,8 +4748,11 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           ...(heldHead ? { heldHead: true as const } : {}),
           ...(dispatchHead !== undefined ? { dispatchHead } : {}),
         });
-        if (!reg.ok) logger.warn("[router] held dispatch not registered", { code: reg.code, detail: reg.detail });
-        else rememberLiveHold(handle);
+        if (!reg.ok) {
+          logger.warn("[router] held dispatch not registered", { code: reg.code, detail: reg.detail });
+          // The gate below posts the verdict directly; a reservation left behind would make router_verify answer `held` for hours.
+          pending.releaseHandle(handle);
+        } else rememberLiveHold(handle);
         runHeldGate(fin, handle, callInput, scratch, delta === undefined ? undefined : { delta }, undefined);
         return { outputText: fin.outputText, suffix: "", verification: { kind: "held", handle }, metadata: {} };
       }

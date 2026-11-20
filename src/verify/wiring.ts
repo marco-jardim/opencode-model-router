@@ -654,8 +654,13 @@ export type HandleReport =
   | { readonly kind: "expired"; readonly handle: string }
   /** Joined another call's run, which outlived this call's deadline (R8). */
   | { readonly kind: "elsewhere"; readonly handle: string; readonly description: string }
-  /** QA-2.1-9 (phase 2.1): a held background result; its own gate posts the verdict to the session, so nothing ran here. */
-  | { readonly kind: "held"; readonly handle: string; readonly description: string };
+  /**
+   * QA-2.1-9 (phase 2.1): a held background result; its own gate posts the verdict to the session, so nothing ran here.
+   * No `description` for a handle that is reserved but not yet registered (the child is still running): nothing is stored yet.
+   */
+  | { readonly kind: "held"; readonly handle: string; readonly description?: string }
+  /** The call carried no session id, so no handle can be resolved (R6). `input` is the handle, or "pending: true". */
+  | { readonly kind: "no-session"; readonly input: string };
 
 export interface VerifyReport {
   readonly items: readonly HandleReport[];
@@ -667,6 +672,9 @@ export interface VerifyReport {
 export const ROUTER_VERIFY_ARGS_TEXT =
   "[router] router_verify: pass exactly one of `handles` (a non-empty list of vrf_ handles) or `pending: true`; nothing was run.";
 export const ROUTER_VERIFY_NO_PENDING_TEXT = "[router] router_verify: no unverified delegations in this session; nothing was run.";
+/** R6: handles and the pending list are scoped by the calling session; a call without one can resolve nothing. */
+export const NO_SESSION_TEXT =
+  "no session: this call carries no session id, so no handle can be resolved; nothing was run, and retrying will not change the answer";
 export const ROUTER_VERIFY_NO_RETRY_TEXT = "[router] Nothing was retried or escalated; whether to re-dispatch is your call.";
 /** Section 1.5-18. The run always uses the current tree. */
 export const DRIFT_NOTICE = "tree drifted since delegation; verdict reflects current state";
@@ -815,8 +823,12 @@ export function formatVerifyReport(
       blocks.push(`- ${item.handle} \u00b7 ${item.description} \u00b7 ${VERIFYING_ELSEWHERE_TEXT}`);
       continue;
     }
+    if (item.kind === "no-session") {
+      blocks.push(`- ${sanitizeDescription(item.input)} \u00b7 ${NO_SESSION_TEXT}`);
+      continue;
+    }
     if (item.kind === "held") {
-      blocks.push(`- ${item.handle} \u00b7 ${item.description} \u00b7 ${HELD_RESULT_TEXT}`);
+      blocks.push(`- ${item.handle} \u00b7 ${item.description !== undefined ? `${item.description} \u00b7 ` : ""}${HELD_RESULT_TEXT}`);
       continue;
     }
     const { result } = item;
@@ -872,7 +884,7 @@ export function backgroundOutcomes(items: readonly HandleReport[]): BackgroundOu
         : { kind: "reported", handle: item.handle };
     }
     if (item.kind === "elsewhere" || item.kind === "held") return { kind: "reported", handle: item.handle };
-    return { kind: "gone", handle: item.kind === "unknown" ? item.input : item.handle };
+    return { kind: "gone", handle: item.kind === "unknown" || item.kind === "no-session" ? item.input : item.handle };
   });
 }
 
@@ -1060,7 +1072,7 @@ export interface VerificationWiring {
   applyLineage(res: GateResult, ctx: LineageContext): GateResult;
   /**
    * 2.4.3a, section 1.5-18: router_verify for `sessionID` (the calling orchestrator; "" = none, so
-   * every handle is unknown). Never rejects; never retries or escalates.
+   * every handle and `pending` is answered "no session"). Never rejects; never retries or escalates.
    * - Handles are normalized, deduped and capped at MAX_HANDLES_PER_CALL; `pending` is listOpen, so
    *   runs already in flight are joined (R8). Lookups are scoped by session (R6).
    * - ONE Deadline of gateBudgetMs per call, created before any preparation (section 1.5-13) and
@@ -3475,7 +3487,12 @@ export function createVerificationWiring(deps: {
       let targets: Array<{ readonly input: string; readonly handle: string | undefined }> = [];
       if (target.kind === "pending") {
         // QA-2.4-3: listPending adds the background verdicts not yet replayed (a cached replay, no run).
-        if (sessionID !== "") targets = pending.listPending(sessionID, { verifying: true }).map(e => ({ input: e.handle, handle: e.handle }));
+        // R6: without a session there is nothing to list; "no unverified delegations in this session" would read as "not yet".
+        if (sessionID === "") {
+          const item: HandleReport = { kind: "no-session", input: "pending: true" };
+          return { items: [item], excess: 0, text: formatVerifyReport([item], 0, false) };
+        }
+        targets = pending.listPending(sessionID, { verifying: true }).map(e => ({ input: e.handle, handle: e.handle }));
         if (targets.length === 0) return { items: [], excess: 0, text: ROUTER_VERIFY_NO_PENDING_TEXT };
       } else {
         const seen = new Set<string>();
@@ -3488,7 +3505,8 @@ export function createVerificationWiring(deps: {
           targets.push({ input, handle });
         }
       }
-      const excess = Math.max(0, targets.length - MAX_HANDLES_PER_CALL);
+      // Without a session every handle gets the same terminal answer, so there is no "rest" to call again with.
+      const excess = sessionID === "" ? 0 : Math.max(0, targets.length - MAX_HANDLES_PER_CALL);
       targets = targets.slice(0, MAX_HANDLES_PER_CALL);
 
       // 2. The call's one deadline (section 1.5-13), before any preparation.
@@ -3514,8 +3532,12 @@ export function createVerificationWiring(deps: {
       const cwds = new Map<string, string>();
       try {
         for (const t of targets) {
-          if (t.handle === undefined || sessionID === "") {
-            slots.push({ kind: "unknown", input: t.handle ?? t.input });
+          if (sessionID === "") {
+            slots.push({ kind: "no-session", input: t.handle ?? t.input });
+            continue;
+          }
+          if (t.handle === undefined) {
+            slots.push({ kind: "unknown", input: t.input });
             continue;
           }
           // QA-2.1-9 (phase 2.1, v2 only): a held entry is verified by its background gate, which posts the verdict to the
@@ -3526,6 +3548,13 @@ export function createVerificationWiring(deps: {
           const looked = pending.get(sessionID, t.handle);
           if (looked.kind === "found" && looked.entry.hold !== undefined && looked.entry.state !== "verifying" && looked.entry.state !== "verified") {
             slots.push({ kind: "held", handle: looked.entry.handle, description: looked.entry.description });
+            continue;
+          }
+          // A handle reserved at the background ack is shown to the orchestrator every turn but registered only when the child
+          // finishes: until then it is held, not unknown. Only the session it was reserved for may see that (R6): another
+          // session's reservation stays unknown. The verdict is replayed through the entry once it is registered and settled.
+          if (looked.kind === "unknown" && pending.reservedBy(t.handle) === sessionID) {
+            slots.push({ kind: "held", handle: t.handle });
             continue;
           }
           const c = pending.markVerifying(sessionID, t.handle);

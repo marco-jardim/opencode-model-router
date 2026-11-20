@@ -15,6 +15,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **OpenCode v2: `router_verify` on a background handle whose child is still running answers `held`, not `unknown handle`.**
+  The handle is reserved and listed every turn from the background ack but registered only when the child finishes, so
+  until then the registry did not know it and an orchestrator that polled it got `unknown handle` again and again. The
+  session the handle was issued to now gets the held answer, and the verdict is replayed once it settles. Another
+  session's reserved handle still reads as unknown, and a reservation is released when the held entry cannot be
+  registered, so the handle is not answered `held` for hours after the gate posted its verdict directly.
+- **`router_verify` answers an unknown handle terminally, and a call without a session id explicitly.** `unknown handle`
+  now says the session has no record of it (never issued here, issued to another session, or no longer tracked after a restart,
+  eviction or a failed background run) and that retrying will not change the answer. A call with no session id, for handles or `pending: true`,
+  is answered `no session` instead of `unknown handle` or "no unverified delegations in this session". Wording only on
+  OpenCode v1.
 - **OpenCode v2: resumed background dispatches keep their own results and verification handles.** Historical completions
   first scanned after a resume no longer supply the resumed attempt's result, and held placeholders retain their attempt's
   announced handle instead of changing to the newest handle for the same child session.
