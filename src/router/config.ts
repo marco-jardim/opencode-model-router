@@ -1827,6 +1827,22 @@ function validateRoles(routing: Record<string, unknown>): Record<string, string[
 }
 
 const BACKGROUND_MODES: readonly BackgroundMode[] = ["auto", "model", "off"];
+
+/**
+ * Environment override for `routing.background.mode` (OpenCode v2): `off`, `model` or `auto`, case-insensitive, highest
+ * priority. For one-shot runs (`opencode run`, CI, scripts): the host exits when the orchestrator ends its turn, so a
+ * background dispatch is lost; `MODEL_ROUTER_BACKGROUND=off` keeps every dispatch foreground without editing the config.
+ */
+export const BACKGROUND_ENV = "MODEL_ROUTER_BACKGROUND";
+
+/** The mode `BACKGROUND_ENV` asks for; unset or empty: none; any other value: none plus the issue to warn once. */
+export function backgroundModeFromEnv(raw: string | undefined): { mode?: BackgroundMode; issue?: string } {
+  if (raw === undefined || raw.trim() === "") return {};
+  const value = raw.trim().toLowerCase();
+  if ((BACKGROUND_MODES as readonly string[]).includes(value)) return { mode: value as BackgroundMode };
+  return { issue: `${BACKGROUND_ENV}="${raw}" is not one of ${BACKGROUND_MODES.join("|")}; ignored, routing.background.mode applies` };
+}
+
 const LEASES_MODES: readonly LeasesMode[] = ["enforce", "off"];
 const LEASES_RUN_POLICIES: readonly LeasesRunPolicy[] = ["annotate", "refuse"];
 const BACKGROUND_MIN_PREDICTED_MAX_MS = 3_600_000;
@@ -3878,6 +3894,7 @@ export function resolveRouting(
   cfg: RouterConfig | undefined,
   host: RouterHost,
   logger?: Pick<PluginLogger, "warn">,
+  env: Readonly<Record<string, string | undefined>> = process.env,
 ): ResolvedRouting {
   const r: RoutingConfig = cfg?.routing ?? {};
   const d = ROUTING_DEFAULTS;
@@ -3895,7 +3912,9 @@ export function resolveRouting(
   const sanitizedOrphans = sanitizeOrphans(host === "v2" ? r.orphans : undefined);
   const background = sanitizedBackground.value;
   const leases = sanitizedLeases.value;
-  for (const issue of [...sanitizedBackground.issues, ...sanitizedLeases.issues, ...sanitizedOrphans.issues]) {
+  // MODEL_ROUTER_BACKGROUND wins over routing.background.mode; an unknown value warns once (below) and is ignored.
+  const envBackground = backgroundModeFromEnv(env[BACKGROUND_ENV]);
+  for (const issue of [...sanitizedBackground.issues, ...sanitizedLeases.issues, ...sanitizedOrphans.issues, ...(envBackground.issue === undefined ? [] : [envBackground.issue])]) {
     if (warnedRoutingIssues.has(issue)) continue;
     warnedRoutingIssues.add(issue);
     if (logger) logger.warn(issue);
@@ -3950,7 +3969,7 @@ export function resolveRouting(
       notify: r.advisor?.notify ?? d.advisor.notify,
     }),
     background: Object.freeze({
-      mode: background?.mode ?? d.background.mode,
+      mode: envBackground.mode ?? background?.mode ?? d.background.mode,
       minPredictedMs: background?.minPredictedMs ?? d.background.minPredictedMs,
     }),
     leases: Object.freeze({

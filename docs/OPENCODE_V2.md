@@ -161,6 +161,15 @@ required verification but a held result cannot be offered (see below), the route
 background it: an `auto` selection falls back to the foreground, and an explicit
 `background: true` is turned into `background: false`.
 
+**One-shot runs (`opencode run`, CI, scripts).** A background dispatch needs a host that keeps
+running: the protocol tells the orchestrator to end its turn after one, and a one-shot run
+exits right there, taking the running child with it. Set `MODEL_ROUTER_BACKGROUND=off` for those
+runs: it overrides `routing.background.mode` without editing the config (`off`, `model` or
+`auto`, case-insensitive; an unknown value warns once and the configured mode applies). With
+`off` every dispatch stays in the foreground and the orchestrator waits for its result. When the
+plugin is disposed with a background child still running, it logs one warning naming the lost
+dispatches and this fix.
+
 **Held results.** When a backgrounded call has `required` verification, its result is held:
 the orchestrator does not see the child's output until the verdict exists. While a result is
 held, every request (and every compaction) shows the orchestrator this in place of the
