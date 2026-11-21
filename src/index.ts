@@ -1,7 +1,7 @@
 import type { Plugin } from "@opencode-ai/plugin";
 import { completionIdentity, observeV2 } from "./compat/v2-observations";
 import type { RouterPluginInput } from "./compat/child-session";
-import { DEPTH_BANNER, ResumeRejectedError, TASK_VERIFICATION } from "./compat/child-session";
+import { DEPTH_BANNER, ResumeRejectedError, SESSION_DIRECTORY, TASK_VERIFICATION } from "./compat/child-session";
 
 // Imports for internal use within this module
 import {
@@ -2819,11 +2819,14 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       // by its authority check. Always on: neither `/bypass` nor the enforcement mode turns it off. Only a session the router has
       // not proven to be the root is checked (`isProvenRootCaller`: a tracked child, a grader, a session with a parentID, an unknown
       // or unresolvable one): the orchestrator is the user's own agent, acting under the host's permissions. The paths are checked
-      // first, so a call that writes no git metadata never costs a session lookup.
+      // first, so a call that writes no git metadata never costs a session lookup. Relative paths and the session's repository are
+      // resolved against the session's own location on v2 (the bridge's SESSION_DIRECTORY), else the instance directory (v1).
       if (typeof input?.tool === "string") {
         let gitRefusal: string | undefined;
         try {
-          gitRefusal = gitMetadataWriteRefusal(input.tool, output?.args, projectDir ?? process.cwd());
+          const sessionDirectory: unknown = input?.[SESSION_DIRECTORY];
+          const base = typeof sessionDirectory === "string" && isAbsolute(sessionDirectory) ? sessionDirectory : projectDir ?? process.cwd();
+          gitRefusal = gitMetadataWriteRefusal(input.tool, output?.args, base);
         } catch {
           // Unreachable (the guard never throws); a delegated session is still refused (fail closed).
           gitRefusal = "[router] Refused: the router could not check this write for git metadata, which delegated agents may not write (fail closed).";

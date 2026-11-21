@@ -12,6 +12,9 @@ import { isPathSeparator, trimEndWhile } from "../../util/linear-trim";
 /** A win32 8.3 short-name segment (`PROGRA~1`, `MARQUI~1.TXT`): refused, never expanded (S11, P-11: fail closed). */
 export const SHORT_NAME_SEGMENT = /(?:^|[\\/])[^\\/~]{1,8}~\d+(?:\.[^\\/.]{0,3})?(?=[\\/]|$)/;
 
+/** A UNC directory `\\server\share[\…]` (either separator); never a device path (`\\?\…`, `\\.\…`). */
+const UNC_DIRECTORY = /^[\\/]{2}(?![.?][\\/])[^\\/]+[\\/][^\\/]+/;
+
 /**
  * The canonical long form of a path a role session names (T2.3.1). The RAW path (a relative one joined to `base` as text) goes to
  * `realpath` (`realpathSync.native`: links, junctions, case and 8.3 as on disk) WITHOUT lexical normalisation first, so a link is
@@ -25,13 +28,17 @@ export const SHORT_NAME_SEGMENT = /(?:^|[\\/])[^\\/~]{1,8}~\d+(?:\.[^\\/.]{0,3})
  *
  * `shortNames: "resolve"` (the delegated-agent git metadata guard, router/git-metadata-guard.ts) lets an 8.3 spelling through to
  * `realpath`, which expands it to the long name on disk; one left in the missing tail names no existing entry (a lookup matches
- * long and short names alike), so it is the literal name the host would create. Every other refusal stays.
+ * long and short names alike), so it is the literal name the host would create. `uncRoot` (the same guard: the session directory
+ * of a project on a share) lets a UNC path through when it lies inside that UNC directory as Win32 resolves it (`..` collapsed as
+ * text) — the project's own share, which the host already reaches; any other UNC path and every device path stay refused. Every
+ * other refusal stays.
  */
 export function canonicalAuthorityPath(
   path: string,
   base: string,
   opts: {
     platform?: NodeJS.Platform; realpath?: (path: string) => string; lstat?: (path: string) => unknown; shortNames?: "refuse" | "resolve";
+    uncRoot?: string;
   } = {},
 ): string | undefined {
   const platform = opts.platform ?? process.platform;
@@ -44,8 +51,11 @@ export function canonicalAuthorityPath(
   const unc = (value: string): boolean => /^[\\/]{2}/.test(value);
   if (platform === "win32") {
     const shortName = (value: string): boolean => opts.shortNames !== "resolve" && SHORT_NAME_SEGMENT.test(value);
-    if (shortName(text) || unc(text) || /^[A-Za-z]:(?![\\/])/.test(text) || /^[\\/](?![\\/])/.test(text)) return undefined;
-    if (!api.isAbsolute(text) && (shortName(base) || unc(base))) return undefined;
+    const uncRoot = opts.uncRoot !== undefined && UNC_DIRECTORY.test(opts.uncRoot) ? opts.uncRoot : undefined;
+    const full = api.isAbsolute(text) ? text : `${trimEndWhile(base, isPathSeparator)}\\${text}`;
+    const ownShare = uncRoot !== undefined && UNC_DIRECTORY.test(full) && insideWorkRoot(win32.resolve(full), uncRoot);
+    if (shortName(text) || (unc(text) && !ownShare) || /^[A-Za-z]:(?![\\/])/.test(text) || /^[\\/](?![\\/])/.test(text)) return undefined;
+    if (!api.isAbsolute(text) && (shortName(base) || (unc(base) && !ownShare))) return undefined;
   }
   if (!api.isAbsolute(text) && !api.isAbsolute(base)) return undefined;
   const sep = platform === "win32" ? "\\" : "/";

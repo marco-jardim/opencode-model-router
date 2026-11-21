@@ -103,6 +103,16 @@ describe("v1 legacy hooks: delegated agents never write git metadata", () => {
     await expect(before(bare, "SUB", "write", { filePath: join(fx.bwt, "a.ts"), content: "x" })).resolves.toBeUndefined();
   });
 
+  it("a bare repository holding its own worktree: its config and hooks are refused, the checkout's files pass", async () => {
+    const hooks = await plugin(fx.projMain);
+    await child(hooks, "SUB", "medium");
+    for (const path of ["../config", "../hooks/pre-commit", join(fx.projAdmin, "HEAD")]) {
+      await expect(before(hooks, "SUB", "write", { filePath: path, content: "x" }), path).rejects.toThrow(REFUSED);
+      await expect(before(hooks, "SUB", "patch", writeCall("patch", path, "")), path).rejects.toThrow(REFUSED);
+    }
+    await expect(before(hooks, "SUB", "edit", { filePath: "a.ts" })).resolves.toBeUndefined();
+  });
+
   it("a plugin agent with edit granted (#81) is refused git metadata and keeps its ordinary edits", async () => {
     const editor = { tier: "fast", description: "Editor", permission: { read: "allow", edit: "allow" } };
     const hooks = await plugin(fx.repo, { agents: { editor } });

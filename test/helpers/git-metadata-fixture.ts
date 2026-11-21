@@ -1,7 +1,8 @@
 /**
  * Repositories on disk for the delegated-agent git metadata guard tests (src/router/git-metadata-guard.ts): a repository with a
  * nested one, a linked worktree of it (`.git` file → `<repo>/.git/worktrees/wt`, common dir `<repo>/.git`), and a linked worktree
- * of a bare repository (common dir `bare.git`, not named `.git`). Canonical (long-name) paths, so an 8.3 temp directory never
+ * of a bare repository (common dir `bare.git`, not named `.git`), and a bare repository `proj.git` whose linked worktree lies
+ * inside it (`proj.git/main`). Canonical (long-name) paths, so an 8.3 temp directory never
  * reaches the code under test.
  */
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
@@ -22,6 +23,12 @@ export interface GitMetadataFixture {
   readonly bareAdmin: string;
   /** A linked worktree of `bare`. */
   readonly bwt: string;
+  /** A bare repository whose linked worktree `projMain` lies inside it (`proj.git/main`). */
+  readonly proj: string;
+  /** The git directory of `projMain`: `<proj>/worktrees/main`. */
+  readonly projAdmin: string;
+  /** The linked worktree inside `proj`. */
+  readonly projMain: string;
   /** Creates a directory link (a junction on win32) at `path` to `target`; false when the platform refuses it. */
   link(target: string, path: string): boolean;
   cleanup(): void;
@@ -60,8 +67,13 @@ export function gitMetadataFixture(): GitMetadataFixture {
   const bwt = join(root, "bwt");
   const bareAdmin = join(bare, "worktrees", "bwt");
   linkedWorktree(bareAdmin, bwt);
+  const proj = join(root, "proj.git");
+  gitDirectory(proj);
+  const projAdmin = join(proj, "worktrees", "main");
+  const projMain = join(proj, "main");
+  linkedWorktree(projAdmin, projMain);
   return {
-    root, repo, wt, admin, bare, bareAdmin, bwt,
+    root, repo, wt, admin, bare, bareAdmin, bwt, proj, projAdmin, projMain,
     link(target, path) {
       try {
         symlinkSync(target, path, process.platform === "win32" ? "junction" : "dir");

@@ -11,6 +11,12 @@ export const TASK_VERIFICATION = Symbol.for("opencode-model-router.task-verifica
 /** An advisory depth banner for this call; the v2 bridge delivers it. */
 export const DEPTH_BANNER = Symbol.for("opencode-model-router.depth-banner");
 
+/**
+ * v2: the calling session's own directory (its location, where the host resolves its relative paths), set by the v2 bridge on
+ * the legacy tool.execute.before INPUT of a write-class call; the git metadata guard resolves against it. V1 hosts never set it.
+ */
+export const SESSION_DIRECTORY = Symbol.for("opencode-model-router.session-directory");
+
 /** A host-owned child lifecycle, so v2 never fabricates REST sessions or IDs. */
 export interface ChildSessionRequest {
   /** v2-only read-only grading diagnostics, started after the runner's session/cwd preparation. */

@@ -70,15 +70,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **Delegated agents can no longer write repository git metadata.** Role agents were already refused; tier agents,
-  plugin agents (#81) and every other delegated session now are too. An `edit`, `write`, `multiedit`, `patch` or
-  `apply_patch` call is refused when a file it names is `.git` or below it, in any spelling the filesystem treats as
-  `.git` (case, trailing dots or spaces, NTFS streams, 8.3 names, a link), or lies in the git or common directory of the
-  session's repository (a linked worktree's too). A path the router cannot resolve, and a patch whose files it cannot
-  read, is refused as well. The refusal reads `[router] Refused: writing git metadata (<path>) is not allowed for
-  delegated agents.` The orchestrator session is not affected; `/bypass` and the enforcement mode do not turn the check
-  off. Ordinary files and `.gitattributes`, `.gitignore` or `.github/` are unaffected. The published agent permissions
-  are unchanged. OpenCode v1 and v2.
+- **Delegated agents can no longer write repository git metadata with the file tools (edit, write, multiedit,
+  patch).** Role agents were already refused; tier agents, plugin agents (#81) and every other delegated session now are
+  too. An `edit`, `write`, `multiedit`, `patch` or `apply_patch` call is refused when a file it names is `.git` or below
+  it, in any spelling the filesystem treats as `.git` (case, trailing dots or spaces, NTFS streams, 8.3 names, a link,
+  `..` read either as the filesystem or as the host resolves it), or lies in the git or common directory of the
+  session's repository (a linked worktree's too, also a bare repository that holds the worktree; the checkout's own
+  files stay writable). On OpenCode v2 paths resolve against the session's own location. A path the router cannot
+  resolve, and a patch whose files it cannot read, is refused as well; that includes UNC and device paths, except paths
+  inside the session's own directory when the project itself is on a share. The refusal reads `[router] Refused:
+  writing git metadata (<path>) is not allowed for delegated agents.` The orchestrator session is not affected;
+  `/bypass` and the enforcement mode do not turn the check off. Shell commands are not covered. Ordinary files and
+  `.gitattributes`, `.gitignore` or `.github/` are unaffected. The published agent permissions are unchanged. OpenCode
+  v1 and v2.
 
 ## [2.9.1] - 2026-10-25
 

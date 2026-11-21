@@ -42,15 +42,15 @@ afterEach(async () => {
   rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
-/** A v2 host: `root` is the orchestrator session, every other session a child of it. */
-async function host(directory: string, override: unknown = {}) {
+/** A v2 host: `root` is the orchestrator session, every other session a child of it, located in `sessions`. */
+async function host(directory: string, override: unknown = {}, sessions: string = directory) {
   mkdirSync(dirname(overridePath()), { recursive: true });
   writeFileSync(overridePath(), JSON.stringify(override));
   invalidateConfigCache();
   vi.spyOn(console, "warn").mockImplementation(() => {});
   const info = (sessionID: string) => (sessionID === "root"
-    ? { id: sessionID, agent: "build", location: { directory } }
-    : { id: sessionID, parentID: "root", agent: "medium", location: { directory } });
+    ? { id: sessionID, agent: "build", location: { directory: sessions } }
+    : { id: sessionID, parentID: "root", agent: "medium", location: { directory: sessions } });
   const toolHooks: Record<string, (event: any) => Promise<void>> = {};
   const none = () => ({ dispose: vi.fn(async () => {}) });
   const agents: Record<string, any> = { build: { id: "build", mode: "primary", permissions: [], request: { settings: {}, headers: {}, body: {} } } };
@@ -128,6 +128,17 @@ describe("v2: delegated agents never write git metadata", () => {
       await expect(call("child", "editor", tool, v2Call(tool, join(fx.repo, "sub", ".git", "config"))), tool).rejects.toThrow(REFUSED);
       await expect(call("child", "editor", tool, v2Call(tool, join(fx.repo, ".gitattributes"))), tool).resolves.toBeUndefined();
     }
+  });
+
+  it("resolves against the session's own location, not the plugin's: relative headers and its repository's git directories", async () => {
+    // The plugin's location is `repo`; the child session runs in `bwt`, a linked worktree of the bare `bare.git`.
+    const call = await host(fx.repo, {}, fx.bwt);
+    for (const tool of V2_WRITE_TOOLS) {
+      await expect(call("child", "heavy", tool, v2Call(tool, join(fx.bare, "hooks", "pre-commit"))), tool).rejects.toThrow(REFUSED);
+    }
+    // `../bare.git/config` from `bwt` (the host's reading) is the common directory; the plugin's `repo` would not protect it.
+    await expect(call("child", "heavy", "apply_patch", v2Call("apply_patch", "../bare.git/config"))).rejects.toThrow(REFUSED);
+    await expect(call("child", "heavy", "apply_patch", v2Call("apply_patch", "a.ts"))).resolves.toBeUndefined();
   });
 
   it("the orchestrator is unaffected", async () => {
