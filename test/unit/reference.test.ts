@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { execFile, spawn, spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import * as fsp from "node:fs/promises";
@@ -171,6 +171,22 @@ async function repoState(cwd: string) {
   };
 }
 
+/**
+ * The user's global configuration for one test (GIT_CONFIG_GLOBAL names a file under `base` holding `text`); call the returned
+ * function to restore. A filter the repository also sets identically there is the user's (a `git lfs install --local` copy),
+ * so router-run git keeps it, while one only the repository names is blanked.
+ */
+async function userGlobalConfig(text: string): Promise<() => void> {
+  const file = join(base, "global.gitconfig");
+  await fsp.writeFile(file, text);
+  const saved = process.env.GIT_CONFIG_GLOBAL;
+  process.env.GIT_CONFIG_GLOBAL = file;
+  return () => {
+    if (saved === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+    else process.env.GIT_CONFIG_GLOBAL = saved;
+  };
+}
+
 async function worktreeCount(cwd: string): Promise<number> {
   return (await git(cwd, "worktree", "list", "--porcelain")).split(/\r?\n/).filter((l) => l.startsWith("worktree ")).length;
 }
@@ -316,34 +332,41 @@ describe("captureReference", { timeout: 60_000 }, () => {
     // Short: on win32 the MSYS `sleep` escapes `taskkill /T` (its parent is a fork stub)
     // and holds git's stderr pipe until it exits, so the seam resolves only after it.
     await git(repo, "config", "filter.slow.clean", "sleep 3; cat");
-    const past = new Date(Date.now() - 60_000);
-    await fsp.utimes(join(repo, "slow.txt"), past, past); // stat-dirty, same size: the refresh re-cleans it
-    const userIndex = join(repo, ".git", "index");
-    const indexBefore = await fsp.readFile(userIndex);
-    const controller = new AbortController();
-    let stashOpts: SeamOptions;
-    let lockSeen = false;
-    const killing: CaptureDeps["argv"] = async (file, args, opts) => {
-      if (!args.includes("stash")) return argv(file, args, opts);
-      stashOpts = opts;
-      const kill = new AbortController();
-      const running = argv(file, args, { ...opts, signal: kill.signal });
-      const lock = `${opts?.env?.GIT_INDEX_FILE ?? userIndex}.lock`;
-      lockSeen = await waitFor(() => exists(lock), 15_000);
-      controller.abort(); // the caller gives up...
-      kill.abort(); // ...and git is tree-killed while it holds the lock, as a timeout would do
-      return running;
-    };
-    const started = Date.now();
-    expect(await captureReference(repo, controller.signal, captureDeps({ argv: killing }))).toBeUndefined();
-    expect(Date.now() - started).toBeLessThan(15_000);
-    expect(lockSeen).toBe(true);
-    expect(stashOpts?.signal).toBeUndefined();
-    const privateIndex = stashOpts?.env?.GIT_INDEX_FILE ?? "";
-    expect(privateIndex.toLowerCase().startsWith(tmp.toLowerCase())).toBe(true);
-    expect(await exists(`${userIndex}.lock`)).toBe(false);
-    expect(Buffer.compare(await fsp.readFile(userIndex), indexBefore)).toBe(0);
-    expect((await fsp.readdir(join(repo, ".git"))).filter((name) => name.startsWith("index.stash."))).toEqual([]);
+    // The slow filter is the user's (global, with its identical repository copy): router-run git blanks only a filter the
+    // repository alone names, so a repository-only one would never slow `stash create` down.
+    const restoreGlobal = await userGlobalConfig('[filter "slow"]\n\tclean = "sleep 3; cat"\n');
+    try {
+      const past = new Date(Date.now() - 60_000);
+      await fsp.utimes(join(repo, "slow.txt"), past, past); // stat-dirty, same size: the refresh re-cleans it
+      const userIndex = join(repo, ".git", "index");
+      const indexBefore = await fsp.readFile(userIndex);
+      const controller = new AbortController();
+      let stashOpts: SeamOptions;
+      let lockSeen = false;
+      const killing: CaptureDeps["argv"] = async (file, args, opts) => {
+        if (!args.includes("stash")) return argv(file, args, opts);
+        stashOpts = opts;
+        const kill = new AbortController();
+        const running = argv(file, args, { ...opts, signal: kill.signal });
+        const lock = `${opts?.env?.GIT_INDEX_FILE ?? userIndex}.lock`;
+        lockSeen = await waitFor(() => exists(lock), 15_000);
+        controller.abort(); // the caller gives up...
+        kill.abort(); // ...and git is tree-killed while it holds the lock, as a timeout would do
+        return running;
+      };
+      const started = Date.now();
+      expect(await captureReference(repo, controller.signal, captureDeps({ argv: killing }))).toBeUndefined();
+      expect(Date.now() - started).toBeLessThan(15_000);
+      expect(lockSeen).toBe(true);
+      expect(stashOpts?.signal).toBeUndefined();
+      const privateIndex = stashOpts?.env?.GIT_INDEX_FILE ?? "";
+      expect(privateIndex.toLowerCase().startsWith(tmp.toLowerCase())).toBe(true);
+      expect(await exists(`${userIndex}.lock`)).toBe(false);
+      expect(Buffer.compare(await fsp.readFile(userIndex), indexBefore)).toBe(0);
+      expect((await fsp.readdir(join(repo, ".git"))).filter((name) => name.startsWith("index.stash."))).toEqual([]);
+    } finally {
+      restoreGlobal();
+    }
     // The producer's next index write still works.
     await git(repo, "config", "--unset", "filter.slow.clean");
     await git(repo, "add", "slow.txt");
@@ -395,6 +418,109 @@ describe("captureReference", { timeout: 60_000 }, () => {
     expect(calls.length).toBeGreaterThan(5);
     for (const args of calls) expect(args[0]).toBe("--no-optional-locks");
     expect(Buffer.compare(await fsp.readFile(userIndex), indexBefore)).toBe(0);
+  });
+
+  it("every git call carries workRootReadArgs() right after --no-optional-locks; D9's hooksPath on worktree add comes later and wins", async () => {
+    const calls: string[][] = [];
+    const recording: CaptureDeps["argv"] = (file, args, opts) => {
+      calls.push([...args]);
+      return argv(file, args, opts);
+    };
+    const ref = await captureReference(repo, new AbortController().signal, captureDeps({ argv: recording }));
+    expect(ref).toBeDefined();
+    if (!ref) return;
+    const handle = await mat(ref, { argv: recording });
+    await handle.dispose();
+    const nul = isWin ? "NUL" : "/dev/null";
+    const prefix = ["--no-optional-locks", ...gitTools.workRootReadArgs()];
+    expect(prefix).toEqual(expect.arrayContaining(["core.fsmonitor=false", `core.hooksPath=${nul}`, "gpg.ssh.defaultKeyCommand=",
+      "protocol.allow=never", "protocol.ext.allow=never", "protocol.file.allow=never"]));
+    expect(calls.length).toBeGreaterThan(5);
+    for (const args of calls) {
+      expect(args.slice(0, prefix.length)).toEqual(prefix);
+      expect(args).not.toContain("diff.autoRefreshIndex=false");
+    }
+    const adds = calls.filter((args) => args.includes("worktree") && args.includes("add"));
+    expect(adds).toHaveLength(1);
+    const add = adds[0] ?? [];
+    const hooks = add.flatMap((arg, index) => (arg.startsWith("core.hooksPath=") ? [{ arg, index }] : []));
+    expect(hooks.map((h) => h.arg.slice("core.hooksPath=".length))).toEqual([nul, expect.stringContaining("omr-nohooks-")]);
+    expect(hooks[1]!.index).toBeGreaterThan(hooks[0]!.index);
+    expect(add[hooks[1]!.index - 1]).toBe("-c");
+  });
+
+  it("repository-only filter/merge drivers are blanked for capture and materialize; a global filter's repository copy still runs", async () => {
+    const scratch = await fsp.mkdtemp(join(tmpdir(), "omr-ref-drivers-"));
+    const slash = (path: string) => path.replace(/\\/g, "/");
+    const evil = join(scratch, "EVIL_RAN");
+    const dup = join(scratch, "DUP_RAN");
+    const script = join(scratch, "filter.js");
+    await fsp.writeFile(script, "require('node:fs').appendFileSync(process.argv[2], 'ran\\n'); process.stdin.pipe(process.stdout);\n");
+    const command = (marker: string) => `"${slash(process.execPath)}" "${slash(script)}" "${slash(marker)}"`;
+    await fsp.writeFile(join(repo, ".gitattributes"), "*.evil filter=evil\n*.dup filter=dup\n");
+    await fsp.writeFile(join(repo, "x.evil"), "x0\n");
+    await fsp.writeFile(join(repo, "y.dup"), "y0\n");
+    await git(repo, "add", "-A");
+    await git(repo, "commit", "-q", "-m", "drivers");
+    for (const kind of ["clean", "smudge"]) {
+      await git(repo, "config", `filter.evil.${kind}`, command(evil));
+      await git(repo, "config", `filter.dup.${kind}`, command(dup));
+    }
+    await git(repo, "config", "merge.evil.driver", `${command(evil)} %O %A %B`);
+    const restoreGlobal = await userGlobalConfig("");
+    try {
+      // The user's global filter, written by git exactly as the repository's copy (`git lfs install --local`).
+      for (const kind of ["clean", "smudge"]) await git(repo, "config", "--file", join(base, "global.gitconfig"), `filter.dup.${kind}`, command(dup));
+      await fsp.writeFile(join(repo, "x.evil"), "x1, a dirty tracked file\n");
+      await fsp.writeFile(join(repo, "y.dup"), "y1, a dirty tracked file\n");
+      const calls: string[][] = [];
+      const recording: CaptureDeps["argv"] = (file, args, opts) => {
+        calls.push([...args]);
+        return argv(file, args, opts);
+      };
+      const ref = await captureReference(repo, new AbortController().signal, captureDeps({ argv: recording }));
+      expect(ref).toBeDefined();
+      if (!ref) return;
+      // `stash create` hashed both dirty files: only the user's filter ran.
+      expect(await exists(evil)).toBe(false);
+      expect(await exists(dup)).toBe(true);
+      await fsp.rm(dup);
+      const handle = await mat(ref, { argv: recording });
+      try {
+        // The checkout (smudge) and the drift diff (clean): again only the user's filter.
+        expect(await exists(evil)).toBe(false);
+        expect(await exists(dup)).toBe(true);
+      } finally {
+        await handle.dispose();
+      }
+      for (const [label, find] of [
+        ["stash create", (args: string[]) => args.includes("stash")],
+        ["worktree add", (args: string[]) => args.includes("worktree") && args.includes("add")],
+        ["drift diff", (args: string[]) => args.includes("diff") && args.includes("--no-ext-diff")],
+      ] as const) {
+        const args = calls.find(find) ?? [];
+        for (const setting of ["filter.evil.clean=", "filter.evil.smudge=", "filter.evil.required=false", "merge.evil.driver="]) {
+          expect(args, `${label}: ${setting}`).toContain(setting);
+        }
+        expect(args.some((arg) => arg.startsWith("filter.dup.")), label).toBe(false);
+      }
+    } finally {
+      restoreGlobal();
+    }
+    // Control: plain git runs the repository's filter.
+    await git(repo, "diff", "HEAD");
+    expect(await exists(evil)).toBe(true);
+    await fsp.rm(scratch, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  });
+
+  it("a driver listing that cannot be read means no reference (fail closed)", async () => {
+    const failing: CaptureDeps["argv"] = async (file, args, opts) =>
+      args.includes("--show-scope") ? { code: 128, stdout: "", stderr: "fatal: simulated", timedOut: false } : argv(file, args, opts);
+    expect(await captureReference(repo, new AbortController().signal, captureDeps({ argv: failing }))).toBeUndefined();
+    const ref = await capture();
+    const result = await materialize(ref, undefined, new AbortController().signal, deps({ argv: failing }));
+    expect(result).toMatchObject({ ok: false, reason: "error" });
+    expect(await refDirsIn(tmp)).toEqual([]);
   });
 
   it("QA-1.5-18/22: every git call resets the four pathspec env switches to \"0\"; caller keys still arrive", async () => {
@@ -1482,8 +1608,10 @@ describe("materialize / dispose", { timeout: 60_000 }, () => {
 
     let hooksPath = "";
     const recording: CaptureDeps["argv"] = (file, args, opts) => {
-      const config = args.find((arg) => arg.startsWith("core.hooksPath="));
-      if (config) hooksPath = config.slice("core.hooksPath=".length);
+      // Every call carries the work-root read prefix's null-device hooksPath; the worktree add's effective value is its last
+      // `-c core.hooksPath=` (git's later `-c` wins), D9's fresh path.
+      const config = args.filter((arg) => arg.startsWith("core.hooksPath=")).at(-1);
+      if (config && args.includes("worktree") && args.includes("add")) hooksPath = config.slice("core.hooksPath=".length);
       return withMarker(file, args, opts);
     };
     const handle = await mat(await capture(), { argv: recording });
@@ -1612,6 +1740,9 @@ describe("materialize / dispose", { timeout: 60_000 }, () => {
     const ref = await capture();
     // Short: the MSYS `sleep` escapes `taskkill /T` and holds git's stderr until it exits.
     await git(repo, "config", "filter.slow.smudge", "sleep 3; cat");
+    // The user's filter (global, with its identical repository copy): a repository-only one is blanked for the checkout.
+    const restoreGlobal = await userGlobalConfig('[filter "slow"]\n\tsmudge = "sleep 3; cat"\n');
+    onTestFinished(restoreGlobal);
     const admin = join(repo, ".git", "worktrees");
     const controller = new AbortController();
     let lockSeen = false;

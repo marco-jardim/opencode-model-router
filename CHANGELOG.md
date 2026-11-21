@@ -15,6 +15,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Router-run git commands in the work root no longer run repository-configured programs.** The verification
+  snapshot of the work root and the reference worktree's git calls now turn off `core.fsmonitor`, hooks (including
+  `post-index-change` on an index write), `gpg.ssh.defaultKeyCommand` and every transport, while keeping git's index
+  refresh, so snapshot fingerprints are unchanged. The snapshot (default and hardened), the reference worktree, the
+  executor's git calls and its landing probes also blank the filter (`clean`, `smudge`, `process`) and merge drivers
+  that only the repository's own configuration names. A driver set identically in system or global configuration
+  keeps working, so global Git LFS and its `git lfs install --local` copy are unaffected. The router's other hardened
+  git calls now blank `gpg.ssh.defaultKeyCommand` too. Reading driver scopes needs git 2.26 or newer. If the driver
+  configuration cannot be read, there is no snapshot or reference, and no executor git call runs.
 - **One invalid value in an overrides file no longer drops the whole file (#80).** A bad tier `effort`, an
   `activePreset` naming no preset or an out-of-range `routing` key used to discard every other key of that file too,
   `routing` included. Now only the offending key path goes: the top-level key it sits under, or inside `presets` the

@@ -6,8 +6,8 @@
 
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import {
-  gitEnvironment, gitExecutable, gitPointers, hardeningArgs, isNetworkOrDevicePath, spawnBounded, stripUrlUserinfo,
-  workRootGuards,
+  DRIVER_SCOPE_ARGS, gitEnvironment, gitExecutable, gitPointers, hardeningArgs, isNetworkOrDevicePath, repositoryOnlyDriverArgs,
+  spawnBounded, stripUrlUserinfo, workRootGuards,
 } from "../router/git-tools";
 import {
   ExecutorError, GIT_ID_PATTERN, PLAN_ID_PATTERN, WIP_TRAILER,
@@ -113,13 +113,15 @@ export interface GitContext {
   excludesFile: string;
   /** DV6 snapshot of the user's line-ending configuration. */
   conversion: { autocrlf: string | null; eol: string | null };
+  /** The `-c` pairs blanking the filter/merge drivers only the repository's own configuration names (git-tools repositoryOnlyDriverArgs). */
+  drivers?: readonly string[];
 }
 
 /**
  * `hardeningArgs()` (git-tools) then, in this order (a later `-c` wins over the NUL hooksPath it sets):
  * core.longpaths, core.hooksPath, core.excludesFile, core.editor, sequence.editor, the signing switches, the
  * rebase/merge switches, rerere, submodule.recurse, advice.detachedHead, user.useConfigOnly, then core.autocrlf and
- * core.eol when the snapshot has them.
+ * core.eol when the snapshot has them, then the repository-only driver blanking (`drivers`).
  */
 export function executorGitArgs(c: GitContext): string[] {
   const args = [
@@ -134,7 +136,24 @@ export function executorGitArgs(c: GitContext): string[] {
   ];
   if (c.conversion.autocrlf !== null) args.push("-c", `core.autocrlf=${c.conversion.autocrlf}`);
   if (c.conversion.eol !== null) args.push("-c", `core.eol=${c.conversion.eol}`);
+  if (c.drivers !== undefined) args.push(...c.drivers);
   return args;
+}
+
+/**
+ * The repository-only driver blanking for `toplevel` (git-tools DRIVER_SCOPE_ARGS, repositoryOnlyDriverArgs), read through the
+ * user runner, which sees the user's system/global configuration: a global LFS filter and its `git lfs install --local` copy
+ * are kept. A failed read is `E_GIT` (no executor git runs without it).
+ */
+export async function readRepositoryDrivers(userGit: GitRunner, toplevel: string): Promise<string[]> {
+  const r = await userGit.run([...DRIVER_SCOPE_ARGS], { cwd: toplevel, timeoutMs: GIT_OP_TIMEOUT_MS, maxOutputBytes: 1024 * 1024 });
+  if (r.code === 1) return [];
+  if (r.code !== 0) throw gitFailure("config --show-scope", r);
+  try {
+    return repositoryOnlyDriverArgs(r.stdout);
+  } catch (error) {
+    throw new ExecutorError("E_GIT", errorText(error), { toplevel });
+  }
 }
 
 /** Fixed content of `slot-excludes` (DV5): ignore rules never affect tracked files. */
@@ -672,7 +691,8 @@ export function createGitOps(d: GitOpsDeps): GitOps {
     const pending = (async (): Promise<OpsContext> => {
       await prepareFiles();
       const { conversion, ...identity } = await readCommitIdentity(d.userGit, toplevel);
-      return { args: executorGitArgs({ hooksDir, excludesFile, conversion }), identity };
+      const drivers = await readRepositoryDrivers(d.userGit, toplevel);
+      return { args: executorGitArgs({ hooksDir, excludesFile, conversion, drivers }), identity };
     })();
     contextPromise = pending;
     pending.catch(() => { if (contextPromise === pending) contextPromise = undefined; });

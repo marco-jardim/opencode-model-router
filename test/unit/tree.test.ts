@@ -11,6 +11,18 @@ const state = vi.hoisted(() => ({
   priorities: [] as [number, number][], priorityThrows: false,
   hashError: null as Error | null,
 }));
+/** git's own subcommand and arguments: the argv after the global options (`--no-pager`, `--no-optional-locks`, `-c k=v`). */
+const { subcommand } = vi.hoisted(() => ({
+  subcommand: (args: readonly string[]): string[] => {
+    let i = 0;
+    while (i < args.length) {
+      if (args[i] === "-c") i += 2;
+      else if (args[i] === "--no-pager" || args[i] === "--no-optional-locks") i += 1;
+      else break;
+    }
+    return args.slice(i);
+  },
+}));
 vi.mock("node:os", async importOriginal => ({
   ...(await importOriginal<typeof import("node:os")>()),
   homedir: (await import("../setup/home-guard")).guardedHomedir, // keep the global home guard (QA-1.1-22)
@@ -29,7 +41,7 @@ vi.mock("node:child_process", async () => {
       const args = binary === "nice" ? rawArgs.slice(4) : rawArgs;
       state.calls.push(args);
       state.directories.push(options.cwd);
-      const command = args.slice(1).join(" ");
+      const command = subcommand(args).join(" ");
       const output = command === "rev-parse --show-toplevel" ? process.cwd()
         : command === "rev-parse HEAD" ? state.head
         : command === "rev-parse HEAD --symbolic-full-name HEAD" ? state.head + (state.branchRef === null ? "" : `\n${state.branchRef}\n`)
@@ -69,6 +81,11 @@ const HARDENED = vi.hoisted(() => ({
   executableGuards: [] as string[][],
   /** #141: when set, gitExecutable refuses (a planted git inside the guards, or none found) by throwing this. */
   refuse: undefined as string | undefined,
+  /** The repository-only driver blanking (git-tools repositoryDriverArgs) the snapshot is given, and the calls it made. */
+  drivers: [] as string[],
+  driverCalls: [] as { root: string; executable: string | undefined; timeoutMs: number | undefined }[],
+  /** When set, repositoryDriverArgs rejects with this (an unreadable listing). */
+  driversFail: undefined as string | undefined,
 }));
 vi.mock("../../src/router/git-tools", async importOriginal => ({
   ...(await importOriginal<typeof import("../../src/router/git-tools")>()),
@@ -88,8 +105,13 @@ vi.mock("../../src/router/git-tools", async importOriginal => ({
     HARDENED.guardRoots.push(root);
     return [root, `${root}/.guard`];
   },
+  repositoryDriverArgs: async (root: string, options: { executable?: string; timeoutMs?: number } = {}) => {
+    HARDENED.driverCalls.push({ root, executable: options.executable, timeoutMs: options.timeoutMs });
+    if (HARDENED.driversFail !== undefined) throw new Error(HARDENED.driversFail);
+    return [...HARDENED.drivers];
+  },
 }));
-beforeEach(() => Object.assign(HARDENED, { guardRoots: [], executableGuards: [], refuse: undefined }));
+beforeEach(() => Object.assign(HARDENED, { guardRoots: [], executableGuards: [], refuse: undefined, drivers: [], driverCalls: [], driversFail: undefined }));
 beforeEach(() => Object.assign(state, {
   head: "head1", status: "", diff: "", index: "", untracked: "", content: "", stage: "", error: false,
   branchRef: "refs/heads/main",
@@ -169,12 +191,12 @@ describe("Git tree fingerprint adapter", () => {
         const onError = vi.fn();
         const git = vi.fn(async (args: readonly string[], opts: SnapshotGitOptions) => {
           expect(opts.timeoutMs).toBe(10_000);
-          if (args.slice(1).join(" ") === commands[index]) throw error;
+          if (subcommand(args).join(" ") === commands[index]) throw error;
           return execGit(args, opts);
         });
         expect(await snapshotTree(process.cwd(), new AbortController().signal, { git, onError })).toBeUndefined();
         expect(git).toHaveBeenCalledTimes(index + 1);
-        expect(git.mock.calls.map(([args]) => args.slice(1).join(" "))).toEqual(commands.slice(0, index + 1));
+        expect(git.mock.calls.map(([args]) => subcommand(args).join(" "))).toEqual(commands.slice(0, index + 1));
         expect(onError).toHaveBeenCalledExactlyOnceWith(expected);
         expect(expected.length).toBeLessThanOrEqual(200);
         expect(expected).not.toMatch(/[\r\n]|secret-123456/);
@@ -259,11 +281,76 @@ describe("Git tree fingerprint adapter", () => {
     expect(seen).toHaveLength(7);
     for (const { args, opts } of seen) {
       expect(args[0]).toBe("--no-pager");
-      expect(args).not.toContain("core.fsmonitor=false");
+      expect(args).toContain("core.fsmonitor=false");
       expect("env" in opts || "executable" in opts).toBe(false);
     }
     expect(state.binaries).toEqual(Array(7).fill(HARDENED.executable));
     expect(HARDENED.inheritedCalls).toHaveLength(1);
+  });
+
+  it("the default snapshot runs work-root read args (no fsmonitor, no hooks, no ssh key command, no transport), never hardeningArgs()", async () => {
+    const seen: (readonly string[])[] = [];
+    const git = async (args: readonly string[], opts: SnapshotGitOptions) => {
+      seen.push(args);
+      return execGit(args, opts);
+    };
+    expect(await snapshotTree(process.cwd(), new AbortController().signal, { git, ignoredDigest: true })).toBeDefined();
+    expect(seen.length).toBeGreaterThanOrEqual(7);
+    const nul = process.platform === "win32" ? "NUL" : "/dev/null";
+    for (const args of seen) {
+      const globals = args.slice(0, args.length - subcommand(args).length);
+      expect(globals.slice(0, 1)).toEqual(["--no-pager"]);
+      for (const setting of ["core.fsmonitor=false", `core.hooksPath=${nul}`, "gpg.ssh.defaultKeyCommand=", "protocol.allow=never",
+        "protocol.ext.allow=never", "protocol.file.allow=never", "protocol.ssh.allow=never"]) {
+        expect(globals[globals.indexOf(setting) - 1], setting).toBe("-c");
+      }
+      // Pin: the fingerprint depends on git's index refresh (stat-only dirty files would show in `diff HEAD --binary`).
+      expect(args).not.toContain("diff.autoRefreshIndex=false");
+      expect(args.some(arg => arg.startsWith("diff.autoRefreshIndex"))).toBe(false);
+      // Not the hardened mode's process options either.
+      expect(globals).not.toContain("--no-optional-locks");
+    }
+  });
+
+  it("repository-only drivers are blanked after root, in both modes, before every later process; none for a plain repository", async () => {
+    HARDENED.drivers = ["-c", "filter.evil.clean=", "-c", "filter.evil.required=false"];
+    const seen: (readonly string[])[] = [];
+    const git = async (args: readonly string[], opts: SnapshotGitOptions) => {
+      seen.push(args);
+      return execGit(args, opts);
+    };
+    const signal = new AbortController().signal;
+    for (const hardened of [false, true]) {
+      seen.length = 0;
+      HARDENED.driverCalls = [];
+      expect(await snapshotTree(resolve("packages/app"), signal, { git, hardened })).toBeDefined();
+      expect(seen).toHaveLength(7);
+      // Read once, for the toplevel, with the snapshot's executable (the hardened one; the default resolves its own).
+      expect(HARDENED.driverCalls).toEqual([{
+        root: process.cwd(), executable: hardened ? HARDENED.executable : undefined, timeoutMs: SNAPSHOT_GIT_TIMEOUT_MS,
+      }]);
+      // `rev-parse --show-toplevel` runs before they are known (it runs no filter); every later process carries them, right before
+      // the subcommand, so they follow (and win over) the mode's own prefix.
+      expect(subcommand(seen[0]!)).toEqual(["rev-parse", "--show-toplevel"]);
+      expect(seen[0]).not.toContain("filter.evil.clean=");
+      for (const args of seen.slice(1)) {
+        const sub = subcommand(args);
+        expect(args.slice(args.length - sub.length - HARDENED.drivers.length, args.length - sub.length)).toEqual(HARDENED.drivers);
+      }
+    }
+    // A repository without its own drivers: no extra argument.
+    HARDENED.drivers = [];
+    seen.length = 0;
+    expect(await snapshotTree(process.cwd(), signal, { git })).toBeDefined();
+    for (const args of seen) expect(args.some(arg => arg.startsWith("filter.") || arg.startsWith("merge."))).toBe(false);
+  });
+
+  it("an unreadable driver listing leaves no snapshot (fail closed), labelled `drivers`", async () => {
+    HARDENED.driversFail = "Cannot read the repository's driver configuration (128): fatal";
+    const onError = vi.fn();
+    expect(await snapshotTree(process.cwd(), new AbortController().signal, { onError })).toBeUndefined();
+    expect(onError).toHaveBeenCalledExactlyOnceWith("drivers: Cannot read the repository's driver configuration (128): fatal");
+    expect(state.calls.map(args => subcommand(args).join(" "))).toEqual(["rev-parse --show-toplevel"]);
   });
   it("#141: the default seam runs git by absolute path from outside the work-root guards of its cwd, never a bare `git`", async () => {
     const cwd = resolve("packages/app");
@@ -317,7 +404,7 @@ describe("Git tree fingerprint adapter", () => {
   });
 
   describe("the checked-out branch (I7, P0.2)", () => {
-    const headCalls = () => state.calls.filter(args => args.slice(1).join(" ") === "rev-parse HEAD --symbolic-full-name HEAD");
+    const headCalls = () => state.calls.filter(args => subcommand(args).join(" ") === "rev-parse HEAD --symbolic-full-name HEAD");
 
     it("attached: the short name of refs/heads/<name>, from the one rev-parse process", async () => {
       state.branchRef = "refs/heads/feat/x";
@@ -790,5 +877,120 @@ describe("listIgnoredModules — the linked repository's ignored modules (cross-
     expect(await tree.fileMtimeMs(resolve(repo, "src/a.ts"))).toBe(at.getTime());
     expect(await tree.fileMtimeMs(resolve(repo, "src/missing.ts"))).toBeUndefined();
     expect(await tree.fileMtimeMs(resolve(repo, "src/a.ts/child.ts"))).toBeUndefined(); // ENOTDIR (ENOENT on Windows)
+  }, 60_000);
+});
+
+// Real git, without the file-wide mocks (as the blocks above): a filter only the repository's own configuration names never runs
+// from a snapshot, default or hardened; a global filter's identical repository copy (`git lfs install --local`) still does.
+describe("snapshotTree — repository-only drivers (real git)", () => {
+  type TreeModule = typeof import("../../src/verify/tree");
+  type GitOptions = import("../../src/verify/tree").SnapshotGitOptions;
+  let tree: TreeModule;
+  let repo: string;
+  let outside: string;
+  let gitIn: (...args: string[]) => string = () => "";
+  let write: (rel: string, content: string) => Promise<void>;
+  let exists: (path: string) => boolean = () => false;
+  let remove: (path: string) => Promise<void>;
+  /** A filter command that appends to `marker` and passes its input through. */
+  let filter: (marker: string) => string = () => "";
+  const signal = new AbortController().signal;
+  const saved: Record<string, string | undefined> = {};
+  let cleanup: (() => Promise<void>) | undefined;
+
+  afterAll(async () => {
+    for (const [name, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    await cleanup?.();
+  });
+
+  beforeAll(async () => {
+    vi.doUnmock("node:fs/promises");
+    vi.doUnmock("node:child_process");
+    vi.doUnmock("../../src/router/git-tools");
+    vi.resetModules();
+    tree = await import("../../src/verify/tree");
+    const fs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    const fsSync = await vi.importActual<typeof import("node:fs")>("node:fs");
+    const cp = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+    const os = await vi.importActual<typeof import("node:os")>("node:os");
+    const path = await vi.importActual<typeof import("node:path")>("node:path");
+    repo = await fs.mkdtemp(path.join(os.tmpdir(), "omr-drivers-"));
+    outside = await fs.mkdtemp(path.join(os.tmpdir(), "omr-drivers-out-"));
+    cleanup = async () => {
+      await fs.rm(repo, { recursive: true, force: true });
+      await fs.rm(outside, { recursive: true, force: true });
+    };
+    write = async (rel, content) => fs.writeFile(path.join(repo, rel), content);
+    exists = (file) => fsSync.existsSync(file);
+    remove = (file) => fs.rm(file, { force: true });
+    const slash = (file: string) => file.replaceAll("\\", "/");
+    const script = path.join(outside, "filter.js");
+    await fs.writeFile(script, "require('node:fs').appendFileSync(process.argv[2], 'ran\\n'); process.stdin.pipe(process.stdout);\n");
+    filter = (marker) => `"${slash(process.execPath)}" "${slash(script)}" "${slash(marker)}"`;
+    // The user's global configuration: a filter the repository also sets, identically (as `git lfs install --local` does).
+    const global = path.join(outside, "global.gitconfig");
+    await fs.writeFile(global, "");
+    for (const name of ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_SYSTEM"]) saved[name] = process.env[name];
+    process.env.GIT_CONFIG_GLOBAL = global;
+    process.env.GIT_CONFIG_NOSYSTEM = "1";
+    delete process.env.GIT_CONFIG_SYSTEM;
+    const env = {
+      ...process.env,
+      GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.com", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.com",
+    };
+    gitIn = (...args) => cp.execFileSync("git", ["-c", "core.autocrlf=false", "-c", "commit.gpgsign=false", ...args], { cwd: repo, env, encoding: "utf8" });
+    // `git config --file` writes the value exactly as `git config` writes the repository's copy (quotes escaped alike).
+    gitIn("config", "--file", global, "filter.dup.clean", filter(path.join(outside, "DUP_RAN")));
+    await write(".gitattributes", "*.txt filter=evil\n*.dat filter=dup\n");
+    await write("a.txt", "one\n");
+    await write("b.dat", "one\n");
+    gitIn("init", "-q");
+    gitIn("add", ".");
+    gitIn("commit", "-q", "-m", "init");
+    gitIn("config", "filter.evil.clean", filter(path.join(outside, "EVIL_RAN")));
+    gitIn("config", "filter.dup.clean", filter(path.join(outside, "DUP_RAN")));
+    gitIn("config", "merge.evil.driver", `${filter(path.join(outside, "MERGE_RAN"))} %O %A %B`);
+  }, 60_000);
+
+  it("blanks the repository-only filter and merge driver in both modes; keeps the global filter's repository copy", async () => {
+    const evil = resolve(outside, "EVIL_RAN");
+    const dup = resolve(outside, "DUP_RAN");
+    await write("a.txt", "two, a modified tracked file\n");
+    await write("b.dat", "two, a modified tracked file\n");
+    for (const hardened of [false, true]) {
+      await remove(evil);
+      await remove(dup);
+      const seen: (readonly string[])[] = [];
+      const git = async (args: readonly string[], opts: GitOptions) => {
+        seen.push(args);
+        return tree.execGit(args, opts);
+      };
+      const snapshot = await tree.snapshotTree(repo, signal, { git, hardened, digestPaths: [] });
+      expect(snapshot?.dirty, `hardened=${hardened}`).toBe(true);
+      expect(exists(evil), `hardened=${hardened}: the repository-only filter ran`).toBe(false);
+      expect(exists(dup), `hardened=${hardened}: the global filter's copy did not run`).toBe(true);
+      const status = seen.find(args => args.includes("status")) ?? [];
+      for (const setting of ["filter.evil.clean=", "filter.evil.required=false", "merge.evil.driver="]) expect(status).toContain(setting);
+      expect(status.some(arg => arg.startsWith("filter.dup."))).toBe(false);
+    }
+    // Control: plain git runs the repository's filter.
+    gitIn("diff", "HEAD");
+    expect(exists(evil)).toBe(true);
+  }, 60_000);
+
+  it("a repository without its own drivers gets no driver arguments", async () => {
+    gitIn("config", "--unset", "filter.evil.clean");
+    gitIn("config", "--unset", "merge.evil.driver");
+    const seen: (readonly string[])[] = [];
+    const git = async (args: readonly string[], opts: GitOptions) => {
+      seen.push(args);
+      return tree.execGit(args, opts);
+    };
+    expect(await tree.snapshotTree(repo, signal, { git, digestPaths: [] })).toBeDefined();
+    expect(seen.length).toBeGreaterThan(1);
+    for (const args of seen) expect(args.some(arg => arg.startsWith("filter.") || arg.startsWith("merge."))).toBe(false);
   }, 60_000);
 });

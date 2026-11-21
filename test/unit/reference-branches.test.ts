@@ -6,6 +6,7 @@
 // created to directories inside that dir, and afterEach unlinks every link before the
 // recursive removal (module rules R1/R2), so no cleanup can reach real data.
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { DRIVER_SCOPE_ARGS, workRootReadArgs } from "../../src/router/git-tools";
 import { createHash } from "node:crypto";
 import * as fsp from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -95,6 +96,7 @@ function fakeGit(override?: Override): FakeGit {
     if (cmd.startsWith("diff-tree ")) return { stdout: "" };
     if (cmd.startsWith("cat-file -e ")) return {};
     if (cmd === "config --get core.autocrlf") return { code: 1 };
+    if (cmd === DRIVER_SCOPE_ARGS.join(" ")) return { code: 1 }; // no filter/merge driver configured anywhere
     if (cmd.startsWith("ls-files ")) return { stdout: "" };
     if (cmd === "worktree list --porcelain") {
       let out = `worktree ${root}\nHEAD ${HEAD}\n\n`;
@@ -112,7 +114,13 @@ function fakeGit(override?: Override): FakeGit {
     return { code: 1, stderr: `unexpected git ${cmd}` };
   };
   const argv: ArgvSeam = async (_file, fullArgs, opts) => {
-    const args = fullArgs.slice(1); // drop --no-optional-locks
+    // Every call starts with --no-optional-locks and the work-root read prefix (no fsmonitor, no hooks, no transport); a
+    // scripted repository configures no driver, so nothing follows it but the command.
+    const prefix = ["--no-optional-locks", ...workRootReadArgs()];
+    if (fullArgs.slice(0, prefix.length).join("\0") !== prefix.join("\0")) {
+      return { code: 128, stdout: "", stderr: `missing work-root read prefix: ${fullArgs.join(" ")}` };
+    }
+    const args = fullArgs.slice(prefix.length);
     const cmd = args.join(" ");
     calls.push(cmd);
     const reply = (await override?.(cmd, args, opts)) ?? (await fallback(cmd, args));

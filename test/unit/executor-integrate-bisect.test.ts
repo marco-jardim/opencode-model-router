@@ -445,6 +445,48 @@ describe("createLander", () => {
     ]);
   });
 
+  it("places the repository-only driver blanking after the hardening of every probe, read once per toplevel; a failed read fails the probe", async () => {
+    const drivers = ["-c", "filter.evil.clean=", "-c", "merge.evil.driver=", "-c", "filter.evil.required=false"];
+    const probes: Record<string, RunResult> = {
+      "rev-parse --show-toplevel": runResult(0, "/repo\n"), "symbolic-ref -q HEAD": runResult(0, "refs/heads/main\n"), status: runResult(0, ""),
+    };
+    const seen: string[][] = [];
+    const run = stub<GitRunner>({
+      run: async args => {
+        seen.push([...args]);
+        const sub = args.slice(PROBE_PREFIX_LENGTH + drivers.length);
+        return probes[sub[0] === "status" ? "status" : sub.join(" ")] ?? runResult(1);
+      },
+    });
+    const igit = stub<IntegrateGit>({
+      readRef: async () => "base", isAncestor: async (_cwd, ancestor) => ancestor !== req.candidate,
+      diffNameStatus: async () => [], ignoredAt: async () => [],
+    });
+    const guard: WriteGuard = { assertWriteCwd: async () => undefined };
+    const reads: string[] = [];
+    let failing = false;
+    const lander = createLander({ git: stub<GitOps>({}), igit, guard, run, realpath: async p => p, platform: "linux",
+      drivers: async top => {
+        reads.push(top);
+        if (failing) throw new Error("Cannot read the repository's driver configuration (128): fatal");
+        return drivers;
+      } });
+    expect(await lander.inspect(req)).toEqual({ ok: true, baseTip: "base", noop: false });
+    expect(seen).toHaveLength(3);
+    for (const args of seen) expect(args.slice(0, PROBE_PREFIX_LENGTH + drivers.length)).toEqual([...probePrefix("/repo"), ...drivers]);
+    expect(await lander.inspect(req)).toMatchObject({ ok: true });
+    expect(reads).toEqual(["/repo"]); // cached per toplevel
+    // Another toplevel is read afresh; a failed read fails the probe (no probe without it) and is retried next time.
+    failing = true;
+    await expect(lander.inspect({ ...req, toplevel: "/other" })).rejects.toThrow(/driver configuration/);
+    expect(seen).toHaveLength(6);
+    failing = false;
+    seen.length = 0;
+    await lander.inspect({ ...req, toplevel: "/other" });
+    expect(reads).toEqual(["/repo", "/other", "/other"]);
+    expect(seen[0]?.slice(0, PROBE_PREFIX_LENGTH + drivers.length)).toEqual([...probePrefix("/other"), ...drivers]);
+  });
+
   it("compares the realpaths of the reported and the recorded toplevel", async () => {
     const { lander } = world({
       realpath: async p => (p === "/link" ? "/repo" : p),

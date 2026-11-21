@@ -171,10 +171,103 @@ export function hardeningArgs(): string[] {
   return ["--no-optional-locks", "--no-pager", "-c", "core.pager=cat", "-c", "core.fsmonitor=false", "-c", "diff.external=",
     "-c", `core.hooksPath=${NULL_DEVICE}`, ...PROTOCOL_HARDENING,
     "-c", "maintenance.auto=false", "-c", "gc.auto=0", "-c", "color.ui=false",
-    // G2: signature display would run gpg.program; blank every signing program too.
+    // G2: signature display would run gpg.program; blank every signing program too (and the ssh key lookup command).
     "-c", "log.showSignature=false", "-c", "gpg.program=", "-c", "gpg.ssh.program=", "-c", "gpg.x509.program=",
+    "-c", "gpg.ssh.defaultKeyCommand=",
     // G3: diff's opportunistic index refresh writes .git even with --no-optional-locks.
     "-c", "diff.autoRefreshIndex=false", "-c", "core.splitIndex=false", "-c", "index.threads=1"];
+}
+
+/**
+ * The read prefix of a router-run git in the work root that keeps git's own index semantics (the default work-root snapshot,
+ * the reference runner): no fsmonitor, no hooks (the `hardeningArgs()` null-device hooksPath, so no `post-index-change` on an
+ * index write), no ssh key lookup command, no transport. Unlike `hardeningArgs()` it keeps `diff.autoRefreshIndex`: turning
+ * the refresh off would show stat-only dirty files in `diff HEAD` and change the snapshot's fingerprint. A later
+ * `-c core.hooksPath=…` still wins over the null device.
+ */
+export function workRootReadArgs(): string[] {
+  return ["-c", "core.fsmonitor=false", "-c", `core.hooksPath=${NULL_DEVICE}`, "-c", "gpg.ssh.defaultKeyCommand=", ...PROTOCOL_HARDENING];
+}
+
+/** Repository driver programs a work-root git may run: filter clean/smudge/process and merge drivers. */
+const REPOSITORY_DRIVER_QUERY = "^(filter\\..+\\.(clean|smudge|process)|merge\\..+\\.driver)$";
+const REPOSITORY_DRIVER_KEY = /^(?:filter\.(.+)\.(?:clean|smudge|process)|merge\..+\.driver)$/;
+/** The configuration scopes the user controls; every other scope (local, worktree, an unknown one) is the repository's. */
+const USER_SCOPES: ReadonlySet<string> = new Set(["system", "global", "command"]);
+
+/**
+ * Every filter/merge driver program with the scope that sets it (`git config --show-scope`, git >= 2.26), NUL-separated:
+ * `<scope>\0<key>\n<value>\0`. Exit 1: none is set. Parsed by {@link repositoryOnlyDriverArgs}.
+ */
+export const DRIVER_SCOPE_ARGS: readonly string[] = Object.freeze(["config", "-z", "--show-scope", "--get-regexp", REPOSITORY_DRIVER_QUERY]);
+
+/**
+ * Router-run git in the work root must not run a program the repository configured: from a {@link DRIVER_SCOPE_ARGS} listing,
+ * `-c <key>=` for every filter clean/smudge/process and merge driver whose effective value comes from the repository's own
+ * configuration (local, worktree, or a file those include) and is not also set, identically, in the system, global or
+ * command-line configuration; a blanked filter also gets `-c filter.<name>.required=false` (as `inspectGit` does). A global
+ * LFS filter and its `git lfs install --local` copy are kept, and a repository without its own drivers gets no arguments.
+ * Throws when a key cannot be blanked (`-c` splits at the first `=`).
+ */
+export function repositoryOnlyDriverArgs(listing: string): string[] {
+  const fields = listing.split("\0");
+  const userValues = new Map<string, Set<string>>();
+  const effective = new Map<string, { scope: string; value: string | undefined }>();
+  for (let index = 0; index + 1 < fields.length; index += 2) {
+    const scope = fields[index]!;
+    const entry = fields[index + 1]!;
+    const newline = entry.indexOf("\n");
+    const key = newline === -1 ? entry : entry.slice(0, newline);
+    if (!REPOSITORY_DRIVER_KEY.test(key)) continue;
+    // A value-less key (boolean true) names no program git could run; it never matches a user value.
+    const value = newline === -1 ? undefined : entry.slice(newline + 1);
+    if (USER_SCOPES.has(scope) && value !== undefined) {
+      const values = userValues.get(key) ?? new Set<string>();
+      values.add(value);
+      userValues.set(key, values);
+    }
+    effective.set(key, { scope, value }); // the last value wins, as for git
+  }
+  const args: string[] = [];
+  const optional = new Set<string>();
+  for (const [key, { scope, value }] of effective) {
+    if (USER_SCOPES.has(scope) || (value !== undefined && userValues.get(key)?.has(value) === true)) continue;
+    if (key.includes("=")) throw new Error("Refusing repository: a filter/merge driver name contains '=' and cannot be neutralized");
+    args.push("-c", `${key}=`);
+    const filter = /^filter\.(.+)\.(?:clean|smudge|process)$/.exec(key);
+    if (filter) optional.add(`filter.${filter[1]}.required=false`);
+  }
+  for (const setting of optional) args.push("-c", setting);
+  return args;
+}
+
+/** The user's own configuration locations, which plain git honours (git-tools strips every other GIT_* variable). */
+function userConfigVariables(): Record<string, string> {
+  const passed: Record<string, string> = {};
+  for (const name of ["GIT_CONFIG_SYSTEM", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM"]) {
+    const value = process.env[name];
+    if (value !== undefined) passed[name] = value;
+  }
+  return passed;
+}
+
+/**
+ * {@link repositoryOnlyDriverArgs} for a router-run git in the work root `root`, from a {@link DRIVER_SCOPE_ARGS} listing read as
+ * plain git reads the user's configuration (no inherited GIT_* except the user's GIT_CONFIG_SYSTEM/GLOBAL/NOSYSTEM), so a
+ * repository copy of a system/global driver is kept also where the run itself hides that configuration (`gitEnvironment()`).
+ * `executable`: default the router's git outside the work-root guards of `root`. Throws when the listing cannot be read: the
+ * caller has no run (fail closed).
+ */
+export async function repositoryDriverArgs(root: string, options: { executable?: string; signal?: AbortSignal; timeoutMs?: number } = {}): Promise<string[]> {
+  const executable = options.executable ?? gitExecutable(workRootGuards(root));
+  const env: NodeJS.ProcessEnv = { ...strippedEnvironment(), ...userConfigVariables(),
+    GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0", GIT_NO_LAZY_FETCH: "1" };
+  const result = await spawnBounded(executable, [...hardeningArgs(), ...DRIVER_SCOPE_ARGS], root,
+    { env, signal: options.signal, timeoutMs: options.timeoutMs ?? DEADLINE_MS, maxBytes: 1024 * 1024 });
+  if (result.truncated) throw new Error("Git driver configuration exceeds its size bound");
+  if (result.code === 1) return [];
+  if (result.code !== 0) throw queryFailure("Cannot read the repository's driver configuration", result);
+  return repositoryOnlyDriverArgs(result.output.toString("utf8"));
 }
 
 function validateInput(operation: GitOperation, input: GitInput): { ref?: string } {
@@ -801,11 +894,7 @@ const inheritedCache = new Map<string, readonly string[]>();
  * and configuration location.
  */
 async function inheritedConfig(executable: string, budget: Budget): Promise<readonly string[]> {
-  const passed: Record<string, string> = {};
-  for (const name of ["GIT_CONFIG_SYSTEM", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM"]) {
-    const value = process.env[name];
-    if (value !== undefined) passed[name] = value;
-  }
+  const passed = userConfigVariables();
   const key = JSON.stringify([executable, passed, process.env.HOME, process.env.USERPROFILE, process.env.XDG_CONFIG_HOME]);
   const cached = inheritedCache.get(key);
   if (cached) return cached;

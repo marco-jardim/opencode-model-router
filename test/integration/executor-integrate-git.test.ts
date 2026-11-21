@@ -22,7 +22,7 @@ import {
   createIntegrateGit, createIntegrationChecks, createWriteGuard, BackgroundRuns,
   type CommandRunner, type IntegrateGit, type IntegrationChecks, type ResolvedCommand, type RunResolver, type WriteGuard,
 } from "../../src/executor/integrate/checks";
-import { hardeningArgs } from "../../src/router/git-tools";
+import { hardeningArgs, repositoryDriverArgs } from "../../src/router/git-tools";
 import { maxRangeProbes } from "../../src/executor/integrate/bisect";
 import { createLander } from "../../src/executor/integrate/land";
 import { createPhaseSuiteRunner, revertMessage } from "../../src/executor/integrate/phase-suite";
@@ -584,6 +584,21 @@ describe("landing on real git (3.2.5)", SLOW, () => {
     expect(probes.some((c) => c.args.includes("status"))).toBe(true);
     for (const c of probes) for (const a of hardeningArgs()) expect(c.args, `probe ${c.args.join(" ")}`).toContain(a);
     expect(existsSync(marker)).toBe(false);
+  });
+
+  it("with the production drivers (repositoryDriverArgs), every read probe blanks a filter only the owner checkout configures", async () => {
+    const s = landSetup("drivers");
+    git(s.repo, "config", "filter.evil.clean", "false");
+    git(s.repo, "config", "merge.evil.driver", "false");
+    const lander = createLander({ git: s.env.ops, igit: s.env.igit, guard: s.env.guard, run: s.env.run, realpath: (p) => fsp.realpath(p),
+      platform: process.platform, drivers: (top) => repositoryDriverArgs(top) });
+    s.env.gitCalls.length = 0;
+    expect(await lander.fastForward(s.req)).toEqual({ kind: "landed", from: s.c0, to: s.cand });
+    const probes = s.env.gitCalls.filter((c) => c.args[0] === "-C" && c.args.some((a) => ["status", "symbolic-ref", "rev-parse"].includes(a)));
+    expect(probes.some((c) => c.args.includes("status"))).toBe(true);
+    for (const c of probes) {
+      for (const a of ["filter.evil.clean=", "filter.evil.required=false", "merge.evil.driver="]) expect(c.args, `probe ${c.args.join(" ")}`).toContain(a);
+    }
   });
 
   it("the phase tag omr/<planId>/phase/<id> is created once; a second create is exists-same, a different commit exists-other", async () => {

@@ -22,6 +22,11 @@ export interface LanderDeps {
   /** Hardened runner for the read-only owner-checkout probes (toplevel, HEAD, status); each call uses `-C <toplevel>`. */
   run: GitRunner;
   realpath: (p: string) => Promise<string>; platform: NodeJS.Platform;
+  /**
+   * The `-c` pairs blanking the filter/merge drivers only the owner checkout's own configuration names (production: git-tools
+   * `repositoryDriverArgs`), read once per toplevel and placed after the hardening of every probe. A rejection fails the probe.
+   */
+  drivers?: (toplevel: string) => Promise<readonly string[]>;
 }
 
 export interface LanderApi {
@@ -61,9 +66,23 @@ function parseStatusPaths(stdout: string): string[] {
 }
 
 export function createLander(d: LanderDeps): LanderApi {
+  const driverArgs = new Map<string, Promise<readonly string[]>>();
+  function drivers(toplevel: string): Promise<readonly string[]> {
+    if (d.drivers === undefined) return Promise.resolve([]);
+    let pending = driverArgs.get(toplevel);
+    if (pending === undefined) {
+      const read = d.drivers(toplevel);
+      pending = read;
+      driverArgs.set(toplevel, read);
+      read.catch(() => { if (driverArgs.get(toplevel) === read) driverArgs.delete(toplevel); }); // a failed read is retried
+    }
+    return pending;
+  }
+
   async function probe(toplevel: string, args: readonly string[]): Promise<{ code: number | null; stdout: string }> {
-    // hardeningArgs() neutralises configured hooks/fsmonitor/pagers: `status` must not run a repo-configured program.
-    const r = await d.run.run(["-C", toplevel, "--no-optional-locks", ...hardeningArgs(), ...args], { cwd: toplevel, timeoutMs: READ_TIMEOUT_MS });
+    // hardeningArgs() neutralises configured hooks/fsmonitor/pagers and `drivers` the repository-only filter/merge drivers:
+    // `status` must not run a repo-configured program.
+    const r = await d.run.run(["-C", toplevel, "--no-optional-locks", ...hardeningArgs(), ...await drivers(toplevel), ...args], { cwd: toplevel, timeoutMs: READ_TIMEOUT_MS });
     return { code: r.code, stdout: r.stdout };
   }
 

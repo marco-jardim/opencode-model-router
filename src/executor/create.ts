@@ -12,7 +12,7 @@ import { CLASS_STATIC_TIER } from "../routing/classify/types";
 import { createDurationModel, DURATION_PRIOR_MS, type DurationModel } from "../routing/outcomes/durations";
 import { CLASS_ROLE_KIND } from "../routing/engine/roles-taxonomy";
 import { runArgv } from "../verify/exec";
-import { hardeningArgs, spawnBounded, workRootGuards } from "../router/git-tools";
+import { hardeningArgs, repositoryDriverArgs, spawnBounded, workRootGuards } from "../router/git-tools";
 import { createCapacityController } from "./capacity";
 import { createPlanCompiler, type CompilerDeps } from "./compile";
 import { createGitOps, createGitRunner } from "./git";
@@ -495,7 +495,8 @@ function assembleExecutor(context: { directory: string }, options: CreateExecuto
         },
       });
       const suite = createPhaseSuiteRunner({ checks, igit, git: ops, pool, resolver, background, clock, logger });
-      const lander = createLander({ git: ops, igit, guard, run: git, realpath, platform: process.platform });
+      const lander = createLander({ git: ops, igit, guard, run: git, realpath, platform: process.platform,
+        drivers: (top) => repositoryDriverArgs(top) });
       const queue = createIntegrationQueue({ planId, writer: input.writer,
         history: { steps: async () => (await store.exportPlan(planId)).events.filter((event): event is IntegrationStepEvent => event.type === "integration-step") },
         git: ops, igit, pool, leases: input.leases, checks, suite, lander, listener: input.listener,

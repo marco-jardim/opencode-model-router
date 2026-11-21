@@ -8,7 +8,8 @@ import { tmpdir } from "node:os";
 import { basename, delimiter, dirname, join, relative } from "node:path";
 import {
   dropPartialCredential, errorMessage, quoteGitPath, GIT_OPERATIONS, gitArgv, gitCandidates, gitEnvironment, gitExecutable, gitTools, hardeningArgs, inspectGit,
-  linkedTrackedDirectories, numstatNames, parseInheritedConfig, runBoundedProcess, selectGitExecutable, stripUrlUserinfo, validatePath, validateRef,
+  linkedTrackedDirectories, numstatNames, parseInheritedConfig, PROTOCOL_HARDENING, repositoryDriverArgs, repositoryOnlyDriverArgs, runBoundedProcess,
+  selectGitExecutable, stripUrlUserinfo, validatePath, validateRef, workRootReadArgs,
   type GitInput, type GitInspectOptions, type GitOperation,
 } from "../../src/router/git-tools";
 import { sensitiveGitPathspecs, SENSITIVE_PATH_PATTERNS } from "../../src/router/sensitive-paths";
@@ -232,7 +233,7 @@ describe("shell-free git inspection", () => {
     const args = gitArgv(operation, { path: "file.txt" }, root);
     expect(args.slice(0, hardeningArgs().length)).toEqual(hardeningArgs());
     for (const flag of ["--no-optional-locks", "--no-pager", "core.pager=cat", "core.fsmonitor=false", "diff.external=", "protocol.allow=never",
-      "log.showSignature=false", "gpg.program=", "gpg.ssh.program=", "diff.autoRefreshIndex=false", "core.splitIndex=false", "index.threads=1",
+      "log.showSignature=false", "gpg.program=", "gpg.ssh.program=", "gpg.ssh.defaultKeyCommand=", "diff.autoRefreshIndex=false", "core.splitIndex=false", "index.threads=1",
       "gc.auto=0", "maintenance.auto=false",
       // Phase 4 QA (m5): every transport refused on the command line, so a repository's protocol.<name>.allow cannot re-enable one.
       "protocol.ext.allow=never", "protocol.file.allow=never", "protocol.ssh.allow=never", "protocol.git.allow=never",
@@ -543,6 +544,77 @@ describe("shell-free git inspection", () => {
       .toEqual(["core.autocrlf=true", "safe.directory=*", "core.longpaths=true", "core.safecrlf=warn", "core.eol=lf"]);
     expect(parseInheritedConfig("__proto__\nx\0safe.directory\nbad\nvalue\0")).toEqual([]);
   });
+  it("workRootReadArgs: no fsmonitor, the null-device hooksPath, no ssh key command, every transport refused; never diff.autoRefreshIndex", () => {
+    const args = workRootReadArgs();
+    const nul = WIN ? "NUL" : "/dev/null";
+    expect(args).toEqual(["-c", "core.fsmonitor=false", "-c", `core.hooksPath=${nul}`, "-c", "gpg.ssh.defaultKeyCommand=", ...PROTOCOL_HARDENING]);
+    expect(args.some(arg => arg.startsWith("diff.autoRefreshIndex"))).toBe(false);
+    // The same null device as hardeningArgs(), which also blanks the ssh key command now.
+    expect(hardeningArgs()).toContain(`core.hooksPath=${nul}`);
+    expect(hardeningArgs()[hardeningArgs().indexOf("gpg.ssh.defaultKeyCommand=") - 1]).toBe("-c");
+  });
+  it("repositoryOnlyDriverArgs blanks only the drivers the repository alone sets (scoped listing)", () => {
+    const entry = (scope: string, key: string, value?: string) => `${scope}\0${key}${value === undefined ? "" : `\n${value}`}\0`;
+    const lfs = "git-lfs clean -- %f";
+    expect(repositoryOnlyDriverArgs("")).toEqual([]);
+    // A global LFS filter and its `git lfs install --local` copy: kept, no argument at all.
+    expect(repositoryOnlyDriverArgs(entry("global", "filter.lfs.clean", lfs) + entry("local", "filter.lfs.clean", lfs)
+      + entry("system", "filter.lfs.process", "git-lfs filter-process") + entry("local", "filter.lfs.process", "git-lfs filter-process"))).toEqual([]);
+    // A system/global/command-line value alone is the user's.
+    expect(repositoryOnlyDriverArgs(entry("system", "filter.a.smudge", "x") + entry("command", "merge.m.driver", "y"))).toEqual([]);
+    // Repository-only programs (local, worktree, an unknown scope), a changed local copy, a merge driver, a value-less key: blanked.
+    expect(repositoryOnlyDriverArgs(
+      entry("global", "filter.lfs.clean", lfs) + entry("local", "filter.lfs.clean", `${lfs}; evil`)
+      + entry("local", "filter.evil.process", "evil") + entry("worktree", "filter.wt.smudge", "evil") + entry("unknown", "filter.u.clean", "evil")
+      + entry("local", "merge.evil.driver", "evil %A") + entry("local", "filter.bare.clean"),
+    )).toEqual([
+      "-c", "filter.lfs.clean=", "-c", "filter.evil.process=", "-c", "filter.wt.smudge=", "-c", "filter.u.clean=", "-c", "merge.evil.driver=",
+      "-c", "filter.bare.clean=",
+      "-c", "filter.lfs.required=false", "-c", "filter.evil.required=false", "-c", "filter.wt.required=false", "-c", "filter.u.required=false",
+      "-c", "filter.bare.required=false",
+    ]);
+    // The last value wins, as for git: a command-line value after the local one is the user's; a local one after a global one is not.
+    expect(repositoryOnlyDriverArgs(entry("local", "filter.x.clean", "evil") + entry("command", "filter.x.clean", "mine"))).toEqual([]);
+    expect(repositoryOnlyDriverArgs(entry("global", "filter.x.clean", "mine") + entry("local", "filter.x.clean", "evil")))
+      .toEqual(["-c", "filter.x.clean=", "-c", "filter.x.required=false"]);
+    // Subsections keep their case and spaces; other keys (diff drivers, required, junk) are not this helper's.
+    expect(repositoryOnlyDriverArgs(entry("local", "filter.My Filter.clean", "evil") + entry("local", "filter.x.required", "true")
+      + entry("local", "diff.x.textconv", "evil") + "junk\0"))
+      .toEqual(["-c", "filter.My Filter.clean=", "-c", "filter.My Filter.required=false"]);
+    // `-c` splits at the first '=': such a name cannot be blanked, so the repository is refused.
+    expect(() => repositoryOnlyDriverArgs(entry("local", "filter.a=b.clean", "evil"))).toThrow(/cannot be neutralized/);
+  });
+  it("repositoryDriverArgs (real git): a repository-only filter is blanked and never runs; a global filter's local copy runs", async () => {
+    repository();
+    const evil = join(outside, "EVIL_RAN");
+    const dup = join(outside, "DUP_RAN");
+    writeFileSync(join(root, ".gitattributes"), "*.txt filter=evil\n*.dat filter=dup\n");
+    writeFileSync(join(root, "b.dat"), "one\n");
+    git("add", "-A"); git("commit", "-qm", "drivers");
+    expect(await repositoryDriverArgs(root)).toEqual([]); // nothing configured: no argument
+    const clean = (marker: string) => `${markerCommand(marker)}; cat`;
+    git("config", "filter.evil.clean", clean(evil));
+    git("config", "filter.dup.clean", clean(dup));
+    git("config", "merge.evil.driver", `${markerCommand(evil)}; false`);
+    // The user's global configuration (GIT_CONFIG_GLOBAL, honoured as plain git does), written by git as the local copy.
+    const global = process.env.GIT_CONFIG_GLOBAL ?? "";
+    execFileSync(gitExecutable(), ["config", "--file", global, "filter.dup.clean", clean(dup)], { cwd: outside, env: gitEnvironment() });
+    const args = await repositoryDriverArgs(root);
+    expect(args).toEqual(["-c", "filter.evil.clean=", "-c", "merge.evil.driver=", "-c", "filter.evil.required=false"]);
+    // A hardened run (no system/global config) with those arguments: the repository's filter never runs, its copy of the
+    // user's filter does.
+    writeFileSync(join(root, "file.txt"), "changed\n");
+    writeFileSync(join(root, "b.dat"), "changed\n");
+    execFileSync(gitExecutable(), [...hardeningArgs(), ...args, "diff", "--no-ext-diff", "HEAD"], { cwd: root, env: gitEnvironment(), encoding: "utf8" });
+    expect(existsSync(evil)).toBe(false);
+    expect(existsSync(dup)).toBe(true);
+    // Control: without them the repository's filter runs.
+    plain(root, "diff", "HEAD");
+    expect(existsSync(evil)).toBe(true);
+    // Not a repository: nothing the repository could set. An unreadable listing throws (the caller fails closed).
+    expect(await repositoryDriverArgs(outside)).toEqual([]);
+    await expect(repositoryDriverArgs(join(outside, "missing"))).rejects.toThrow();
+  }, 30_000);
   it.each([
     ["https://user:token@host/repo", "https://host/repo"],
     ["https://user:p@ss@host/r", "https://host/r"],
