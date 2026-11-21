@@ -16,11 +16,14 @@ import { gitPointers } from "../router/git-tools";
 import { expandTask, loadExpansionEnv, type ExpandedTask } from "./expand";
 import {
   deleteSlotRef,
+  gitCommitFailure,
+  gitStderrTail,
   listSlotRefs,
   orphanRefName,
   phaseTagName,
   planRefPrefix,
   restoreSlotWork,
+  sanitizeGitDiagnostic,
   snapshotSlotWork,
   slotCommitIdentityArgs,
   taskBranchName,
@@ -325,7 +328,14 @@ function errorCode(e: unknown): string | null {
   return null;
 }
 
-const IDENTITY_PATTERN = /please tell me who you are|unable to auto-detect|empty ident|author identity unknown/i;
+/** Git errors keep stderr in details; carry a safe summary through logs, contexts and blocking items. */
+function gitDiagnostic(e: unknown): { message: string; gitExitCode: string; stderr: string } {
+  const detail = e instanceof ExecutorError && typeof e.detail === "object" && e.detail !== null && !Array.isArray(e.detail) ? e.detail : {};
+  const gitExitCode = typeof detail.code === "number" ? String(detail.code) : "unknown";
+  const stderr = gitStderrTail(typeof detail.stderr === "string" ? detail.stderr : "");
+  const message = sanitizeGitDiagnostic(errorText(e)).slice(0, 1200);
+  return { message: `${message}${gitExitCode === "unknown" || message.includes("exit ") ? "" : ` (git exit ${gitExitCode})`}${stderr === "" || message.includes(stderr) ? "" : `; stderr: ${stderr}`}`, gitExitCode, stderr };
+}
 
 /** A git step that failed on a leftover `index.lock` (a git killed mid-commit, D11). */
 const INDEX_LOCK_PATTERN = /index\.lock/i;
@@ -373,14 +383,7 @@ export async function commitTaskInSlot(
       if (await removeIndexLock(git, o)) r = await git.run(args, o);
     }
     if (r.code !== 0) {
-      const text = `${r.stderr}\n${r.stdout}`;
-      // The verb after any leading `-c key=value` pairs (the commit's injected identity).
-      const verb = args.find((arg, k) => arg !== "-c" && args[k - 1] !== "-c") ?? "";
-      throw new ExecutorError(IDENTITY_PATTERN.test(text) ? "E_IDENTITY" : "E_GIT", `git ${verb} failed`, {
-        args: [...args],
-        code: r.code,
-        stderr: r.stderr.slice(0, 2000),
-      });
+      throw gitCommitFailure(args.includes("commit") ? "commit" : args[0] ?? "", r);
     }
     return r.stdout;
   };
@@ -397,7 +400,7 @@ export async function commitTaskInSlot(
   }
   await step(["switch", "-C", i.branch]);
   await step(["add", "-A"]);
-  const identity = await slotCommitIdentityArgs(i.identity);
+  const identity = await slotCommitIdentityArgs(git, o, i.identity);
   await step([...identity, "commit", "--no-verify", "--no-gpg-sign", "-m", i.message, ...(i.trailer === undefined ? [] : ["-m", i.trailer])]);
   const head = (await step(["rev-parse", "HEAD"])).trim();
   return { changed: true, commit: head };
@@ -1526,6 +1529,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
   const wipRestored = new Map<string, number>();
   /** QA-PDF21-3: `<plan>/<slot>` of the slots whose failed save raised its blocking item already (cleared by a save). */
   const wipFailRaised = new Set<string>();
+  const wipFailures = new Map<string, string>();
 
   /** The quarantine directory is durable even if the process dies between the rename and journaling its item. */
   function quarantinedSlots(p: PlanRt): string[] {
@@ -1597,11 +1601,15 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         ...(d.commitIdentity === undefined ? {} : { identity: d.commitIdentity }),
       });
       wipFailRaised.delete(`${p.planId}/${slot.slot}`);
+      wipFailures.delete(`${p.planId}/${slot.slot}`);
       if (r.saved) counter(p, "wip-saved", taskId === null ? { slot: slot.slot, ref } : { taskId, slot: slot.slot, ref }, deferredMetrics);
       return r.saved || r.reason === "unchanged" ? "saved" : "clean";
     } catch (e) {
-      d.log("error", `saving the work in slot ${slot.slot} failed; the slot is kept as it is`, errorText(e));
-      counter(p, "wip-failed", taskId === null ? { slot: slot.slot } : { taskId, slot: slot.slot }, deferredMetrics);
+      const diagnostic = gitDiagnostic(e);
+      wipFailures.set(`${p.planId}/${slot.slot}`, diagnostic.message);
+      d.log("error", `saving the work in slot ${slot.slot} failed; the slot is kept as it is`, diagnostic);
+      counter(p, "wip-failed", { ...(taskId === null ? {} : { taskId }), slot: slot.slot,
+        gitExitCode: diagnostic.gitExitCode, stderr: diagnostic.stderr }, deferredMetrics);
       return "failed";
     }
   }
@@ -1684,7 +1692,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         kind: "failure",
         severity: "blocking",
         taskId,
-        text: wipHoldText(slotName, what, taskId),
+        text: wipHoldText(p, slotName, what, taskId),
         options: [],
       });
       return item.id;
@@ -1805,8 +1813,9 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
   }
 
   /** The text of `wipHold`'s item; `answer` reads the slot back from it (`wipHoldSlotOf`, QA-PDF21-15). */
-  function wipHoldText(slotName: string, what: string, taskId: TaskId | null): string {
-    return `${WIP_HOLD_PREFIX}${slotName} could not be saved before ${what}; the slot keeps its work and stays leased${taskId === null ? "" : ` to ${taskId}`} (see the log). Fix the slot's git state, then answer`;
+  function wipHoldText(p: PlanRt, slotName: string, what: string, taskId: TaskId | null): string {
+    const diagnostic = wipFailures.get(`${p.planId}/${slotName}`);
+    return `${WIP_HOLD_PREFIX}${slotName} could not be saved before ${what}; the slot keeps its work and stays leased${taskId === null ? "" : ` to ${taskId}`} (see the log).${diagnostic === undefined ? "" : ` ${diagnostic}`} Fix the slot's git state, then answer`;
   }
 
   /**
@@ -3269,7 +3278,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     // `parkItemOf` picks that item on the answer), its pending dependents are blocked and its file leases are kept with
     // the slot (as the policy's park keeps them for a kept slot, and `rebuildLeases` rebuilds them after a restart).
     const holdWhat = "its release (lease-needed)";
-    const holdText = saved === "failed" && slotName !== null ? wipHoldText(slotName, holdWhat, t.id) : null;
+    const holdText = saved === "failed" && slotName !== null ? wipHoldText(p, slotName, holdWhat, t.id) : null;
     const applied = await appendIf(p, (cur) => {
       const c = own(cur, t.id);
       if (c === null || c.state !== "running" || openAttempt(c, a.n) === null) return [];
@@ -3340,11 +3349,17 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     let lease: SlotLease;
     let r: { changed: false } | { changed: true; commit: string };
     const branch = taskBranchName(p.planId, taskId);
+    const att = t.attempts.find((x) => x.n === n);
     try {
       lease = await slotLeaseOf(p, t);
       // D11: the attempt's trailer makes the commit idempotent across a crash between the commit and row 21.
-      const att = t.attempts.find((x) => x.n === n);
       if (att !== undefined && d.verifier.observe !== undefined) await d.verifier.observe(t, lease, att, await finalTextOf(p, taskId, att), planTaskContext(p));
+    } catch (e) {
+      if (p.disposed) return;
+      await commitFailed(errorText(e));
+      return;
+    }
+    try {
       if (p.disposed) return;
       r = await commitTaskInSlot(d.git, {
         slot: lease,
@@ -3356,7 +3371,9 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       });
     } catch (e) {
       if (p.disposed) return;
-      await commitFailed(errorText(e));
+      const diagnostic = gitDiagnostic(e);
+      d.log("warn", `task ${taskId} git commit failed`, diagnostic);
+      await commitFailed(diagnostic.message);
       return;
     }
     if (p.disposed) return;

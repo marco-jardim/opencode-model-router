@@ -1534,7 +1534,8 @@ describe("failure, retry, conflict and commit failure", () => {
     run.complete("Done.");
     await h.runOf("T1", 2);
 
-    expect(h.task("T1").attempts[0]?.context).toBe("git commit failed");
+    expect(h.task("T1").attempts[0]?.context).toContain("git commit failed (exit 1)");
+    expect(h.task("T1").attempts[0]?.context).toContain(`stderr: ${stderr}`);
     expect(h.verifier.calls).toEqual([]);
     expect(h.parts().queue.enqueued).toEqual([]);
     expect((await h.events()).some((e) => e.type === "task-transition" && e.from === "completed" && e.to === "failed" && e.trigger === "commit-failed")).toBe(true);
@@ -1957,7 +1958,7 @@ describe("verification outcomes", () => {
     h.git.failOn = { verb: "status", stderr: "fatal: not a git repository" };
     run.complete("Done.");
     await h.runOf("T1", 2);
-    expect(h.task("T1").attempts[0]?.context).toBe("git status failed");
+    expect(h.task("T1").attempts[0]?.context).toBe("git status failed (exit 1); stderr: fatal: not a git repository");
     expect(h.verifier.calls).toEqual([]);
   });
 });
@@ -2066,6 +2067,7 @@ describe("restart: lease rebuild, slot lookup and capacity restore", () => {
     await h.runtime.onChildEnd("T1", 1, { kind: "completed", childSessionID: "ses-c1", text: "Done.", endedAt: h.clock.iso() });
     await h.runOf("T1", 2);
     expect(h.task("T1").attempts[0]).toMatchObject({ outcome: "succeeded", context: "slot record missing" });
+    expect(h.logs.some((line) => line.includes("git commit failed"))).toBe(false);
     expect(h.verifier.calls).toEqual([]);
     expect(h.parts().policy.counted.map((c) => c.n)).toEqual([1]);
   });

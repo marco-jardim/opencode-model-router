@@ -11,7 +11,7 @@ import {
   RESUME_PROMPT, classifyChildText, commitTaskInSlot, createExecutorRuntime, realCollaborators,
   type CollaboratorInput, type ExecutorRuntimeHandle, type PlanCollaborators, type RuntimeDeps,
 } from "../../src/executor/runtime";
-import { createGitRunner, readCommitIdentity, orphanRefName, restoreSlotWork, snapshotSlotWork, taskBranchName, wipRefName, wipTrailer } from "../../src/executor/git";
+import { createGitRunner, gitStderrTail, readCommitIdentity, slotCommitIdentityArgs, orphanRefName, restoreSlotWork, snapshotSlotWork, taskBranchName, wipRefName, wipTrailer } from "../../src/executor/git";
 import { hardeningArgs } from "../../src/router/git-tools";
 import { createLedgerStore, createNodeClock } from "../../src/executor/ledger";
 import { createCapacityController } from "../../src/executor/capacity";
@@ -190,7 +190,114 @@ describe("executor commit identity under the production hardening", () => {
       expect(await sh(r.top, "cat-file", "commit", commit)).not.toContain("gpgsig");
       expect(await sh(r.top, "show", "-s", "--format=%B", commit)).toBe("unchanged message\n\nOmr-Test: unchanged\n\n");
     }, TEST_MS);
+
+    it(`${kind}: missing identity reaches warnings, durable diagnostics and the blocking inbox with git stderr`, async () => {
+      const h = await rig();
+      const raw = createGitRunner({ mode: "hardened", toplevel: h.r.top });
+      h.deps.git = { run: (args, o) => raw.run([...hardeningArgs(), ...args], o) };
+      const emptyGlobal = join(h.r.root, "empty.gitconfig");
+      await writeFile(emptyGlobal, "");
+      const user = createGitRunner({ mode: "user", toplevel: h.r.top });
+      const userGit: GitRunner = { run: (args, o) => user.run(args, { ...o, env: { GIT_CONFIG_GLOBAL: emptyGlobal, GIT_CONFIG_NOSYSTEM: "1" } }) };
+      h.deps.commitIdentity = () => readCommitIdentity(userGit, h.r.top);
+      const compile = h.deps.compiler.compile;
+      h.deps.compiler.compile = async (...args) => {
+        const out = await compile(...args);
+        out.draft.config.maxAttempts = 1;
+        return out;
+      };
+      const warnings = vi.spyOn(h.deps, "log");
+      await h.start();
+      const first = await h.launched(1);
+      await h.child(first, "identity-child");
+      await sh(h.r.top, "config", "--unset", "user.name");
+      await sh(h.r.top, "config", "--unset", "user.email");
+      await writeFile(join(h.r.slot, "b.txt"), "must be kept\n");
+      await h.end(first, "identity-child", kind === "task" ? "DONE: finished" : "ESCALATE: stuck");
+      await vi.waitFor(async () => {
+        expect((await h.ledger()).inbox.some((item) => item.answer === null && item.severity === "blocking"
+          && item.text.includes("user.name/user.email") && item.text.includes("stderr:"))).toBe(true);
+      }, { timeout: WAIT_MS, interval: 20 });
+      const warn = warnings.mock.calls.find(([level, message]) => level === (kind === "task" ? "warn" : "error") && message.includes(kind === "task" ? "git commit failed" : "saving the work"));
+      expect(warn?.[2]).toMatchObject({ gitExitCode: "128", stderr: expect.stringMatching(/identity|email/i) });
+      const diagnostic = warn?.[2];
+      if (typeof diagnostic !== "object" || diagnostic === null || !("stderr" in diagnostic) || typeof diagnostic.stderr !== "string") {
+        throw new Error("missing warning stderr");
+      }
+      const stderrTail = diagnostic.stderr;
+      expect(stderrTail.length).toBeLessThanOrEqual(500);
+      expect(stderrTail).not.toMatch(/[\r\n]/);
+      const l = await h.ledger();
+      if (kind === "task") {
+        expect(l.tasks.T1?.attempts[0]?.context).toContain("user.name/user.email");
+        expect(l.tasks.T1?.attempts[0]?.context).toContain(stderrTail);
+      }
+      expect(l.inbox.some((item) => item.text.includes(stderrTail) && item.text.includes("exit 128"))).toBe(true);
+      expect(h.journal.some((event) => event.type === "metric" && event.metric.name === "counter" && event.metric.key === "wip-failed"
+        && event.metric.labels.gitExitCode === "128" && event.metric.labels.stderr === stderrTail)).toBe(true);
+      for (const event of h.journal) {
+        if (event.type === "metric" && event.metric.name === "counter" && event.metric.key === "wip-failed") {
+          expect(event.metric.labels).not.toHaveProperty("error");
+        }
+      }
+      expect(await readFile(join(h.r.slot, "b.txt"), "utf8")).toBe("must be kept\n");
+    }, TEST_MS);
   }
+
+  it("preserves an invalid global identity's resolver message in the error and details", async () => {
+    const r = await repo();
+    await sh(r.top, "config", "--unset", "user.name");
+    await sh(r.top, "config", "--unset", "user.email");
+    const global = join(r.root, "invalid.gitconfig");
+    await writeFile(global, '[user]\n name = Invalid <Name>\n email = invalid@example.com\n');
+    const user = createGitRunner({ mode: "user", toplevel: r.top });
+    const userGit: GitRunner = { run: (args, o) => user.run(args, { ...o, env: { GIT_CONFIG_GLOBAL: global, GIT_CONFIG_NOSYSTEM: "1" } }) };
+    const raw = createGitRunner({ mode: "hardened", toplevel: r.top });
+    const hardened: GitRunner = { run: (args, o) => raw.run([...hardeningArgs(), ...args], o) };
+    const resolverMessage = "user.name contains a character that is not allowed in a commit identity";
+    await expect(slotCommitIdentityArgs(hardened, { cwd: r.slot, timeoutMs: WAIT_MS }, () => readCommitIdentity(userGit, r.top)))
+      .rejects.toMatchObject({ code: "E_IDENTITY", message: expect.stringContaining(resolverMessage), detail: { resolverMessage } });
+  }, TEST_MS);
+
+  it("does not label a verifier observation error as a git commit failure", async () => {
+    const h = await rig();
+    const logs = vi.spyOn(h.deps, "log");
+    await h.start();
+    const first = await h.launched(1);
+    await h.child(first, "observe-child");
+    await h.runtime.pause(PLAN, ORCH);
+    h.deps.verifier.observe = async () => { throw new Error("observation unavailable"); };
+    await h.end(first, "observe-child", "DONE: finished");
+    await untilState(h, "ready");
+    expect((await h.ledger()).tasks.T1?.attempts[0]?.context).toBe("observation unavailable");
+    expect(logs.mock.calls.some(([, message]) => message.includes("git commit failed"))).toBe(false);
+    expect(h.queue.enqueue).not.toHaveBeenCalled();
+  }, TEST_MS);
+
+  it("sanitizes credentials and control characters before bounding the stderr tail", () => {
+    const tail = gitStderrTail(`${"prefix ".repeat(200)}\n\x1b[31mfatal: https://user:pass@example.com/repo?token=query-secret\npassword=local-secret Bearer bearer-secret\tend`);
+    expect(tail.length).toBeLessThanOrEqual(500);
+    expect(tail).not.toMatch(/user:pass|query-secret|local-secret|bearer-secret|[\r\n\t\x1b]/);
+    expect(tail).toContain("fatal: https://example.com/repo?token=*** password=*** Bearer *** end");
+    // If clipping happened first, the password= marker would be lost and the secret's suffix would leak.
+    expect(gitStderrTail(`password=${"secret-body".repeat(100)} end`)).toBe("password=*** end");
+  });
+
+  it("redacts inherited secret env values before bounding stderr", () => {
+    const secret = "env-secret-body".repeat(100);
+    vi.stubEnv("OMR_IDENTITY_TEST_SECRET", secret);
+    try {
+      expect(gitStderrTail(`${secret} end`)).toBe("*** end");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("redacts private keys before bounding stderr, including an unfinished PEM", () => {
+    const body = "private-key-body".repeat(100);
+    expect(gitStderrTail(`-----BEGIN RSA PRIVATE KEY-----\n${body}\n-----END RSA PRIVATE KEY----- end`)).toBe("[redacted key] end");
+    expect(gitStderrTail(`-----BEGIN PRIVATE KEY-----\n${body}`)).toBe("[redacted key]");
+  });
 });
 
 // ---------------------------------------------------------------------------------------------------------------

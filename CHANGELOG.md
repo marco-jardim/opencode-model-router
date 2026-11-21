@@ -40,7 +40,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is answered `no session` instead of `unknown handle` or "no unverified delegations in this session". Wording only on
   OpenCode v1.
 - **Plan executor: task commits and slot WIP saves use the user's resolved git identity even when it is only global.**
-  Both paths explicitly disable signing and keep hooks and global config disabled in hardened git.
+  Both paths explicitly disable signing and keep hooks and global config disabled in hardened git. Failures retain a
+  sanitized stderr tail and exit code in warnings, metrics or attempt contexts, and blocking inbox items, with identity
+  setup guidance when no identity is configured.
 - **OpenCode v2: resumed background dispatches keep their own results and verification handles.** Historical completions
   first scanned after a resume no longer supply the resumed attempt's result, and held placeholders retain their attempt's
   announced handle instead of changing to the newest handle for the same child session.
