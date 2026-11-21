@@ -6,6 +6,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { hardenedEnvironment } from "../../src/executor/git";
 import {
   COMMIT_SUBJECT_PATTERN, SLOT_EXCLUDES_CONTENT, commitTypeFor, createGitOps, createGitRunner, encodeRefId, executorGitArgs, formatCommitMessage,
+  gitCallLocation,
   integrationBranchName, phaseTagName, planRefPrefix, readCommitIdentity, taskBranchName,
   type GitOps,
 } from "../../src/executor/git";
@@ -38,6 +39,19 @@ describe("executorGitArgs", () => {
     const withConv = executorGitArgs({ hooksDir: "h", excludesFile: "e", conversion: { autocrlf: "true", eol: "lf" } });
     expect(withConv).toContain("core.autocrlf=true");
     expect(withConv).toContain("core.eol=lf");
+  });
+  it("carries the hardening's ssh key command blank; the driver blanking is the runner's, never a cached argument", () => {
+    expect(args).toContain("gpg.ssh.defaultKeyCommand=");
+    expect(args.some(a => a.startsWith("filter.") || /^merge\..+\.driver=/.test(a))).toBe(false);
+  });
+  it("gitCallLocation: the cwd after -C and the --git-dir/--work-tree options before the subcommand", () => {
+    const top = resolve("/top");
+    expect(gitCallLocation(["-c", "a=b", "--no-pager", "status", "-C", "x"], top)).toEqual({ cwd: top, location: [] });
+    expect(gitCallLocation(["-C", "/elsewhere", "--no-optional-locks", "-c", "-C", "rev-parse"], top))
+      .toEqual({ cwd: resolve("/elsewhere"), location: [] });
+    expect(gitCallLocation(["-c", "x=y", "--git-dir=/s/.git", "--work-tree=/s", "--literal-pathspecs", "commit", "--git-dir=/no"], top))
+      .toEqual({ cwd: top, location: ["--git-dir=/s/.git", "--work-tree=/s"] });
+    expect(gitCallLocation(["-C", "sub", "-C", "deeper", "ls-files"], top)).toEqual({ cwd: resolve(top, "sub", "deeper"), location: [] });
   });
   it("has the fixed excludes content", () => {
     expect(SLOT_EXCLUDES_CONTENT.split("\n")).toContain("node_modules/");

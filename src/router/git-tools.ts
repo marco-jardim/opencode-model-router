@@ -162,19 +162,237 @@ export function gitEnvironment(extra: Record<string, string> = {}): NodeJS.Proce
  * Every transport refused on the command line. A repository's `protocol.<name>.allow=always` beats a
  * generic `protocol.allow=never`, and GIT_NO_LAZY_FETCH is honoured only from git 2.44, so a partial
  * clone's promisor (an `ext::` command, say) could otherwise run on a lazy fetch. Command-line `-c`
- * overrides repository config; no router git call needs a transport.
+ * overrides repository config; no router git call needs a transport. A repository's own `protocol.<name>.allow` for any other
+ * name (a remote helper) is set to `never` by {@link repositoryOnlyDriverArgs}.
  */
-export const PROTOCOL_HARDENING: readonly string[] = Object.freeze(["ext", "file", "ssh", "git", "http", "https"]
+export const PROTOCOL_HARDENING: readonly string[] = Object.freeze(["ext", "file", "ssh", "git", "http", "https", "ftp", "ftps"]
   .flatMap(name => ["-c", `protocol.${name}.allow=never`]).concat(["-c", "protocol.allow=never"]));
 
 export function hardeningArgs(): string[] {
   return ["--no-optional-locks", "--no-pager", "-c", "core.pager=cat", "-c", "core.fsmonitor=false", "-c", "diff.external=",
     "-c", `core.hooksPath=${NULL_DEVICE}`, ...PROTOCOL_HARDENING,
     "-c", "maintenance.auto=false", "-c", "gc.auto=0", "-c", "color.ui=false",
-    // G2: signature display would run gpg.program; blank every signing program too.
+    // G2: signature display would run gpg.program; blank every signing program too (and the ssh key lookup command).
     "-c", "log.showSignature=false", "-c", "gpg.program=", "-c", "gpg.ssh.program=", "-c", "gpg.x509.program=",
+    "-c", "gpg.ssh.defaultKeyCommand=",
     // G3: diff's opportunistic index refresh writes .git even with --no-optional-locks.
     "-c", "diff.autoRefreshIndex=false", "-c", "core.splitIndex=false", "-c", "index.threads=1"];
+}
+
+/**
+ * The read prefix of a router-run git in the work root that keeps git's own index semantics (the default work-root snapshot,
+ * the reference runner): no fsmonitor, no hooks (the `hardeningArgs()` null-device hooksPath, so no `post-index-change` on an
+ * index write), no ssh key lookup command, no external diff (defence in depth: every patch diff also passes `--no-ext-diff`),
+ * no transport. Unlike `hardeningArgs()` it keeps `diff.autoRefreshIndex`: turning the refresh off would show stat-only dirty
+ * files in `diff HEAD` and change the snapshot's fingerprint. A later `-c core.hooksPath=…` still wins over the null device.
+ */
+export function workRootReadArgs(): string[] {
+  return ["-c", "core.fsmonitor=false", "-c", `core.hooksPath=${NULL_DEVICE}`, "-c", "gpg.ssh.defaultKeyCommand=", "-c", "diff.external=",
+    ...PROTOCOL_HARDENING];
+}
+
+/**
+ * Repository settings through which a work-root git could run a program: filter clean/smudge/process and merge drivers,
+ * `protocol.<name>.allow` (a remote helper), and the include directives that can bring more of them in.
+ */
+const REPOSITORY_DRIVER_QUERY = "^(filter\\..+\\.(clean|smudge|process)|merge\\..+\\.driver|protocol\\..+\\.allow|include\\.path|includeif\\..+\\.path)$";
+const DRIVER_KEY = /^(?:filter\.(.+)\.(?:clean|smudge|process)|merge\..+\.driver)$/;
+const PROTOCOL_KEY = /^protocol\..+\.allow$/;
+const INCLUDE_KEY = /^(?:include\.path|includeif\..+\.path)$/;
+/** The configuration scopes the user controls; every other scope (local, worktree, an unknown one) is the repository's. */
+const USER_SCOPES: ReadonlySet<string> = new Set(["system", "global", "command"]);
+/** git's own include depth bound (MAX_INCLUDE_DEPTH), and the include targets one listing reads at most. */
+const MAX_INCLUDE_DEPTH = 10;
+const MAX_INCLUDE_TARGETS = 50;
+
+/**
+ * Every driver/protocol/include setting with the scope and origin that set it (`git config --show-scope --show-origin`, git
+ * >= 2.26), NUL-separated: `<scope>\0<origin>\0<key>\n<value>\0`. Exit 1: none is set. Parsed by {@link parseDriverListing}.
+ */
+export const DRIVER_SCOPE_ARGS: readonly string[] = Object.freeze(["config", "-z", "--show-scope", "--show-origin", "--get-regexp", REPOSITORY_DRIVER_QUERY]);
+
+/** One entry of a {@link DRIVER_SCOPE_ARGS} listing; `value` is undefined for a value-less key. */
+export interface DriverEntry { readonly scope: string; readonly origin: string; readonly key: string; readonly value: string | undefined }
+
+function splitConfigEntry(field: string): { key: string; value: string | undefined } {
+  const newline = field.indexOf("\n");
+  return newline === -1 ? { key: field, value: undefined } : { key: field.slice(0, newline), value: field.slice(newline + 1) };
+}
+
+/** The entries of a {@link DRIVER_SCOPE_ARGS} listing, in git's order (a later value of a key wins). */
+export function parseDriverListing(listing: string): DriverEntry[] {
+  const fields = listing.split("\0");
+  const entries: DriverEntry[] = [];
+  for (let index = 0; index + 2 < fields.length; index += 3) {
+    entries.push({ scope: fields[index]!, origin: fields[index + 1]!, ...splitConfigEntry(fields[index + 2]!) });
+  }
+  return entries;
+}
+
+/**
+ * Router-run git in the work root must not run a program the repository configured. From a {@link DRIVER_SCOPE_ARGS} listing
+ * (and the `included` driver/protocol keys of every repository include target, whatever its condition):
+ * - `-c <key>=` for every filter clean/smudge/process and merge driver whose effective value comes from the repository's own
+ *   configuration (local, worktree, or a file those include), and for every included one, unless the value is also set,
+ *   identically, in the system, global or command-line configuration. A global LFS filter and its `git lfs install --local`
+ *   copy are kept; a repository without its own drivers gets no arguments.
+ * - a blanked filter gets `-c filter.<name>.required=<required>`: `false` for a read-only snapshot (as `inspectGit`), `true`
+ *   where git writes (the executor, the reference), so git refuses instead of storing or checking out unfiltered content.
+ * - `-c protocol.<name>.allow=never` for every `protocol.<name>.allow` the repository sets.
+ * Throws when a key cannot be blanked (`-c` splits at the first `=`).
+ */
+export function repositoryOnlyDriverArgs(listing: string,
+  options: { required?: boolean; included?: readonly { key: string; value: string | undefined }[] } = {}): string[] {
+  const userValues = new Map<string, Set<string>>();
+  const effective = new Map<string, { scope: string; value: string | undefined }>();
+  const protocols = new Set<string>();
+  for (const { scope, key, value } of parseDriverListing(listing)) {
+    const user = USER_SCOPES.has(scope);
+    if (PROTOCOL_KEY.test(key)) {
+      if (!user) protocols.add(key);
+      continue;
+    }
+    if (!DRIVER_KEY.test(key)) continue;
+    // A value-less key (boolean true) names no program git could run; it never matches a user value.
+    if (user && value !== undefined) {
+      const values = userValues.get(key) ?? new Set<string>();
+      values.add(value);
+      userValues.set(key, values);
+    }
+    effective.set(key, { scope, value }); // the last value wins, as for git
+  }
+  const trusted = (key: string, value: string | undefined) => value !== undefined && userValues.get(key)?.has(value) === true;
+  const blank = new Set<string>();
+  for (const [key, { scope, value }] of effective) if (!USER_SCOPES.has(scope) && !trusted(key, value)) blank.add(key);
+  for (const { key, value } of options.included ?? []) {
+    if (PROTOCOL_KEY.test(key)) protocols.add(key);
+    else if (DRIVER_KEY.test(key) && !trusted(key, value)) blank.add(key);
+  }
+  const args: string[] = [];
+  const filters = new Set<string>();
+  const refuse = () => new Error("Refusing repository: a filter/merge driver or protocol name contains '=' and cannot be neutralized");
+  for (const key of blank) {
+    if (key.includes("=")) throw refuse();
+    args.push("-c", `${key}=`);
+    const filter = /^filter\.(.+)\.(?:clean|smudge|process)$/.exec(key);
+    if (filter) filters.add(`filter.${filter[1]}.required=${options.required === true}`);
+  }
+  for (const setting of filters) args.push("-c", setting);
+  for (const key of protocols) {
+    if (key.includes("=")) throw refuse();
+    args.push("-c", `${key}=never`);
+  }
+  return args;
+}
+
+/** One `git config` query, run where and as the protected command runs: its exit code and stdout. */
+export type DriverQuery = (args: readonly string[]) => Promise<{ readonly code: number | null; readonly stdout: string }>;
+
+/** The file an include directive names (git's rules: `~/`, absolute, else relative to the including file); undefined: none. */
+function includeTarget(value: string | undefined, base: string | undefined): string | undefined {
+  if (value === undefined || value === "") return undefined; // git refuses a value-less include itself
+  if (value === "~" || value.startsWith("~/") || value.startsWith("~\\")) return join(process.env.HOME ?? homedir(), value.slice(1));
+  if (value.startsWith("~") || value.startsWith("%(prefix)")) {
+    throw new Error(`Refusing repository: the config include ${JSON.stringify(value)} cannot be resolved`);
+  }
+  if (isAbsolute(value) || win32.isAbsolute(value)) return value;
+  return base === undefined ? undefined : resolve(base, value); // a relative include outside a file: git refuses it
+}
+
+/**
+ * {@link repositoryOnlyDriverArgs} from `query` ({@link DRIVER_SCOPE_ARGS}, then `config --file <target>` for every include
+ * directive the repository's configuration holds, nested ones too, whatever its condition: a linked worktree's `gitdir:` or a
+ * slot's `onbranch:` may enable a target the listing's own context does not). `cwd`: where the listing ran (a relative origin
+ * is resolved against it). A missing target is skipped, as git skips it; an unreadable, network or device target, or more
+ * than {@link MAX_INCLUDE_TARGETS} targets or {@link MAX_INCLUDE_DEPTH} levels, throws (fail closed).
+ */
+export async function collectRepositoryDriverArgs(query: DriverQuery, cwd: string, options: { required?: boolean } = {}): Promise<string[]> {
+  const listed = await query(DRIVER_SCOPE_ARGS);
+  if (listed.code === 1) return []; // nothing set anywhere
+  if (listed.code !== 0) throw new Error(`Cannot read the repository's driver configuration (exit ${listed.code})`);
+  const pending: { path: string; depth: number }[] = [];
+  for (const { scope, origin, key, value } of parseDriverListing(listed.stdout)) {
+    if (USER_SCOPES.has(scope) || !INCLUDE_KEY.test(key)) continue;
+    const base = origin.startsWith("file:") ? dirname(resolve(cwd, origin.slice("file:".length))) : undefined;
+    const path = includeTarget(value, base);
+    if (path !== undefined) pending.push({ path, depth: 1 });
+  }
+  const included: { key: string; value: string | undefined }[] = [];
+  const seen = new Set<string>();
+  for (let next = pending.shift(); next !== undefined; next = pending.shift()) {
+    const { path, depth } = next;
+    if (depth > MAX_INCLUDE_DEPTH || seen.size >= MAX_INCLUDE_TARGETS) {
+      throw new Error("Refusing repository: too many or too deeply nested config includes");
+    }
+    const id = foldCase(resolve(path));
+    if (seen.has(id)) continue;
+    seen.add(id);
+    if (isNetworkOrDevicePath(path)) throw new Error(`Refusing repository: the config include ${path} is a network or device path`);
+    if (lstatOrUndefined(path) === undefined) continue; // git skips a missing include too
+    const read = await query(["config", "--file", path, "-z", "--get-regexp", REPOSITORY_DRIVER_QUERY]);
+    if (read.code === 1) continue;
+    if (read.code !== 0) throw new Error(`Cannot read the config include ${path} (exit ${read.code})`);
+    for (const field of read.stdout.split("\0")) {
+      if (field === "") continue;
+      const entry = splitConfigEntry(field);
+      if (!INCLUDE_KEY.test(entry.key)) {
+        included.push(entry);
+        continue;
+      }
+      const target = includeTarget(entry.value, dirname(resolve(path)));
+      if (target !== undefined) pending.push({ path: target, depth: depth + 1 });
+    }
+  }
+  return repositoryOnlyDriverArgs(listed.stdout, { required: options.required === true, included });
+}
+
+/** The user's own configuration locations, which plain git honours (git-tools strips every other GIT_* variable). */
+function userConfigVariables(): Record<string, string> {
+  const passed: Record<string, string> = {};
+  for (const name of ["GIT_CONFIG_SYSTEM", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM"]) {
+    const value = process.env[name];
+    if (value !== undefined) passed[name] = value;
+  }
+  return passed;
+}
+
+/**
+ * The environment of a driver listing for a command that runs with `runEnv` (default: this process's environment): the same
+ * variables, so the listing sees what the command will see (GIT_DIR, GIT_CONFIG_PARAMETERS/COUNT …), except that the user's
+ * own system/global configuration is visible (GIT_CONFIG_SYSTEM/GLOBAL/NOSYSTEM as this process has them: the trusted values a
+ * repository copy is compared with, even for a run that hides them) and the legacy GIT_CONFIG, which only `git config`
+ * honours (it would replace the repository's configuration in the listing alone), is dropped.
+ */
+export function driverListingEnvironment(runEnv?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(runEnv ?? process.env)) {
+    if (!/^GIT_CONFIG(?:_GLOBAL|_SYSTEM|_NOSYSTEM)?$/i.test(key)) env[key] = value;
+  }
+  return { ...env, ...userConfigVariables(), GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0", GIT_NO_LAZY_FETCH: "1" };
+}
+
+/**
+ * {@link collectRepositoryDriverArgs} for a router-run git in `root`, spawned directly: `executable` (default the router's git
+ * outside the work-root guards of `root`), `location` (the command's `--git-dir=`/`--work-tree=` options), `env` (the
+ * command's environment, see {@link driverListingEnvironment}), `required` (see {@link repositoryOnlyDriverArgs}). Throws when
+ * the configuration cannot be read: the caller has no run (fail closed).
+ */
+export async function repositoryDriverArgs(root: string, options: {
+  executable?: string; signal?: AbortSignal; timeoutMs?: number; required?: boolean; location?: readonly string[]; env?: NodeJS.ProcessEnv;
+} = {}): Promise<string[]> {
+  const executable = options.executable ?? gitExecutable(workRootGuards(root));
+  const env = driverListingEnvironment(options.env);
+  const deadline = performance.now() + (options.timeoutMs ?? DEADLINE_MS);
+  const query: DriverQuery = async (args) => {
+    const remaining = deadline - performance.now();
+    if (remaining <= 0) throw new Error("Git driver configuration query timed out");
+    const result = await spawnBounded(executable, [...hardeningArgs(), ...(options.location ?? []), ...args], root,
+      { env, signal: options.signal, timeoutMs: remaining, maxBytes: 1024 * 1024 });
+    if (result.truncated) throw new Error("Git driver configuration exceeds its size bound");
+    if (result.code !== 0 && result.code !== 1) throw queryFailure("Cannot read the repository's driver configuration", result);
+    return { code: result.code, stdout: result.output.toString("utf8") };
+  };
+  return collectRepositoryDriverArgs(query, root, { required: options.required === true });
 }
 
 function validateInput(operation: GitOperation, input: GitInput): { ref?: string } {
@@ -801,11 +1019,7 @@ const inheritedCache = new Map<string, readonly string[]>();
  * and configuration location.
  */
 async function inheritedConfig(executable: string, budget: Budget): Promise<readonly string[]> {
-  const passed: Record<string, string> = {};
-  for (const name of ["GIT_CONFIG_SYSTEM", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM"]) {
-    const value = process.env[name];
-    if (value !== undefined) passed[name] = value;
-  }
+  const passed = userConfigVariables();
   const key = JSON.stringify([executable, passed, process.env.HOME, process.env.USERPROFILE, process.env.XDG_CONFIG_HOME]);
   const cached = inheritedCache.get(key);
   if (cached) return cached;

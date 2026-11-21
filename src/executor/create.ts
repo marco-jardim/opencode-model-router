@@ -15,7 +15,7 @@ import { runArgv } from "../verify/exec";
 import { hardeningArgs, spawnBounded, workRootGuards } from "../router/git-tools";
 import { createCapacityController } from "./capacity";
 import { createPlanCompiler, type CompilerDeps } from "./compile";
-import { createGitOps, createGitRunner, readCommitIdentity } from "./git";
+import { createGitOps, createGitRunner, readCommitIdentity, withRepositoryDrivers } from "./git";
 import { BackgroundRuns, createIntegrateGit, createIntegrationChecks, createWriteGuard } from "./integrate/checks";
 import { createLander } from "./integrate/land";
 import { createPhaseSuiteRunner } from "./integrate/phase-suite";
@@ -393,7 +393,10 @@ function assembleExecutor(context: { directory: string }, options: CreateExecuto
   let launcher: ReturnType<typeof createTaskLauncher> | null = null;
   try {
     const rawGit = createGitRunner({ mode: "hardened", toplevel });
-    const git: RuntimeDeps["git"] = { run: (args, opts) => rawGit.run([...hardeningArgs(), ...args], opts) };
+    // Every executor git call (GitOps, the runtime's commits/WIP/reset/clean, igit, the lander's probes, the compiler): the
+    // hardening, then the repository-only driver blanking read afresh for that call (required=true: git refuses rather than
+    // writing unfiltered content).
+    const git: RuntimeDeps["git"] = withRepositoryDrivers({ run: (args, opts) => rawGit.run([...hardeningArgs(), ...args], opts) }, toplevel);
     const userGit = createGitRunner({ mode: "user", toplevel });
     const store = createLedgerStore({ home, observations: options.observations });
     const opsOf = (planId: PlanId) => createGitOps({ git, userGit, fs, planId, toplevel, executorHome: home });

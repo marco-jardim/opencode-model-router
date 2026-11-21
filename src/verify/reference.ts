@@ -142,7 +142,15 @@
 //   AbortSignal.any([signal, AbortSignal.timeout(remaining)]).
 //   Every git call in this module runs as `git --no-optional-locks ...`
 //   (QA-1.5-2), so a read-only call never refreshes, and so never rewrites,
-//   the user's index.
+//   the user's index. Right after that flag comes git-tools workRootReadArgs()
+//   (no fsmonitor, null-device hooksPath, no ssh key command, no transport);
+//   a later `-c core.hooksPath=` (D9's worktree add) still wins. Capture and
+//   materialize also blank the filter/merge drivers only the repository's own
+//   configuration names, include targets of any condition too, with
+//   filter.<name>.required=true so a blanked filter makes git refuse instead of
+//   writing unfiltered content (git-tools collectRepositoryDriverArgs); every
+//   call runs with GIT_NO_LAZY_FETCH=1. A configuration that cannot be read
+//   means no reference.
 //   1. `git rev-parse --show-toplevel` (cwd: the dispatch cwd) -> root. A
 //      non-zero exit (outside a repository, or a bare repository) returns
 //      undefined.
@@ -735,7 +743,7 @@ import { gitTopOf, perimeterKey } from "./git-top";
 // Type-only: pin.ts imports perimeter.ts, which imports this module; samePin is loaded lazily in step 7.
 import type { LinkPin, PinWhy } from "./pin";
 import type { PluginLogger } from "../router/logger";
-import { gitExecutable, workRootGuards } from "../router/git-tools";
+import { collectRepositoryDriverArgs, gitExecutable, workRootGuards, workRootReadArgs } from "../router/git-tools";
 
 // --- Seams --------------------------------------------------------------------
 
@@ -1309,6 +1317,8 @@ interface GitRun {
   readonly signal?: AbortSignal;
   /** Merged over process.env by the seam. */
   readonly env?: Record<string, string>;
+  /** `-c` pairs placed after the work-root read prefix and before `args`: the repository-only driver blanking. */
+  readonly config?: readonly string[];
 }
 
 /** Overrides for the pathspec environment switches git would otherwise inherit (QA-1.5-18). */
@@ -1360,9 +1370,11 @@ async function runGit(argv: ArgvSeam, args: readonly string[], run: GitRun): Pro
   if (run.signal) opts.signal = run.signal;
   // QA-1.5-18: pathspec env switches (literal/glob/noglob/icase) change what every pathspec
   // means; git reads them as booleans, so "0" neutralises them whatever the plugin inherited.
-  opts.env = { ...PATHSPEC_ENV_RESET, ...run.env };
+  // GIT_NO_LAZY_FETCH (git >= 2.44): a partial clone's missing object fails the call instead of fetching it.
+  opts.env = { ...PATHSPEC_ENV_RESET, GIT_NO_LAZY_FETCH: "1", ...run.env };
   try {
-    const result = await argv(gitExecutable(workRootGuards(run.cwd)), ["--no-optional-locks", ...args], opts);
+    // workRootReadArgs() before the caller's args, so a later `-c core.hooksPath=<noHooks>` (D9) wins over its null device.
+    const result = await argv(gitExecutable(workRootGuards(run.cwd)), ["--no-optional-locks", ...workRootReadArgs(), ...(run.config ?? []), ...args], opts);
     if (result.timedOut || run.signal?.aborted) return undefined;
     // QA-1.5-21: the p12 seam keeps exit code 0 when it cuts stdout at maxBuffer.
     const cut =
@@ -1375,6 +1387,29 @@ async function runGit(argv: ArgvSeam, args: readonly string[], run: GitRun): Pro
   } catch (error) {
     // The seam reports spawn failures and aborts by rejecting; both mean "no result".
     return { code: -1, stdout: "", stderr: describeError(error), timedOut: run.signal?.aborted };
+  }
+}
+
+/**
+ * The `-c` pairs that blank the filter/merge drivers (and set the protocols to `never`) only `root`'s own configuration names,
+ * include targets of any condition too (git-tools collectRepositoryDriverArgs), read through the seam, in the environment of
+ * the reference's own git calls, which reads the user's system/global configuration as plain git does: a global LFS filter
+ * and its `git lfs install --local` copy are kept. `required=true`: the reference writes (stash create, the checkout), so a
+ * blanked filter makes git refuse instead of storing or checking out unfiltered content. Undefined when the configuration
+ * cannot be read, the budget is spent, a key cannot be blanked, or the environment carries the legacy GIT_CONFIG (which would
+ * replace the repository's configuration in the listing alone): the caller has no reference (fail closed).
+ */
+async function repositoryDrivers(argv: ArgvSeam, root: string, budget: Budget): Promise<readonly string[] | undefined> {
+  if (budget.spent() || Object.keys(process.env).some((key) => key.toUpperCase() === "GIT_CONFIG")) return undefined;
+  const query = async (args: readonly string[]) => {
+    const result = budget.spent() ? undefined : await runGit(argv, args, { cwd: root, timeoutMs: budget.remaining(), signal: budget.signal });
+    if (!result || budget.spent()) throw new Error("the driver configuration could not be read in time");
+    return result;
+  };
+  try {
+    return await collectRepositoryDriverArgs(query, root, { required: true });
+  } catch {
+    return undefined;
   }
 }
 
@@ -1589,15 +1624,20 @@ async function captureInner(cwd: string, signal: AbortSignal, deps: CaptureDeps)
   const platform = process.platform;
   const p = pathFor(platform);
   const budget = makeBudget(signal, deps.timeoutMs ?? DEFAULT_CAPTURE_TIMEOUT_MS);
+  let config: readonly string[] = [];
   const git = async (args: readonly string[], at: string) => {
     if (budget.spent()) return undefined;
-    const result = await runGit(deps.argv, args, { cwd: at, timeoutMs: budget.remaining(), signal: budget.signal });
+    const result = await runGit(deps.argv, args, { cwd: at, timeoutMs: budget.remaining(), signal: budget.signal, config });
     return result && result.code === 0 && !budget.spent() ? result : undefined;
   };
 
   const top = await git(["rev-parse", "--show-toplevel"], cwd);
   if (!top) return undefined;
   const root = p.resolve(stripNewline(top.stdout));
+  // `stash create` hashes the working tree through the clean filters: blank the repository-only ones first.
+  const drivers = await repositoryDrivers(deps.argv, root, budget);
+  if (drivers === undefined) return undefined;
+  config = drivers;
   const stage = await git(["ls-files", "--stage"], root);
   if (!stage || /^160000 /m.test(stage.stdout)) return undefined;
   // Section 2f (QA-1.5-6): neither stash create nor the drift diff sees an edit to an
@@ -1623,6 +1663,7 @@ async function captureInner(cwd: string, signal: AbortSignal, deps: CaptureDeps)
       cwd: root,
       timeoutMs: budget.remaining(),
       env: { GIT_INDEX_FILE: copy },
+      config,
     });
     return stash && stash.code === 0 && !budget.spent() ? stash.stdout.trim() : undefined;
   });
@@ -1811,8 +1852,9 @@ export async function materialize(
     await cleanup();
     return fail(reason, detail);
   };
+  let config: readonly string[] = [];
   const git = async (args: readonly string[]) =>
-    budget.spent() ? undefined : runGit(deps.argv, args, { cwd: root, timeoutMs: budget.remaining(), signal: budget.signal });
+    budget.spent() ? undefined : runGit(deps.argv, args, { cwd: root, timeoutMs: budget.remaining(), signal: budget.signal, config });
 
   try {
     // 0. Same-repository guard.
@@ -1823,6 +1865,12 @@ export async function materialize(
         return fail("error", "currentTree is not inside the reference repository");
       }
     }
+    // 0b. The checkout (smudge) and the drift diff (clean) run filters: blank the repository-only ones for every call, in the
+    //     live repository and in the reference worktree (which shares its configuration).
+    const drivers = await repositoryDrivers(deps.argv, root, budget);
+    if (budget.spent()) return fail("aborted", "aborted before the worktree was created");
+    if (drivers === undefined) return fail("error", "the repository's filter/merge driver configuration cannot be read");
+    config = drivers;
     // 1. The unreferenced stash commit may have been pruned (section 8).
     const exists = await git(["cat-file", "-e", `${ref.commit}^{commit}`]);
     if (budget.spent()) return fail("aborted", "aborted before the worktree was created");
@@ -1873,7 +1921,7 @@ export async function materialize(
       "-c", `core.hooksPath=${noHooks}`,
       "-c", "advice.detachedHead=false",
       "worktree", "add", "--detach", ...lock, candidate, ref.commit,
-    ], { cwd: root, timeoutMs: budget.remaining(), signal: budget.signal, env: { LC_ALL: "C" } });
+    ], { cwd: root, timeoutMs: budget.remaining(), signal: budget.signal, env: { LC_ALL: "C" }, config });
     let added = await add(["--lock", "--reason", referenceLockReason(deps.pid ?? process.pid)]);
     if (added && added.code !== 0 && !budget.spent() && ADD_LOCK_UNSUPPORTED.test(added.stderr)) {
       // git < 2.33: the option parser failed before anything was written; the dir must still be empty.
@@ -2018,7 +2066,7 @@ export async function materialize(
           ...(only.length > 0 ? ["--literal-pathspecs"] : []),
           "-c", "core.splitIndex=false", "diff", "--name-only", "-z", "--no-renames", "--no-ext-diff", ref.commit, "--", ...only,
         ], {
-          cwd: root, timeoutMs: budget.remaining(), signal: budget.signal, env: { GIT_INDEX_FILE: copy },
+          cwd: root, timeoutMs: budget.remaining(), signal: budget.signal, env: { GIT_INDEX_FILE: copy }, config,
         }));
     const diff = await driftDiff();
     const nowUntracked = await git(["ls-files", "--others", "--exclude-standard", "-z"]);
@@ -2128,6 +2176,7 @@ export async function materialize(
           cwd,
           timeoutMs: budget.remaining(),
           signal,
+          config,
         });
         return listed && listed.code === 0 ? parseEolList(listed.stdout) : undefined;
       };

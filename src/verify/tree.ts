@@ -105,9 +105,10 @@ export const execGit: SnapshotGit = (args, opts) => new Promise<string>((ok, fai
   try {
     // #141: a refused or missing executable throws here and rejects like a spawn error, with nothing spawned.
     const git = opts.executable ?? tools.gitExecutable(tools.workRootGuards(opts.cwd));
+    // GIT_NO_LAZY_FETCH (git >= 2.44): a partial clone's missing object fails the read instead of fetching it.
     child = spawn(nice ? "nice" : git, nice ? ["-n", "10", "--", git, ...args] : [...args], {
       cwd: opts.cwd, windowsHide: true, detached: !isWin, stdio: ["ignore", "pipe", "ignore"],
-      ...(opts.env !== undefined ? { env: opts.env } : {}),
+      env: { ...(opts.env ?? process.env), GIT_NO_LAZY_FETCH: "1" },
     });
   } catch (e) {
     fail(e);
@@ -173,7 +174,9 @@ export interface SnapshotOptions {
    * Cross-repo QA-1 F4 (I11): run every git process of the snapshot hardened, as the router's other git calls in a repository
    * it does not own (git-tools.ts): `hardeningArgs()` (no fsmonitor, no hooks, no pager, no external diff, no optional locks),
    * the user's `safe.directory` values and inherited line-ending settings (`core.autocrlf` …), `gitEnvironment()` (no inherited GIT_*, no system or global config) and git by absolute
-   * path outside the snapshotted tree. The perimeter's extra roots use it. Default false: the snapshot of W is unchanged.
+   * path outside the snapshotted tree. The perimeter's extra roots use it. Default false: the snapshot of W runs with
+   * `workRootReadArgs()` (no fsmonitor, no hooks, no transport) and keeps git's index refresh. Both modes blank the filter and
+   * merge drivers only the repository's own configuration names (`repositoryDriverArgs`).
    */
   hardened?: boolean;
   /** The git process seam (tests). Default execGit. */
@@ -514,9 +517,11 @@ export async function snapshotTree(cwd: string, signal: AbortSignal, options: Sn
   let gitCwd = cwd;
   const run = options.git ?? execGit;
   const lowPriority = options.lowPriority === true;
-  let prefix: readonly string[] = ["--no-pager"];
+  // The default snapshot (W) keeps git's index refresh (no `hardeningArgs()`: diff.autoRefreshIndex=false would change the
+  // fingerprint) but never runs a repository-configured fsmonitor, hook, ssh key command or transport (`workRootReadArgs()`).
+  let prefix: readonly string[] = ["--no-pager", ...tools.workRootReadArgs()];
   let hardening: Pick<SnapshotGitOptions, "env" | "executable"> = {};
-  type Stage = "root" | "head" | "status" | "diff-worktree" | "diff-index" | "index" | "untracked-list" | "hash" | "index-tags" | "ignored-list";
+  type Stage = "root" | "drivers" | "head" | "status" | "diff-worktree" | "diff-index" | "index" | "untracked-list" | "hash" | "index-tags" | "ignored-list";
   let stage: Stage = "root";
   const git = (label: Stage, args: string[]) => {
     stage = label;
@@ -534,11 +539,25 @@ export async function snapshotTree(cwd: string, signal: AbortSignal, options: Sn
     // ls-files otherwise scopes untracked contents to a subdirectory cwd,
     // missing same-path edits in sibling packages that tests may import.
     gitCwd = root;
+    // Status and diff run clean filters: a filter (or merge driver) only the repository's own configuration names is blanked,
+    // in both modes (required=false: a read never stores content); a system/global one and its identical repository copy
+    // (`git lfs install --local`) are kept. The listing runs in the environment of the snapshot's own processes. A
+    // configuration that cannot be read leaves no snapshot.
+    stage = "drivers";
+    prefix = [...prefix, ...await tools.repositoryDriverArgs(root, {
+      ...(hardening.executable !== undefined ? { executable: hardening.executable } : {}),
+      ...(hardening.env !== undefined ? { env: hardening.env } : {}), signal, timeoutMs: SNAPSHOT_GIT_TIMEOUT_MS,
+    })];
     // One process, so HEAD and its branch describe the same checkout.
     const [headLine, refLine] = (await git("head", ["rev-parse", "HEAD", "--symbolic-full-name", "HEAD"])).split(/\r?\n/);
     const head = (headLine ?? "").trim();
     const branch = parseBranchLine(refLine);
-    const status = await git("status", ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+    // A submodule's dirty marker does not describe its content. Refuse rather than cache a fingerprint that would excuse
+    // unmeasured changes there, and before `status`/`diff`, which would run git inside a populated submodule with its own
+    // configuration. The listing is not hashed.
+    if (/^160000 /m.test(await git("index", ["ls-files", "--stage"]))) return undefined;
+    // --no-optional-locks: the default snapshot's status never rewrites the user's index (output unchanged).
+    const status = await git("status", ["--no-optional-locks", "status", "--porcelain=v1", "-z", "--untracked-files=all"]);
     const files: ChangedFile[] = [];
     const records = status.split("\0");
     for (let i = 0; i < records.length; i++) {
@@ -555,9 +574,6 @@ export async function snapshotTree(cwd: string, signal: AbortSignal, options: Sn
     const hash = createHash("sha256").update(status);
     hash.update(await git("diff-worktree", ["diff", "HEAD", "--binary", "--no-ext-diff", "--no-textconv"]));
     hash.update(await git("diff-index", ["diff", "--cached", "--binary", "--no-ext-diff", "--no-textconv"]));
-    // A submodule's dirty marker does not describe its content. Refuse rather
-    // than cache a fingerprint that would excuse unmeasured changes there.
-    if (/^160000 /m.test(await git("index", ["ls-files", "--stage"]))) return undefined;
     const untracked = (await git("untracked-list", ["ls-files", "--others", "--exclude-standard", "--full-name", "-z"]))
       .split("\0").filter(Boolean).sort();
     stage = "hash";

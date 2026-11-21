@@ -16,7 +16,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
-  COMMIT_SUBJECT_PATTERN, createGitOps, createGitRunner, formatCommitMessage, integrationBranchName, phaseTagName, taskBranchName, type GitOps,
+  COMMIT_SUBJECT_PATTERN, createGitOps, createGitRunner, formatCommitMessage, integrationBranchName, phaseTagName, taskBranchName,
+  withRepositoryDrivers, type GitOps,
 } from "../../src/executor/git";
 import {
   createIntegrateGit, createIntegrationChecks, createWriteGuard, BackgroundRuns,
@@ -584,6 +585,23 @@ describe("landing on real git (3.2.5)", SLOW, () => {
     expect(probes.some((c) => c.args.includes("status"))).toBe(true);
     for (const c of probes) for (const a of hardeningArgs()) expect(c.args, `probe ${c.args.join(" ")}`).toContain(a);
     expect(existsSync(marker)).toBe(false);
+  });
+
+  it("through the production runner (withRepositoryDrivers), every read probe blanks a filter only the owner checkout configures", async () => {
+    const s = landSetup("drivers");
+    git(s.repo, "config", "filter.evil.clean", "false");
+    git(s.repo, "config", "merge.evil.driver", "false");
+    const lander = createLander({ git: s.env.ops, igit: s.env.igit, guard: s.env.guard, run: withRepositoryDrivers(s.env.run, s.repo),
+      realpath: (p) => fsp.realpath(p), platform: process.platform });
+    s.env.gitCalls.length = 0;
+    expect(await lander.fastForward(s.req)).toEqual({ kind: "landed", from: s.c0, to: s.cand });
+    const probes = s.env.gitCalls.filter((c) => c.args.includes("-C") && c.args.some((a) => ["status", "symbolic-ref", "rev-parse", "ls-files"].includes(a)));
+    expect(probes.some((c) => c.args.includes("status"))).toBe(true);
+    expect(probes.some((c) => c.args.includes("ls-files"))).toBe(true); // the populated-submodule check
+    for (const c of probes) {
+      for (const a of ["filter.evil.clean=", "filter.evil.required=true", "merge.evil.driver="]) expect(c.args, `probe ${c.args.join(" ")}`).toContain(a);
+      expect(c.args.indexOf("filter.evil.clean=")).toBeLessThan(c.args.indexOf("-C"));
+    }
   });
 
   it("the phase tag omr/<planId>/phase/<id> is created once; a second create is exists-same, a different commit exists-other", async () => {

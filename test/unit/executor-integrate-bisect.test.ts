@@ -394,6 +394,7 @@ describe("createLander", () => {
     w.probes = {
       "rev-parse --show-toplevel": runResult(0, "/repo\n"),
       "symbolic-ref -q HEAD": runResult(0, "refs/heads/main\n"),
+      "ls-files --stage -z": runResult(0, "100644 1111111111111111111111111111111111111111 0\tsrc/a.ts\0"),
       status: runResult(0, ""),
       ...over.probes,
     };
@@ -439,10 +440,50 @@ describe("createLander", () => {
   it("every owner-checkout probe runs hardened with -C <toplevel>", async () => {
     const { w, lander } = world();
     expect(await lander.inspect(req)).toEqual({ ok: true, baseTip: "base", noop: false });
-    expect(w.seen.map(a => a.slice(0, PROBE_PREFIX_LENGTH))).toEqual([probePrefix("/repo"), probePrefix("/repo"), probePrefix("/repo")]);
+    expect(w.seen.map(a => a.slice(0, PROBE_PREFIX_LENGTH))).toEqual([probePrefix("/repo"), probePrefix("/repo"), probePrefix("/repo"), probePrefix("/repo")]);
     expect(w.seen.map(a => a.slice(PROBE_PREFIX_LENGTH))).toEqual([
-      ["rev-parse", "--show-toplevel"], ["symbolic-ref", "-q", "HEAD"], ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none"],
+      ["rev-parse", "--show-toplevel"], ["symbolic-ref", "-q", "HEAD"], ["ls-files", "--stage", "-z"],
+      ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none"],
     ]);
+  });
+
+  it("fails closed before `status` when the owner checkout has a populated submodule; an unpopulated gitlink runs nothing", async () => {
+    const gitlinks = [`100644 ${"1".repeat(40)} 0\tsrc/a.ts`, `160000 ${"2".repeat(40)} 0\tvendor/lib`, `160000 ${"3".repeat(40)} 0\tvendor/empty`, ""].join("\0");
+    const probes: Record<string, RunResult> = {
+      "rev-parse --show-toplevel": runResult(0, "/repo\n"), "symbolic-ref -q HEAD": runResult(0, "refs/heads/main\n"),
+      "ls-files --stage -z": runResult(0, gitlinks), status: runResult(0, ""),
+    };
+    const seen: string[][] = [];
+    const run = stub<GitRunner>({
+      run: async args => {
+        seen.push([...args]);
+        const sub = args.slice(PROBE_PREFIX_LENGTH);
+        return probes[sub[0] === "status" ? "status" : sub.join(" ")] ?? runResult(1);
+      },
+    });
+    const igit = stub<IntegrateGit>({
+      readRef: async () => "base", isAncestor: async (_cwd, ancestor) => ancestor !== req.candidate,
+      diffNameStatus: async () => [], ignoredAt: async () => [],
+    });
+    const guard: WriteGuard = { assertWriteCwd: async () => undefined };
+    const checked: string[] = [];
+    const populated = new Set<string>();
+    const lander = createLander({ git: stub<GitOps>({}), igit, guard, run, realpath: async p => p, platform: "linux",
+      exists: async p => { checked.push(p); return populated.has(p); } });
+    // Neither gitlink is populated: status runs and the checkout is clean.
+    expect(await lander.inspect(req)).toEqual({ ok: true, baseTip: "base", noop: false });
+    const lib = nodePath.join("/repo", "vendor/lib", ".git");
+    expect(checked).toEqual([lib, nodePath.join("/repo", "vendor/empty", ".git")]);
+    expect(seen.some(args => args.includes("status"))).toBe(true);
+    // A populated one: refused before `status` runs, and the landing reports an error (nothing lands).
+    populated.add(lib);
+    seen.length = 0;
+    await expect(lander.inspect(req)).rejects.toThrow(/populated submodules \(vendor\/lib\)/);
+    expect(seen.some(args => args.includes("status"))).toBe(false);
+    expect(await lander.fastForward(req)).toMatchObject({ kind: "error", message: expect.stringMatching(/land manually/) });
+    // A listing that fails is no permission either.
+    probes["ls-files --stage -z"] = runResult(128);
+    await expect(lander.inspect(req)).rejects.toThrow(/ls-files failed/);
   });
 
   it("compares the realpaths of the reported and the recorded toplevel", async () => {

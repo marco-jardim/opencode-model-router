@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { V2Executor, V2ExecutorHost } from "../../src/compat/v2-hooks";
 import { createExecutor, createExecutorAccess, lateRuntime, PlanSlotPools, prepareExecutor, slotsDirOf } from "../../src/executor/create";
 import * as configModule from "../../src/router/config";
@@ -398,6 +398,28 @@ describe("createExecutor assembly seams", () => {
     vi.restoreAllMocks();
     for (const root of roots.splice(0)) await removeDirWhenReleased(root);
   }, 30_000);
+  // The scripted repository has no configuration to list: the driver listing of every executor git call (executor/git.ts
+  // withRepositoryDrivers) finds nothing. The test below pins that the assembled runner applies it.
+  beforeEach(() => { vi.spyOn(gitToolsModule, "repositoryDriverArgs").mockResolvedValue([]); });
+
+  it("every assembled executor git call carries the repository-only driver blanking, read for that call (required, the call's location and environment)", async () => {
+    const run = vi.fn<ReturnType<typeof gitModule.createGitRunner>["run"]>(async () => ({ code: 0, signal: null, stdout: "output", stderr: "", truncated: false, durationMs: 0 }));
+    vi.spyOn(gitModule, "createGitRunner").mockReturnValue({ run });
+    const listing = vi.spyOn(gitToolsModule, "repositoryDriverArgs").mockResolvedValue(["-c", "filter.evil.clean=", "-c", "filter.evil.required=true"]);
+    const h = capture();
+    await h.compiler.git.run(["rev-parse", "HEAD"], prepared.toplevel);
+    await h.compiler.git.run(["status"], prepared.toplevel);
+    expect(run).toHaveBeenNthCalledWith(1, [...gitToolsModule.hardeningArgs(), "-c", "filter.evil.clean=", "-c", "filter.evil.required=true",
+      "rev-parse", "HEAD"], { cwd: prepared.toplevel, timeoutMs: 5_000 });
+    expect(listing).toHaveBeenCalledTimes(2); // read again for every call
+    expect(listing.mock.calls[0]?.[0]).toBe(prepared.toplevel);
+    expect(listing.mock.calls[0]?.[1]).toMatchObject({ required: true, location: [], env: gitModule.hardenedEnvironment(undefined) });
+    // A listing that fails: E_GIT, and the call does not run.
+    listing.mockRejectedValueOnce(new Error("Cannot read the repository's driver configuration (128): fatal"));
+    run.mockClear();
+    await expect(h.compiler.git.run(["status"], prepared.toplevel)).rejects.toMatchObject({ code: "E_GIT" });
+    expect(run).not.toHaveBeenCalled();
+  }, 15_000);
 
   // QA-5.1-20: copies refused by claims wait on process-wide sets per home. Registered after this describe's other hooks, so it
   // runs first: no waiter of one test assembles an executor when the next hook (or test) releases the claim.
