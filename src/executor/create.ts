@@ -15,7 +15,7 @@ import { runArgv } from "../verify/exec";
 import { hardeningArgs, spawnBounded, workRootGuards } from "../router/git-tools";
 import { createCapacityController } from "./capacity";
 import { createPlanCompiler, type CompilerDeps } from "./compile";
-import { createGitOps, createGitRunner } from "./git";
+import { createGitOps, createGitRunner, readCommitIdentity } from "./git";
 import { BackgroundRuns, createIntegrateGit, createIntegrationChecks, createWriteGuard } from "./integrate/checks";
 import { createLander } from "./integrate/land";
 import { createPhaseSuiteRunner } from "./integrate/phase-suite";
@@ -541,7 +541,8 @@ function assembleExecutor(context: { directory: string }, options: CreateExecuto
       observations: options.observations,
       slots: planPools.facade, slotsFor: (id) => planPools.of(id), purgeSlots: (id, finished) => planPools.purge(id, finished),
       forgetSlots: (id) => planPools.forget(id),
-      scheduler: createScheduler(), launcher: taskLauncher, routes, verifier: host.verifier, git, hosts: host.hosts, bindings: host.bindings, clock,
+      scheduler: createScheduler(), launcher: taskLauncher, routes, verifier: host.verifier, git,
+      commitIdentity: () => readCommitIdentity(userGit, toplevel), hosts: host.hosts, bindings: host.bindings, clock,
       leaseRegistry: { acquireWrite: (owner, writes) => {
           const result = leases.registry.acquireWrite(owner, writes);
           if (result.ok) return { ok: true };

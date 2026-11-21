@@ -39,6 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   eviction or a failed background run) and that retrying will not change the answer. A call with no session id, for handles or `pending: true`,
   is answered `no session` instead of `unknown handle` or "no unverified delegations in this session". Wording only on
   OpenCode v1.
+- **Plan executor: task commits and slot WIP saves use the user's resolved git identity even when it is only global.**
+  Both paths explicitly disable signing and keep hooks and global config disabled in hardened git. Failures retain a
+  sanitized stderr tail and exit code in warnings, metrics or attempt contexts, and blocking inbox items, with identity
+  setup guidance when no identity is configured.
 - **OpenCode v2: a hung plan-executor disposal no longer holds location cleanup forever.** The adapter waits at most
   30 seconds, warns on timeout, aborts the launcher's controllers and continues teardown. The original disposal remains
   observed and keeps the repository claim until it completes; restart the host if that claim stays stuck.

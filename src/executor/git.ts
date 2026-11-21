@@ -173,9 +173,37 @@ function splitNul(text: string): string[] {
   return text.split("\0").filter(part => part !== "");
 }
 
+/** Sanitize before clipping, so a clipped credential cannot lose the marker identifying it. */
+export function sanitizeGitDiagnostic(text: string): string {
+  let clean = stripUrlUserinfo(text)
+    .replace(/-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?(?:-----END [^-]*PRIVATE KEY-----|$)/g, "[redacted key]")
+    .replace(/\b(Bearer|Basic)\s+\S+/gi, "$1 ***")
+    .replace(/\b([\w.-]{0,64}(?:token|password|passwd|secret|api[_-]?key|credential)[\w.-]{0,64}\s{0,64}[=:]\s{0,64})(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;]+)/gi, "$1***");
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value !== undefined && value.length >= 4 && /token|password|passwd|secret|api[_-]?key|credential/i.test(key)) clean = clean.split(value).join("***");
+  }
+  return clean.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+export function gitStderrTail(text: string): string {
+  return sanitizeGitDiagnostic(text).slice(-500);
+}
+
+const IDENTITY_FAILURE = /please tell me who you are|unable to auto-detect|empty ident|(?:author|committer) identity unknown|no email was given/i;
+const IDENTITY_HINT = "git has no commit identity in the executor's environment (global config is not read by hardened git): " +
+  "set user.name/user.email in the repository, or configure them in your user/global config for the executor's identity resolver. The executor never invents one.";
+
 function gitFailure(op: string, r: ProcessResult): ExecutorError {
   const stderr = tailBytes(stripUrlUserinfo(r.stderr), GIT_STDERR_TAIL_BYTES);
   return new ExecutorError("E_GIT", `git ${op} failed (exit ${r.code ?? r.signal ?? "unknown"})`, { op, code: r.code, stderr });
+}
+
+export function gitCommitFailure(op: string, r: ProcessResult): ExecutorError {
+  const stderr = gitStderrTail(r.stderr);
+  const identity = IDENTITY_FAILURE.test(r.stderr);
+  return new ExecutorError(identity ? "E_IDENTITY" : "E_GIT",
+    `git ${op} failed (exit ${r.code ?? r.signal ?? "unknown"})${identity ? `; ${IDENTITY_HINT}` : ""}${stderr === "" ? "" : `; stderr: ${stderr}`}`,
+    { op, code: r.code, stderr });
 }
 
 function requireCommit(value: string, what: string): string {
@@ -188,6 +216,30 @@ function requireCommit(value: string, what: string): string {
 // ---------------------------------------------------------------------------------------------------------------
 
 export interface CommitIdentity { name: string; email: string }
+
+/** The same explicit identity injection used by GitOps.commit and the runtime's two commit paths. */
+function commitIdentityArgs(identity: CommitIdentity): string[] {
+  return ["-c", `user.name=${identity.name}`, "-c", `user.email=${identity.email}`];
+}
+
+export type ResolveCommitIdentity = () => Promise<CommitIdentity>;
+
+export async function slotCommitIdentityArgs(
+  git: GitRunner, o: { cwd: string; timeoutMs: number }, identity: ResolveCommitIdentity | undefined,
+): Promise<string[]> {
+  if (identity === undefined) return []; // Injected test runners may already supply their own identity.
+  try {
+    return commitIdentityArgs(await identity());
+  } catch (error) {
+    if (!(error instanceof ExecutorError) || error.code !== "E_IDENTITY") throw error;
+    // Read-only probe: retain git's actual exit/stderr without attempting a commit with a guessed identity.
+    const r = await git.run(["-c", "user.useConfigOnly=true", "var", "GIT_COMMITTER_IDENT"], o);
+    const stderr = gitStderrTail(r.stderr);
+    const resolverMessage = sanitizeGitDiagnostic(error.message).slice(0, 1200);
+    throw new ExecutorError("E_IDENTITY", `${resolverMessage}; ${IDENTITY_HINT} (git identity probe exit ${r.code ?? "unknown"})${stderr === "" ? "" : `; stderr: ${stderr}`}`,
+      { op: "identity", code: r.code, stderr, resolverMessage });
+  }
+}
 
 const identityCache = new WeakMap<GitRunner, Map<string, Promise<CommitIdentity & { conversion: GitContext["conversion"] }>>>();
 
@@ -380,7 +432,7 @@ async function slotRun(git: GitRunner, o: SlotCall, op: string, args: readonly s
     return await git.run(args, { cwd: o.cwd, timeoutMs: o.timeoutMs, maxOutputBytes: GIT_MAX_OUTPUT_BYTES });
   } catch (error) {
     if (error instanceof ExecutorError) throw error;
-    throw new ExecutorError("E_GIT", `git ${op} could not run: ${stripUrlUserinfo(errorText(error)).slice(0, 300)}`,
+    throw new ExecutorError("E_GIT", `git ${op} could not run: ${gitStderrTail(errorText(error))}`,
       { op, code: errorCode(error) ?? null, stderr: "" });
   }
 }
@@ -417,7 +469,7 @@ export async function snapshotSlotWork(
   git: GitRunner,
   i: {
     cwd: string; ref: string; message: string; trailer: string; timeoutMs: number;
-    base?: string; fallbackRef?: string; removeIndexLock?: () => Promise<boolean>;
+    base?: string; fallbackRef?: string; removeIndexLock?: () => Promise<boolean>; identity?: ResolveCommitIdentity;
   },
 ): Promise<WipSnapshot> {
   const o: SlotCall = { cwd: i.cwd, timeoutMs: i.timeoutMs };
@@ -428,7 +480,7 @@ export async function snapshotSlotWork(
       lockRemoved = true;
       if (await i.removeIndexLock()) r = await slotRun(git, o, op, args);
     }
-    if (r.code !== 0) throw gitFailure(op, r);
+    if (r.code !== 0) throw gitCommitFailure(op, r);
     return r.stdout;
   };
   const status = await must("status", ["status", "--porcelain", "--untracked-files=all"]);
@@ -464,7 +516,8 @@ export async function snapshotSlotWork(
     }
   }
   const files = splitNul(await must("diff", ["diff", "--cached", "--name-only", "-z", "--no-renames", parent])).length;
-  const commit = (await must("commit-tree", ["commit-tree", tree, "-p", parent, "-m", i.message, "-m", i.trailer])).trim();
+  const identity = await slotCommitIdentityArgs(git, o, i.identity);
+  const commit = (await must("commit-tree", [...identity, "commit-tree", "--no-gpg-sign", tree, "-p", parent, "-m", i.message, "-m", i.trailer])).trim();
   requireCommit(commit, "WIP commit");
   const zero = "0".repeat(commit.length);
   const update = ["update-ref", "--no-deref", `refs/heads/${i.ref}`, commit, old ?? zero];
@@ -482,7 +535,7 @@ export async function snapshotSlotWork(
         }
       }
       throw new ExecutorError("E_GIT", `git update-ref failed twice; WIP commit ${commit} ${keptAt === null ? "has no ref" : `kept at ${keptAt}`}`, {
-        op: "update-ref", code: r.code, stderr: stripUrlUserinfo(r.stderr).slice(0, 2000), commit, keptAt,
+        op: "update-ref", code: r.code, stderr: gitStderrTail(r.stderr), commit, keptAt,
       });
     }
   }
@@ -706,7 +759,7 @@ export function createGitOps(d: GitOpsDeps): GitOps {
   }
 
   function identityArgs(x: OpsContext, wanted: boolean | undefined): string[] {
-    return wanted === true ? ["-c", `user.name=${x.identity.name}`, "-c", `user.email=${x.identity.email}`] : [];
+    return wanted === true ? commitIdentityArgs(x.identity) : [];
   }
 
   /** The hooks directory is re-checked before every call: an op can run a hook only from a non-empty directory. */
