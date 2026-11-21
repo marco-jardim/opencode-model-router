@@ -28,7 +28,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { keyedSmokeEnv } from "../setup/smoke-tmp-guard";
-import { effectiveTierModels, smokeTierOverride } from "./helpers/tier-override";
+import { assertHostDirectory, effectiveTierModels, smokeTierOverride } from "./helpers/tier-override";
 import {
   prepareFixtureRepo,
   type FixtureRepo,
@@ -182,7 +182,8 @@ d("layer-2 acceptance gate smoke", () => {
           ],
           {
             cwd: REPO_ROOT,
-            env: { ...keyedSmokeEnv(), MODEL_ROUTER_ENFORCE: "1" },
+            // `opencode run` sessions live in $PWD, not the cwd (#153; see assertHostDirectory).
+            env: { ...keyedSmokeEnv(), MODEL_ROUTER_ENFORCE: "1", PWD: REPO_ROOT },
             encoding: "utf8",
             maxBuffer: 20 * 1024 * 1024,
             timeout: 180_000,
@@ -317,7 +318,9 @@ d("layer-2 acceptance gate smoke", () => {
 //
 // The project is a throwaway git copy of test/fixtures/projects/vitest-app
 // (npm ci included) built by the e2e helper. opencode runs with that copy as
-// its cwd; the plugin is loaded through the SAME repo-root opencode.json the
+// its cwd AND its PWD (`opencode run` creates the session in $PWD, so an
+// inherited PWD would run it, and register the tier agents, in the vitest
+// launch directory instead: #153); the plugin is loaded through the SAME repo-root opencode.json the
 // test above writes (OPENCODE_CONFIG points at it, since a cwd outside the
 // repo would not discover it), and it is removed again in `finally`.
 //
@@ -389,8 +392,10 @@ function writeProjectTierOverrides(dir: string): void {
  * private home, same project directory). Without this a dropped layer, or a
  * `/preset` state file in the private home that outranks `activePreset`, only
  * shows up after a multi-minute run as `Model not found: anthropic/...`.
+ * The same holds for a host env whose PWD names another directory (#153).
  */
 function assertOverrideTakesEffect(dir: string): void {
+  assertHostDirectory(projectHostEnv(dir), dir);
   const home = keyedSmokeEnv().HOME;
   if (!home) throw new Error("keyedSmokeEnv() returned no HOME");
   const seen = effectiveTierModels(dir, home);
@@ -413,8 +418,24 @@ interface OcRun {
   runnerArgv: string[][];
 }
 
+/**
+ * The env `runOpencode` spawns the host with for a project in `dir`. PWD is pinned to `dir` as in
+ * depth-effort.smoke.test.ts (`env: { ...this.env, PWD: project }`): see {@link assertHostDirectory}.
+ */
+function projectHostEnv(dir: string): NodeJS.ProcessEnv {
+  return {
+    ...keyedSmokeEnv(),
+    MODEL_ROUTER_ENFORCE: "1",
+    MODEL_ROUTER_DISPATCH_DEBUG: "1",
+    OPENCODE_CONFIG: TEMP_CONFIG,
+    PWD: dir,
+  };
+}
+
 /** One `opencode run` in the project dir, plugin loaded through the repo-root temp config. */
 function runOpencode(project: VerifyProject, prompt: string): OcRun {
+  const env = projectHostEnv(project.repo.dir);
+  assertHostDirectory(env, project.repo.dir);
   fs.rmSync(project.argvLog, { force: true });
   fs.writeFileSync(
     TEMP_CONFIG,
@@ -443,12 +464,7 @@ function runOpencode(project: VerifyProject, prompt: string): OcRun {
       ],
       {
         cwd: project.repo.dir,
-        env: {
-          ...keyedSmokeEnv(),
-          MODEL_ROUTER_ENFORCE: "1",
-          MODEL_ROUTER_DISPATCH_DEBUG: "1",
-          OPENCODE_CONFIG: TEMP_CONFIG,
-        },
+        env,
         encoding: "utf8",
         maxBuffer: 50 * 1024 * 1024,
         timeout: VERIFY_SPAWN_TIMEOUT_MS,

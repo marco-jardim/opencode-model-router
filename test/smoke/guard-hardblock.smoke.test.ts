@@ -147,7 +147,8 @@ function runEnforced(prompt: string, outFile: string) {
     ],
     {
       cwd: REPO_ROOT,
-      env: { ...keyedSmokeEnv(), MODEL_ROUTER_ENFORCE: "1" },
+      // `opencode run` sessions live in $PWD, not the cwd: pin it to where the override is (#153).
+      env: { ...keyedSmokeEnv(), MODEL_ROUTER_ENFORCE: "1", PWD: REPO_ROOT },
       encoding: "utf8",
       maxBuffer: 20 * 1024 * 1024,
       timeout: 180_000,

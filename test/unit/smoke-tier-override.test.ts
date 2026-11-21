@@ -3,7 +3,7 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { configPath, getConfigNotices, invalidateConfigCache, loadConfig, OVERRIDE_FILENAME } from "../../src/router/config";
-import { effectiveTierModels, SMOKE_PRESET, smokeTierOverride } from "../smoke/helpers/tier-override";
+import { assertHostDirectory, effectiveTierModels, SMOKE_PRESET, smokeTierOverride } from "../smoke/helpers/tier-override";
 
 // guard-hardblock.smoke.test.ts writes this overrides file when MODEL_ROUTER_SMOKE_MODEL is set, then asserts the
 // subagent ran on that model. An override the loader drops keeps the bundled tiers, which only the weekly credentialed
@@ -73,6 +73,25 @@ describe("smoke tier override (MODEL_ROUTER_SMOKE_MODEL)", () => {
     const seen = effectiveTierModels(dir, join(root, "home"));
     expect(seen.activePreset).toBe("anthropic");
     expect(seen.models.fast).not.toBe(model);
+  });
+
+  // #153: `opencode run` creates its session in $PWD, so an inherited parent PWD runs it (and registers the tier agents)
+  // outside the directory whose override effectiveTierModels checked.
+  it("assertHostDirectory: an unset PWD or one naming the checked directory passes", () => {
+    const dir = join(root, "project");
+    expect(() => assertHostDirectory({}, dir)).not.toThrow();
+    expect(() => assertHostDirectory({ PWD: dir }, dir)).not.toThrow();
+    expect(() => assertHostDirectory({ PWD: join(dir, "sub", "..") }, dir)).not.toThrow();
+    expect(() => assertHostDirectory({ PWD: dir.toUpperCase() }, dir, "win32")).not.toThrow();
+  });
+
+  it("assertHostDirectory: a PWD naming another directory fails and names both", () => {
+    const dir = join(root, "project");
+    const elsewhere = join(root, "repo-root");
+    expect(() => assertHostDirectory({ PWD: elsewhere }, dir)).toThrow(
+      `opencode run would create its session in PWD ${elsewhere}, not in the checked directory ${dir}`,
+    );
+    expect(() => assertHostDirectory({ PWD: dir.toUpperCase() }, dir, "linux")).toThrow(/#153/);
   });
 
   it("the former fixture (the bundled preset patched with variant \"\") loses only `variant` (#80): the bundled variant still rides along", () => {

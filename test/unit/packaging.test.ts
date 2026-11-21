@@ -186,7 +186,7 @@ describe("packaging: v2 TUI entry (#90 P1.3, amendments A2/A9)", () => {
     expect(pkg.dependencies ?? {}).toEqual({});
     // The unit tests' reactive solid-js build and the real-host smoke (A7) depend on these exact versions.
     expect(pkg.devDependencies).toMatchObject({
-      "solid-js": "1.9.15",
+      "solid-js": "1.9.17",
       "@lydell/node-pty": "1.2.0-beta.15",
       "@xterm/headless": "6.0.0",
     });

@@ -3,8 +3,9 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import ModelRouterPlugin from "../../src/index";
-import { OVERRIDE_FILENAME, invalidateConfigCache, loadConfig } from "../../src/router/config";
+import { OVERRIDE_FILENAME, invalidateConfigCache, loadConfig, resolveActiveTiers } from "../../src/router/config";
 import type { Preset } from "../../src/router/config";
+import { smokeTierOverride } from "../smoke/helpers/tier-override";
 import { resetAgentOptionsEffortWarnings } from "../../src/router/agent-options";
 import { resolveSubagentOverrides } from "../../src/router/subagents";
 import { pluginAgentMarker } from "../../src/router/plugin-agents";
@@ -96,6 +97,38 @@ describe("plugin agents on v1 (config hook)", () => {
     expect(def.permission.webfetch).toBe("allow");
     expect(def.permission["*"] ?? def.permission.bash).toBeDefined();
     expect(pluginAgentMarker(def)?.readOnly).toBe(true);
+  });
+
+  // #153: the tier agents a v1 host runs are the ones the config hook of the plugin instance for the
+  // host's INSTANCE directory (ctx.directory) registers; process.cwd() (here the repo) plays no part.
+  // `opencode run` picks that directory from $PWD before the spawn cwd, so a smoke that writes the
+  // override into its cwd but inherits another PWD gets the bundled models (see layer2-gate smoke).
+  it("registers the tier agents from the project-local override of ctx.directory (#153)", async () => {
+    const model = "opencode-go/qwen3.7-plus";
+    const project = join(root, "project");
+    const other = join(root, "other");
+    for (const dir of [project, other]) mkdirSync(join(dir, ".git"), { recursive: true });
+    mkdirSync(join(project, ".opencode"), { recursive: true });
+    writeFileSync(join(project, ".opencode", OVERRIDE_FILENAME), JSON.stringify(smokeTierOverride(model)));
+    invalidateConfigCache();
+    const register = async (directory: string) => {
+      const hooks = await ModelRouterPlugin({ directory, worktree: directory } as unknown as Parameters<typeof ModelRouterPlugin>[0]);
+      const opencodeConfig: Parameters<NonNullable<typeof hooks.config>>[0] = {};
+      try {
+        await hooks.config?.(opencodeConfig);
+      } finally {
+        await hooks.dispose?.();
+      }
+      return opencodeConfig.agent ?? {};
+    };
+
+    const inProject = await register(project);
+    for (const name of ["fast", "medium", "heavy"]) expect(inProject[name]?.model, name).toBe(model);
+
+    // A host instance for any other directory never sees that project's override.
+    const elsewhere = await register(other);
+    expect(elsewhere.fast?.model).toBe(resolveActiveTiers(loadConfig(other)).fast?.model);
+    expect(elsewhere.fast?.model).not.toBe(model);
   });
 
   it("without an agents block nothing is registered", async () => {
