@@ -1050,6 +1050,8 @@ const MAX_SEEN_COMPLETION_ELEMENTS = 64;
 export const PENDING_RELOAD_RETRY_MS = 30_000;
 /** QA-2.1-8: `dispose` waits at most this long for the background work in flight (verdict posts, recoveries). */
 const BACKGROUND_DRAIN_MS = 5_000;
+/** Host-facing executor wait: allow the runtime's 10 s per-plan queue bound plus runtime/pool teardown headroom. */
+const EXECUTOR_DISPOSE_MS = 30_000;
 /**
  * Non-enumerable slot on the cleanup function `registerV2Hooks` returns: `() => Promise<void>` that resolves once no background
  * work is in flight (verdict posts, recoveries, reloads, including work they start). Lets integration tests await what an
@@ -2693,7 +2695,25 @@ export async function registerV2Hooks(
     const ownedExecutor = executor;
     executor = null;
     hostEventListeners.clear();
-    if (ownedExecutor !== null) await disposeExecutor(ownedExecutor);
+    if (ownedExecutor !== null) {
+      let executorTimer: ReturnType<typeof setTimeout> | undefined;
+      const finished = await Promise.race([
+        // Keep observing the original disposal: it logs late errors and alone owns release of the repository claim.
+        disposeExecutor(ownedExecutor).then(() => true),
+        new Promise<false>((resolve) => { executorTimer = setTimeout(() => resolve(false), EXECUTOR_DISPOSE_MS); }),
+      ]);
+      if (executorTimer !== undefined) clearTimeout(executorTimer);
+      if (!finished) {
+        ingestLogger.warn(`[router] executor: disposal did not finish in ${EXECUTOR_DISPOSE_MS} ms; continuing cleanup; the repository claim stays held until disposal completes (restart clears a stuck claim)`);
+        // W7: runtime disposal was attempted first. Still abort launcher-owned controllers before their runner goes away.
+        // This is idempotent, has no internal waits, and may be called again when the original disposal eventually ends.
+        try {
+          await ownedExecutor.launcher.dispose();
+        } catch (error) {
+          ingestLogger.warn("[router] executor: the launcher could not be disposed", { error: String(error) });
+        }
+      }
+    }
     executorLifetime.abort();
     for (const dispose of bgDisposers.reverse()) {
       try {

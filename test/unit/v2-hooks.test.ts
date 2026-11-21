@@ -1341,7 +1341,7 @@ describe("plan executor wiring in the v2 adapter (3.1.7: W2, W4, W5, W6, M41)", 
       manualReady: vi.fn((): Array<{ taskId: string; kind: string }> => []),
       start: vi.fn(async () => undefined),
       recordMetric: vi.fn(),
-      dispose: vi.fn(async () => undefined),
+      dispose: vi.fn(async (): Promise<void> => undefined),
       isPlanChild: vi.fn((sessionID: string) => sessionID === PLAN_CHILD),
     };
     const launcher = { dispose: vi.fn(async () => undefined) };
@@ -1417,6 +1417,73 @@ describe("plan executor wiring in the v2 adapter (3.1.7: W2, W4, W5, W6, M41)", 
     expect(w.listeners.size).toBe(0);
     expect(x.runtime.dispose).toHaveBeenCalled();
     expect(x.launcher.dispose).toHaveBeenCalled();
+  });
+
+  it.each([false, true])("W7: a hung executor cannot hold location cleanup; late rejection=%s", async (rejectLater) => {
+    const x = fakeExecutor();
+    let rejectDispose: (error: Error) => void = () => { throw new Error("dispose has not started"); };
+    x.runtime.dispose.mockImplementation(() => new Promise<void>((_resolve, reject) => { rejectDispose = reject; }));
+    const hooksDispose = vi.fn(async () => undefined);
+    const w = await startWired({ executor: x.factory, hooks: { dispose: hooksDispose } });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const unhandled = vi.fn();
+    process.on("unhandledRejection", unhandled);
+    vi.useFakeTimers();
+    try {
+      let completed = false;
+      const cleanup = w.cleanup().then(() => { completed = true; });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(x.runtime.dispose).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(29_999);
+      expect(completed).toBe(false);
+      expect(x.launcher.dispose).not.toHaveBeenCalled();
+      expect(hooksDispose).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      // Before the fix this stays false: cleanup is still waiting on runtime.dispose forever.
+      expect(completed).toBe(true);
+      await cleanup;
+      expect(x.launcher.dispose).toHaveBeenCalledOnce();
+      expect(x.runtime.dispose.mock.invocationCallOrder[0]).toBeLessThan(x.launcher.dispose.mock.invocationCallOrder[0]!);
+      expect(w.listeners.size).toBe(0);
+      expect(w.f.registrations.every((registration) => registration.dispose.mock.calls.length === 1)).toBe(true);
+      expect(hooksDispose).toHaveBeenCalledOnce();
+      expect(x.launcher.dispose.mock.invocationCallOrder[0]).toBeLessThan(hooksDispose.mock.invocationCallOrder[0]!);
+      const timeouts = warn.mock.calls.filter(([message]) => String(message).includes("executor") && String(message).includes("30000 ms"));
+      expect(timeouts).toHaveLength(1);
+      expect(String(timeouts[0]?.[0])).toContain("claim");
+      if (rejectLater) {
+        rejectDispose(new Error("late runtime dispose failure"));
+        await vi.advanceTimersByTimeAsync(0);
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining("[router] executor: the runtime could not be disposed"));
+      }
+      await vi.advanceTimersByTimeAsync(0);
+      expect(unhandled).not.toHaveBeenCalled();
+      await w.cleanup();
+      expect(warn.mock.calls.filter(([message]) => String(message).includes("30000 ms"))).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+      process.off("unhandledRejection", unhandled);
+      warn.mockRestore();
+    }
+  });
+
+  it("W7: a normal executor gets its full 10-second queue disposal window", async () => {
+    const x = fakeExecutor();
+    x.runtime.dispose.mockImplementation(() => new Promise<void>((resolve) => { setTimeout(resolve, 10_000); }));
+    const w = await startWired({ executor: x.factory });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.useFakeTimers();
+    try {
+      const cleanup = w.cleanup();
+      await vi.advanceTimersByTimeAsync(10_000);
+      await cleanup;
+      expect(x.launcher.dispose).toHaveBeenCalledOnce();
+      expect(warn.mock.calls.filter(([message]) => String(message).includes("30000 ms"))).toHaveLength(0);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+      warn.mockRestore();
+    }
   });
 
   it("a handed-over executor is adopted once through the startup path; another, or any after dispose, is refused (QA-5.1-26)", async () => {
