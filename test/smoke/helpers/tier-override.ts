@@ -1,3 +1,4 @@
+import { resolve } from "node:path";
 import { invalidateConfigCache, loadConfig, resolveActiveTiers } from "../../../src/router/config";
 
 /** Preset the smoke model override defines and activates; it exists only in the overrides file. */
@@ -55,4 +56,25 @@ export function effectiveTierModels(
     }
     invalidateConfigCache();
   }
+}
+
+/**
+ * Throws, naming both directories, when `env` (what a smoke spawns `opencode run` with) carries a `PWD` other than `dir`
+ * (the spawn cwd, whose override was checked).
+ *
+ * `opencode run` creates its session in `Filesystem.resolve(process.env.PWD ?? process.cwd())` (OpenCode
+ * packages/opencode/src/cli/cmd/run.ts), not in its working directory. An inherited parent `PWD` therefore runs the
+ * session, and the plugin instance whose `config` hook registers the tier agents, in the parent's directory: an override
+ * written into `dir` never applies and the subagent fails on `Model not found: anthropic/…` (#153). An unset `PWD` is
+ * fine (the host falls back to its cwd). Paths compare resolved, case-insensitively on win32.
+ */
+export function assertHostDirectory(env: NodeJS.ProcessEnv, dir: string, platform: NodeJS.Platform = process.platform): void {
+  const pwd = env.PWD;
+  if (pwd === undefined) return;
+  const key = (p: string): string => (platform === "win32" ? resolve(p).toLowerCase() : resolve(p));
+  if (key(pwd) === key(dir)) return;
+  throw new Error(
+    `opencode run would create its session in PWD ${pwd}, not in the checked directory ${dir}: ` +
+      `pin PWD to the spawn cwd (env: { ..., PWD: dir }), or the host ignores that directory's router override (#153).`,
+  );
 }
