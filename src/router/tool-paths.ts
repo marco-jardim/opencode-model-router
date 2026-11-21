@@ -71,7 +71,23 @@ export function applyPatchHeaderPaths(args: unknown): string[] {
  */
 function hostPatchPaths(a: Record<string, unknown>): string[] | undefined {
   const text = PATCH_KEYS.map(key => a[key]).find(value => typeof value === "string");
-  if (typeof text !== "string") return undefined;
+  return typeof text === "string" ? patchTextPaths(text) : undefined;
+}
+
+/**
+ * The paths of every patch text key of `a` (the git metadata guard's widest reading: a host that took another key than the first
+ * string would write those): the host's own text ({@link hostPatchPaths}) must be readable, another key's text adds its paths when
+ * it is. Undefined when the host's own text is unreadable.
+ */
+function everyPatchTextPaths(a: Record<string, unknown>): string[] | undefined {
+  const host = hostPatchPaths(a);
+  if (host === undefined) return undefined;
+  const texts = PATCH_KEYS.map(key => a[key]).filter((value): value is string => typeof value === "string");
+  return [...host, ...texts.flatMap(text => patchTextPaths(text) ?? [])];
+}
+
+/** The header paths of one patch text; undefined when a header names no path or there is none. */
+function patchTextPaths(text: string): string[] | undefined {
   const paths: string[] = [];
   for (const raw of text.split(/\r?\n/)) {
     const line = raw.trimStart();
@@ -198,18 +214,45 @@ function none(): ToolTargets {
   return { access: "none", paths: [], roots: [] };
 }
 
-function writeTargets(tool: string, a: Record<string, unknown>, cwd: string): ToolTargets {
+/**
+ * The paths a write-class call names, as written, and whether its targets are known: false only for a patch whose text cannot
+ * be read ({@link hostPatchPaths}), whose header paths are then missing.
+ */
+function rawWriteTargets(tool: string, a: Record<string, unknown>, everyPatchText = false): { texts: (string | undefined)[]; known: boolean } {
   if (tool === "patch" || tool === "apply_patch") {
     // An unreadable patch has unknown targets: a write of nothing the caller can name. The host also honours the
     // path arguments `filePath`, `path` and `file_path` of a patch call (`toolCallPaths` in src/compat/v2-hooks.ts).
+    const headers = everyPatchText ? everyPatchTextPaths(a) : hostPatchPaths(a);
     const keyed = HOST_PATCH_PATH_KEYS.map(key => nonEmpty(a[key]));
-    return { access: "write", paths: resolved([...(hostPatchPaths(a) ?? []), ...keyed], cwd), roots: [] };
+    return { texts: [...(headers ?? []), ...keyed], known: headers !== undefined };
   }
   const raw = pathArgs(a);
   if (tool === "multiedit" && Array.isArray(a.edits)) {
     for (const edit of a.edits) raw.push(...pathArgs(record(edit)));
   }
-  return { access: "write", paths: resolved(raw, cwd), roots: [] };
+  return { texts: raw, known: true };
+}
+
+function writeTargets(tool: string, a: Record<string, unknown>, cwd: string): ToolTargets {
+  return { access: "write", paths: resolved(rawWriteTargets(tool, a).texts, cwd), roots: [] };
+}
+
+/**
+ * The files a write-class call ({@link WRITE_CLASS}) names, as written (not resolved: a link must be resolved before any `..`
+ * after it), deduped, in the order {@link toolTargets} reads them — and for a patch also the headers of every other patch text key
+ * (a superset of the lease targets: {@link toolTargets} reads only the text the host takes). Undefined when its targets are
+ * unknown — a `patch` / `apply_patch` whose (host's) text has no header, a header without a path, or no text at all — so the
+ * caller fails closed. Empty for any other tool. Never throws.
+ */
+export function writeTargetTexts(tool: string, args: unknown): string[] | undefined {
+  const name = typeof tool === "string" ? tool.toLowerCase() : "";
+  if (!WRITE_CLASS.has(name)) return [];
+  try {
+    const { texts, known } = rawWriteTargets(name, record(args), true);
+    return known ? dedupe(texts.filter((text): text is string => text !== undefined)) : undefined;
+  } catch {
+    return undefined; // arguments that cannot be read: unknown targets
+  }
 }
 
 /**

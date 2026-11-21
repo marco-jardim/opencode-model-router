@@ -480,6 +480,30 @@ describe("createExecutor assembly seams", () => {
     return { executor, host, deps: captured.runtime, compiler: captured.compiler, inner: captured.inner };
   }
 
+  it("wires the user-mode identity resolver into assembled runtime commits without weakening hardening", async () => {
+    const raw = vi.fn<ReturnType<typeof gitModule.createGitRunner>["run"]>(async args => ({
+      code: 0, signal: null, stdout: args.includes("status") ? " M a.ts\n" : args.includes("rev-parse") ? "c".repeat(40) : "",
+      stderr: "", truncated: false, durationMs: 0,
+    }));
+    const user = vi.fn<ReturnType<typeof gitModule.createGitRunner>["run"]>(async args => {
+      const value = args.at(-1) === "user.name" ? "User Config Identity" : args.at(-1) === "user.email" ? "user-config@example.com" : null;
+      return { code: value === null ? 1 : 0, signal: null, stdout: value === null ? "" : `${value}\n`, stderr: "", truncated: false, durationMs: 0 };
+    });
+    vi.spyOn(gitModule, "createGitRunner").mockImplementation(({ mode }) => ({ run: mode === "user" ? user : raw }));
+    const { deps } = capture();
+    expect(await deps.commitIdentity?.()).toMatchObject({ name: "User Config Identity", email: "user-config@example.com" });
+    expect(user).toHaveBeenCalledWith(["config", "--includes", "--get", "user.name"], expect.objectContaining({ cwd: prepared.toplevel }));
+    await runtimeModule.commitTaskInSlot(deps.git, {
+      slot: { slot: "slot-1", path: prepared.toplevel, planId: "plan-a", owner: "test", commit: "b".repeat(40) },
+      branch: "identity-task", message: "unchanged", timeoutMs: 1000,
+      ...(deps.commitIdentity === undefined ? {} : { identity: deps.commitIdentity }),
+    });
+    expect(raw).toHaveBeenCalledWith(expect.arrayContaining([
+      "user.name=User Config Identity", "user.email=user-config@example.com", "commit", "--no-verify", "--no-gpg-sign",
+      "gpg.program=", "protocol.allow=never",
+    ]), expect.objectContaining({ cwd: prepared.toplevel }));
+  });
+
   it.each(["medium", "heavy"] as const)("R3-5. the real route resolver preserves the resolved %s tier", async (tier) => {
     const { deps } = capture();
     const task = taskNode("T1");

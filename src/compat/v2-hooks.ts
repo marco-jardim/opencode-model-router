@@ -6,7 +6,7 @@ import type { SessionContext } from "@opencode/plugin/promise/session";
 import type { SystemPart } from "@opencode/ai";
 import type { V2Runtime } from "./v2-client";
 import { V2_GRADER_AGENT } from "./v2-client";
-import { DEPTH_BANNER, TASK_VERIFICATION } from "./child-session";
+import { DEPTH_BANNER, SESSION_DIRECTORY, TASK_VERIFICATION } from "./child-session";
 import { realpathSync, statSync } from "node:fs";
 import { basename, isAbsolute, join, posix, resolve, win32 } from "node:path";
 import { loadConfig, resolveRolesRouting } from "../router/config";
@@ -38,7 +38,7 @@ import { recordRoleOrphan, takeRoleBindingLookupNotice } from "../routing/roles/
 import type { DispatchGrant } from "../routing/roles/policy";
 import { forgetWorkingSet, workingSetOf } from "../routing/wire/working-set";
 import {
-  createRepoProbe, displaySafe, gitMetadataSegment, readSetEligible, readSetPredicate, type InReadSet,
+  createRepoProbe, displaySafe, namesGitMetadata, readSetEligible, readSetPredicate, type InReadSet,
 } from "../routing/roles/read-set";
 import {
   AUTHORITY_TEXT, AUTHORITY_TOOL_NAME, consumeAuthority, discardAuthority, evictAuthority, markAnnotated, previewAuthority, quoteChildText,
@@ -642,7 +642,7 @@ export function toolCallPaths(tool: string, args: unknown): string[] | undefined
 export function editsGitMetadata(path: string, target: string, root: string): boolean {
   const base = root.replace(/[\\/]+$/, "");
   const below = target.length > base.length ? target.slice(base.length) : "";
-  return [path, below].some((text) => text.split(/[\\/]/).some(gitMetadataSegment));
+  return namesGitMetadata(path, below);
 }
 
 /**
@@ -3629,8 +3629,16 @@ export async function registerV2Hooks(
       try {
         const original = args && typeof args === "object" ? { ...args } : args;
         const output = { args };
+        // The git metadata guard (index.ts) resolves a write-class call's relative paths and repository against the session's own
+        // location, as the host does; a failed lookup leaves it the plugin's directory (sessionInfoOf: cached per session).
+        const sessionDirectory = roleActionOf(event.tool) === "edit"
+          ? await sessionDirectoryOf(String(event.sessionID)).catch(() => undefined)
+          : undefined;
         await within(hookContext(event), async () => {
-          await legacy["tool.execute.before"]?.({ ...event, tool: legacyToolName(event.tool), callID: event.id }, output);
+          await legacy["tool.execute.before"]?.({
+            ...event, tool: legacyToolName(event.tool), callID: event.id,
+            ...(sessionDirectory === undefined ? {} : { [SESSION_DIRECTORY]: sessionDirectory }),
+          }, output);
         });
         const verifying = (output as Record<PropertyKey, unknown>)[TASK_VERIFICATION] === true;
         const banner = (output as Record<PropertyKey, unknown>)[DEPTH_BANNER];
