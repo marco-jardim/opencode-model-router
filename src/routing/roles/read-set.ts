@@ -40,6 +40,15 @@ function isDotOrSpace(char: string): boolean {
   return char === "." || char === " ";
 }
 
+/**
+ * Some segment of one of `texts` (paths, split on `/` and `\`) names `.git` ({@link gitMetadataSegment}). The one `.git` test of
+ * the read set ({@link readSetEligible}), the role edit check (`editsGitMetadata`, compat/v2-hooks.ts) and the delegated-agent
+ * write guard (router/git-metadata-guard.ts).
+ */
+export function namesGitMetadata(...texts: readonly string[]): boolean {
+  return texts.some((text) => text.split(/[\\/]/).some(gitMetadataSegment));
+}
+
 /** A path written fully qualified: `X:\…` / `X:/…` on win32 (never drive- or root-relative), `/…` elsewhere. */
 export function fullyQualifiedPath(path: string): boolean {
   return process.platform === "win32" ? /^[A-Za-z]:[\\/]/.test(path) : path.startsWith("/");
@@ -54,7 +63,7 @@ export function fullyQualifiedPath(path: string): boolean {
  */
 export function readSetEligible(path: string, target: string, hostRelative = false): boolean {
   if (!hostRelative && !fullyQualifiedPath(path)) return false;
-  return ![path, target].some((text) => text.split(/[\\/]/).some(gitMetadataSegment));
+  return !namesGitMetadata(path, target);
 }
 
 /** C0/C1 controls, format characters (bidi controls, zero-width), line/paragraph separators, unassigned, and `[` `]`. */
