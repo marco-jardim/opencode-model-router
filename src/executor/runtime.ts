@@ -22,10 +22,12 @@ import {
   planRefPrefix,
   restoreSlotWork,
   snapshotSlotWork,
+  slotCommitIdentityArgs,
   taskBranchName,
   wipRefName,
   wipTrailer,
   type WipRestore,
+  type ResolveCommitIdentity,
 } from "./git";
 import { dependentPhases } from "./integrate/queue";
 import type { PlanRoleBindings } from "./launch";
@@ -360,7 +362,7 @@ async function removeIndexLock(git: GitRunner, o: { cwd: string; timeoutMs: numb
  */
 export async function commitTaskInSlot(
   git: GitRunner,
-  i: { slot: SlotLease; branch: string; message: string; timeoutMs: number; trailer?: string },
+  i: { slot: SlotLease; branch: string; message: string; timeoutMs: number; trailer?: string; identity?: ResolveCommitIdentity },
 ): Promise<{ changed: false } | { changed: true; commit: string }> {
   const o = { cwd: i.slot.path, timeoutMs: i.timeoutMs };
   let lockRemoved = false;
@@ -372,7 +374,9 @@ export async function commitTaskInSlot(
     }
     if (r.code !== 0) {
       const text = `${r.stderr}\n${r.stdout}`;
-      throw new ExecutorError(IDENTITY_PATTERN.test(text) ? "E_IDENTITY" : "E_GIT", `git ${args[0] ?? ""} failed`, {
+      // The verb after any leading `-c key=value` pairs (the commit's injected identity).
+      const verb = args.find((arg, k) => arg !== "-c" && args[k - 1] !== "-c") ?? "";
+      throw new ExecutorError(IDENTITY_PATTERN.test(text) ? "E_IDENTITY" : "E_GIT", `git ${verb} failed`, {
         args: [...args],
         code: r.code,
         stderr: r.stderr.slice(0, 2000),
@@ -393,7 +397,8 @@ export async function commitTaskInSlot(
   }
   await step(["switch", "-C", i.branch]);
   await step(["add", "-A"]);
-  await step(["commit", "-m", i.message, ...(i.trailer === undefined ? [] : ["-m", i.trailer])]);
+  const identity = await slotCommitIdentityArgs(i.identity);
+  await step([...identity, "commit", "--no-verify", "--no-gpg-sign", "-m", i.message, ...(i.trailer === undefined ? [] : ["-m", i.trailer])]);
   const head = (await step(["rev-parse", "HEAD"])).trim();
   return { changed: true, commit: head };
 }
@@ -468,6 +473,8 @@ export interface RuntimeDeps {
   routes: RouteResolver;
   verifier: PlanTaskVerifier;
   git: GitRunner;
+  /** User-mode config read, validated and cached by readCommitIdentity; never enables global config for writes. */
+  commitIdentity?: ResolveCommitIdentity;
   hosts: HostSessions;
   clock: Clock;
   leaseRegistry: LeaseRegistryPort;
@@ -1587,6 +1594,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         ...(slot.base === undefined || slot.base === null ? {} : { base: slot.base }),
         fallbackRef: orphanRefName(p.planId, slot.slot, d.clock.now(), orphanTag()),
         removeIndexLock: () => removeIndexLock(d.git, o),
+        ...(d.commitIdentity === undefined ? {} : { identity: d.commitIdentity }),
       });
       wipFailRaised.delete(`${p.planId}/${slot.slot}`);
       if (r.saved) counter(p, "wip-saved", taskId === null ? { slot: slot.slot, ref } : { taskId, slot: slot.slot, ref }, deferredMetrics);
@@ -3343,6 +3351,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         branch,
         message: `${taskId}: ${t.title} (attempt ${n})`,
         timeoutMs: GIT_TIMEOUT_MS,
+        ...(d.commitIdentity === undefined ? {} : { identity: d.commitIdentity }),
         ...(att === undefined ? {} : { trailer: attemptTrailer(p.planId, taskId, n, att.nonce) }),
       });
     } catch (e) {

@@ -2198,7 +2198,7 @@ describe("D11 commit trailer", () => {
     await untilEnqueued(h, "T1");
     const commit = need(h.git.calls.find((c) => c.args[0] === "commit"), "commit call");
     expect(commit.args).toContain(attemptTrailer(PLAN_ID, "T1", 1, run.req.nonce));
-    expect(commit.args.slice(0, 2)).toEqual(["commit", "-m"]);
+    expect(commit.args.slice(0, 4)).toEqual(["commit", "--no-verify", "--no-gpg-sign", "-m"]);
   });
 
   it("a crash after the commit, before row 21: the clean slot's HEAD carries the trailer, so the task verifies with that commit", async () => {

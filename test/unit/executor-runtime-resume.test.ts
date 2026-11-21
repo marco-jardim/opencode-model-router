@@ -8,10 +8,11 @@ import { hostname, tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { ROUTER_BUDGET_NOTE_PREFIX } from "../../src/router/prompts";
 import {
-  RESUME_PROMPT, classifyChildText, createExecutorRuntime, realCollaborators,
+  RESUME_PROMPT, classifyChildText, commitTaskInSlot, createExecutorRuntime, realCollaborators,
   type CollaboratorInput, type ExecutorRuntimeHandle, type PlanCollaborators, type RuntimeDeps,
 } from "../../src/executor/runtime";
-import { orphanRefName, restoreSlotWork, snapshotSlotWork, taskBranchName, wipRefName, wipTrailer } from "../../src/executor/git";
+import { createGitRunner, readCommitIdentity, orphanRefName, restoreSlotWork, snapshotSlotWork, taskBranchName, wipRefName, wipTrailer } from "../../src/executor/git";
+import { hardeningArgs } from "../../src/router/git-tools";
 import { createLedgerStore, createNodeClock } from "../../src/executor/ledger";
 import { createCapacityController } from "../../src/executor/capacity";
 import { createScheduler } from "../../src/executor/schedule";
@@ -129,6 +130,68 @@ async function refOf(top: string, ref: string): Promise<string | null> {
 async function status(slot: string): Promise<string> {
   return (await sh(slot, "status", "--porcelain", "--untracked-files=all")).trim();
 }
+
+describe("executor commit identity under the production hardening", () => {
+  for (const kind of ["task", "wip"] as const) {
+    it(`${kind}: global-only identity, local signing and rejecting hooks still produce an unsigned commit`, async () => {
+      const r = await repo();
+      const global = join(r.root, "global.gitconfig");
+      await writeFile(global, '[user]\n name = Global Executor\n email = global@example.com\n');
+      await sh(r.top, "config", "--unset", "user.name");
+      await sh(r.top, "config", "--unset", "user.email");
+      await sh(r.top, "config", "commit.gpgsign", "true");
+      const hooks = join(r.root, "rejecting-hooks");
+      await mkdir(hooks);
+      for (const hook of ["pre-commit", "prepare-commit-msg", "commit-msg", "post-commit"]) {
+        await writeFile(join(hooks, hook), "#!/bin/sh\necho hook-ran >&2\nexit 1\n", { mode: 0o755 });
+      }
+      await sh(r.top, "config", "core.hooksPath", hooks);
+      const raw = createGitRunner({ mode: "hardened", toplevel: r.top });
+      const calls: string[][] = [];
+      const hardened: GitRunner = { run: (args, o) => {
+        calls.push([...args]);
+        return raw.run([...hardeningArgs(), ...args], o);
+      } };
+      const user = createGitRunner({ mode: "user", toplevel: r.top });
+      const userGit: GitRunner = { run: (args, o) => user.run(args, { ...o, env: { GIT_CONFIG_GLOBAL: global, GIT_CONFIG_NOSYSTEM: "1" } }) };
+      const identity = () => readCommitIdentity(userGit, r.top);
+      expect(await identity()).toMatchObject({ name: "Global Executor", email: "global@example.com" });
+      expect((await hardened.run(["config", "--get", "user.name"], { cwd: r.slot, timeoutMs: WAIT_MS })).code).toBe(1);
+      // Behaviour check: unlike commit, commit-tree ignores commit.gpgSign; signing needs an explicit -S.
+      const tree = (await sh(r.top, "rev-parse", "HEAD^{tree}")).trim();
+      const signingProbe = await hardened.run(["-c", "user.name=Probe", "-c", "user.email=probe@example.com",
+        "commit-tree", tree, "-m", "signing probe"], { cwd: r.slot, timeoutMs: WAIT_MS });
+      expect(signingProbe.code).toBe(0);
+      expect(await sh(r.top, "cat-file", "commit", signingProbe.stdout.trim())).not.toContain("gpgsig");
+      const explicitSigning = await hardened.run(["-c", "user.name=Probe", "-c", "user.email=probe@example.com",
+        "commit-tree", "-S", tree, "-m", "signing probe"], { cwd: r.slot, timeoutMs: WAIT_MS });
+      expect(explicitSigning.code).not.toBe(0);
+      expect(explicitSigning.stderr).toMatch(/sign|gpg|cannot run/i);
+      await writeFile(join(r.slot, "a.txt"), "changed\n");
+      const common = { timeoutMs: WAIT_MS, message: "unchanged message", trailer: "Omr-Test: unchanged", identity };
+      let commit: string;
+      if (kind === "task") {
+        const input = { ...common, slot: { slot: "slot-1", path: r.slot, planId: PLAN, owner: "test", commit: r.base }, branch: "identity-task" };
+        const result = await commitTaskInSlot(hardened, input);
+        expect(result.changed).toBe(true);
+        if (!result.changed) throw new Error("task did not commit");
+        commit = result.commit;
+      } else {
+        const input = { ...common, cwd: r.slot, ref: "identity-wip" };
+        const result = await snapshotSlotWork(hardened, input);
+        expect(result.saved).toBe(true);
+        if (!result.saved) throw new Error("WIP did not commit");
+        commit = result.commit;
+      }
+      expect((await sh(r.top, "show", "-s", "--format=%an|%ae|%cn|%ce", commit)).trim())
+        .toBe("Global Executor|global@example.com|Global Executor|global@example.com");
+      expect(calls.filter((args) => args.includes(kind === "task" ? "commit" : "commit-tree")).at(-1))
+        .toEqual(expect.arrayContaining(["--no-gpg-sign", "user.name=Global Executor", "user.email=global@example.com"]));
+      expect(await sh(r.top, "cat-file", "commit", commit)).not.toContain("gpgsig");
+      expect(await sh(r.top, "show", "-s", "--format=%B", commit)).toBe("unchanged message\n\nOmr-Test: unchanged\n\n");
+    }, TEST_MS);
+  }
+});
 
 // ---------------------------------------------------------------------------------------------------------------
 // rig: real ledger, scheduler, capacity and policy; doubles for the pool (real git underneath), launcher and queue

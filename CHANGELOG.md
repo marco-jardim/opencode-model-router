@@ -39,6 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   eviction or a failed background run) and that retrying will not change the answer. A call with no session id, for handles or `pending: true`,
   is answered `no session` instead of `unknown handle` or "no unverified delegations in this session". Wording only on
   OpenCode v1.
+- **Plan executor: task commits and slot WIP saves use the user's resolved git identity even when it is only global.**
+  Both paths explicitly disable signing and keep hooks and global config disabled in hardened git.
 - **OpenCode v2: resumed background dispatches keep their own results and verification handles.** Historical completions
   first scanned after a resume no longer supply the resumed attempt's result, and held placeholders retain their attempt's
   announced handle instead of changing to the newest handle for the same child session.

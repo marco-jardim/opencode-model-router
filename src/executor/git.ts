@@ -189,6 +189,19 @@ function requireCommit(value: string, what: string): string {
 
 export interface CommitIdentity { name: string; email: string }
 
+/** The same explicit identity injection used by GitOps.commit and the runtime's two commit paths. */
+function commitIdentityArgs(identity: CommitIdentity): string[] {
+  return ["-c", `user.name=${identity.name}`, "-c", `user.email=${identity.email}`];
+}
+
+export type ResolveCommitIdentity = () => Promise<CommitIdentity>;
+
+/** A resolver failure (`E_IDENTITY` from readCommitIdentity) propagates: the executor never invents an identity. */
+export async function slotCommitIdentityArgs(identity: ResolveCommitIdentity | undefined): Promise<string[]> {
+  if (identity === undefined) return []; // Injected test runners may already supply their own identity.
+  return commitIdentityArgs(await identity());
+}
+
 const identityCache = new WeakMap<GitRunner, Map<string, Promise<CommitIdentity & { conversion: GitContext["conversion"] }>>>();
 
 async function readConfig(userGit: GitRunner, toplevel: string, key: string): Promise<string | null> {
@@ -417,7 +430,7 @@ export async function snapshotSlotWork(
   git: GitRunner,
   i: {
     cwd: string; ref: string; message: string; trailer: string; timeoutMs: number;
-    base?: string; fallbackRef?: string; removeIndexLock?: () => Promise<boolean>;
+    base?: string; fallbackRef?: string; removeIndexLock?: () => Promise<boolean>; identity?: ResolveCommitIdentity;
   },
 ): Promise<WipSnapshot> {
   const o: SlotCall = { cwd: i.cwd, timeoutMs: i.timeoutMs };
@@ -464,7 +477,8 @@ export async function snapshotSlotWork(
     }
   }
   const files = splitNul(await must("diff", ["diff", "--cached", "--name-only", "-z", "--no-renames", parent])).length;
-  const commit = (await must("commit-tree", ["commit-tree", tree, "-p", parent, "-m", i.message, "-m", i.trailer])).trim();
+  const identity = await slotCommitIdentityArgs(i.identity);
+  const commit = (await must("commit-tree", [...identity, "commit-tree", "--no-gpg-sign", tree, "-p", parent, "-m", i.message, "-m", i.trailer])).trim();
   requireCommit(commit, "WIP commit");
   const zero = "0".repeat(commit.length);
   const update = ["update-ref", "--no-deref", `refs/heads/${i.ref}`, commit, old ?? zero];
@@ -706,7 +720,7 @@ export function createGitOps(d: GitOpsDeps): GitOps {
   }
 
   function identityArgs(x: OpsContext, wanted: boolean | undefined): string[] {
-    return wanted === true ? ["-c", `user.name=${x.identity.name}`, "-c", `user.email=${x.identity.email}`] : [];
+    return wanted === true ? commitIdentityArgs(x.identity) : [];
   }
 
   /** The hooks directory is re-checked before every call: an op can run a hook only from a non-empty directory. */

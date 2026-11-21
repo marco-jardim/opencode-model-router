@@ -5478,7 +5478,7 @@ describe("helpers exported by runtime.ts", () => {
       "status --porcelain",
       "switch -C omr/plan-one/t/T1",
       "add -A",
-      "commit -m T1: title (attempt 1)",
+      "commit --no-verify --no-gpg-sign -m T1: title (attempt 1)",
       "rev-parse HEAD",
     ]);
     expect(dirty.calls.every((c) => c.cwd === slot.path)).toBe(true);
