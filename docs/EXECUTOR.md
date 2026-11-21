@@ -131,9 +131,9 @@ copies wait for the same home, one takes the claim and the others keep waiting; 
 it waits never assembles. The handed-over executor is wired exactly like one assembled at start: the copy's adapter
 adopts it through the same path, so it gets the plan state and manual-ready line, the executor instructions, the host
 events of its plan children, the retry stop for those children and the launcher metrics. The adapter disposes it in the
-same order as one assembled at start (runtime, then launcher, before the lease registry and the child runner go), which
-releases the claim. An executor that finishes assembling after its copy began to dispose is not adopted: it is disposed
-at once, and that also releases the claim.
+same order as one assembled at start (runtime, then launcher, before the lease registry and the child runner go); completed
+runtime/pool disposal releases the claim (the adapter's bounded wait below does not). An executor that finishes assembling
+after its copy began to dispose is not adopted: it is disposed at once, and that also releases the claim.
 An earlier configuration or repository-discovery reason is preserved when the child runner is also missing.
 
 The executor home is **`<git common dir>\omr-executor`** (`EXECUTOR_HOME_DIRNAME = "omr-executor"`), shared by the
@@ -156,8 +156,14 @@ tag gave up, or the tag exists elsewhere. A status change alone is not enough; p
 Disposal clears tool/command access first, then disposes the runtime (unsubscribes host events, clears runtime timers
 and verifier observations, cancels running plan-task verifications, aborts launcher-owned children, settles work already
 running, disposes each integration queue before closing its ledger writer). It then closes all slot pools, clears settle
-timers and releases this repository's claim in the process. The adapter disposes runtime then launcher before its background processor;
-launcher disposal is idempotent.
+timers and releases this repository's claim in the process. The adapter disposes runtime then launcher before its background processor.
+Its host-facing executor wait is bounded by **30 seconds** (`EXECUTOR_DISPOSE_MS`), allowing the runtime's 10-second
+per-plan integration-queue disposal bound plus headroom for runtime and slot-pool teardown. If that wait expires, the adapter
+logs one warning, still disposes the launcher to abort its controllers, then continues background/runner and remaining location
+teardown. Launcher disposal is idempotent and has no internal waits, so it is safe to call again when runtime disposal eventually
+ends. The original disposal continues observed, with late errors logged; the timeout does **not** release the repository claim.
+The claim stays held until runtime/pool disposal actually completes; if it never completes, restart the host process to clear it
+(a location reload alone cannot take over that repository).
 A verification cut by disposal is re-verified at the next start, never treated as a pass.
 
 Plan control belongs to the **root orchestrator**: a session at depth 0, with no parent. All state-changing and authority
