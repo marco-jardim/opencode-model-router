@@ -6,6 +6,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { hardenedEnvironment } from "../../src/executor/git";
 import {
   COMMIT_SUBJECT_PATTERN, SLOT_EXCLUDES_CONTENT, commitTypeFor, createGitOps, createGitRunner, encodeRefId, executorGitArgs, formatCommitMessage,
+  gitCallLocation,
   integrationBranchName, phaseTagName, planRefPrefix, readCommitIdentity, taskBranchName,
   type GitOps,
 } from "../../src/executor/git";
@@ -39,13 +40,18 @@ describe("executorGitArgs", () => {
     expect(withConv).toContain("core.autocrlf=true");
     expect(withConv).toContain("core.eol=lf");
   });
-  it("appends the repository-only driver blanking last, after the hardening and the executor's own settings; none by default", () => {
+  it("carries the hardening's ssh key command blank; the driver blanking is the runner's, never a cached argument", () => {
+    expect(args).toContain("gpg.ssh.defaultKeyCommand=");
     expect(args.some(a => a.startsWith("filter.") || /^merge\..+\.driver=/.test(a))).toBe(false);
-    const drivers = ["-c", "filter.evil.clean=", "-c", "merge.evil.driver=", "-c", "filter.evil.required=false"];
-    const withDrivers = executorGitArgs({ hooksDir: "h", excludesFile: "e", conversion: { autocrlf: "true", eol: null }, drivers });
-    expect(withDrivers.slice(-drivers.length)).toEqual(drivers);
-    expect(withDrivers.slice(0, -drivers.length)).toEqual(executorGitArgs({ hooksDir: "h", excludesFile: "e", conversion: { autocrlf: "true", eol: null } }));
-    expect(withDrivers).toContain("gpg.ssh.defaultKeyCommand=");
+  });
+  it("gitCallLocation: the cwd after -C and the --git-dir/--work-tree options before the subcommand", () => {
+    const top = resolve("/top");
+    expect(gitCallLocation(["-c", "a=b", "--no-pager", "status", "-C", "x"], top)).toEqual({ cwd: top, location: [] });
+    expect(gitCallLocation(["-C", "/elsewhere", "--no-optional-locks", "-c", "-C", "rev-parse"], top))
+      .toEqual({ cwd: resolve("/elsewhere"), location: [] });
+    expect(gitCallLocation(["-c", "x=y", "--git-dir=/s/.git", "--work-tree=/s", "--literal-pathspecs", "commit", "--git-dir=/no"], top))
+      .toEqual({ cwd: top, location: ["--git-dir=/s/.git", "--work-tree=/s"] });
+    expect(gitCallLocation(["-C", "sub", "-C", "deeper", "ls-files"], top)).toEqual({ cwd: resolve(top, "sub", "deeper"), location: [] });
   });
   it("has the fixed excludes content", () => {
     expect(SLOT_EXCLUDES_CONTENT.split("\n")).toContain("node_modules/");
@@ -259,34 +265,6 @@ describe("GitOps context and identity", () => {
     expect(git.calls[0]?.args).toContain("core.eol=lf");
   });
 
-  it("reads the repository-only drivers through the user runner (scoped listing) and blanks them in every call", async () => {
-    const listing = "global\0filter.lfs.clean\ngit-lfs clean -- %f\0local\0filter.lfs.clean\ngit-lfs clean -- %f\0"
-      + "local\0filter.evil.smudge\nevil\0local\0merge.evil.driver\nevil %A\0";
-    const values: Record<string, string> = { "user.name": "A", "user.email": "a@b.c" };
-    const identity = (args: string[]): Partial<ProcessResult> => {
-      const v = values[args[args.length - 1] ?? ""];
-      return v === undefined ? { code: 1 } : { stdout: `${v}\n` };
-    };
-    const answering = fakeRunner(args => (args.includes("--show-scope") ? { stdout: listing } : identity(args)));
-    const git = fakeRunner();
-    await makeOps(git, answering).worktreeList();
-    const scoped = answering.calls.find(c => c.args.includes("--show-scope"));
-    expect(scoped).toEqual({ args: [...gitTools.DRIVER_SCOPE_ARGS], cwd: TOP });
-    const drivers = ["-c", "filter.evil.smudge=", "-c", "merge.evil.driver=", "-c", "filter.evil.required=false"];
-    expect(git.calls.length).toBeGreaterThan(0);
-    for (const call of git.calls) {
-      const at = call.args.indexOf("filter.evil.smudge=");
-      expect(call.args.slice(at - 1, at - 1 + drivers.length)).toEqual(drivers);
-      expect(call.args.some(arg => arg.startsWith("filter.lfs."))).toBe(false);
-      expect(at).toBeGreaterThan(call.args.indexOf("user.useConfigOnly=true"));
-    }
-    // A listing that cannot be read is E_GIT: no executor git runs without it.
-    const failing = fakeRunner(args => (args.includes("--show-scope") ? { code: 128, stderr: "fatal: bad config" } : identity(args)));
-    const none = fakeRunner();
-    await expect(makeOps(none, failing).worktreeList()).rejects.toMatchObject({ code: "E_GIT" });
-    expect(none.calls).toHaveLength(0);
-  });
-
   it("omits whitespace-only line-ending settings from the git context", async () => {
     const user = identityRunner({ "user.name": "A", "user.email": "a@b.c", "core.autocrlf": " \t ", "core.eol": "  " });
     await expect(readCommitIdentity(user, TOP)).resolves.toMatchObject({ conversion: { autocrlf: null, eol: null } });
@@ -327,10 +305,7 @@ describe("GitOps context and identity", () => {
     const ops = makeOps(fakeRunner(), user);
     await ops.worktreeList();
     await ops.worktreeList();
-    // The four identity/conversion reads and the one driver listing of the (cached) context, once for both calls.
-    expect(user.calls.filter(c => c.args.includes("--includes"))).toHaveLength(4);
-    expect(user.calls.filter(c => c.args.includes("--show-scope"))).toHaveLength(1);
-    expect(user.calls).toHaveLength(5);
+    expect(user.calls).toHaveLength(4);
     const first = readCommitIdentity(user, TOP);
     expect(readCommitIdentity(user, TOP)).toBe(first);
     await first;

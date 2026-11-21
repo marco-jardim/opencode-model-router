@@ -83,7 +83,7 @@ const HARDENED = vi.hoisted(() => ({
   refuse: undefined as string | undefined,
   /** The repository-only driver blanking (git-tools repositoryDriverArgs) the snapshot is given, and the calls it made. */
   drivers: [] as string[],
-  driverCalls: [] as { root: string; executable: string | undefined; timeoutMs: number | undefined }[],
+  driverCalls: [] as { root: string; executable: string | undefined; timeoutMs: number | undefined; env: NodeJS.ProcessEnv | undefined; required: boolean | undefined }[],
   /** When set, repositoryDriverArgs rejects with this (an unreadable listing). */
   driversFail: undefined as string | undefined,
 }));
@@ -105,8 +105,8 @@ vi.mock("../../src/router/git-tools", async importOriginal => ({
     HARDENED.guardRoots.push(root);
     return [root, `${root}/.guard`];
   },
-  repositoryDriverArgs: async (root: string, options: { executable?: string; timeoutMs?: number } = {}) => {
-    HARDENED.driverCalls.push({ root, executable: options.executable, timeoutMs: options.timeoutMs });
+  repositoryDriverArgs: async (root: string, options: { executable?: string; timeoutMs?: number; env?: NodeJS.ProcessEnv; required?: boolean } = {}) => {
+    HARDENED.driverCalls.push({ root, executable: options.executable, timeoutMs: options.timeoutMs, env: options.env, required: options.required });
     if (HARDENED.driversFail !== undefined) throw new Error(HARDENED.driversFail);
     return [...HARDENED.drivers];
   },
@@ -173,15 +173,16 @@ describe("Git tree fingerprint adapter", () => {
     expect(reason).not.toMatch(/[\r\n]|ghp_/);
     expect(reason).toContain("[REDACTED]");
   });
-  it.each(["root", "head", "status", "diff-worktree", "diff-index", "index", "untracked-list"])(
+  it.each(["root", "head", "index", "status", "diff-worktree", "diff-index", "untracked-list"])(
     "labels timeout and spawn failures at %s without retrying or returning a snapshot", async stage => {
+      // The gitlink check (`ls-files --stage`) runs before status and the diffs.
       const commands = [
-        "rev-parse --show-toplevel", "rev-parse HEAD --symbolic-full-name HEAD",
+        "rev-parse --show-toplevel", "rev-parse HEAD --symbolic-full-name HEAD", "ls-files --stage",
         "status --porcelain=v1 -z --untracked-files=all", "diff HEAD --binary --no-ext-diff --no-textconv",
-        "diff --cached --binary --no-ext-diff --no-textconv", "ls-files --stage",
+        "diff --cached --binary --no-ext-diff --no-textconv",
         "ls-files --others --exclude-standard --full-name -z",
       ];
-      const index = ["root", "head", "status", "diff-worktree", "diff-index", "index", "untracked-list"].indexOf(stage);
+      const index = ["root", "head", "index", "status", "diff-worktree", "diff-index", "untracked-list"].indexOf(stage);
       const timeout = `git timed out after ${SNAPSHOT_GIT_TIMEOUT_MS} ms`;
       for (const [error, expected] of [
         [new Error(timeout), `${stage}: ${timeout}`],
@@ -307,9 +308,16 @@ describe("Git tree fingerprint adapter", () => {
       // Pin: the fingerprint depends on git's index refresh (stat-only dirty files would show in `diff HEAD --binary`).
       expect(args).not.toContain("diff.autoRefreshIndex=false");
       expect(args.some(arg => arg.startsWith("diff.autoRefreshIndex"))).toBe(false);
-      // Not the hardened mode's process options either.
-      expect(globals).not.toContain("--no-optional-locks");
+      // Only `status` takes --no-optional-locks (it never rewrites the user's index); the diffs keep git's own refresh.
+      expect(globals.includes("--no-optional-locks")).toBe(subcommand(args)[0] === "status");
     }
+    expect(seen.filter(args => subcommand(args)[0] === "status")).toHaveLength(1);
+  });
+
+  it("a gitlink is refused before `status` or `diff` runs (they would run git inside a populated submodule)", async () => {
+    state.stage = "160000 commit 0\tsubmodule";
+    expect(await capture()).toBeUndefined();
+    expect(state.calls.map(args => subcommand(args)[0])).toEqual(["rev-parse", "rev-parse", "ls-files"]);
   });
 
   it("repository-only drivers are blanked after root, in both modes, before every later process; none for a plain repository", async () => {
@@ -325,9 +333,11 @@ describe("Git tree fingerprint adapter", () => {
       HARDENED.driverCalls = [];
       expect(await snapshotTree(resolve("packages/app"), signal, { git, hardened })).toBeDefined();
       expect(seen).toHaveLength(7);
-      // Read once, for the toplevel, with the snapshot's executable (the hardened one; the default resolves its own).
+      // Read once, for the toplevel, with the snapshot's executable and environment (the hardened ones; the default resolves its
+      // own executable and runs in this process's environment), never required (a read stores nothing).
       expect(HARDENED.driverCalls).toEqual([{
         root: process.cwd(), executable: hardened ? HARDENED.executable : undefined, timeoutMs: SNAPSHOT_GIT_TIMEOUT_MS,
+        env: hardened ? HARDENED.env : undefined, required: undefined,
       }]);
       // `rev-parse --show-toplevel` runs before they are known (it runs no filter); every later process carries them, right before
       // the subcommand, so they follow (and win over) the mode's own prefix.
@@ -335,7 +345,10 @@ describe("Git tree fingerprint adapter", () => {
       expect(seen[0]).not.toContain("filter.evil.clean=");
       for (const args of seen.slice(1)) {
         const sub = subcommand(args);
-        expect(args.slice(args.length - sub.length - HARDENED.drivers.length, args.length - sub.length)).toEqual(HARDENED.drivers);
+        const at = args.indexOf("filter.evil.clean=") - 1;
+        expect(args.slice(at, at + HARDENED.drivers.length)).toEqual(HARDENED.drivers);
+        // After the mode's prefix (so they win over it), before the subcommand (status's own --no-optional-locks may follow).
+        expect(args.slice(at + HARDENED.drivers.length, args.length - sub.length).every(arg => arg === "--no-optional-locks")).toBe(true);
       }
     }
     // A repository without its own drivers: no extra argument.

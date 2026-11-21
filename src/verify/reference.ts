@@ -146,8 +146,11 @@
 //   (no fsmonitor, null-device hooksPath, no ssh key command, no transport);
 //   a later `-c core.hooksPath=` (D9's worktree add) still wins. Capture and
 //   materialize also blank the filter/merge drivers only the repository's own
-//   configuration names (git-tools DRIVER_SCOPE_ARGS, repositoryOnlyDriverArgs);
-//   a listing that cannot be read means no reference.
+//   configuration names, include targets of any condition too, with
+//   filter.<name>.required=true so a blanked filter makes git refuse instead of
+//   writing unfiltered content (git-tools collectRepositoryDriverArgs); every
+//   call runs with GIT_NO_LAZY_FETCH=1. A configuration that cannot be read
+//   means no reference.
 //   1. `git rev-parse --show-toplevel` (cwd: the dispatch cwd) -> root. A
 //      non-zero exit (outside a repository, or a bare repository) returns
 //      undefined.
@@ -740,7 +743,7 @@ import { gitTopOf, perimeterKey } from "./git-top";
 // Type-only: pin.ts imports perimeter.ts, which imports this module; samePin is loaded lazily in step 7.
 import type { LinkPin, PinWhy } from "./pin";
 import type { PluginLogger } from "../router/logger";
-import { DRIVER_SCOPE_ARGS, gitExecutable, repositoryOnlyDriverArgs, workRootGuards, workRootReadArgs } from "../router/git-tools";
+import { collectRepositoryDriverArgs, gitExecutable, workRootGuards, workRootReadArgs } from "../router/git-tools";
 
 // --- Seams --------------------------------------------------------------------
 
@@ -1367,7 +1370,8 @@ async function runGit(argv: ArgvSeam, args: readonly string[], run: GitRun): Pro
   if (run.signal) opts.signal = run.signal;
   // QA-1.5-18: pathspec env switches (literal/glob/noglob/icase) change what every pathspec
   // means; git reads them as booleans, so "0" neutralises them whatever the plugin inherited.
-  opts.env = { ...PATHSPEC_ENV_RESET, ...run.env };
+  // GIT_NO_LAZY_FETCH (git >= 2.44): a partial clone's missing object fails the call instead of fetching it.
+  opts.env = { ...PATHSPEC_ENV_RESET, GIT_NO_LAZY_FETCH: "1", ...run.env };
   try {
     // workRootReadArgs() before the caller's args, so a later `-c core.hooksPath=<noHooks>` (D9) wins over its null device.
     const result = await argv(gitExecutable(workRootGuards(run.cwd)), ["--no-optional-locks", ...workRootReadArgs(), ...(run.config ?? []), ...args], opts);
@@ -1387,19 +1391,23 @@ async function runGit(argv: ArgvSeam, args: readonly string[], run: GitRun): Pro
 }
 
 /**
- * The `-c` pairs that blank the filter/merge drivers only `root`'s own configuration names (git-tools repositoryOnlyDriverArgs),
- * from a DRIVER_SCOPE_ARGS listing through the seam, which reads the user's system/global configuration as plain git does: a
- * global LFS filter and its `git lfs install --local` copy are kept. Undefined when the listing fails, the budget is spent or a
- * key cannot be blanked: the caller has no reference (fail closed).
+ * The `-c` pairs that blank the filter/merge drivers (and set the protocols to `never`) only `root`'s own configuration names,
+ * include targets of any condition too (git-tools collectRepositoryDriverArgs), read through the seam, in the environment of
+ * the reference's own git calls, which reads the user's system/global configuration as plain git does: a global LFS filter
+ * and its `git lfs install --local` copy are kept. `required=true`: the reference writes (stash create, the checkout), so a
+ * blanked filter makes git refuse instead of storing or checking out unfiltered content. Undefined when the configuration
+ * cannot be read, the budget is spent, a key cannot be blanked, or the environment carries the legacy GIT_CONFIG (which would
+ * replace the repository's configuration in the listing alone): the caller has no reference (fail closed).
  */
 async function repositoryDrivers(argv: ArgvSeam, root: string, budget: Budget): Promise<readonly string[] | undefined> {
-  if (budget.spent()) return undefined;
-  const listed = await runGit(argv, DRIVER_SCOPE_ARGS, { cwd: root, timeoutMs: budget.remaining(), signal: budget.signal });
-  if (!listed || budget.spent()) return undefined;
-  if (listed.code === 1) return []; // no driver is configured anywhere
-  if (listed.code !== 0) return undefined;
+  if (budget.spent() || Object.keys(process.env).some((key) => key.toUpperCase() === "GIT_CONFIG")) return undefined;
+  const query = async (args: readonly string[]) => {
+    const result = budget.spent() ? undefined : await runGit(argv, args, { cwd: root, timeoutMs: budget.remaining(), signal: budget.signal });
+    if (!result || budget.spent()) throw new Error("the driver configuration could not be read in time");
+    return result;
+  };
   try {
-    return repositoryOnlyDriverArgs(listed.stdout);
+    return await collectRepositoryDriverArgs(query, root, { required: true });
   } catch {
     return undefined;
   }

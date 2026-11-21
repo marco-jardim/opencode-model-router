@@ -3,6 +3,8 @@
 // (`repo.toplevel`): every probe runs with `-C <toplevel>`, never against another worktree of the same repository.
 // Never forces and never creates a non-fast-forward.
 
+import { lstat } from "node:fs/promises";
+import { join } from "node:path";
 import { hardeningArgs } from "../../router/git-tools";
 import { phaseTagName as gitPhaseTagName } from "../git";
 import type { GitOps } from "../git";
@@ -22,11 +24,8 @@ export interface LanderDeps {
   /** Hardened runner for the read-only owner-checkout probes (toplevel, HEAD, status); each call uses `-C <toplevel>`. */
   run: GitRunner;
   realpath: (p: string) => Promise<string>; platform: NodeJS.Platform;
-  /**
-   * The `-c` pairs blanking the filter/merge drivers only the owner checkout's own configuration names (production: git-tools
-   * `repositoryDriverArgs`), read once per toplevel and placed after the hardening of every probe. A rejection fails the probe.
-   */
-  drivers?: (toplevel: string) => Promise<readonly string[]>;
+  /** Whether a path exists (a populated submodule's `.git`). Default: `lstat` succeeds. */
+  exists?: (p: string) => Promise<boolean>;
 }
 
 export interface LanderApi {
@@ -66,24 +65,31 @@ function parseStatusPaths(stdout: string): string[] {
 }
 
 export function createLander(d: LanderDeps): LanderApi {
-  const driverArgs = new Map<string, Promise<readonly string[]>>();
-  function drivers(toplevel: string): Promise<readonly string[]> {
-    if (d.drivers === undefined) return Promise.resolve([]);
-    let pending = driverArgs.get(toplevel);
-    if (pending === undefined) {
-      const read = d.drivers(toplevel);
-      pending = read;
-      driverArgs.set(toplevel, read);
-      read.catch(() => { if (driverArgs.get(toplevel) === read) driverArgs.delete(toplevel); }); // a failed read is retried
-    }
-    return pending;
-  }
+  const exists = d.exists ?? (async (p: string) => lstat(p).then(() => true, () => false));
 
   async function probe(toplevel: string, args: readonly string[]): Promise<{ code: number | null; stdout: string }> {
-    // hardeningArgs() neutralises configured hooks/fsmonitor/pagers and `drivers` the repository-only filter/merge drivers:
-    // `status` must not run a repo-configured program.
-    const r = await d.run.run(["-C", toplevel, "--no-optional-locks", ...hardeningArgs(), ...await drivers(toplevel), ...args], { cwd: toplevel, timeoutMs: READ_TIMEOUT_MS });
+    // hardeningArgs() neutralises configured hooks/fsmonitor/pagers: `status` must not run a repo-configured program. The
+    // production runner (executor/git.ts withRepositoryDrivers) also blanks the repository-only filter/merge drivers.
+    const r = await d.run.run(["-C", toplevel, "--no-optional-locks", ...hardeningArgs(), ...args], { cwd: toplevel, timeoutMs: READ_TIMEOUT_MS });
     return { code: r.code, stdout: r.stdout };
+  }
+
+  /**
+   * The populated submodules of the owner checkout (gitlinks whose directory holds a `.git`). `status --ignore-submodules=none`
+   * runs `git status` inside each with that submodule's own configuration, whose filter/merge drivers the superproject's
+   * listing never sees, so the cleanliness check refuses to run there (an unpopulated gitlink runs nothing).
+   */
+  async function populatedSubmodules(toplevel: string): Promise<string[]> {
+    const listed = await probe(toplevel, ["ls-files", "--stage", "-z"]);
+    if (listed.code !== 0) throw new Error(`git ls-files failed in the owner checkout (exit ${listed.code ?? "unknown"})`);
+    const populated: string[] = [];
+    for (const record of listed.stdout.split("\0")) {
+      const tab = record.indexOf("\t");
+      if (!record.startsWith("160000 ") || tab === -1) continue;
+      const path = record.slice(tab + 1);
+      if (await exists(join(toplevel, path, ".git"))) populated.push(path);
+    }
+    return populated;
   }
 
   async function inspect(req: LandRequest): Promise<LandInspection> {
@@ -116,7 +122,12 @@ export function createLander(d: LanderDeps): LanderApi {
       return { ok: false, refusal: { reason: "not-checked-out", head: headRef === "" ? null : headRef }, baseTip };
     }
 
-    // 3. The owner checkout is clean.
+    // 3. The owner checkout is clean. A populated submodule fails closed first (see populatedSubmodules).
+    const submodules = await populatedSubmodules(toplevel);
+    if (submodules.length > 0) {
+      throw new Error(`the owner checkout has populated submodules (${submodules.slice(0, 5).join(", ")}): the executor does not run git `
+        + "inside them with their own configuration; land manually");
+    }
     const status = await probe(toplevel, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none"]);
     if (status.code !== 0) throw new Error(`git status failed in the owner checkout (exit ${status.code ?? "unknown"})`);
     const dirty = parseStatusPaths(status.stdout);

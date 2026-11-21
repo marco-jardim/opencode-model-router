@@ -9,10 +9,11 @@ import { basename, delimiter, dirname, join, relative } from "node:path";
 import {
   dropPartialCredential, errorMessage, quoteGitPath, GIT_OPERATIONS, gitArgv, gitCandidates, gitEnvironment, gitExecutable, gitTools, hardeningArgs, inspectGit,
   linkedTrackedDirectories, numstatNames, parseInheritedConfig, PROTOCOL_HARDENING, repositoryDriverArgs, repositoryOnlyDriverArgs, runBoundedProcess,
-  selectGitExecutable, stripUrlUserinfo, validatePath, validateRef, workRootReadArgs,
+  selectGitExecutable, stripUrlUserinfo, validatePath, validateRef, workRootReadArgs, driverListingEnvironment,
   type GitInput, type GitInspectOptions, type GitOperation,
 } from "../../src/router/git-tools";
 import { sensitiveGitPathspecs, SENSITIVE_PATH_PATTERNS } from "../../src/router/sensitive-paths";
+import { createGitRunner, withRepositoryDrivers } from "../../src/executor/git";
 
 vi.mock("node:child_process", async importOriginal => {
   const actual = await importOriginal<typeof import("node:child_process")>();
@@ -547,14 +548,16 @@ describe("shell-free git inspection", () => {
   it("workRootReadArgs: no fsmonitor, the null-device hooksPath, no ssh key command, every transport refused; never diff.autoRefreshIndex", () => {
     const args = workRootReadArgs();
     const nul = WIN ? "NUL" : "/dev/null";
-    expect(args).toEqual(["-c", "core.fsmonitor=false", "-c", `core.hooksPath=${nul}`, "-c", "gpg.ssh.defaultKeyCommand=", ...PROTOCOL_HARDENING]);
+    expect(args).toEqual(["-c", "core.fsmonitor=false", "-c", `core.hooksPath=${nul}`, "-c", "gpg.ssh.defaultKeyCommand=", "-c", "diff.external=",
+      ...PROTOCOL_HARDENING]);
     expect(args.some(arg => arg.startsWith("diff.autoRefreshIndex"))).toBe(false);
+    for (const name of ["ext", "file", "ssh", "git", "http", "https", "ftp", "ftps"]) expect(PROTOCOL_HARDENING).toContain(`protocol.${name}.allow=never`);
     // The same null device as hardeningArgs(), which also blanks the ssh key command now.
     expect(hardeningArgs()).toContain(`core.hooksPath=${nul}`);
     expect(hardeningArgs()[hardeningArgs().indexOf("gpg.ssh.defaultKeyCommand=") - 1]).toBe("-c");
   });
   it("repositoryOnlyDriverArgs blanks only the drivers the repository alone sets (scoped listing)", () => {
-    const entry = (scope: string, key: string, value?: string) => `${scope}\0${key}${value === undefined ? "" : `\n${value}`}\0`;
+    const entry = (scope: string, key: string, value?: string) => `${scope}\0file:.git/config\0${key}${value === undefined ? "" : `\n${value}`}\0`;
     const lfs = "git-lfs clean -- %f";
     expect(repositoryOnlyDriverArgs("")).toEqual([]);
     // A global LFS filter and its `git lfs install --local` copy: kept, no argument at all.
@@ -583,7 +586,75 @@ describe("shell-free git inspection", () => {
       .toEqual(["-c", "filter.My Filter.clean=", "-c", "filter.My Filter.required=false"]);
     // `-c` splits at the first '=': such a name cannot be blanked, so the repository is refused.
     expect(() => repositoryOnlyDriverArgs(entry("local", "filter.a=b.clean", "evil"))).toThrow(/cannot be neutralized/);
+    // Where git writes, a blanked filter is required, so git refuses instead of writing unfiltered content.
+    expect(repositoryOnlyDriverArgs(entry("local", "filter.x.clean", "evil") + entry("global", "filter.lfs.clean", lfs)
+      + entry("local", "filter.lfs.clean", lfs), { required: true })).toEqual(["-c", "filter.x.clean=", "-c", "filter.x.required=true"]);
+    // The repository's own protocol.<name>.allow (a remote helper) is set to never; the user's and the hardening's are not touched.
+    expect(repositoryOnlyDriverArgs(entry("local", "protocol.foo.allow", "always") + entry("worktree", "protocol.file.allow", "always")
+      + entry("command", "protocol.ext.allow", "never") + entry("global", "protocol.bar.allow", "always")))
+      .toEqual(["-c", "protocol.foo.allow=never", "-c", "protocol.file.allow=never"]);
+    // Keys of an include target (whatever its condition) are blanked too, unless identical to the user's value.
+    expect(repositoryOnlyDriverArgs(entry("global", "filter.lfs.clean", lfs), {
+      included: [{ key: "filter.inc.smudge", value: "evil" }, { key: "filter.lfs.clean", value: lfs }, { key: "merge.m.driver", value: "evil" },
+        { key: "protocol.baz.allow", value: "always" }, { key: "core.pager", value: "evil" }],
+    })).toEqual(["-c", "filter.inc.smudge=", "-c", "merge.m.driver=", "-c", "filter.inc.required=false", "-c", "protocol.baz.allow=never"]);
   });
+  it("driverListingEnvironment: the run's own variables, the user's config locations, never the legacy GIT_CONFIG", () => {
+    const user = process.env.GIT_CONFIG_GLOBAL;
+    const env = driverListingEnvironment({ PATH: "p", GIT_DIR: "/d", GIT_CONFIG_PARAMETERS: "'a.b'='c'", GIT_CONFIG: "/evil",
+      git_config_global: "NUL", GIT_CONFIG_NOSYSTEM: "1" });
+    expect(env).toMatchObject({ PATH: "p", GIT_DIR: "/d", GIT_CONFIG_PARAMETERS: "'a.b'='c'", GIT_NO_LAZY_FETCH: "1" });
+    expect(Object.keys(env).some(key => key.toUpperCase() === "GIT_CONFIG")).toBe(false);
+    expect(Object.keys(env).filter(key => /^git_config_global$/i.test(key))).toEqual(user === undefined ? [] : ["GIT_CONFIG_GLOBAL"]);
+    expect(env.GIT_CONFIG_GLOBAL).toBe(user);
+    expect(env.GIT_CONFIG_NOSYSTEM).toBe(process.env.GIT_CONFIG_NOSYSTEM); // "1" in these tests: the process's own value
+    // Default: this process's environment.
+    expect(driverListingEnvironment().PATH ?? driverListingEnvironment().Path).toBe(process.env.PATH);
+  });
+  it("collectRepositoryDriverArgs (real git): include targets of any condition are read and blanked; a missing one is skipped", async () => {
+    repository();
+    const target = join(outside, "inc.gitconfig");
+    const nested = join(outside, "nested.gitconfig");
+    writeFileSync(target, `[filter "inc"]\n\tclean = evil\n[protocol "helper"]\n\tallow = always\n[include]\n\tpath = nested.gitconfig\n`);
+    writeFileSync(nested, `[merge "deep"]\n\tdriver = evil %A\n`);
+    git("config", "includeIf.onbranch:never-checked-out.path", slash(target)); // the condition is false here
+    git("config", "--add", "include.path", slash(join(outside, "missing.gitconfig")));
+    expect(await repositoryDriverArgs(root)).toEqual([
+      "-c", "filter.inc.clean=", "-c", "merge.deep.driver=", "-c", "filter.inc.required=false", "-c", "protocol.helper.allow=never",
+    ]);
+    // An include target that exists but cannot be read fails closed (a directory here).
+    mkdirSync(join(outside, "dir.gitconfig"));
+    git("config", "--add", "include.path", slash(join(outside, "dir.gitconfig")));
+    await expect(repositoryDriverArgs(root)).rejects.toThrow();
+  }, 30_000);
+  it("withRepositoryDrivers (real git): a write under a repository-only filter fails closed; the global filter's copy still runs", async () => {
+    repository();
+    const evil = join(outside, "EVIL_RAN");
+    const dup = join(outside, "DUP_RAN");
+    writeFileSync(join(root, ".gitattributes"), "*.txt filter=evil\n*.dat filter=dup\n");
+    writeFileSync(join(root, "b.dat"), "one\n");
+    git("add", "-A"); git("commit", "-qm", "drivers");
+    // No racily clean entry: an index write would re-check it through its (required, blanked) filter and refuse.
+    for (const name of ["file.txt", "b.dat", ".gitattributes"]) utimesSync(join(root, name), OLD, OLD);
+    git("update-index", "-q", "--refresh");
+    const clean = (marker: string) => `${markerCommand(marker)}; cat`;
+    git("config", "filter.evil.clean", clean(evil));
+    git("config", "filter.dup.clean", clean(dup));
+    execFileSync(gitExecutable(), ["config", "--file", process.env.GIT_CONFIG_GLOBAL ?? "", "filter.dup.clean", clean(dup)], { cwd: outside, env: gitEnvironment() });
+    const runner = withRepositoryDrivers(createGitRunner({ mode: "hardened", toplevel: root }), root);
+    writeFileSync(join(root, "b.dat"), "changed\n");
+    const kept = await runner.run([...hardeningArgs(), "add", "b.dat"], { cwd: root, timeoutMs: 30_000 });
+    expect(kept.code).toBe(0);
+    expect(existsSync(dup)).toBe(true);
+    // From outside the repository through -C: the listing runs where the call runs.
+    writeFileSync(join(root, "file.txt"), "changed\n");
+    const refused = await runner.run([...hardeningArgs(), "-C", root, "add", "file.txt"], { cwd: outside, timeoutMs: 30_000 });
+    expect(refused.code).not.toBe(0);
+    expect(refused.stderr).toMatch(/clean filter 'evil' failed/);
+    expect(existsSync(evil)).toBe(false);
+    // An unreadable configuration: E_GIT, and the call does not run.
+    await expect(runner.run(["status"], { cwd: join(outside, "missing"), timeoutMs: 30_000 })).rejects.toMatchObject({ code: "E_GIT" });
+  }, 30_000);
   it("repositoryDriverArgs (real git): a repository-only filter is blanked and never runs; a global filter's local copy runs", async () => {
     repository();
     const evil = join(outside, "EVIL_RAN");

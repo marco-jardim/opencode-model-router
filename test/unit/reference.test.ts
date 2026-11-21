@@ -458,7 +458,6 @@ describe("captureReference", { timeout: 60_000 }, () => {
     await fsp.writeFile(script, "require('node:fs').appendFileSync(process.argv[2], 'ran\\n'); process.stdin.pipe(process.stdout);\n");
     const command = (marker: string) => `"${slash(process.execPath)}" "${slash(script)}" "${slash(marker)}"`;
     await fsp.writeFile(join(repo, ".gitattributes"), "*.evil filter=evil\n*.dup filter=dup\n");
-    await fsp.writeFile(join(repo, "x.evil"), "x0\n");
     await fsp.writeFile(join(repo, "y.dup"), "y0\n");
     await git(repo, "add", "-A");
     await git(repo, "commit", "-q", "-m", "drivers");
@@ -467,28 +466,30 @@ describe("captureReference", { timeout: 60_000 }, () => {
       await git(repo, "config", `filter.dup.${kind}`, command(dup));
     }
     await git(repo, "config", "merge.evil.driver", `${command(evil)} %O %A %B`);
+    await git(repo, "config", "protocol.helper.allow", "always");
+    // An include whose condition is false here (another branch): its drivers are blanked all the same.
+    const included = join(scratch, "included.gitconfig");
+    await fsp.writeFile(included, `[filter "inc"]\n\tsmudge = evil\n`);
+    await git(repo, "config", "includeIf.onbranch:some-other-branch.path", slash(included));
     const restoreGlobal = await userGlobalConfig("");
+    const calls: string[][] = [];
+    const recording: CaptureDeps["argv"] = (file, args, opts) => {
+      calls.push([...args]);
+      return argv(file, args, opts);
+    };
     try {
       // The user's global filter, written by git exactly as the repository's copy (`git lfs install --local`).
       for (const kind of ["clean", "smudge"]) await git(repo, "config", "--file", join(base, "global.gitconfig"), `filter.dup.${kind}`, command(dup));
-      await fsp.writeFile(join(repo, "x.evil"), "x1, a dirty tracked file\n");
       await fsp.writeFile(join(repo, "y.dup"), "y1, a dirty tracked file\n");
-      const calls: string[][] = [];
-      const recording: CaptureDeps["argv"] = (file, args, opts) => {
-        calls.push([...args]);
-        return argv(file, args, opts);
-      };
       const ref = await captureReference(repo, new AbortController().signal, captureDeps({ argv: recording }));
       expect(ref).toBeDefined();
       if (!ref) return;
-      // `stash create` hashed both dirty files: only the user's filter ran.
-      expect(await exists(evil)).toBe(false);
+      // `stash create` hashed the dirty file through the user's filter.
       expect(await exists(dup)).toBe(true);
       await fsp.rm(dup);
       const handle = await mat(ref, { argv: recording });
       try {
-        // The checkout (smudge) and the drift diff (clean): again only the user's filter.
-        expect(await exists(evil)).toBe(false);
+        // The checkout (smudge) and the drift diff (clean): the user's filter again.
         expect(await exists(dup)).toBe(true);
       } finally {
         await handle.dispose();
@@ -499,11 +500,33 @@ describe("captureReference", { timeout: 60_000 }, () => {
         ["drift diff", (args: string[]) => args.includes("diff") && args.includes("--no-ext-diff")],
       ] as const) {
         const args = calls.find(find) ?? [];
-        for (const setting of ["filter.evil.clean=", "filter.evil.smudge=", "filter.evil.required=false", "merge.evil.driver="]) {
+        for (const setting of ["filter.evil.clean=", "filter.evil.smudge=", "filter.inc.smudge=", "merge.evil.driver=",
+          "filter.evil.required=true", "filter.inc.required=true", "protocol.helper.allow=never"]) {
           expect(args, `${label}: ${setting}`).toContain(setting);
         }
         expect(args.some((arg) => arg.startsWith("filter.dup.")), label).toBe(false);
       }
+      expect(await exists(evil)).toBe(false);
+
+      // A tracked file under the repository-only filter: the reference fails closed instead of writing unfiltered content.
+      await fsp.writeFile(join(repo, "x.evil"), "x0\n");
+      const passthrough = ["-c", "filter.evil.clean=cat", "-c", "filter.evil.smudge=cat"];
+      await git(repo, ...passthrough, "add", "x.evil");
+      await git(repo, ...passthrough, "commit", "-q", "-m", "evil-filtered file");
+      const past = new Date(Date.now() - 60_000);
+      await fsp.utimes(join(repo, "x.evil"), past, past);
+      await git(repo, ...passthrough, "update-index", "-q", "--refresh"); // stat-clean and not racy: stash create reads nothing
+      const clean = await captureReference(repo, new AbortController().signal, captureDeps({ argv: recording }));
+      expect(clean).toBeDefined();
+      if (!clean) return;
+      // The checkout would smudge x.evil: git refuses (required filter), materialize fails and leaves nothing behind.
+      expect(await materialize(clean, undefined, new AbortController().signal, deps({ argv: recording })))
+        .toMatchObject({ ok: false, reason: "worktree-add-failed" });
+      expect(await refDirsIn(tmp)).toEqual([]);
+      // A dirty one: stash create would clean it, so there is no reference at all.
+      await fsp.writeFile(join(repo, "x.evil"), "x1, a dirty tracked file\n");
+      expect(await captureReference(repo, new AbortController().signal, captureDeps({ argv: recording }))).toBeUndefined();
+      expect(await exists(evil)).toBe(false);
     } finally {
       restoreGlobal();
     }
@@ -511,6 +534,18 @@ describe("captureReference", { timeout: 60_000 }, () => {
     await git(repo, "diff", "HEAD");
     expect(await exists(evil)).toBe(true);
     await fsp.rm(scratch, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  });
+
+  it("the legacy GIT_CONFIG in the environment means no reference (the driver listing would read that file alone)", async () => {
+    const saved = process.env.GIT_CONFIG;
+    process.env.GIT_CONFIG = join(base, "legacy.gitconfig");
+    try {
+      expect(await captureReference(repo, new AbortController().signal, captureDeps())).toBeUndefined();
+    } finally {
+      if (saved === undefined) delete process.env.GIT_CONFIG;
+      else process.env.GIT_CONFIG = saved;
+    }
+    expect(await captureReference(repo, new AbortController().signal, captureDeps())).toBeDefined();
   });
 
   it("a driver listing that cannot be read means no reference (fail closed)", async () => {

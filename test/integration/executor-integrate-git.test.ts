@@ -16,13 +16,14 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
-  COMMIT_SUBJECT_PATTERN, createGitOps, createGitRunner, formatCommitMessage, integrationBranchName, phaseTagName, taskBranchName, type GitOps,
+  COMMIT_SUBJECT_PATTERN, createGitOps, createGitRunner, formatCommitMessage, integrationBranchName, phaseTagName, taskBranchName,
+  withRepositoryDrivers, type GitOps,
 } from "../../src/executor/git";
 import {
   createIntegrateGit, createIntegrationChecks, createWriteGuard, BackgroundRuns,
   type CommandRunner, type IntegrateGit, type IntegrationChecks, type ResolvedCommand, type RunResolver, type WriteGuard,
 } from "../../src/executor/integrate/checks";
-import { hardeningArgs, repositoryDriverArgs } from "../../src/router/git-tools";
+import { hardeningArgs } from "../../src/router/git-tools";
 import { maxRangeProbes } from "../../src/executor/integrate/bisect";
 import { createLander } from "../../src/executor/integrate/land";
 import { createPhaseSuiteRunner, revertMessage } from "../../src/executor/integrate/phase-suite";
@@ -586,18 +587,20 @@ describe("landing on real git (3.2.5)", SLOW, () => {
     expect(existsSync(marker)).toBe(false);
   });
 
-  it("with the production drivers (repositoryDriverArgs), every read probe blanks a filter only the owner checkout configures", async () => {
+  it("through the production runner (withRepositoryDrivers), every read probe blanks a filter only the owner checkout configures", async () => {
     const s = landSetup("drivers");
     git(s.repo, "config", "filter.evil.clean", "false");
     git(s.repo, "config", "merge.evil.driver", "false");
-    const lander = createLander({ git: s.env.ops, igit: s.env.igit, guard: s.env.guard, run: s.env.run, realpath: (p) => fsp.realpath(p),
-      platform: process.platform, drivers: (top) => repositoryDriverArgs(top) });
+    const lander = createLander({ git: s.env.ops, igit: s.env.igit, guard: s.env.guard, run: withRepositoryDrivers(s.env.run, s.repo),
+      realpath: (p) => fsp.realpath(p), platform: process.platform });
     s.env.gitCalls.length = 0;
     expect(await lander.fastForward(s.req)).toEqual({ kind: "landed", from: s.c0, to: s.cand });
-    const probes = s.env.gitCalls.filter((c) => c.args[0] === "-C" && c.args.some((a) => ["status", "symbolic-ref", "rev-parse"].includes(a)));
+    const probes = s.env.gitCalls.filter((c) => c.args.includes("-C") && c.args.some((a) => ["status", "symbolic-ref", "rev-parse", "ls-files"].includes(a)));
     expect(probes.some((c) => c.args.includes("status"))).toBe(true);
+    expect(probes.some((c) => c.args.includes("ls-files"))).toBe(true); // the populated-submodule check
     for (const c of probes) {
-      for (const a of ["filter.evil.clean=", "filter.evil.required=false", "merge.evil.driver="]) expect(c.args, `probe ${c.args.join(" ")}`).toContain(a);
+      for (const a of ["filter.evil.clean=", "filter.evil.required=true", "merge.evil.driver="]) expect(c.args, `probe ${c.args.join(" ")}`).toContain(a);
+      expect(c.args.indexOf("filter.evil.clean=")).toBeLessThan(c.args.indexOf("-C"));
     }
   });
 

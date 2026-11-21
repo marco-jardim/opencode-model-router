@@ -6,7 +6,7 @@
 
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import {
-  DRIVER_SCOPE_ARGS, gitEnvironment, gitExecutable, gitPointers, hardeningArgs, isNetworkOrDevicePath, repositoryOnlyDriverArgs,
+  gitEnvironment, gitExecutable, gitPointers, hardeningArgs, isNetworkOrDevicePath, repositoryDriverArgs,
   spawnBounded, stripUrlUserinfo, workRootGuards,
 } from "../router/git-tools";
 import {
@@ -113,15 +113,13 @@ export interface GitContext {
   excludesFile: string;
   /** DV6 snapshot of the user's line-ending configuration. */
   conversion: { autocrlf: string | null; eol: string | null };
-  /** The `-c` pairs blanking the filter/merge drivers only the repository's own configuration names (git-tools repositoryOnlyDriverArgs). */
-  drivers?: readonly string[];
 }
 
 /**
  * `hardeningArgs()` (git-tools) then, in this order (a later `-c` wins over the NUL hooksPath it sets):
  * core.longpaths, core.hooksPath, core.excludesFile, core.editor, sequence.editor, the signing switches, the
  * rebase/merge switches, rerere, submodule.recurse, advice.detachedHead, user.useConfigOnly, then core.autocrlf and
- * core.eol when the snapshot has them, then the repository-only driver blanking (`drivers`).
+ * core.eol when the snapshot has them. The repository-only driver blanking is the runner's ({@link withRepositoryDrivers}).
  */
 export function executorGitArgs(c: GitContext): string[] {
   const args = [
@@ -136,24 +134,61 @@ export function executorGitArgs(c: GitContext): string[] {
   ];
   if (c.conversion.autocrlf !== null) args.push("-c", `core.autocrlf=${c.conversion.autocrlf}`);
   if (c.conversion.eol !== null) args.push("-c", `core.eol=${c.conversion.eol}`);
-  if (c.drivers !== undefined) args.push(...c.drivers);
   return args;
 }
 
+/** Bound of one driver listing (its include reads included) before an executor git call. */
+const DRIVER_LISTING_TIMEOUT_MS = 15_000;
+
 /**
- * The repository-only driver blanking for `toplevel` (git-tools DRIVER_SCOPE_ARGS, repositoryOnlyDriverArgs), read through the
- * user runner, which sees the user's system/global configuration: a global LFS filter and its `git lfs install --local` copy
- * are kept. A failed read is `E_GIT` (no executor git runs without it).
+ * Where an executor git call runs: `cwd` after a leading `-C <dir>`, and the `--git-dir=`/`--work-tree=` options it passes
+ * (in-slot calls), read from the global options before the subcommand.
  */
-export async function readRepositoryDrivers(userGit: GitRunner, toplevel: string): Promise<string[]> {
-  const r = await userGit.run([...DRIVER_SCOPE_ARGS], { cwd: toplevel, timeoutMs: GIT_OP_TIMEOUT_MS, maxOutputBytes: 1024 * 1024 });
-  if (r.code === 1) return [];
-  if (r.code !== 0) throw gitFailure("config --show-scope", r);
-  try {
-    return repositoryOnlyDriverArgs(r.stdout);
-  } catch (error) {
-    throw new ExecutorError("E_GIT", errorText(error), { toplevel });
+export function gitCallLocation(args: readonly string[], cwd: string): { cwd: string; location: string[] } {
+  let at = cwd;
+  const location: string[] = [];
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index] ?? "";
+    if (arg === "-c") { index++; continue; }
+    if (arg === "-C") { at = resolve(at, args[++index] ?? ""); continue; }
+    if (arg.startsWith("--git-dir=") || arg.startsWith("--work-tree=")) { location.push(arg); continue; }
+    if (arg.startsWith("-")) continue; // another global option (--no-pager, --no-optional-locks, --literal-pathspecs)
+    break;
   }
+  return { cwd: at, location };
+}
+
+/**
+ * A hardened `GitRunner` (`createGitRunner({ mode: "hardened" })`, possibly with a hardening prefix) whose every call first
+ * blanks the filter/merge drivers only the repository's own configuration names and sets its own `protocol.<name>.allow` to
+ * `never` (git-tools `repositoryDriverArgs`, include targets of any condition included), placed before the call's own
+ * arguments. The configuration is read again for every call (one `git config` process, plus one per include target): a
+ * driver added or changed mid-plan (a hook-less `git config` in a slot, a checkout that switches an `onbranch:` include) is
+ * never missed, and it costs far less than the call it protects. The listing runs where the call runs (its `-C`, `--git-dir`,
+ * `--work-tree`) in the call's own environment with the user's system/global configuration visible, so a global LFS filter
+ * and its `git lfs install --local` copy are kept. `filter.<name>.required=true`: a blanked filter makes git refuse
+ * (commit, cherry-pick, checkout, reset, clean) instead of writing unfiltered content. A configuration that cannot be read
+ * is `E_GIT`, and the call does not run.
+ */
+export function withRepositoryDrivers(inner: GitRunner, toplevel: string): GitRunner {
+  let executable: string | undefined;
+  return {
+    async run(args: readonly string[], p: ProcOpts): Promise<ProcessResult> {
+      const { cwd, location } = gitCallLocation(args, p.cwd);
+      let drivers: string[];
+      try {
+        executable ??= gitExecutable(workRootGuards(toplevel));
+        drivers = await repositoryDriverArgs(cwd, {
+          executable, env: hardenedEnvironment(p.env), required: true, location,
+          timeoutMs: Math.min(p.timeoutMs, DRIVER_LISTING_TIMEOUT_MS), ...(p.signal === undefined ? {} : { signal: p.signal }),
+        });
+      } catch (error) {
+        throw new ExecutorError("E_GIT", `git driver configuration could not be read: ${stripUrlUserinfo(errorText(error)).slice(0, 300)}`,
+          { op: "config", code: null, stderr: "" });
+      }
+      return inner.run([...drivers, ...args], p);
+    },
+  };
 }
 
 /** Fixed content of `slot-excludes` (DV5): ignore rules never affect tracked files. */
@@ -691,8 +726,7 @@ export function createGitOps(d: GitOpsDeps): GitOps {
     const pending = (async (): Promise<OpsContext> => {
       await prepareFiles();
       const { conversion, ...identity } = await readCommitIdentity(d.userGit, toplevel);
-      const drivers = await readRepositoryDrivers(d.userGit, toplevel);
-      return { args: executorGitArgs({ hooksDir, excludesFile, conversion, drivers }), identity };
+      return { args: executorGitArgs({ hooksDir, excludesFile, conversion }), identity };
     })();
     contextPromise = pending;
     pending.catch(() => { if (contextPromise === pending) contextPromise = undefined; });

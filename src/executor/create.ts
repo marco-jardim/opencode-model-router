@@ -12,10 +12,10 @@ import { CLASS_STATIC_TIER } from "../routing/classify/types";
 import { createDurationModel, DURATION_PRIOR_MS, type DurationModel } from "../routing/outcomes/durations";
 import { CLASS_ROLE_KIND } from "../routing/engine/roles-taxonomy";
 import { runArgv } from "../verify/exec";
-import { hardeningArgs, repositoryDriverArgs, spawnBounded, workRootGuards } from "../router/git-tools";
+import { hardeningArgs, spawnBounded, workRootGuards } from "../router/git-tools";
 import { createCapacityController } from "./capacity";
 import { createPlanCompiler, type CompilerDeps } from "./compile";
-import { createGitOps, createGitRunner } from "./git";
+import { createGitOps, createGitRunner, withRepositoryDrivers } from "./git";
 import { BackgroundRuns, createIntegrateGit, createIntegrationChecks, createWriteGuard } from "./integrate/checks";
 import { createLander } from "./integrate/land";
 import { createPhaseSuiteRunner } from "./integrate/phase-suite";
@@ -393,7 +393,10 @@ function assembleExecutor(context: { directory: string }, options: CreateExecuto
   let launcher: ReturnType<typeof createTaskLauncher> | null = null;
   try {
     const rawGit = createGitRunner({ mode: "hardened", toplevel });
-    const git: RuntimeDeps["git"] = { run: (args, opts) => rawGit.run([...hardeningArgs(), ...args], opts) };
+    // Every executor git call (GitOps, the runtime's commits/WIP/reset/clean, igit, the lander's probes, the compiler): the
+    // hardening, then the repository-only driver blanking read afresh for that call (required=true: git refuses rather than
+    // writing unfiltered content).
+    const git: RuntimeDeps["git"] = withRepositoryDrivers({ run: (args, opts) => rawGit.run([...hardeningArgs(), ...args], opts) }, toplevel);
     const userGit = createGitRunner({ mode: "user", toplevel });
     const store = createLedgerStore({ home, observations: options.observations });
     const opsOf = (planId: PlanId) => createGitOps({ git, userGit, fs, planId, toplevel, executorHome: home });
@@ -495,8 +498,7 @@ function assembleExecutor(context: { directory: string }, options: CreateExecuto
         },
       });
       const suite = createPhaseSuiteRunner({ checks, igit, git: ops, pool, resolver, background, clock, logger });
-      const lander = createLander({ git: ops, igit, guard, run: git, realpath, platform: process.platform,
-        drivers: (top) => repositoryDriverArgs(top) });
+      const lander = createLander({ git: ops, igit, guard, run: git, realpath, platform: process.platform });
       const queue = createIntegrationQueue({ planId, writer: input.writer,
         history: { steps: async () => (await store.exportPlan(planId)).events.filter((event): event is IntegrationStepEvent => event.type === "integration-step") },
         git: ops, igit, pool, leases: input.leases, checks, suite, lander, listener: input.listener,
