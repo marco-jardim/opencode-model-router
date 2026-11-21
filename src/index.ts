@@ -25,6 +25,7 @@ import {
 import type { RouterConfig, TierConfig, Preset, ModeConfig, EffortLevel } from "./router/config";
 import { buildAgentOptions, warnAgentOptionsEffortOnce } from "./router/agent-options";
 import { gitTools, nearestCheckout, type GitRootResolver } from "./router/git-tools";
+import { gitMetadataWriteRefusal } from "./router/git-metadata-guard";
 import { isReadOnlyTier, legacyReadOnlyTools, mergePermissions, readOnlyPermissions } from "./router/read-only";
 import { buildPluginAgentDefinition, mergeHostAgentEntry, pluginAgentMarker } from "./router/plugin-agents";
 import { filterSensitiveGrep } from "./router/sensitive-paths";
@@ -2813,6 +2814,30 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       if (rememberRoleSession(input?.sessionID, input?.agent)) {
         sessionStore.markChildSession(input.sessionID);
         applyPendingRoleCap(input.sessionID); // QA-P21-2-3
+      }
+      // Security: a delegated agent never writes git metadata (router/git-metadata-guard.ts); on v2 a role agent was already refused
+      // by its authority check. Always on: neither `/bypass` nor the enforcement mode turns it off. Only a session the router has
+      // not proven to be the root is checked (`isProvenRootCaller`: a tracked child, a grader, a session with a parentID, an unknown
+      // or unresolvable one): the orchestrator is the user's own agent, acting under the host's permissions. The paths are checked
+      // first, so a call that writes no git metadata never costs a session lookup.
+      if (typeof input?.tool === "string") {
+        let gitRefusal: string | undefined;
+        try {
+          gitRefusal = gitMetadataWriteRefusal(input.tool, output?.args, projectDir ?? process.cwd());
+        } catch {
+          // Unreachable (the guard never throws); a delegated session is still refused (fail closed).
+          gitRefusal = "[router] Refused: the router could not check this write for git metadata, which delegated agents may not write (fail closed).";
+        }
+        if (gitRefusal !== undefined && !(await isProvenRootCaller(input?.sessionID))) {
+          try {
+            if (typeof input.sessionID === "string") {
+              trajectoryStore.recordToolEvent(input.sessionID, { tool: input.tool, readOnly: false, blocked: true });
+            }
+          } catch (error) {
+            logger.warn("[router] git metadata guard: refusal not recorded", { error: describeError(error) });
+          }
+          throw new Error(gitRefusal);
+        }
       }
       if (bypassed) {
         noteBypassedRoleCall(input?.sessionID); // QA-P21-1-7

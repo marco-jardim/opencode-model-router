@@ -22,11 +22,17 @@ export const SHORT_NAME_SEGMENT = /(?:^|[\\/])[^\\/~]{1,8}~\d+(?:\.[^\\/.]{0,3})
  * trimmed), a NUL, a wildcard, and on win32 an 8.3 spelling, a UNC/device
  * path (`\\server\…`, `\\?\…`: no filesystem call may reach a remote host), a drive-relative path (`C:x`) or a rooted path without
  * a drive (`\x`); and when anything fails to resolve for another reason than "does not exist".
+ *
+ * `shortNames: "resolve"` (the delegated-agent git metadata guard, router/git-metadata-guard.ts) lets an 8.3 spelling through to
+ * `realpath`, which expands it to the long name on disk; one left in the missing tail names no existing entry (a lookup matches
+ * long and short names alike), so it is the literal name the host would create. Every other refusal stays.
  */
 export function canonicalAuthorityPath(
   path: string,
   base: string,
-  opts: { platform?: NodeJS.Platform; realpath?: (path: string) => string; lstat?: (path: string) => unknown } = {},
+  opts: {
+    platform?: NodeJS.Platform; realpath?: (path: string) => string; lstat?: (path: string) => unknown; shortNames?: "refuse" | "resolve";
+  } = {},
 ): string | undefined {
   const platform = opts.platform ?? process.platform;
   const realpath = opts.realpath ?? ((p: string) => realpathSync.native(p));
@@ -37,8 +43,9 @@ export function canonicalAuthorityPath(
   const api = platform === "win32" ? win32 : posix;
   const unc = (value: string): boolean => /^[\\/]{2}/.test(value);
   if (platform === "win32") {
-    if (SHORT_NAME_SEGMENT.test(text) || unc(text) || /^[A-Za-z]:(?![\\/])/.test(text) || /^[\\/](?![\\/])/.test(text)) return undefined;
-    if (!api.isAbsolute(text) && (SHORT_NAME_SEGMENT.test(base) || unc(base))) return undefined;
+    const shortName = (value: string): boolean => opts.shortNames !== "resolve" && SHORT_NAME_SEGMENT.test(value);
+    if (shortName(text) || unc(text) || /^[A-Za-z]:(?![\\/])/.test(text) || /^[\\/](?![\\/])/.test(text)) return undefined;
+    if (!api.isAbsolute(text) && (shortName(base) || unc(base))) return undefined;
   }
   if (!api.isAbsolute(text) && !api.isAbsolute(base)) return undefined;
   const sep = platform === "win32" ? "\\" : "/";

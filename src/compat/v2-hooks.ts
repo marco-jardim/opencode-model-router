@@ -38,7 +38,7 @@ import { recordRoleOrphan, takeRoleBindingLookupNotice } from "../routing/roles/
 import type { DispatchGrant } from "../routing/roles/policy";
 import { forgetWorkingSet, workingSetOf } from "../routing/wire/working-set";
 import {
-  createRepoProbe, displaySafe, gitMetadataSegment, readSetEligible, readSetPredicate, type InReadSet,
+  createRepoProbe, displaySafe, namesGitMetadata, readSetEligible, readSetPredicate, type InReadSet,
 } from "../routing/roles/read-set";
 import {
   AUTHORITY_TEXT, AUTHORITY_TOOL_NAME, consumeAuthority, discardAuthority, evictAuthority, markAnnotated, previewAuthority, quoteChildText,
@@ -642,7 +642,7 @@ export function toolCallPaths(tool: string, args: unknown): string[] | undefined
 export function editsGitMetadata(path: string, target: string, root: string): boolean {
   const base = root.replace(/[\\/]+$/, "");
   const below = target.length > base.length ? target.slice(base.length) : "";
-  return [path, below].some((text) => text.split(/[\\/]/).some(gitMetadataSegment));
+  return namesGitMetadata(path, below);
 }
 
 /**
