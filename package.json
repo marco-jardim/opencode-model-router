@@ -61,7 +61,7 @@
     "@opencode-ai/plugin": ">=1.0.0 <2.0.0"
   },
   "devDependencies": {
-    "@lydell/node-pty": "1.2.0-beta.15",
+    "@lydell/node-pty": "1.2.0-beta.18",
     "@opencode/plugin": "2.0.31",
     "@types/node": "^26.2.0",
     "@vitest/coverage-v8": "^5.1.1",
