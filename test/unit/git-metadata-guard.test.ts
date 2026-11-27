@@ -304,6 +304,19 @@ describe("writeTargetTexts: the write targets toolTargets reads, as written", ()
     expect(writeTargetTexts("apply_patch", { patchText: "", patch: "*** Add File: a.ts" })).toBeUndefined();
   });
 
+  it("#161: another key's text with a header it cannot read fails closed; one with no header stays ignored", () => {
+    for (const secondary of ["*** Add File: .git/hooks/x\n*** Update File:", "  *** Delete File:   \r\n", "*** Move to:"]) {
+      const args = { patchText: "*** Add File: a.ts", input: secondary };
+      expect(writeTargetTexts("apply_patch", args), JSON.stringify(secondary)).toBeUndefined();
+      expect(gitMetadataWriteRefusal("apply_patch", args, fx.repo), JSON.stringify(secondary)).toBe(GIT_METADATA_PATCH_UNREADABLE);
+      // The lease targets read the host's text only.
+      expect(toolTargets("apply_patch", args, resolve("/work")).paths).toEqual([resolve("/work", "a.ts")]);
+    }
+    const ignored = { patchText: "*** Add File: a.ts", patch_text: "*** Begin Patch\n--- a/x\n+++ b/x\n*** End Patch", input: "" };
+    expect(writeTargetTexts("apply_patch", ignored)).toEqual(["a.ts"]);
+    expect(gitMetadataWriteRefusal("apply_patch", ignored, fx.repo)).toBeUndefined();
+  });
+
   it("is undefined for an unreadable patch (toolTargets keeps its path arguments) and empty for other tools", () => {
     const args = { patchText: "--- a/x\n+++ b/x\n", filePath: "c.ts" };
     expect(writeTargetTexts("apply_patch", args)).toBeUndefined();

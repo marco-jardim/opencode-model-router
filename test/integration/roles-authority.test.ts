@@ -23,6 +23,7 @@ import ModelRouterPlugin from "../../src/index";
 import {
   canonicalAuthorityPath, insideWorkRoot, isPermissionRefusal, listedWorktreeRoot, patchPaths, registerV2Hooks, roleActionOf, roleAuthorityDecision,
   roleCatalogFailureNotice, roleToolKept, toolCallPaths, unsafeSearchPattern, HOST_TOOL_SUCCESS_EVENT, createHostBudgetObserver,
+  SESSION_DIR_NEGATIVE_TTL_MS,
 } from "../../src/compat/v2-hooks";
 import { budgetExhausted, captureBudget } from "../../src/guard/enforce";
 import { evaluatePermission } from "../../src/router/read-only";
@@ -2053,6 +2054,50 @@ describe("QA round 1 (P2.3)", () => {
     expect(stranger.effect).toBe("allow");
     await expect(v2.toolHooks["execute.before"]!({ sessionID: "x1", messageID: "m", id: "t-noagent", tool: "read", input: { path: join(dir, "a.ts") } }))
       .rejects.toThrow(/calling agent is unknown/);
+  });
+
+  it("#161: a role check waits SESSION_INFO_LOOKUP_MS for the session record; one that never answers refuses fail-closed, then retries", async () => {
+    const { dir, v2, sessions } = await started();
+    const route = "[route class=search risk=low scope=single]\nfind the parser";
+    await dispatch(v2, sessions, "s1", "hung1", "explorer", route, dir);
+    await dispatch(v2, sessions, "s2", "slow2", "explorer", route, dir);
+    // Bound through their catalogs, which read no session record: the record is first looked up by the tool calls below.
+    expect(await catalog(v2, "hung1", "explorer")).toContain("read");
+    expect(await catalog(v2, "slow2", "explorer")).toContain("read");
+    const answer = v2.ctx.session.get.getMockImplementation()!;
+    let hung = true;
+    v2.ctx.session.get.mockImplementation(async (request: { sessionID: string }) => {
+      if (request.sessionID === "hung1" && hung) return new Promise<never>(() => undefined);
+      // A healthy but slow host: above the per-call lookups' 2 s, under background.ts's 5 s (the lease wiring's own bound on the
+      // same host), well within SESSION_INFO_LOOKUP_MS.
+      if (request.sessionID === "slow2") await new Promise((resolveLater) => setTimeout(resolveLater, 4_000));
+      return answer(request);
+    });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      /** Advances fake time until `pending` settles; fails at once past `limit` fake milliseconds. */
+      const settles = async (pending: Promise<unknown>, limit = 60_000): Promise<void> => {
+        let done = false;
+        const settled = pending.finally(() => { done = true; });
+        settled.catch(() => undefined);
+        for (let waited = 0; !done && waited < limit; waited += 100) {
+          await vi.advanceTimersByTimeAsync(100);
+          await new Promise((resolveStep) => setImmediate(resolveStep));
+        }
+        expect(done, `settled within ${limit} ms of fake time`).toBe(true);
+        await settled;
+      };
+      const read = (child: string) => toolCall(v2, child, "explorer", "read", { path: join(dir, "a.ts") });
+      await settles(expect(read("slow2")).resolves.toBeUndefined());
+      await settles(expect(read("hung1")).rejects.toThrow(/Refused for role agent explorer in this dispatch: the router could not check this dispatch's authority \(fail closed\)/));
+      // The record that gave up is negatively cached, not kept for good: once the host answers again and the window has passed,
+      // the next call looks it up afresh and passes.
+      hung = false;
+      await vi.advanceTimersByTimeAsync(SESSION_DIR_NEGATIVE_TTL_MS + 100);
+      await settles(expect(read("hung1")).resolves.toBeUndefined());
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("A7: a role session's call to any tool outside the role classes is refused — subagent, shell, todowrite, MCP tools", async () => {

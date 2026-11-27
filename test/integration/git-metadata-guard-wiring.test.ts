@@ -8,7 +8,8 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import ModelRouterPlugin from "../../src/index";
 import { invalidateConfigCache, overridePath } from "../../src/router/config";
-import type { RouterPluginInput } from "../../src/compat/child-session";
+import { SESSION_DIRECTORY, type RouterPluginInput } from "../../src/compat/child-session";
+import { GIT_METADATA_DIRECTORY_UNKNOWN } from "../../src/router/git-metadata-guard";
 import {
   GIT_METADATA_PATHS, ORDINARY_PATHS, WRITE_TOOLS, gitMetadataFixture, writeCall, type GitMetadataFixture,
 } from "../helpers/git-metadata-fixture";
@@ -143,6 +144,38 @@ describe("v1 legacy hooks: delegated agents never write git metadata", () => {
     const hooks = await plugin(fx.repo);
     await before(hooks, "ORCH", "edit", { filePath: "src/a.ts" });
     await before(hooks, "UNSEEN", "write", { filePath: "src/b.ts", content: "x" });
+    expect(lookups).toEqual([]);
+  });
+
+  it("#161: a null SESSION_DIRECTORY (the v2 bridge knows no directory) refuses a delegated session's write-class calls, not the root's", async () => {
+    const hooks = await plugin(fx.repo);
+    await child(hooks, "SUB", "medium");
+    const beforeIn = (sessionID: string, tool: string, args: Record<string, unknown>, directory: unknown): Promise<void> =>
+      hooks["tool.execute.before"]({ sessionID, tool, callID: `c-${++call}`, [SESSION_DIRECTORY]: directory }, { args });
+    const ordinary = join(fx.repo, "src", "a.ts");
+    for (const tool of WRITE_TOOLS) {
+      await expect(beforeIn("SUB", tool, writeCall(tool, ordinary, ordinary), null), tool).rejects.toThrow(GIT_METADATA_DIRECTORY_UNKNOWN);
+      // A path the paths alone refuse keeps the metadata refusal.
+      await expect(beforeIn("SUB", tool, writeCall(tool, join(fx.repo, ".git", "config"), ordinary), null), tool).rejects.toThrow(REFUSED);
+      // The proven root (the orchestrator) is not refused.
+      await expect(beforeIn("ORCH", tool, writeCall(tool, ordinary, ordinary), null), tool).resolves.toBeUndefined();
+    }
+    // An unresolvable session is no proven root: refused.
+    await expect(beforeIn("LOST", "write", { filePath: ordinary, content: "x" }, null)).rejects.toThrow(GIT_METADATA_DIRECTORY_UNKNOWN);
+    // A read-class call is not guarded.
+    await expect(beforeIn("SUB", "read", { filePath: ordinary }, null)).resolves.toBeUndefined();
+    // A directory (as the v2 bridge passes it when known) behaves as before: relative paths resolve against it.
+    await expect(beforeIn("SUB", "write", { filePath: "../bare.git/config", content: "x" }, fx.bwt)).rejects.toThrow(REFUSED);
+    await expect(beforeIn("SUB", "write", { filePath: "a.ts", content: "x" }, fx.bwt)).resolves.toBeUndefined();
+  });
+
+  it("#161: without SESSION_DIRECTORY (OpenCode v1 never sets it) an ordinary write passes and costs no session lookup", async () => {
+    const hooks = await plugin(fx.repo);
+    await child(hooks, "SUB", "medium");
+    for (const tool of WRITE_TOOLS) {
+      await expect(before(hooks, "SUB", tool, writeCall(tool, join(fx.repo, "src", "a.ts"), join(fx.repo, "src", "a.ts"))), tool).resolves.toBeUndefined();
+    }
+    await expect(before(hooks, "UNSEEN", "write", { filePath: join(fx.repo, "src", "b.ts"), content: "x" })).resolves.toBeUndefined();
     expect(lookups).toEqual([]);
   });
 
