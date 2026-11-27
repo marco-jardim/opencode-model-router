@@ -4,7 +4,7 @@ import { Agent } from "@opencode/plugin";
 import type { Hooks } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import {
-  APPROVAL_RELOAD_APPLIES, executorRunnerStatus, processToken, registerV2Hooks, resumeTargetsOf, v2Instructions, V2_BACKGROUND_SETTLED,
+  APPROVAL_RELOAD_APPLIES, CALL_DIRECTORY_STORE_TTL_MS, executorRunnerStatus, processToken, registerV2Hooks, resumeTargetsOf, v2Instructions, V2_BACKGROUND_SETTLED,
   type V2Executor, type V2ExecutorFactory, type V2ExecutorHost,
 } from "../../src/compat/v2-hooks";
 import { approvalReloadLine, markApprovalsChanged, type ApprovalsChange } from "../../src/commands/approvals";
@@ -1323,6 +1323,128 @@ describe("OpenCode 2 hook adapter", () => {
   });
 });
 
+describe("#161: execute.after takes the session directory its execute.before used", () => {
+  afterEach(() => { vi.useRealTimers(); });
+
+  /**
+   * The adapter with a child session located in `host.where` (`null`: the host stops answering, `"fail"`: it rejects); the legacy
+   * after hook (which records the changed file) keeps the `args` it is handed.
+   */
+  async function started() {
+    const f = fixture();
+    const host: { where: string | null } = { where: resolve("/work") };
+    f.ctx.session.get.mockImplementation(async () => {
+      if (host.where === null) return new Promise<never>(() => undefined);
+      if (host.where === "fail") throw new Error("host unavailable");
+      const answer = { id: "child", parentID: "root", agent: "fast", location: { directory: host.where } };
+      return answer;
+    });
+    const seen: unknown[] = [];
+    const events: string[] = [];
+    await f.start({
+      "tool.execute.after": async (input: { args?: unknown }) => { seen.push(input.args); },
+      event: async (input: { event?: { type?: unknown } }) => { events.push(String(input.event?.type)); },
+    });
+    const write = (id: string, sessionID = "child") => ({ ...call, sessionID, id, tool: "write", input: { path: "src/a.ts", content: "x" } });
+    const before = (id: string, sessionID?: string) => f.toolHooks["execute.before"](write(id, sessionID));
+    const after = (id: string, sessionID?: string) =>
+      f.toolHooks["execute.after"]({ ...write(id, sessionID), status: "completed", result: { content: [{ type: "text", text: "ok" }] } });
+    return { f, host, seen, events, before, after, lookups: () => f.ctx.session.get.mock.calls.length };
+  }
+  const filePathOf = (args: unknown): unknown => (args !== null && typeof args === "object" ? Reflect.get(args, "filePath") : undefined);
+
+  it("resolves the call's relative path against the before-hook's answer, with no lookup of its own (a moved session, a failing host)", async () => {
+    const s = await started();
+    await s.before("w1");
+    s.host.where = resolve("/moved"); // the host's session move after the call ran
+    let lookups = s.lookups();
+    await s.after("w1");
+    expect(filePathOf(s.seen.at(-1))).toBe(resolve("/work", "src/a.ts"));
+    expect(s.lookups()).toBe(lookups);
+    s.host.where = resolve("/work");
+    await s.before("w2");
+    s.host.where = "fail";
+    lookups = s.lookups();
+    await s.after("w2");
+    expect(filePathOf(s.seen.at(-1))).toBe(resolve("/work", "src/a.ts"));
+    expect(s.lookups()).toBe(lookups);
+  });
+
+  it("a host that stops answering after the before-hook does not stall the after-hook", async () => {
+    const s = await started();
+    await s.before("w1");
+    s.host.where = null;
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    let done = false;
+    const pending = s.after("w1").finally(() => { done = true; });
+    for (let step = 0; !done && step < 50; step += 1) await new Promise((resolveStep) => setImmediate(resolveStep)); // no fake time passes
+    expect(done, "settled without waiting for a lookup").toBe(true);
+    await pending;
+    expect(filePathOf(s.seen.at(-1))).toBe(resolve("/work", "src/a.ts"));
+  });
+
+  it("the answer is taken once; a call without one looks the directory up itself, and an unknown one skips the legacy hook as before", async () => {
+    const s = await started();
+    await s.before("w1");
+    await s.after("w1");
+    s.host.where = resolve("/moved");
+    let lookups = s.lookups();
+    await s.after("w1"); // taken already: a lookup of its own
+    expect(s.lookups()).toBeGreaterThan(lookups);
+    expect(filePathOf(s.seen.at(-1))).toBe(resolve("/moved", "src/a.ts"));
+    s.host.where = "fail";
+    lookups = s.seen.length;
+    await expect(s.after("never-before", "stranger")).rejects.toThrow(/the session's location could not be read/);
+    expect(s.seen.length).toBe(lookups);
+  });
+
+  it("an answer is only taken by the session that stored it: the same call id from another session looks up itself, and drops it", async () => {
+    const s = await started();
+    await s.before("dup");
+    s.host.where = resolve("/moved");
+    let lookups = s.lookups();
+    await s.after("dup", "other");
+    expect(s.lookups()).toBeGreaterThan(lookups);
+    expect(filePathOf(s.seen.at(-1))).toBe(resolve("/moved", "src/a.ts"));
+    lookups = s.lookups();
+    await s.after("dup"); // dropped by the other session's take: a lookup of its own
+    expect(s.lookups()).toBeGreaterThan(lookups);
+    expect(filePathOf(s.seen.at(-1))).toBe(resolve("/moved", "src/a.ts"));
+  });
+
+  it("a call refused after its directory was taken (here by the file leases) leaves no entry behind", async () => {
+    const s = await started();
+    await s.before("w1"); // `child` now holds the lease on /work/src/a.ts
+    await expect(s.before("w2", "intruder")).rejects.toThrow(/is being edited by session child/);
+    s.host.where = resolve("/moved");
+    const lookups = s.lookups();
+    await s.after("w2", "intruder");
+    expect(s.lookups()).toBeGreaterThan(lookups); // no entry: a lookup of its own
+    expect(filePathOf(s.seen.at(-1))).toBe(resolve("/moved", "src/a.ts"));
+  });
+
+  it("an answer older than CALL_DIRECTORY_STORE_TTL_MS, or of a deleted session, is not used", async () => {
+    const s = await started();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    await s.before("old");
+    vi.setSystemTime(Date.now() + CALL_DIRECTORY_STORE_TTL_MS);
+    s.host.where = resolve("/moved");
+    await s.after("old");
+    expect(filePathOf(s.seen.at(-1))).toBe(resolve("/moved", "src/a.ts"));
+    vi.useRealTimers();
+    s.host.where = resolve("/work");
+    await s.before("gone");
+    s.f.emit({ type: "session.deleted", data: { sessionID: "child" } });
+    // The legacy event hook hears of the deletion after the adapter forgot the session.
+    await vi.waitFor(() => expect(s.events).toContain("session.deleted"));
+    s.host.where = resolve("/moved");
+    const lookups = s.lookups();
+    await s.after("gone");
+    expect(s.lookups()).toBeGreaterThan(lookups);
+    expect(filePathOf(s.seen.at(-1))).toBe(resolve("/moved", "src/a.ts"));
+  });
+});
+
 describe("plan executor wiring in the v2 adapter (3.1.7: W2, W4, W5, W6, M41)", () => {
   const NONCE = "a".repeat(32);
   const planPrompt = (planId: string, taskId: string, attempt = 1): string =>
@@ -1860,6 +1982,31 @@ describe("plan executor wiring in the v2 adapter (3.1.7: W2, W4, W5, W6, M41)", 
       fail = false;
       expect(await refusal(w, "m41-retry")).toMatch(/no matching plan binding/);
     });
+
+    it("#161: a fallback check whose first message never arrives gives up after SESSION_INFO_LOOKUP_MS, as a failed read; the next call checks again", async () => {
+      const w = await startWired();
+      let hung = true;
+      Object.assign(w.f.ctx.session, {
+        context: vi.fn(async () => (hung ? new Promise<never>(() => undefined) : userMessage(planPrompt("plan-one", "T1")))),
+      });
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+      try {
+        let done = false;
+        const pending = refusal(w, "m41-hung").finally(() => { done = true; });
+        await vi.advanceTimersByTimeAsync(9_900);
+        expect(done, "still waiting for the host before 10 s").toBe(false);
+        for (let waited = 0; !done && waited < 5_000; waited += 100) {
+          await vi.advanceTimersByTimeAsync(100);
+          await new Promise((resolveStep) => setImmediate(resolveStep));
+        }
+        expect(done, "settled once the 10 s bound passed").toBe(true);
+        expect(await pending).not.toMatch(/no matching plan binding/); // not read: not checked, as when the read fails
+      } finally {
+        vi.useRealTimers();
+      }
+      hung = false;
+      expect(await refusal(w, "m41-hung")).toMatch(/no matching plan binding/);
+    });
   });
 
   it("tiers mode: a plan child's binding carries the plan identity; its agent is no role agent, so it gets no role action (QA-3.1-2)", async () => {
@@ -1972,6 +2119,81 @@ describe("plan executor wiring in the v2 adapter (3.1.7: W2, W4, W5, W6, M41)", 
     // `shell` maps to router_run
     const shell = await outcome("qa312-shell", "router_run", { script: "test", cwd: slot });
     expect(shell, `router_run with shell: ${shell}`).not.toMatch(refusedForRole);
+  });
+
+  it("#161: roles mode: the stale-resume check's first-message read gives up after SESSION_INFO_LOOKUP_MS, as a target that could not be checked", async () => {
+    const dir = realpathSync.native(mkdtempSync(join(tmpdir(), "omr-161-stale-")));
+    vi.stubEnv("HOME", dir); vi.stubEnv("USERPROFILE", dir); vi.stubEnv("MODEL_ROUTER_ENFORCE", "");
+    mkdirSync(dirname(overridePath()), { recursive: true });
+    writeFileSync(overridePath(), JSON.stringify({ routing: { delegation: "roles", leases: { mode: "off" }, background: { mode: "off" } } }));
+    invalidateConfigCache();
+    const info = (id: string) => (id === "root"
+      ? { id, agent: "build", location: { directory: dir } }
+      : { id, parentID: "root", agent: "explorer", title: "earlier", location: { directory: dir } });
+    const pluginHooks: unknown = await ModelRouterPlugin({
+      directory: dir, worktree: dir, routerHost: "v2",
+      client: { session: { get: async ({ path }: { path: { id: string } }) => ({ data: info(path.id) }) }, app: { log: async () => ({}) } },
+    } as unknown as Parameters<typeof ModelRouterPlugin>[0]);
+    const toolHooks: Record<string, (event: unknown) => Promise<void>> = {};
+    const register = () => ({ dispose: async () => undefined });
+    let wake = (): void => undefined;
+    let staleReads = 0;
+    const ctx = {
+      location: { directory: dir, project: { directory: dir } },
+      agent: { reload: async () => undefined, list: async () => ({ data: [] }), transform: async (cb: (e: unknown) => void) => { cb({ update: () => undefined }); return register(); } },
+      command: { reload: async () => undefined, transform: async (cb: (e: unknown) => void) => { cb({ add: () => undefined }); return register(); } },
+      model: { list: async () => ({ data: [] }) },
+      tool: {
+        transform: async (cb: (e: unknown) => void) => { cb({ add: () => undefined, update: () => undefined }); return register(); },
+        hook: async (name: string, cb: (event: unknown) => Promise<void>) => { toolHooks[name] = cb; return register(); },
+      },
+      session: {
+        get: async ({ sessionID }: { sessionID: string }) => info(sessionID),
+        // The stale-resume check's read of the target's first message (the first read of `stale`) never answers.
+        context: async ({ sessionID }: { sessionID: string }) => (sessionID === "stale" && ++staleReads === 1 ? new Promise<never>(() => undefined) : [] as unknown[]),
+        update: async () => undefined, prompt: async () => undefined, synthetic: async () => undefined, interrupt: async () => undefined,
+        hook: async () => register(),
+      },
+      permission: { hook: async () => register() },
+      event: {
+        subscribe: async function* ({ signal }: { signal: AbortSignal }): AsyncGenerator<never> {
+          signal.addEventListener("abort", () => wake(), { once: true });
+          while (!signal.aborted) await new Promise<void>((resolve) => { wake = resolve; });
+        },
+      },
+    };
+    const v2 = { withToolContext: async <T>(_context: unknown, operation: () => Promise<T>) => operation(), applyChildSystem: () => undefined };
+    cleanups.push(await registerV2Hooks(ctx as unknown as Context, pluginHooks as Hooks, v2 as unknown as Parameters<typeof registerV2Hooks>[2], {
+      hostSettleMs: 0, listRegistrationWorktrees: async () => [],
+    }));
+    cleanups.push(async () => {
+      evictBinding("stale");
+      const dispose: unknown = typeof pluginHooks === "object" && pluginHooks !== null ? Reflect.get(pluginHooks, "dispose") : undefined;
+      if (typeof dispose === "function") await Reflect.apply(dispose, pluginHooks, []);
+      vi.unstubAllEnvs();
+      invalidateConfigCache();
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      let done = false;
+      const resume = { sessionID: "root", agent: "build", messageID: "m", id: "resume-1", tool: "subagent", input: { agent: "explorer", prompt: "continue", task_id: "stale" } };
+      const pending = toolHooks["execute.before"]!(resume).then(() => undefined, () => undefined).finally(() => { done = true; });
+      await vi.advanceTimersByTimeAsync(9_900);
+      expect(done, "the check still waits for the host before 10 s").toBe(false);
+      for (let waited = 0; !done && waited < 20_000; waited += 100) {
+        await vi.advanceTimersByTimeAsync(100);
+        await new Promise((resolveStep) => setImmediate(resolveStep));
+      }
+      expect(done, "the call settled once the 10 s bound passed").toBe(true);
+      await pending;
+      expect(staleReads).toBeGreaterThanOrEqual(1);
+      expect(warn.mock.calls.some((args) => args.some((part) => String(part).includes("a resume target could not be checked")))).toBe(true);
+    } finally {
+      vi.useRealTimers();
+      warn.mockRestore();
+    }
   });
 
   it("an executor-owned in-flight attempt is left out of the adapter's journal snapshot: a restart never recovers it as a dispatch (QA-3.1-10)", async () => {

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve, win32 } from "node:path";
 import { GIT_METADATA_PATCH_UNREADABLE, gitMetadataWriteRefusal, type SessionGitDirectories } from "../../src/router/git-metadata-guard";
 import { toolTargets, writeTargetTexts } from "../../src/router/tool-paths";
@@ -71,6 +71,115 @@ describe("gitMetadataWriteRefusal: a delegated agent never writes git metadata",
       for (const tool of WRITE_TOOLS) {
         expect(gitMetadataWriteRefusal(tool, writeCall(tool, path, join(fx.projMain, "a.ts")), fx.projMain), `${tool} ${path}`).toBeUndefined();
       }
+    }
+  });
+
+  it("#161: the session directory is a bare repository: its own files are refused; its linked worktree's files and files next to it pass", () => {
+    const refused = ["config", "hooks/x", "hooks/pre-commit", "HEAD", "objects/x", "refs/heads/main", "worktrees/main/HEAD", "main/.git",
+      "new/dir/x", join(fx.proj, "config"), join(fx.proj, "hooks", "x"), join(fx.proj, "HEAD")];
+    if (process.platform === "win32") refused.push(join(fx.proj.toUpperCase(), "CONFIG"), "Hooks/X"); // case-insensitive volume
+    for (const path of refused) {
+      for (const tool of WRITE_TOOLS) {
+        expect(gitMetadataWriteRefusal(tool, writeCall(tool, path, join(fx.projMain, "a.ts")), fx.proj), `${tool} ${path}`).toMatch(REFUSED);
+      }
+    }
+    for (const path of ["main/a.ts", "main/src/new/b.ts", join(fx.projMain, "a.ts"), "main/.gitattributes", "../notes.md", join(fx.root, "notes.md")]) {
+      for (const tool of WRITE_TOOLS) {
+        expect(gitMetadataWriteRefusal(tool, writeCall(tool, path, join(fx.projMain, "a.ts")), fx.proj), `${tool} ${path}`).toBeUndefined();
+      }
+    }
+  });
+
+  it("#161: a session directory below a bare repository, outside its worktrees, protects that repository too", () => {
+    for (const base of [join(fx.proj, "hooks"), fx.projAdmin]) {
+      for (const path of [join(fx.proj, "config"), join(fx.proj, "hooks", "post-checkout"), join(fx.projAdmin, "HEAD"), "x"]) {
+        expect(gitMetadataWriteRefusal("write", writeCall("write", path, ""), base), `${base} ${path}`).toMatch(REFUSED);
+      }
+      expect(gitMetadataWriteRefusal("write", writeCall("write", join(fx.projMain, "a.ts"), ""), base), base).toBeUndefined();
+    }
+  });
+
+  it("#161: a linked worktree of a bare repository (inside it or not) still behaves as before: the walk stops at its `.git`", () => {
+    mkdirSync(join(fx.projMain, "src"), { recursive: true });
+    for (const base of [fx.projMain, join(fx.projMain, "src")]) {
+      for (const path of [join(fx.proj, "config"), join(fx.proj, "hooks", "pre-commit"), join(fx.projAdmin, "HEAD")]) {
+        expect(gitMetadataWriteRefusal("write", writeCall("write", path, ""), base), `${base} ${path}`).toMatch(REFUSED);
+      }
+      for (const path of [join(fx.projMain, "a.ts"), join(fx.projMain, "src", "b.ts"), join(fx.root, "notes.md")]) {
+        expect(gitMetadataWriteRefusal("write", writeCall("write", path, ""), base), `${base} ${path}`).toBeUndefined();
+      }
+    }
+    expect(gitMetadataWriteRefusal("write", writeCall("write", join(fx.bare, "config"), ""), fx.bwt)).toMatch(REFUSED);
+    expect(gitMetadataWriteRefusal("write", writeCall("write", join(fx.bwt, "a.ts"), ""), fx.bwt)).toBeUndefined();
+  });
+
+  it("#161: only a worktree confirmed both ways, outside git's own directories, is exempt in a bare session directory", () => {
+    const worktree = (name: string, at: string, back: string, common = "../.."): void => {
+      mkdirSync(join(fx.proj, "worktrees", name), { recursive: true });
+      writeFileSync(join(fx.proj, "worktrees", name, "gitdir"), `${join(at, ".git")}\n`);
+      writeFileSync(join(fx.proj, "worktrees", name, "commondir"), `${common}\n`);
+      mkdirSync(at, { recursive: true });
+      writeFileSync(join(at, ".git"), `gitdir: ${back}\n`);
+    };
+    mkdirSync(join(fx.proj, "plain"), { recursive: true }); // a directory with no `.git` and no admin directory
+    worktree("swapped", join(fx.proj, "swapped"), fx.projAdmin); // its `.git` names another worktree's admin directory
+    worktree("hooked", join(fx.proj, "hooks", "wt"), join(fx.proj, "worktrees", "hooked")); // in git's own `hooks/`
+    worktree("lfsed", join(fx.proj, "lfs", "wt"), join(fx.proj, "worktrees", "lfsed")); // in git's own `lfs/`
+    // Both pointers agree, but the admin directory's `commondir` names another directory than the bare repository.
+    worktree("elsewhere", join(fx.proj, "elsewhere"), join(fx.proj, "worktrees", "elsewhere"), "..");
+    for (const path of ["plain/a.ts", "swapped/a.ts", "hooks/wt/a.ts", "lfs/wt/a.ts", "elsewhere/a.ts"]) {
+      expect(gitMetadataWriteRefusal("write", writeCall("write", path, ""), fx.proj), path).toMatch(REFUSED);
+    }
+    expect(gitMetadataWriteRefusal("write", writeCall("write", "main/a.ts", ""), fx.proj)).toBeUndefined();
+  });
+
+  it("#161: in a bare session directory, a link inside a worktree back into the repository and a stream spelling of its files are refused", (ctx) => {
+    // `config::$DATA` names `config` on NTFS; elsewhere it is a new file inside the repository: refused either way.
+    for (const path of ["config::$DATA", "hooks::$INDEX_ALLOCATION/x", join(fx.proj, "HEAD:stream")]) {
+      expect(gitMetadataWriteRefusal("write", writeCall("write", path, ""), fx.proj), path).toMatch(REFUSED);
+    }
+    if (!fx.link(join(fx.proj, "hooks"), join(fx.projMain, "lnk"))) ctx.skip();
+    for (const base of [fx.proj, fx.projMain]) {
+      expect(gitMetadataWriteRefusal("write", writeCall("write", join(fx.projMain, "lnk", "pre-commit"), ""), base), base).toMatch(REFUSED);
+    }
+    expect(gitMetadataWriteRefusal("write", writeCall("write", "main/a.ts", ""), fx.proj)).toBeUndefined();
+  });
+
+  it("#161: a bare repository whose objects or refs is a link to a local directory is protected; a dangling link is no directory", (ctx) => {
+    const bare = (name: string, linked: "objects" | "refs"): string | undefined => {
+      const dir = join(fx.root, name);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "HEAD"), "ref: refs/heads/main\n");
+      writeFileSync(join(dir, "config"), "[core]\n");
+      mkdirSync(join(dir, linked === "objects" ? "refs" : "objects"));
+      const store = join(fx.root, `${name}-${linked}`);
+      mkdirSync(store);
+      return fx.link(store, join(dir, linked)) ? dir : undefined;
+    };
+    const objects = bare("objects-linked.git", "objects");
+    if (objects === undefined) ctx.skip();
+    const refs = bare("refs-linked.git", "refs");
+    for (const dir of [objects, refs]) {
+      if (dir === undefined) continue;
+      for (const path of ["config", "hooks/x", "HEAD"]) {
+        expect(gitMetadataWriteRefusal("write", writeCall("write", path, ""), dir), `${dir} ${path}`).toMatch(REFUSED);
+      }
+    }
+    const dangling = bare("dangling.git", "objects");
+    if (dangling !== undefined) {
+      rmSync(join(fx.root, "dangling.git-objects"), { recursive: true, force: true });
+      expect(gitMetadataWriteRefusal("write", writeCall("write", "config", ""), dangling)).toBeUndefined();
+    }
+  });
+
+  it("#161: a directory with only part of git's bare shape (HEAD, objects, refs) is no repository", () => {
+    for (const [name, missing] of [["no-refs", "refs"], ["no-objects", "objects"], ["no-head", "HEAD"]] as const) {
+      const dir = join(fx.root, name);
+      mkdirSync(dir, { recursive: true });
+      if (missing !== "HEAD") writeFileSync(join(dir, "HEAD"), "ref: refs/heads/main\n");
+      if (missing !== "objects") mkdirSync(join(dir, "objects"));
+      if (missing !== "refs") mkdirSync(join(dir, "refs"));
+      expect(gitMetadataWriteRefusal("write", writeCall("write", "config", ""), dir), name).toBeUndefined();
     }
   });
 

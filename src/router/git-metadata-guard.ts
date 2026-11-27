@@ -12,14 +12,15 @@
  *   unresolvable entry) — fail closed;
  * - resolves (links and junctions followed, case and 8.3 short names as on disk) to a path with a `.git` segment, or into the git
  *   directory or common directory of the session directory's repository (also when it is not named `.git`: a bare repository's
- *   linked worktree, `--separate-git-dir`), the checkout's own files excepted when such a directory holds the checkout.
+ *   linked worktree, `--separate-git-dir`), the checkout's own files excepted when such a directory holds the checkout; or (#161)
+ *   into the bare repository the session directory itself is in, the files of its linked worktrees inside it excepted.
  * Each file is resolved in two readings, and refused when either hits: as written (links resolved before any `..` after them, as
  * the kernel does on POSIX) and as the host resolves it (`path.resolve`: `..` collapsed as text first). A patch whose targets
  * cannot be read is refused too (fail closed). Never throws.
  */
-import { lstatSync, realpathSync } from "node:fs";
-import { posix, win32 } from "node:path";
-import { gitPointers, nearestRepository } from "./git-tools";
+import { existsSync, lstatSync, readdirSync, readlinkSync, realpathSync, statSync } from "node:fs";
+import { dirname, join, posix, resolve, win32 } from "node:path";
+import { gitPointers, isNetworkOrDevicePath, nearestRepository, readBoundedRegularFile } from "./git-tools";
 import { WRITE_CLASS, writeTargetTexts } from "./tool-paths";
 import { canonicalAuthorityPath, insideWorkRoot } from "../routing/roles/work-root";
 import { displaySafe, namesGitMetadata } from "../routing/roles/read-set";
@@ -30,6 +31,12 @@ export interface SessionGitDirectories {
   readonly directories: readonly string[];
   /** The checkout (repository top) holding the session directory; undefined outside a repository. */
   readonly checkout: string | undefined;
+  /**
+   * #161: the linked worktrees inside a bare repository among `directories` (the session directory's own, when it is in one); each
+   * exempts its own files as `checkout` does. Called only once a target lands in a git directory the checkout does not exempt it
+   * from. Absent when there is no such repository.
+   */
+  readonly worktrees?: () => readonly string[];
 }
 
 /** Seams of {@link gitMetadataWriteRefusal} (tests). */
@@ -83,7 +90,7 @@ const NO_GIT_DIRECTORIES: SessionGitDirectories = Object.freeze({ directories: [
  * from its `.git` pointers without running git ({@link gitPointers}: bounded, never followed onto a network or device path). No
  * directories when there is no repository or a pointer is refused or unreadable: the `.git` segment checks still apply.
  */
-function sessionGitDirectories(directory: string): SessionGitDirectories {
+function checkoutGitDirectories(directory: string): SessionGitDirectories {
   try {
     const checkout = nearestRepository(directory);
     if (checkout === undefined) return NO_GIT_DIRECTORIES;
@@ -103,16 +110,145 @@ function sessionGitDirectories(directory: string): SessionGitDirectories {
   }
 }
 
+/** Bound of the `gitdir` file of a linked worktree's admin directory (as git-tools bounds `.git` and `commondir`). */
+const GITDIR_FILE_BYTES = 4 * 1024;
+/** #161: at most this many entries of a bare repository's `worktrees/` are read; the files of any other worktree stay refused. */
+const MAX_BARE_WORKTREES = 256;
+/** #161: git's own directories in a git directory: a worktree in one of them is never exempt. */
+const GIT_OWN_DIRECTORIES = [
+  "hooks", "info", "logs", "objects", "refs", "worktrees", "modules", "lfs", "rr-cache", "remotes", "branches", "reftable",
+] as const;
+
+/** Two canonical paths name the same directory (win32 case folding). */
+function sameDirectory(a: string, b: string): boolean {
+  return insideWorkRoot(a, b) && insideWorkRoot(b, a);
+}
+
+/** What `path` itself is, never following a link: a plain file or directory, a link (symlink or junction), or undefined. */
+function entryKind(path: string): "file" | "directory" | "link" | undefined {
+  try {
+    const stats = lstatSync(path);
+    return stats.isSymbolicLink() ? "link" : stats.isFile() ? "file" : stats.isDirectory() ? "directory" : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * #161: `path` is a directory, or a link to a local one (git accepts a bare repository whose `objects` or `refs` is a link): the
+ * link's text is never followed when it names a network or device path, nor is a target that resolves to one.
+ */
+function directoryOrLocalLink(path: string): boolean {
+  const kind = entryKind(path);
+  if (kind !== "link") return kind === "directory";
+  try {
+    if (isNetworkOrDevicePath(readlinkSync(path))) return false;
+    const target = realpathSync.native(path);
+    return !isNetworkOrDevicePath(target) && statSync(target).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * #161: `dir` has git's bare repository shape, as git's own discovery checks it: a `HEAD` regular file, and `objects` and `refs`
+ * directories, each also a link to a local directory ({@link directoryOrLocalLink}).
+ */
+function bareShaped(dir: string): boolean {
+  return entryKind(join(dir, "HEAD")) === "file" && directoryOrLocalLink(join(dir, "objects")) && directoryOrLocalLink(join(dir, "refs"));
+}
+
+/** `text` as the first `gitdir:` line of a `.git` file names it, or undefined. */
+function gitdirLine(text: string | undefined): string | undefined {
+  return /^gitdir:\s*(.+?)\s*$/m.exec(text ?? "")?.[1];
+}
+
+/**
+ * #161: the linked worktrees of the bare repository `bare` (canonical) that lie inside it, each confirmed both ways: the `gitdir`
+ * file of its admin directory `worktrees/<name>` names `<worktree>/.git`, that `.git` file names the same admin directory back,
+ * and the admin directory's `commondir` names `bare`. `worktrees`, each `worktrees/<name>` and every file read must be a plain
+ * directory or regular file (no link is followed, so none reaches a network path); each file is read bounded (4 KiB) and a pointer
+ * naming a network or device path is never followed. A worktree that is `bare` itself, holds its admin directory or lies in one of
+ * git's own directories is never one. Canonical; an entry that cannot be read is skipped (its files stay refused). Never throws.
+ */
+function worktreesInside(bare: string): string[] {
+  const read = (path: string): string | undefined =>
+    (entryKind(path) === "file" ? readBoundedRegularFile(path, GITDIR_FILE_BYTES, "worktree pointer")?.trim() : undefined);
+  let names: string[];
+  try {
+    if (entryKind(join(bare, "worktrees")) !== "directory") return [];
+    names = readdirSync(join(bare, "worktrees"));
+  } catch {
+    return [];
+  }
+  const found: string[] = [];
+  for (const name of names.slice(0, MAX_BARE_WORKTREES)) {
+    try {
+      const admin = join(bare, "worktrees", name);
+      if (entryKind(admin) !== "directory") continue;
+      const named = read(join(admin, "gitdir"));
+      if (named === undefined || named === "" || isNetworkOrDevicePath(named)) continue;
+      const candidate = dirname(resolve(admin, named));
+      if (!insideWorkRoot(candidate, bare)) continue; // nothing outside the repository is touched
+      const worktree = realpathSync.native(candidate);
+      if (!insideWorkRoot(worktree, bare) || insideWorkRoot(bare, worktree) || insideWorkRoot(admin, worktree)) continue;
+      if (GIT_OWN_DIRECTORIES.some((own) => insideWorkRoot(worktree, join(bare, own)))) continue;
+      const back = gitdirLine(read(join(worktree, ".git")));
+      if (back === undefined || isNetworkOrDevicePath(back) || !sameDirectory(resolve(worktree, back), admin)) continue;
+      const common = read(join(admin, "commondir"));
+      if (common === undefined || common === "" || isNetworkOrDevicePath(common) || !sameDirectory(resolve(admin, common), bare)) continue;
+      found.push(worktree);
+    } catch {
+      // unreadable: not exempt
+    }
+  }
+  return found;
+}
+
+/**
+ * #161: the bare repository the session directory is in — `directory` itself or its nearest ancestor with git's bare shape
+ * ({@link bareShaped}) when no checkout (a directory holding `.git`) comes first, as git's own discovery finds the repository —
+ * canonical. Undefined otherwise, and when it cannot be read (the checkout's directories and the `.git` segment checks still
+ * apply). Spawns nothing; never throws.
+ */
+function bareRepositoryOf(directory: string): string | undefined {
+  try {
+    for (let current = directory; ; current = dirname(current)) {
+      if (existsSync(join(current, ".git"))) return undefined; // a checkout: its git directories come from its pointers
+      if (bareShaped(current)) return realpathSync.native(current);
+      if (dirname(current) === current) return undefined;
+    }
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The git directories of the session directory's repository ({@link checkoutGitDirectories}) and (#161) the bare repository the
+ * session directory itself is in ({@link bareRepositoryOf}: OpenCode opened at `proj.git`, which holds its worktrees), which no
+ * `.git` pointer names; its linked worktrees ({@link worktreesInside}) are read only once a target lands in it. Never throws.
+ */
+function sessionGitDirectories(directory: string): SessionGitDirectories {
+  const found = checkoutGitDirectories(directory);
+  const bare = bareRepositoryOf(directory);
+  if (bare === undefined) return found;
+  const directories = found.directories.some((dir) => sameDirectory(dir, bare)) ? found.directories : [...found.directories, bare];
+  let worktrees: readonly string[] | undefined;
+  return { directories, checkout: found.checkout, worktrees: () => (worktrees ??= worktreesInside(bare)) };
+}
+
 /**
  * `target` (canonical) lies in one of the session repository's git directories. A git directory that holds the checkout itself
  * (a bare repository with its worktree inside it, or a malformed pointer naming the checkout) exempts only the checkout's own
- * files; a git directory inside the checkout exempts nothing.
+ * files; a git directory inside the checkout exempts nothing. #161: so does a linked worktree a bare repository holds (read only
+ * when the checkout does not exempt the target).
  */
 function insideGitDirectory(target: string, git: SessionGitDirectories): boolean {
   const top = git.checkout;
   return git.directories.some((dir) => {
     if (!insideWorkRoot(target, dir)) return false;
-    return !(top !== undefined && insideWorkRoot(top, dir) && insideWorkRoot(target, top));
+    if (top !== undefined && insideWorkRoot(top, dir) && insideWorkRoot(target, top)) return false;
+    return !(git.worktrees?.() ?? []).some((worktree) => insideWorkRoot(worktree, dir) && insideWorkRoot(target, worktree));
   });
 }
 

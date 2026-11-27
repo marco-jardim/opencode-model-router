@@ -148,6 +148,20 @@ describe("v2: delegated agents never write git metadata", () => {
     await expect(call("child", "heavy", "apply_patch", v2Call("apply_patch", "a.ts"))).resolves.toBeUndefined();
   });
 
+  it("#161: a session located in a bare repository: its own files are refused, its linked worktree's files pass", async () => {
+    const call = await host(fx.repo, {}, fx.proj);
+    for (const tool of V2_WRITE_TOOLS) {
+      for (const path of [join(fx.proj, "config"), join(fx.proj, "hooks", "x"), join(fx.proj, "HEAD")]) {
+        await expect(call("child", "heavy", tool, v2Call(tool, path)), `${tool} ${path}`).rejects.toThrow(REFUSED);
+      }
+      await expect(call("child", "heavy", tool, v2Call(tool, join(fx.projMain, "a.ts"))), tool).resolves.toBeUndefined();
+    }
+    // Relative paths resolve against the session's location, `proj.git`.
+    await expect(call("child", "heavy", "apply_patch", v2Call("apply_patch", "hooks/post-checkout"))).rejects.toThrow(REFUSED);
+    await expect(call("child", "heavy", "write", { path: "config", content: "x" })).rejects.toThrow(REFUSED);
+    await expect(call("child", "heavy", "write", { path: "main/a.ts", content: "x" })).resolves.toBeUndefined();
+  });
+
   it("the orchestrator is unaffected", async () => {
     const call = await host(fx.repo);
     for (const tool of V2_WRITE_TOOLS) {
