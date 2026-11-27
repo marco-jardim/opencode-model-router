@@ -54,7 +54,7 @@ Severities and statuses as recorded below in this file; "not stated" where the f
 | N-2 (input, pdf2-1 Round 5) | major impact, low likelihood | running dependent absent from `launcher.inFlight` vs its slot's release | fixed under G-1 (see note) | Smoke gate and carried inputs; Fixes, G-1 |
 | G-1 | major | executor: adopted child stopped before its slot goes back | fixed | Fixes |
 | G-2 | major, P-1 | executor help gating in `/router` | fixed | Fixes |
-| G-3 | major, docs | dogfood disclosure | fixed (disclosure completed; G13 remains UNMET, owner decision pending) | Fixes |
+| G-3 | major, docs | dogfood disclosure | fixed (disclosure completed; G13 not met, WAIVED by owner decision 2026-11-20) | Fixes |
 | G-4 | minor, security | guarded check executables, full-environment replacement | fixed (`verify/wiring.ts` bare git recorded for follow-up) | Fixes |
 | G-5 | minor, registration | `router_plan` / `/plan` registration | fixed (owner decision 2026-10-16, option (a)) | Fixes; Orchestrator validation of G-5 and G-9 |
 | G-6 | minor, P-2 | serial process-lifecycle project | fixed | Fixes |
@@ -146,8 +146,9 @@ Notes:
   under-DF-2 self-check alongside the existing attempt/fallback history; DF-2-1..7 have individual dispositions,
   including pdf2-1's merge into `cpx/main` `992816b` and its remaining N-2 handoff. Rollback paths are distinguished
   from executed rollbacks; the forced-foreground share is **not measured**, not invented. Dedicated §0.13 incidents
-  disclose DF-1-1's orchestrator read and DF-1.1-3's base-build service interference. **G13 remains UNMET, owner
-  decision pending**; later fixes/scripted fixtures are not a dogfood pass. The opening executor/landing claim in
+  disclose DF-1-1's orchestrator read and DF-1.1-3's base-build service interference. **G13 was not met**; later
+  fixes/scripted fixtures are not a dogfood pass. **G13: WAIVED (owner decision, 2026-11-20)**: it is not re-run, and
+  the A-6.1-3 real-use soak, still pending (#140), is the accepted evidence. The opening executor/landing claim in
   `phase-6.1.md` is marked superseded without deleting history. Sources: committed handover §7, `pdf2-1.md` and
   `phase-6.1.md`; no new measurements or check results claimed. EXECUTOR.md's measured-results section now agrees
   on all windows, DF-2-1..7 dispositions, rollback paths, fallback and the §0.13 incidents. The orchestrator runs
@@ -296,7 +297,7 @@ Notes:
 
 - **G-11 (minor, test, pre-existing): v2-provider-e2e Windows path assertion against a JSON-serialised body**
   — fixed. All four cases fail identically at `7181165` and `8c8c6e0`; this is not host drift. Supplied evidence:
-  `D:\git\omr-cpx-p61\.cpx-logs\gate62-longtemp\v2-e2e.log` shows the exact working-directory expectation uses
+  `D:\git\.omr-cpx-evidence\p61-cpx-logs\gate62-longtemp\v2-e2e.log` shows the exact working-directory expectation uses
   single Windows backslashes while the received JSON-serialised system messages escape them. The capture now
   reads system content from the already `JSON.parse`-decoded request; both working-directory assertions retain
   the same substring and exact project path. The created project directory is canonicalised with `realpath`
@@ -376,7 +377,7 @@ finding, so no round 3 (§0.7).
 ### Final smoke gate (A-6.2-1), 2026-10-16
 
 Head `fcf6b1b`, host OpenCode 2.0.26 (`OPENCODE_V2_BIN`), v1 lanes with 1.18.35 first on `PATH`, no
-`OPENCODE_CONFIG_DIR`/XDG overrides. Logs: `D:\git\omr-cpx-p61\.cpx-logs\gate62-final\`.
+`OPENCODE_CONFIG_DIR`/XDG overrides. Logs: `D:\git\.omr-cpx-evidence\p61-cpx-logs\gate62-final\`.
 
 - `smoke:cpx`: 74/74.
 - `smoke:cpx:provision`: 4/4.
@@ -400,7 +401,7 @@ fsck clean).
 
 Merge `87629fc` (`cpx/p62` into `cpx/main`): `git diff fcf6b1b 87629fc -- src test package.json package-lock.json` is
 empty, so the smoke gate above stands for the merged code. Run in `D:\git\omr-cpx-p62` fast-forwarded to `87629fc`
-(no `.opencode\`, no `OPENCODE_CONFIG_DIR`); logs `D:\git\omr-cpx-p61\.cpx-logs\p62-final-*.log`.
+(no `.opencode\`, no `OPENCODE_CONFIG_DIR`); logs `D:\git\.omr-cpx-evidence\p61-cpx-logs\p62-final-*.log`.
 - `npm run typecheck`: exit 0.
 - `npx vitest run --coverage --coverage.reportOnFailure --maxWorkers=8`: 314 files, **20265 passed, 1 failed, 87
   skipped**; coverage **statements 95.63%, branches 92.21%, functions 96.66%, lines 97.28%**, no threshold error.
@@ -466,6 +467,25 @@ unmerged) and locally on Windows and on Linux (WSL Ubuntu, clean clone with the 
   and 2820-5181 ms on this branch with the same command, and passed on PR #117's Linux e2e; no product overhead found
   by QA (the measured hook is v1, unchanged); recorded with G-10's load-sensitive family.
 
+### 6.2.4 delivered and 6.2.3 cleanup (2026-10-16/17)
+
+- **Delivered.** PR #116 merged as `1e499a4`; follow-ups PR #118 (`7a498e4`, G-23/G-24) and PR #119 (`841fa6e`,
+  G-25). Master run 38984293973 at `841fa6e`: every job green, the Windows job (full suite with coverage, about
+  20 min) and the merged coverage gate included.
+- **Cleanup (6.2.3).** Removed with `git worktree remove` (no prune): every phase and dogfood-fix worktree
+  (`p01`…`p62`, `pdf1-1`…`pdf2-1`, `sync1`) and the bisection scratch `D:\git\omr-cpx-scratch-master`, each first
+  checked clean and contained in `origin/master`. Local and remote branches `cpx/p*`, `cpx/pdf*`, `cpx/sync1`,
+  `cpx/scratch-df11` deleted; 18 `cpx/*-base` tags deleted locally and the 13 that had been pushed deleted remotely.
+  Kept: `cpx/main`, `D:\git\omr-cpx-main`, the `cpx/df*` tags and dogfood worktrees (6.2.5).
+- **Evidence moved, not deleted:** `D:\git\omr-cpx-p61\.cpx-logs` (412 files, 1.8 GB: gate and run logs cited here)
+  is now `D:\git\.omr-cpx-evidence\p61-cpx-logs`; the paths in this report point there. Earlier reports
+  (`dogfood.md`, `phase-6.1-handover.md`) keep their historical paths.
+- **Not done here (no `router_plan` in this session):** the two locked executor slots of the aborted DF-2 plan,
+  `D:\git\.omr-cpx-slots\critical-path-execution-plan-6-1-db-6-1\slot-{1,2}`. 6.2.3-1 removes them through
+  `router_plan action=purge` (or `/plan purge`) in a host that loads the router; never by deleting the slot
+  directories. An empty `D:\git\omr-cpx-p62` directory stays until the process holding it (an OpenCode watcher)
+  exits.
+
 ## Deferred findings
 
 - **G-10 (minor, test):** load-sensitive tests (`v2-background` "QA-DF1-17", `routing-ladder-resume` "QA-2.3-2",
@@ -492,7 +512,8 @@ unmerged) and locally on Windows and on Linux (WSL Ubuntu, clean clone with the 
 - `smoke:cpx:e2e` py-pip cases need `CPX_E2E_PYTHON` pointing at an interpreter with pytest when `py -3` has none
   visible to the executor's venv.
 - G-4 follow-up: ordinary verification's `verify/wiring.ts` test search and committed-diff call still use bare git.
-- G-3: G13 remains UNMET, owner decision pending.
+- G-3: G13 was not met; **WAIVED (owner decision, 2026-11-20)**. The A-6.1-3 real-use soak, still pending (#140), is
+  the accepted evidence.
 - G-16: POSIX support for the plan executor (slots root, provision, environments) in a separate change.
 - G-21: the Windows CI job runs only on master pushes; a Windows regression first shows there. Watch its first run
   after the #116 merge.
