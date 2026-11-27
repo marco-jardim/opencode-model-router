@@ -122,7 +122,9 @@ d("OpenCode 2 native plugin registration", () => {
     const { plugin, get } = await start(false);
     expect(plugin.id).toBe("opencode-model-router");
     expect(plugin.state.status).toBe("active");
-    expect(plugin.source.path.replaceAll("\\", "/")).toBe(`${ROOT.replaceAll("\\", "/")}/server.ts`);
+    // OpenCode 2.0.x reports the resolved entrypoint (<package dir>/server.ts); 2.4.2 reports the package directory.
+    const packageDir = ROOT.replaceAll("\\", "/");
+    expect([packageDir, `${packageDir}/server.ts`]).toContain(plugin.source.path.replaceAll("\\", "/"));
     const agents = (await get("/api/agent")).data;
     for (const tier of ["fast", "medium", "heavy"]) {
       expect(agents.find((agent: any) => agent.id === tier)).toMatchObject({
