@@ -486,6 +486,50 @@ describe("createLander", () => {
     await expect(lander.inspect(req)).rejects.toThrow(/ls-files failed/);
   });
 
+  it("without an injected `exists`, a gitlink is populated exactly when `<toplevel>/<path>/.git` is on disk (lstat)", async () => {
+    const top = await mkdtemp(nodePath.join(tmpdir(), "omr-land-submodule-"));
+    try {
+      const gitlinks = [
+        `160000 ${"2".repeat(40)} 0\tvendor/lib`, `160000 ${"3".repeat(40)} 0\tvendor/empty`, `160000 ${"4".repeat(40)} 0\tvendor/absent`, "",
+      ].join("\0");
+      const probes: Record<string, RunResult> = {
+        "rev-parse --show-toplevel": runResult(0, `${top}\n`), "symbolic-ref -q HEAD": runResult(0, "refs/heads/main\n"),
+        "ls-files --stage -z": runResult(0, gitlinks), status: runResult(0, ""),
+      };
+      const seen: string[][] = [];
+      const run = stub<GitRunner>({
+        run: async args => {
+          seen.push([...args]);
+          const sub = args.slice(PROBE_PREFIX_LENGTH);
+          return probes[sub[0] === "status" ? "status" : sub.join(" ")] ?? runResult(1);
+        },
+      });
+      const igit = stub<IntegrateGit>({
+        readRef: async () => "base", isAncestor: async (_cwd, ancestor) => ancestor !== req.candidate,
+        diffNameStatus: async () => [], ignoredAt: async () => [],
+      });
+      const guard: WriteGuard = { assertWriteCwd: async () => undefined };
+      const lander = createLander({ git: stub<GitOps>({}), igit, guard, run, realpath: async p => p, platform: process.platform });
+      const local: LandRequest = { ...req, toplevel: top };
+      // Checked-out but empty gitlink directories and a missing one: lstat fails for every `.git`, so status runs.
+      await mkdir(nodePath.join(top, "vendor", "lib"), { recursive: true });
+      await mkdir(nodePath.join(top, "vendor", "empty"), { recursive: true });
+      expect(await lander.inspect(local)).toEqual({ ok: true, baseTip: "base", noop: false });
+      expect(seen.some(args => args.includes("status"))).toBe(true);
+      // A submodule gitfile appears in vendor/lib: lstat succeeds, and the landing fails closed before `status`.
+      await writeFile(nodePath.join(top, "vendor", "lib", ".git"), "gitdir: ../../.git/modules/vendor/lib\n");
+      seen.length = 0;
+      await expect(lander.inspect(local)).rejects.toThrow(/populated submodules \(vendor\/lib\)/);
+      expect(seen.some(args => args.includes("status"))).toBe(false);
+      expect(await lander.fastForward(local)).toMatchObject({ kind: "error", message: expect.stringMatching(/land manually/) });
+      // A `.git` directory (a submodule whose git dir was never absorbed) counts as populated too.
+      await mkdir(nodePath.join(top, "vendor", "empty", ".git"));
+      await expect(lander.inspect(local)).rejects.toThrow(/populated submodules \(vendor\/lib, vendor\/empty\)/);
+    } finally {
+      await rm(top, { recursive: true, force: true });
+    }
+  });
+
   it("compares the realpaths of the reported and the recorded toplevel", async () => {
     const { lander } = world({
       realpath: async p => (p === "/link" ? "/repo" : p),
