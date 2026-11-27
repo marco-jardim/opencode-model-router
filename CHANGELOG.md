@@ -20,6 +20,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `enforcement.verify.graderTemperature: null`). OpenCode v1 is unchanged. See "Removing an inherited key with
   `null`" in docs/CONFIG_REFERENCE.md.
 
+### Fixed
+
+- **OpenCode v2: the plan executor applies filters set only in system or global configuration (#162).** Its hardened
+  git reads no system or global configuration, so a filter (or merge driver) set only there, such as a globally
+  installed Git LFS or git-crypt, was not applied: executor commits stored the raw content and checkouts wrote LFS
+  pointer files. Every filter `clean`, `smudge`, `process` and `required` and merge `driver` whose value comes from
+  system, global or command-line configuration is now passed to the executor's git with `-c`, so it runs the filter
+  programs plain git runs, and a global Git LFS works without `git lfs install --local`. Those programs still run
+  without the rest of the user's system and global configuration (`credential.helper`, `lfs.*`, a custom
+  `core.attributesFile`, the system gitattributes), so a checkout whose LFS objects are not local and need
+  authentication fails with `E_GIT` instead of writing pointer files. A forwarded filter program (git-lfs) still reads
+  some repository configuration of its own (`lfs.extension.*`, `lfs.customtransfer.*`), tracked in #184.
+  A driver only the repository's own configuration sets (or sets differently) is still blanked, and nothing is taken
+  from it. A user value `-c` cannot carry as git reads it (a line break, or a byte that is not UTF-8) is not passed
+  on: that filter is blanked and marked required, so git refuses only where it is used. The verification snapshot and
+  reference pass nothing on and send the same git commands as before; one change reaches them: an include target
+  whose existence check hangs now fails the snapshot closed after its own 10 s timeout (OpenCode v1 and v2).
+
 ## [2.10.0] - 2026-11-27
 
 ### Changed

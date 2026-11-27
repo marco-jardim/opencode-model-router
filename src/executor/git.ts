@@ -172,8 +172,12 @@ export function gitCallLocation(args: readonly string[], cwd: string): { cwd: st
  * never missed, and it costs far less than the call it protects. The listing runs where the call runs (its `-C`, `--git-dir`,
  * `--work-tree`) in the call's own environment with the user's system/global configuration visible, so a global LFS filter
  * and its `git lfs install --local` copy are kept. `filter.<name>.required=true`: a blanked filter makes git refuse
- * (commit, cherry-pick, checkout, reset, clean) instead of writing unfiltered content. A configuration that cannot be read
- * is `E_GIT`, and the call does not run.
+ * (commit, cherry-pick, checkout, reset, clean) instead of writing unfiltered content. The hardened environment hides the
+ * system and global configuration, so every filter clean/smudge/process/required and merge driver whose effective value is
+ * the user's (system, global, command line) is passed on with `-c` (`forwardUser`, #162): a filter set only globally (Git
+ * LFS, git-crypt) applies as with plain git. A user value `-c` cannot carry as git read it (a line break, a byte that is not
+ * UTF-8) is not passed on: that filter is blanked and required, so only calls that use it fail. A configuration that cannot
+ * be read, or a user driver name with a `=`, is `E_GIT`, and the call does not run.
  */
 export function withRepositoryDrivers(inner: GitRunner, toplevel: string): GitRunner {
   let executable: string | undefined;
@@ -184,7 +188,7 @@ export function withRepositoryDrivers(inner: GitRunner, toplevel: string): GitRu
       try {
         executable ??= gitExecutable(workRootGuards(toplevel));
         drivers = await repositoryDriverArgs(cwd, {
-          executable, env: hardenedEnvironment(p.env), required: true, location,
+          executable, env: hardenedEnvironment(p.env), required: true, forwardUser: true, location,
           timeoutMs: Math.min(p.timeoutMs, DRIVER_LISTING_TIMEOUT_MS), ...(p.signal === undefined ? {} : { signal: p.signal }),
         });
       } catch (error) {
