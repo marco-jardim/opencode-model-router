@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { Plugin } from "@opencode/plugin";
 import type { ToolContext } from "@opencode/plugin/promise/tool";
 import type { SessionContext } from "@opencode/plugin/promise/session";
-import { createV2Runtime, STRAY_CLEANUP_TIMEOUT_MS, V2_GRADER_AGENT } from "../../src/compat/v2-client";
+import { createV2Runtime, MAX_RUNNER_CHILDREN, RUNNER_CHILD_TTL_MS, STRAY_CLEANUP_TIMEOUT_MS, V2_GRADER_AGENT } from "../../src/compat/v2-client";
 import { createVerificationWiring } from "../../src/verify/wiring";
 import type { RouterConfig } from "../../src/router/config";
 import * as routerConfig from "../../src/router/config";
@@ -1268,5 +1268,70 @@ describe("native v2 child runner: resuming a child (Phase 2.3, D11)", () => {
     const after: SessionContext["system"] = [];
     runtime.applyChildSystem("child", after);
     expect(after).toEqual([]);
+  });
+});
+
+describe("#174: the runner's own children stay known after their run (the host reports them to the parent later)", () => {
+  function timedRuntime() {
+    const f = fixture();
+    const clock = { now: 1_000 };
+    const runtime = createV2Runtime(f.context as unknown as Plugin.Context, { now: () => clock.now });
+    return { ...f, runtime, clock };
+  }
+
+  it("known from the moment the runner learns the id, after the run, its removal and its deletion; forgotten RUNNER_CHILD_TTL_MS after the run", async () => {
+    const { runtime, toolContext, clock } = timedRuntime();
+    let duringRun: boolean | undefined;
+    expect(runtime.isRunnerChild("child")).toBe(false);
+    await runtime.withToolContext(toolContext, () => runtime.childRunner.run({
+      prompt: "grade", onCreated: async (sessionID) => { duringRun = runtime.isRunnerChild(sessionID); },
+    }));
+    expect(duringRun).toBe(true);
+    clock.now += 10_000;
+    await runtime.childRunner.dispose("child");
+    runtime.forgetSession("child");
+    expect(runtime.isRunnerChild("child")).toBe(true);
+    expect(runtime.isRunnerChild("parent")).toBe(false);
+    clock.now += RUNNER_CHILD_TTL_MS - 10_000;
+    expect(runtime.isRunnerChild("child")).toBe(true);
+    clock.now += 1;
+    expect(runtime.isRunnerChild("child")).toBe(false);
+  });
+
+  it("a failed run's child and a resumed child are known too", async () => {
+    const { runtime, toolContext, execute } = timedRuntime();
+    execute.mockImplementationOnce(async (_input, context) => {
+      await context.progress({ sessionID: "failed-child", status: "running" });
+      return { output: { sessionID: "failed-child", status: "error" } };
+    });
+    await expect(runtime.withToolContext(toolContext, () => runtime.childRunner.run({ prompt: "grade", onCreated: async () => {} }))).rejects.toThrow();
+    expect(runtime.isRunnerChild("failed-child")).toBe(true);
+    await runtime.withToolContext(toolContext, () => runtime.childRunner.run({ prompt: "go", resumeSessionID: "child", onCreated: async () => {} }));
+    expect(runtime.isRunnerChild("child")).toBe(true);
+  });
+
+  it("a child the result names is known even when no progress event announced it (a fresh run)", async () => {
+    const { runtime, toolContext, execute } = timedRuntime();
+    execute.mockImplementationOnce(async () => ({ output: { sessionID: "silent-child", status: "completed", output: "ok" } }));
+    await expect(runtime.withToolContext(toolContext, () => runtime.childRunner.run({ prompt: "grade", onCreated: async () => {} }))).rejects.toThrow();
+    expect(runtime.isRunnerChild("silent-child")).toBe(true);
+  });
+
+  it(`keeps at most MAX_RUNNER_CHILDREN (${MAX_RUNNER_CHILDREN}), oldest first out; disposing the runtime forgets them all`, async () => {
+    const { runtime, toolContext, execute } = timedRuntime();
+    let n = 0;
+    execute.mockImplementation(async (_input, context) => {
+      const sessionID = `child-${n++}`;
+      await context.progress({ sessionID, status: "running" });
+      return { output: { sessionID, status: "completed", output: "ok" } };
+    });
+    for (let i = 0; i <= MAX_RUNNER_CHILDREN; i += 1) {
+      await runtime.withToolContext(toolContext, () => runtime.childRunner.run({ prompt: "go", onCreated: async () => {} }));
+    }
+    expect(runtime.isRunnerChild("child-0")).toBe(false);
+    expect(runtime.isRunnerChild("child-1")).toBe(true);
+    expect(runtime.isRunnerChild(`child-${MAX_RUNNER_CHILDREN}`)).toBe(true);
+    await runtime.dispose();
+    expect(runtime.isRunnerChild(`child-${MAX_RUNNER_CHILDREN}`)).toBe(false);
   });
 });

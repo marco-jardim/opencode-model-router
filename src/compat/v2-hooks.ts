@@ -48,8 +48,9 @@ import {
 import { budgetExhausted, type BudgetSnapshot } from "../guard/enforce";
 import { ROUTER_BUDGET_NOTE_PREFIX } from "../router/prompts";
 import { parseReturnPrefix } from "../routing/outcomes/signals";
-import { lookupDispatch } from "../router/sessions";
+import { isRunnerDescription, lookupDispatch } from "../router/sessions";
 import { createSystemAugmenter } from "../routing/wire/hint";
+import { leadingChildReport, rewriteChildReportBodies, type ChildReport } from "./child-report";
 import { createTurnStateRegistry, placeTurnState, ROUTER_TURN_STATE_ATTACH, TURN_STATE_ROOT, type TurnStateRegistry } from "./turn-state";
 // 3.1.7 W6: the `plan` provider after the background ones (completed 30, held 40, in-flight 50), before the route hint (90).
 import { PLAN_PROVIDER_NAME, PLAN_PROVIDER_ORDER } from "./turn-state";
@@ -931,10 +932,12 @@ export function normalizeAgentOptions(options: Readonly<Record<string, unknown>>
 }
 
 /** Register the existing router engine on the public OpenCode 2 domain APIs. */
-/** One host completion element `<subagent sessionID="X" state="S">body</subagent>` in a message text (memo §4.4, C2). */
-interface CompletionElement { child: string; state: "completed" | "error" | "cancelled"; body: string }
-// Further attributes after `state` (the host may add some) are tolerated and kept.
-const COMPLETION_ELEMENT = /<subagent sessionID="([^"]+)" state="([^"]+)"[^>]*>([\s\S]*?)(?:<\/subagent>|$)/g;
+/**
+ * One host completion element in a message text (memo §4.4, C2): `<subagent sessionID="X" state="S">body</subagent>` (2.0.x)
+ * or `<background-result kind="subagent" sessionID="X" state="S" …>body</background-result>` (2.3+, #174). Both are matched
+ * by child-report.ts only; further attributes (the host may add some) are tolerated and kept.
+ */
+export interface CompletionElement { child: string; state: "completed" | "error" | "cancelled"; body: string; description: string | undefined }
 
 /** QA-2.1-8: the refusal of a resume while the pending journal is not reloaded (the session may be held). */
 export function reloadFailedResumeText(child: string): string {
@@ -1027,6 +1030,9 @@ const MAX_SESSION_DIRS = 1000;
 const MAX_ADOPTED_SESSIONS = 5000;
 /** DF-1-4: the children whose completion elements are remembered, and the elements kept per child. */
 const MAX_SEEN_COMPLETION_CHILDREN = 1000;
+/** #174: dispatched children remembered against the runner-description fallback; unknown children warned about once each. */
+const MAX_DISPATCHED_CHILDREN = 5000;
+const MAX_WARNED_COMPLETION_CHILDREN = 1000;
 const MAX_SEEN_COMPLETION_ELEMENTS = 64;
 /** QA-2.1-8: a failed pending-journal reload is tried again at most this often (fail closed meanwhile). */
 export const PENDING_RELOAD_RETRY_MS = 30_000;
@@ -1042,16 +1048,16 @@ const EXECUTOR_DISPOSE_MS = 30_000;
 export const V2_BACKGROUND_SETTLED: unique symbol = Symbol("opencode-model-router.v2.background-settled");
 // QA-2.1-26: a module-private `Symbol()` (not the global registry `Symbol.for`): only code importing this module reaches the seam.
 
-/** The completion elements of a text part that STARTS with one (the host writes a completion as a whole message, C2). */
-function completionElementsOf(text: string): CompletionElement[] {
-  if (!text.trimStart().startsWith("<subagent sessionID=\"")) return [];
-  const found: CompletionElement[] = [];
-  for (const m of text.matchAll(COMPLETION_ELEMENT)) {
-    const state = m[2];
-    if (state !== "completed" && state !== "error" && state !== "cancelled") continue;
-    found.push({ child: m[1] ?? "", state, body: m[3] ?? "" });
-  }
-  return found;
+/**
+ * The completion element of a text part that STARTS with one (the host writes a completion as a whole message, C2): that one
+ * element only, its body running to the last closing tag of its envelope (#174: a closing tag or a further report forged in the
+ * child's text neither cuts it nor adds an element). Exported for tests.
+ */
+export function completionElementsOf(text: string): CompletionElement[] {
+  const report = leadingChildReport(text);
+  const state = report?.state;
+  if (report === undefined || (state !== "completed" && state !== "error" && state !== "cancelled")) return [];
+  return [{ child: report.child, state, body: report.body, description: report.description }];
 }
 
 /**
@@ -1064,27 +1070,32 @@ function completionMessageKey(message: object, index: number): string {
   return `at:${index}`;
 }
 
-/** Applies `defang` to the body of every `<subagent …>` element of a text (a pure rewrite; the element tags stay). */
+/** Applies `defang` to the body of every completion element of a text, in either envelope (a pure rewrite; the element tags stay). */
 function defangSubagentBodies(text: string, defang: (body: string) => string): string {
-  if (!text.includes("<subagent sessionID=\"")) return text;
-  return text.replace(COMPLETION_ELEMENT, (whole: string, _child: string, _state: string, body: string) => {
-    const next = defang(body);
-    if (next === body) return whole;
-    const closed = whole.endsWith("</subagent>");
-    const open = whole.slice(0, whole.length - body.length - (closed ? "</subagent>".length : 0));
-    return `${open}${next}${closed ? "</subagent>" : ""}`;
-  });
+  return rewriteChildReportBodies(text, (report) => defang(report.body));
 }
 
 /** Memo §12 (fail closed): replaces the body of every completion element whose child `isProcessed` rejects. Pure; the element tags stay. */
 function redactUnprocessedElements(text: string, isProcessed: (child: string) => boolean): string {
-  if (!text.includes("<subagent sessionID=\"")) return text;
-  return text.replace(COMPLETION_ELEMENT, (whole: string, child: string, _state: string, was: string) => {
-    if (isProcessed(child)) return whole;
-    const body = `[router] The result of session ${child} is withheld: the router could not restore its verification state.`;
-    const closed = whole.endsWith("</subagent>");
-    const open = whole.slice(0, whole.length - was.length - (closed ? "</subagent>".length : 0));
-    return `${open}${body}${closed ? "</subagent>" : ""}`;
+  return rewriteChildReportBodies(text, (report) => isProcessed(report.child) ? undefined
+    : `[router] The result of session ${report.child} is withheld: the router could not restore its verification state.`);
+}
+
+/** #174: the body the orchestrator reads, in place of the child's text, in the host's report about one of the router's own children. */
+export const RUNNER_CHILD_REPORT_TEXT = "[router] internal child finished; its result is handled by the router.";
+
+/**
+ * #174: `text` with the body of every completion element whose child `isRunnerReport` accepts replaced by
+ * {@link RUNNER_CHILD_REPORT_TEXT} (the body's leading and trailing blanks kept). Pure; the element tags stay.
+ */
+export function rewriteRunnerChildReports(text: string, isRunnerReport: (report: ChildReport) => boolean): string {
+  return rewriteChildReportBodies(text, (report) => {
+    if (!isRunnerReport(report)) return undefined;
+    const trimmed = report.body.trim();
+    if (trimmed === "") return RUNNER_CHILD_REPORT_TEXT;
+    const lead = report.body.slice(0, report.body.length - report.body.trimStart().length);
+    const trail = report.body.slice(report.body.trimEnd().length);
+    return `${lead}${RUNNER_CHILD_REPORT_TEXT}${trail}`;
   });
 }
 
@@ -1150,7 +1161,7 @@ export type V2ExecutorFactory = (host: V2ExecutorHost) => V2Executor | null;
 export async function registerV2Hooks(
   ctx: Context,
   hooks: Hooks,
-  runtime?: Pick<V2Runtime, "withToolContext" | "applyChildSystem"> & Partial<Pick<V2Runtime, "dispose" | "forgetSession" | "childRunner">>,
+  runtime?: Pick<V2Runtime, "withToolContext" | "applyChildSystem"> & Partial<Pick<V2Runtime, "dispose" | "forgetSession" | "childRunner" | "isRunnerChild">>,
   /**
    * `ingest`: the plugin instance's telemetry ingest (M6, QA-2.1-7); without one the adapter ingests nothing.
    * `isBypassed`: the plugin's `/bypass` state (#84 P2.1: the role path's router-gate condition, S10/P-9).
@@ -2214,15 +2225,62 @@ export async function registerV2Hooks(
   };
   const syntheticRaw: unknown = Reflect.get(ctx.session, "synthetic");
   const syntheticOk = typeof syntheticRaw === "function";
+  /**
+   * #174: whether a completion element reports one of the router's own children (an LLM grader, a `router_delegate` producer, a
+   * plan-executor task: every child the native child runner started). The runner's registry is the signal: it still knows the
+   * child after the run ended and the child was removed. The runner's fixed `description` is a fallback only (a registry that
+   * does not know the child: another runtime, or past its bound), and only for a child neither the in-flight registry nor the
+   * record of dispatched children knows: an orchestrator may title its own dispatch alike, and its report must reach it unchanged.
+   */
+  const isRunnerReport = (report: Pick<ChildReport, "child" | "description">): boolean => {
+    if (runtime?.isRunnerChild?.(report.child) === true) return true;
+    return report.description !== undefined && isRunnerDescription(report.description)
+      && !dispatchedChildren.has(report.child) && inflight.byChild(report.child) === undefined;
+  };
+  /**
+   * #174: the children of the `subagent` calls this adapter's tool hooks saw (orchestrator and role dispatches, in every mode).
+   * The runner's own native calls reach no tool hook, so a child in here is never given the runner-description fallback above.
+   * Bounded, oldest first out.
+   */
+  const dispatchedChildren = new Set<string>();
+  const noteDispatchedChild = (child: string): void => {
+    dispatchedChildren.delete(child);
+    dispatchedChildren.add(child);
+    for (const old of dispatchedChildren) {
+      if (dispatchedChildren.size <= MAX_DISPATCHED_CHILDREN) break;
+      dispatchedChildren.delete(old);
+    }
+  };
   /** The held store, for the compaction hook registered before it exists. */
   let heldRef: HeldResults | undefined;
-  /** Memo §4.4 step 5: the compaction hook runs the same matcher over the messages being summarised (C15). Registered only when mode ≠ off. */
+  /**
+   * Memo §4.4 step 5: the compaction hook runs the same matcher over the messages being summarised (C15) when mode ≠ off.
+   * #174: it is registered in every mode, for the runner-child rewrite the context hook also makes in every mode.
+   */
   let compactionRegistered = false;
-  if (bgMode !== "off") {
-    try {
-      registrations.push(await ctx.session.hook("compaction", async (event) => {
-        const messages = event.messages;
-        if (heldRef === undefined || !Array.isArray(messages)) return;
+  try {
+    registrations.push(await ctx.session.hook("compaction", async (event) => {
+      const messages = event.messages;
+      if (!Array.isArray(messages)) return;
+      /** `rewrite` over the text parts of the messages being summarised; a changed message is replaced by a copy. */
+      const rewriteTexts = (rewrite: (text: string) => string): void => {
+        messages.forEach((source, index) => {
+          const content: unknown = (source as { content?: unknown }).content;
+          if (!Array.isArray(content)) return;
+          let touched = false;
+          const next = content.map((part: unknown) => {
+            const text: unknown = part !== null && typeof part === "object" ? Reflect.get(part, "text") : undefined;
+            const type: unknown = part !== null && typeof part === "object" ? Reflect.get(part, "type") : undefined;
+            if (typeof text !== "string" || (type !== undefined && type !== "text")) return part;
+            const rewritten = rewrite(text);
+            if (rewritten === text) return part;
+            touched = true;
+            return { ...(part as object), text: rewritten };
+          });
+          if (touched) messages[index] = Object.assign(Object.create(Object.getPrototypeOf(source)), source, { content: next });
+        });
+      };
+      if (bgMode !== "off" && heldRef !== undefined) {
         adoptSession(String(event.sessionID));
         if (finishApi !== undefined && reloadFailed) {
           // QA-2.1-8: fail closed exactly like the context hook (memo §12): a summary must not carry a completion this process
@@ -2231,35 +2289,23 @@ export async function registerV2Hooks(
             const attempt = inflight.byChild(child);
             return attempt !== undefined && journal.hasProcessed(attempt.key);
           };
-          messages.forEach((source, index) => {
-            const content: unknown = (source as { content?: unknown }).content;
-            if (!Array.isArray(content)) return;
-            let touched = false;
-            const next = content.map((part: unknown) => {
-              const text: unknown = part !== null && typeof part === "object" ? Reflect.get(part, "text") : undefined;
-              const type: unknown = part !== null && typeof part === "object" ? Reflect.get(part, "type") : undefined;
-              if (typeof text !== "string" || (type !== undefined && type !== "text")) return part;
-              const redacted = redactUnprocessedElements(text, isProcessed);
-              if (redacted === text) return part;
-              touched = true;
-              return { ...(part as object), text: redacted };
-            });
-            if (touched) messages[index] = Object.assign(Object.create(Object.getPrototypeOf(source)), source, { content: next });
-          });
+          rewriteTexts((text) => redactUnprocessedElements(text, isProcessed));
         }
         const shaped = messages.map((source) => ({ source, id: (source as { id?: unknown }).id, parts: (source as { content?: unknown }).content }));
         const result = heldRef.apply(String(event.sessionID), shaped);
-        if (result === undefined) return;
-        result.forEach((entry, index) => {
+        result?.forEach((entry, index) => {
           if (entry.parts !== (entry.source as { content?: unknown }).content) {
             messages[index] = Object.assign(Object.create(Object.getPrototypeOf(entry.source)), entry.source, { content: entry.parts });
           }
         });
-      }));
-      compactionRegistered = true;
-    } catch (error) {
-      ingestLogger.warn("[router] background: the compaction hook could not be registered; held results are unavailable", { error: String(error) });
-    }
+      }
+      // #174: a summary never carries the raw text of one of the router's own children (the same lookup and line as the context hook).
+      rewriteTexts((text) => rewriteRunnerChildReports(text, isRunnerReport));
+    }));
+    compactionRegistered = bgMode !== "off";
+  } catch (error) {
+    // Under `off` nothing depends on it but the #174 rewrite of summaries; as before #174, a failure there is not logged.
+    if (bgMode !== "off") ingestLogger.warn("[router] background: the compaction hook could not be registered; held results are unavailable", { error: String(error) });
   }
   const held: HeldResults = createHeldResults({
     observations: options.observations,
@@ -3138,15 +3184,15 @@ export async function registerV2Hooks(
       if (result === undefined) return undefined;
       return result.map((entry) => (entry.parts === entry.source.content ? entry.source : withContent(entry.source, entry.parts)));
     };
-    /** Auto/model: `[router` line starts in every `<subagent …>` element body are defanged (parity with `defangChildResult`). */
-    const defangMessages = (messages: readonly ContextMessage[]): ContextMessage[] | undefined => {
+    /** `rewrite` over every text part of the messages (copies of the changed messages and parts only; `undefined` = unchanged). */
+    const rewriteTextParts = (messages: readonly ContextMessage[], rewrite: (text: string) => string): ContextMessage[] | undefined => {
       let changed = false;
       const next = messages.map((message) => {
         if (!Array.isArray(message.content)) return message;
         let touched = false;
         const content = message.content.map((part) => {
           if (part.type !== "text") return part;
-          const text = defangSubagentBodies(part.text, defangRouterLines);
+          const text = rewrite(part.text);
           if (text === part.text) return part;
           touched = true;
           return { ...part, text };
@@ -3157,12 +3203,24 @@ export async function registerV2Hooks(
       });
       return changed ? next : undefined;
     };
+    /** Auto/model: `[router` line starts in every completion element body (either envelope) are defanged (parity with `defangChildResult`). */
+    const defangMessages = (messages: readonly ContextMessage[]): ContextMessage[] | undefined =>
+      rewriteTextParts(messages, (text) => defangSubagentBodies(text, defangRouterLines));
+    /**
+     * #174: since OpenCode 2.3.0 the host reports every finished child to its parent, the router's own children too: their raw
+     * text (a grader's JSON, a producer's answer) is not for the orchestrator. Their element bodies become one neutral line in
+     * this request snapshot only (the stored history keeps them); the envelope stays.
+     */
+    const rewriteRunnerReports = (messages: readonly ContextMessage[]): ContextMessage[] | undefined =>
+      rewriteTextParts(messages, (text) => rewriteRunnerChildReports(text, isRunnerReport));
     /**
      * DF-1-4: per child, the completion elements already seen in its parent's context, by the message that holds them (QA-DF1-20:
      * message id, part and element index; never their content); bounded. Per adapter copy and lost on restart: a `child-ended`
      * attempt is read again on its parent's next request, so a skipped element never leaves it waiting for the sweep.
      */
     const seenCompletionElements = new Map<string, Set<string>>();
+    /** #174: the children of a completion element with no attempt of its parent that were warned about (once each); bounded. */
+    const warnedCompletionChildren = new Set<string>();
     /** Records a completion element of `child`; true only the first time it is seen. */
     const noteCompletionElement = (child: string, signature: string): boolean => {
       let seen = seenCompletionElements.get(child);
@@ -3213,9 +3271,18 @@ export async function registerV2Hooks(
           for (const [elementIndex, element] of completionElementsOf(part.text).entries()) {
             const attempt = inflight.byChild(element.child);
             if (attempt === undefined || attempt.parentSessionID !== sid) {
-              ingestLogger.warn("[router] background: a completion element names a child with no attempt of this parent", {
-                parent: sid, child: element.child, state: element.state, attempt: attempt === undefined ? "none" : attempt.parentSessionID,
-              });
+              // #174: the host reports the router's own children too (nothing to process, nothing to say); any other child is
+              // warned about once, not on every request whose history still holds its element.
+              if (!isRunnerReport(element) && !warnedCompletionChildren.has(element.child)) {
+                warnedCompletionChildren.add(element.child);
+                for (const old of warnedCompletionChildren) {
+                  if (warnedCompletionChildren.size <= MAX_WARNED_COMPLETION_CHILDREN) break;
+                  warnedCompletionChildren.delete(old);
+                }
+                ingestLogger.warn("[router] background: a completion element names a child with no attempt of this parent", {
+                  parent: sid, child: element.child, state: element.state, attempt: attempt === undefined ? "none" : attempt.parentSessionID,
+                });
+              }
               continue;
             }
             // DF-1-4: the parent's history keeps the completion element of every earlier turn of a resumed child. An element is
@@ -3295,6 +3362,11 @@ export async function registerV2Hooks(
         if (hidden !== undefined) event.messages = hidden;
         const defanged = defangMessages(event.messages);
         if (defanged !== undefined) event.messages = defanged;
+      }
+      // #174: in every mode, after the defang (its neutral line is the router's own). `rawMessages` keeps the original for the scan.
+      if (event.messages !== undefined) {
+        const neutral = rewriteRunnerReports(event.messages);
+        if (neutral !== undefined) event.messages = neutral;
       }
       if (protectedAgent(event.agent)) {
         try {
@@ -4263,6 +4335,8 @@ export async function registerV2Hooks(
       // Phase 2.1 (memo §4.3 steps 1-2). Timing: a non-null child binds the open start; a null child drops it.
       let ackText: string | undefined;
       if (event.tool === "subagent") {
+        // #174: in every mode, so the runner-description fallback never takes this dispatch's report for the runner's.
+        if (resultChild !== null) noteDispatchedChild(resultChild);
         const running = resultChild !== null && ((event as { result?: { output?: { status?: unknown } } }).result)?.output?.status === "running";
         if (timings !== undefined) {
           try {

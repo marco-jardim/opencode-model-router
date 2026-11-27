@@ -10,6 +10,7 @@ import { createLeaseRegistry, foldKeyPath, formatRunNote } from "../router/lease
 import type { LeaseActor, LeaseRegistry, LeaseSeams, Holder, HolderInput } from "../router/leases";
 import { toolTargets } from "../router/tool-paths";
 import { observeV2, type V2Observations } from "./v2-observations";
+import { childReportClose, nextChildReportOpening } from "./child-report";
 
 // ---- constants -------------------------------------------------------------------------------
 
@@ -878,7 +879,6 @@ export interface HeldResults extends HeldSink {
   persisted(): PersistedRecord[];
 }
 
-const SUBAGENT_CLOSE = "</subagent>";
 const VERDICT_PREFIX = "<router-verdict ";
 const SYNTHETIC_ATTEMPTS = 3;
 /** = BACKGROUND_RETRY_BASE_MS (verify/pending.ts:442); kept local so this module imports nothing heavy. */
@@ -1017,12 +1017,13 @@ export function createHeldResults(deps: {
     // One attempt per child, selected by the containing message's dispatch boundary in `apply`.
     const placeholders = heldChildren(sessionID).map((entry) => heldPlaceholder(entry.handle, entry.childSessionID));
     for (const entry of entries.values()) {
-      const marker = `<subagent sessionID="${entry.childSessionID}"`;
       const placeholder = heldPlaceholder(entry.handle, entry.childSessionID);
       let from = 0;
       for (;;) {
-        const at = out.indexOf(marker, from);
-        if (at < 0) break;
+        // #174: the child's completion element in either envelope (`<subagent …>`, 2.3+ `<background-result kind="subagent" …>`).
+        const opening = nextChildReportOpening(out, from, entry.childSessionID);
+        if (opening === undefined) break;
+        const at = opening.index;
         const prior = placeholders.find((known) => out.startsWith(known, at));
         if (prior !== undefined) {
           from = at + prior.length;
@@ -1035,12 +1036,10 @@ export function createHeldResults(deps: {
         }
         // O13: an embedded record. Cut precisely only when the known body follows verbatim, else through the end.
         let end = out.length;
-        const tagEnd = out.indexOf(">", at);
-        if (entry.body !== undefined && tagEnd >= 0) {
-          const bodyEnd = tagEnd + 1 + entry.body.length;
-          if (out.startsWith(entry.body, tagEnd + 1) && out.startsWith(SUBAGENT_CLOSE, bodyEnd)) {
-            end = bodyEnd + SUBAGENT_CLOSE.length;
-          }
+        if (entry.body !== undefined) {
+          const close = childReportClose(opening.tag);
+          const bodyEnd = opening.bodyStart + entry.body.length;
+          if (out.startsWith(entry.body, opening.bodyStart) && out.startsWith(close, bodyEnd)) end = bodyEnd + close.length;
         }
         out = out.slice(0, at) + placeholder + out.slice(end);
         from = at + placeholder.length;

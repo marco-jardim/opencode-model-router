@@ -26,6 +26,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **OpenCode v2: held results are held again on OpenCode 2.3.0 and later, and the host's reports about the router's own
+  children no longer show their raw text to the orchestrator (#174, observed on 2.4.2).** Those hosts report a finished
+  child to its parent as `<background-result kind="subagent" sessionID="…" state="…" …>…</background-result>`, which
+  the router did not recognise (it knew only OpenCode 2.0's `<subagent …>`): a held background result reached the
+  orchestrator before its verdict, and the router did not take the completion from that report. One matcher now reads
+  both shapes, attributes in any order, for the completion scan, the held placeholder (in every request and every
+  compaction), the `[router` line rewrite of child text and the fail-closed redaction. The host also reports the
+  router's own children (an LLM grader, a `router_delegate` producer, a plan-executor task) to the session that ran
+  them. In every request and every compaction their report now carries one line,
+  `[router] internal child finished; its result is handled by the router.`, in place of the child's text; the router
+  still knows its children for an hour after their run, also after it removed them. The extra turns the host starts
+  for those reports are not removed.
 - **OpenCode v2: the router's own child runs work again on OpenCode 2.3.0 and later (#167, reported on 2.4.1).** Those
   hosts answer every native `subagent` call at once with a running result, so every child the router runs itself (an
   LLM grader, a `router_delegate` producer, a plan-executor task) was refused as pending and interrupted: verification
