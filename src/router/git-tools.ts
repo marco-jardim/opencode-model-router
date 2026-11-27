@@ -81,6 +81,14 @@ function lstatOrUndefined(path: string): Stats | undefined {
   }
 }
 
+/** stat (following links) that reports a missing path, a dangling link or a file used as a directory as undefined. */
+function statOrUndefined(path: string): Stats | undefined {
+  try { return statSync(path); } catch (error) {
+    if (errorCode(error) === "ENOENT" || errorCode(error) === "ENOTDIR") return undefined;
+    throw error;
+  }
+}
+
 function isDirectory(path: string): boolean {
   try { return statSync(path).isDirectory(); } catch (error) {
     if (errorCode(error) === "ENOENT" || errorCode(error) === "ENOTDIR") return false;
@@ -303,8 +311,10 @@ function includeTarget(value: string | undefined, base: string | undefined): str
  * {@link repositoryOnlyDriverArgs} from `query` ({@link DRIVER_SCOPE_ARGS}, then `config --file <target>` for every include
  * directive the repository's configuration holds, nested ones too, whatever its condition: a linked worktree's `gitdir:` or a
  * slot's `onbranch:` may enable a target the listing's own context does not). `cwd`: where the listing ran (a relative origin
- * is resolved against it). A missing target is skipped, as git skips it; an unreadable, network or device target, or more
- * than {@link MAX_INCLUDE_TARGETS} targets or {@link MAX_INCLUDE_DEPTH} levels, throws (fail closed).
+ * is resolved against it). A missing target is skipped, as git skips it, and so is a dangling link on every platform (as
+ * POSIX git does; Git for Windows may fail on one instead); an unreadable, network or device target (on win32 also a
+ * reserved device name such as `NUL` or `com1.cfg`), or more than {@link MAX_INCLUDE_TARGETS} targets or
+ * {@link MAX_INCLUDE_DEPTH} levels, throws (fail closed).
  */
 export async function collectRepositoryDriverArgs(query: DriverQuery, cwd: string, options: { required?: boolean } = {}): Promise<string[]> {
   const listed = await query(DRIVER_SCOPE_ARGS);
@@ -328,7 +338,13 @@ export async function collectRepositoryDriverArgs(query: DriverQuery, cwd: strin
     if (seen.has(id)) continue;
     seen.add(id);
     if (isNetworkOrDevicePath(path)) throw new Error(`Refusing repository: the config include ${path} is a network or device path`);
-    if (lstatOrUndefined(path) === undefined) continue; // git skips a missing include too
+    // `C:\dir\NUL`, `nul.txt`, `COM1:`: Windows opens the device whatever the directory (G13, as validatePath).
+    if (process.platform === "win32" && WINDOWS_DEVICE.test(win32.basename(path).split(/[.:]/)[0]!.trimEnd())) {
+      throw new Error(`Refusing repository: the config include ${path} names a reserved Windows device`);
+    }
+    // Links are followed: a dangling link is skipped like a missing include, on every platform. POSIX git skips it too (its
+    // access() follows the link); Git for Windows' access() may not, so it may fail on the link instead (not tested).
+    if (statOrUndefined(path) === undefined) continue;
     const read = await query(["config", "--file", path, "-z", "--get-regexp", REPOSITORY_DRIVER_QUERY]);
     if (read.code === 1) continue;
     if (read.code !== 0) throw new Error(`Cannot read the config include ${path} (exit ${read.code})`);

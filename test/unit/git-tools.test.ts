@@ -9,8 +9,8 @@ import { basename, delimiter, dirname, join, relative } from "node:path";
 import {
   dropPartialCredential, errorMessage, quoteGitPath, GIT_OPERATIONS, gitArgv, gitCandidates, gitEnvironment, gitExecutable, gitTools, hardeningArgs, inspectGit,
   linkedTrackedDirectories, numstatNames, parseInheritedConfig, PROTOCOL_HARDENING, repositoryDriverArgs, repositoryOnlyDriverArgs, runBoundedProcess,
-  selectGitExecutable, stripUrlUserinfo, validatePath, validateRef, workRootReadArgs, driverListingEnvironment,
-  type GitInput, type GitInspectOptions, type GitOperation,
+  selectGitExecutable, stripUrlUserinfo, validatePath, validateRef, workRootReadArgs, driverListingEnvironment, collectRepositoryDriverArgs,
+  type DriverQuery, type GitInput, type GitInspectOptions, type GitOperation,
 } from "../../src/router/git-tools";
 import { sensitiveGitPathspecs, SENSITIVE_PATH_PATTERNS } from "../../src/router/sensitive-paths";
 import { createGitRunner, withRepositoryDrivers } from "../../src/executor/git";
@@ -626,6 +626,61 @@ describe("shell-free git inspection", () => {
     mkdirSync(join(outside, "dir.gitconfig"));
     git("config", "--add", "include.path", slash(join(outside, "dir.gitconfig")));
     await expect(repositoryDriverArgs(root)).rejects.toThrow();
+  }, 30_000);
+  /** A driver query whose listing holds `entries` (scope local) and whose `config --file` reads are recorded and answered by `files`. */
+  function fakeDriverQuery(entries: readonly string[], reads: string[], files: Record<string, { code: number; stdout: string }> = {}): DriverQuery {
+    return async (args) => {
+      const file = args.indexOf("--file");
+      if (file === -1) return { code: 0, stdout: entries.map(entry => `local\0file:.git/config\0${entry}\0`).join("") };
+      const path = args[file + 1] ?? "";
+      reads.push(path);
+      return files[path] ?? { code: 128, stdout: "" };
+    };
+  }
+  it.skipIf(!WIN)("collectRepositoryDriverArgs: an include target naming a reserved Windows device is refused before git reads it (G13)", async () => {
+    const reads: string[] = [];
+    for (const name of ["NUL", "nul.gitconfig", "con ", "COM1", "COM\u00b9", "com1.cfg", "lpt9.x", "aux:", "CONOUT$", "prn. txt"]) {
+      await expect(collectRepositoryDriverArgs(fakeDriverQuery([`include.path\n${join(outside, name)}`], reads), root), name)
+        .rejects.toThrow(/names a reserved Windows device/);
+    }
+    expect(reads).toEqual([]);
+    // Nested (relative to the including file) too. A name that only starts like a device, an empty base name or an alternate
+    // data stream of an ordinary file is an ordinary, here missing, target: skipped, never refused.
+    const parent = join(outside, "inc.gitconfig");
+    writeFileSync(parent, "");
+    const nested = { [parent]: { code: 0, stdout: "include.path\nsub\\aux.cfg\0" } };
+    await expect(collectRepositoryDriverArgs(fakeDriverQuery([`include.path\n${parent}`], reads, nested), root))
+      .rejects.toThrow(/names a reserved Windows device/);
+    expect(reads).toEqual([parent]);
+    const ordinary = ["nullish.gitconfig", "com10", "console.cfg", ".gitconfig", "inc.gitconfig:stream"];
+    expect(await collectRepositoryDriverArgs(fakeDriverQuery(ordinary.map(name => `include.path\n${join(outside, name)}`), reads), root))
+      .toEqual([]);
+    expect(reads).toEqual([parent]);
+  });
+  it("collectRepositoryDriverArgs: a dangling-link include target is skipped, as git skips a missing one", async (ctx) => {
+    const gone = join(outside, "gone.gitconfig");
+    const link = join(outside, "dangling.gitconfig");
+    try { symlinkSync(gone, link, "file"); } catch (error) {
+      // A file symlink needs Developer Mode or SeCreateSymbolicLinkPrivilege on win32 (no junction for a file).
+      if (WIN && (error as NodeJS.ErrnoException).code === "EPERM") ctx.skip("file symlinks are not available on this machine"); // throws
+      throw error;
+    }
+    const reads: string[] = [];
+    const query = fakeDriverQuery([`include.path\n${link}`, "filter.x.clean\nevil"], reads);
+    expect(await collectRepositoryDriverArgs(query, root)).toEqual(["-c", "filter.x.clean=", "-c", "filter.x.required=false"]);
+    expect(reads).toEqual([]);
+    if (!WIN) {
+      // POSIX git skips it as well (its access() follows the link). Git for Windows is not checked: its access() may not follow
+      // the link, and it may fail on it instead of skipping it.
+      repository();
+      git("config", "include.path", slash(link));
+      expect(await repositoryDriverArgs(root)).toEqual([]);
+    }
+    // Once the link resolves it is an ordinary include and is read; a read that fails (the injected query answers 128 here,
+    // whatever real git would do with this file) fails closed.
+    writeFileSync(gone, "");
+    await expect(collectRepositoryDriverArgs(query, root)).rejects.toThrow(/Cannot read the config include/);
+    expect(reads).toEqual([link]);
   }, 30_000);
   it("withRepositoryDrivers (real git): a write under a repository-only filter fails closed; the global filter's copy still runs", async () => {
     repository();
