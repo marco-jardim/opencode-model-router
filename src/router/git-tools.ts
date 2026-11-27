@@ -1,6 +1,6 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, openSync, readSync, realpathSync, statSync, type Stats } from "node:fs";
-import { lstat } from "node:fs/promises";
+import { lstat, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, win32 } from "node:path";
 import { tool } from "@opencode-ai/plugin";
@@ -81,12 +81,23 @@ function lstatOrUndefined(path: string): Stats | undefined {
   }
 }
 
-/** stat (following links) that reports a missing path, a dangling link or a file used as a directory as undefined. */
-function statOrUndefined(path: string): Stats | undefined {
-  try { return statSync(path); } catch (error) {
-    if (errorCode(error) === "ENOENT" || errorCode(error) === "ENOTDIR") return undefined;
+const DRIVER_QUERY_TIMEOUT = "Git driver configuration query timed out";
+
+/**
+ * Async stat (following links): false for a missing path, a dangling link or a file used as a directory; any other error
+ * throws. With `deadline` (a `performance.now()` value) a stat still pending then, or a deadline already past, throws.
+ */
+async function includeTargetExists(path: string, deadline: number | undefined): Promise<boolean> {
+  const remaining = deadline === undefined ? undefined : deadline - performance.now();
+  if (remaining !== undefined && remaining <= 0) throw new Error(DRIVER_QUERY_TIMEOUT);
+  const found = stat(path).then(() => true, (error: unknown) => {
+    if (errorCode(error) === "ENOENT" || errorCode(error) === "ENOTDIR") return false;
     throw error;
-  }
+  });
+  if (remaining === undefined) return found;
+  let timer: NodeJS.Timeout | undefined;
+  const expired = new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error(DRIVER_QUERY_TIMEOUT)), remaining); });
+  try { return await Promise.race([found, expired]); } finally { clearTimeout(timer); }
 }
 
 function isDirectory(path: string): boolean {
@@ -204,7 +215,11 @@ export function workRootReadArgs(): string[] {
  * `protocol.<name>.allow` (a remote helper), and the include directives that can bring more of them in.
  */
 const REPOSITORY_DRIVER_QUERY = "^(filter\\..+\\.(clean|smudge|process)|merge\\..+\\.driver|protocol\\..+\\.allow|include\\.path|includeif\\..+\\.path)$";
-const DRIVER_KEY = /^(?:filter\.(.+)\.(?:clean|smudge|process)|merge\..+\.driver)$/;
+/** {@link REPOSITORY_DRIVER_QUERY} plus `filter.<name>.required`: the listing of a call that forwards the user's drivers (#162). */
+const FORWARD_DRIVER_QUERY = "^(filter\\..+\\.(clean|smudge|process|required)|merge\\..+\\.driver|protocol\\..+\\.allow|include\\.path|includeif\\..+\\.path)$";
+const DRIVER_KEY = /^(?:filter\.(.+)\.(?:clean|smudge|process|required)|merge\..+\.driver)$/;
+/** A driver key that names a program; `filter.<name>.required` names none and is never blanked. */
+const PROGRAM_KEY = /^(?:filter\.(.+)\.(?:clean|smudge|process)|merge\..+\.driver)$/;
 const PROTOCOL_KEY = /^protocol\..+\.allow$/;
 const INCLUDE_KEY = /^(?:include\.path|includeif\..+\.path)$/;
 /** The configuration scopes the user controls; every other scope (local, worktree, an unknown one) is the repository's. */
@@ -218,6 +233,8 @@ const MAX_INCLUDE_TARGETS = 50;
  * >= 2.26), NUL-separated: `<scope>\0<origin>\0<key>\n<value>\0`. Exit 1: none is set. Parsed by {@link parseDriverListing}.
  */
 export const DRIVER_SCOPE_ARGS: readonly string[] = Object.freeze(["config", "-z", "--show-scope", "--show-origin", "--get-regexp", REPOSITORY_DRIVER_QUERY]);
+/** {@link DRIVER_SCOPE_ARGS} that also lists `filter.<name>.required` (`forwardUser`, see {@link repositoryOnlyDriverArgs}). */
+const FORWARD_SCOPE_ARGS: readonly string[] = Object.freeze(["config", "-z", "--show-scope", "--show-origin", "--get-regexp", FORWARD_DRIVER_QUERY]);
 
 /** One entry of a {@link DRIVER_SCOPE_ARGS} listing; `value` is undefined for a value-less key. */
 export interface DriverEntry { readonly scope: string; readonly origin: string; readonly key: string; readonly value: string | undefined }
@@ -247,10 +264,17 @@ export function parseDriverListing(listing: string): DriverEntry[] {
  * - a blanked filter gets `-c filter.<name>.required=<required>`: `false` for a read-only snapshot (as `inspectGit`), `true`
  *   where git writes (the executor, the reference), so git refuses instead of storing or checking out unfiltered content.
  * - `-c protocol.<name>.allow=never` for every `protocol.<name>.allow` the repository sets.
- * Throws when a key cannot be blanked (`-c` splits at the first `=`).
+ * - with `forwardUser` (the executor, whose git hides the system and global configuration), first `-c <key>=<value>` for every
+ *   filter clean/smudge/process/required and merge driver whose effective value comes from the system, global or command-line
+ *   configuration, so the call runs the filter programs plain git would run (a global Git LFS filter, #162). Nothing of a
+ *   filter with a blanked key, and no blanked merge driver, is forwarded; nothing is ever forwarded from the repository's
+ *   configuration. A user key `-c` would not pass on as git read it (see {@link UNFORWARDABLE}) is not forwarded: it is
+ *   blanked (a `required` key is not: blank reads as false) and its filter gets `required=true` whatever `required` is, so
+ *   git refuses only where that filter is used; no other key of that filter is forwarded.
+ * Throws when a key cannot be blanked (`-c` splits at the first `=`), and when a key to forward has a `=` in its name.
  */
 export function repositoryOnlyDriverArgs(listing: string,
-  options: { required?: boolean; included?: readonly { key: string; value: string | undefined }[] } = {}): string[] {
+  options: { required?: boolean; forwardUser?: boolean; included?: readonly { key: string; value: string | undefined }[] } = {}): string[] {
   const userValues = new Map<string, Set<string>>();
   const effective = new Map<string, { scope: string; value: string | undefined }>();
   const protocols = new Set<string>();
@@ -271,12 +295,13 @@ export function repositoryOnlyDriverArgs(listing: string,
   }
   const trusted = (key: string, value: string | undefined) => value !== undefined && userValues.get(key)?.has(value) === true;
   const blank = new Set<string>();
-  for (const [key, { scope, value }] of effective) if (!USER_SCOPES.has(scope) && !trusted(key, value)) blank.add(key);
+  for (const [key, { scope, value }] of effective) if (PROGRAM_KEY.test(key) && !USER_SCOPES.has(scope) && !trusted(key, value)) blank.add(key);
   for (const { key, value } of options.included ?? []) {
     if (PROTOCOL_KEY.test(key)) protocols.add(key);
-    else if (DRIVER_KEY.test(key) && !trusted(key, value)) blank.add(key);
+    else if (PROGRAM_KEY.test(key) && !trusted(key, value)) blank.add(key);
   }
-  const args: string[] = [];
+  const { args, refused }: { args: string[]; refused: readonly string[] } =
+    options.forwardUser === true ? forwardedUserDrivers(effective, blank) : { args: [], refused: [] };
   const filters = new Set<string>();
   const refuse = () => new Error("Refusing repository: a filter/merge driver or protocol name contains '=' and cannot be neutralized");
   for (const key of blank) {
@@ -286,11 +311,60 @@ export function repositoryOnlyDriverArgs(listing: string,
     if (filter) filters.add(`filter.${filter[1]}.required=${options.required === true}`);
   }
   for (const setting of filters) args.push("-c", setting);
+  const refusedFilters = new Set<string>();
+  for (const key of refused) {
+    if (PROGRAM_KEY.test(key)) args.push("-c", `${key}=`);
+    const name = DRIVER_KEY.exec(key)?.[1];
+    if (name !== undefined) refusedFilters.add(`filter.${name}.required=true`);
+  }
+  for (const setting of refusedFilters) args.push("-c", setting);
   for (const key of protocols) {
     if (key.includes("=")) throw refuse();
     args.push("-c", `${key}=never`);
   }
   return args;
+}
+
+/**
+ * What a forwarded key or value must not hold: a line break or NUL, which `-c` would not pass on as git read it, or U+FFFD.
+ * Listings are decoded as UTF-8 (`toString("utf8")`), so a byte that is not UTF-8 reads as U+FFFD, and forwarding that value
+ * would name another command (a literal U+FFFD is refused the same way, fail closed).
+ */
+const UNFORWARDABLE = /[\0\r\n\uFFFD]/;
+
+/**
+ * The `forwardUser` part of {@link repositoryOnlyDriverArgs}. `args`: `-c <key>=<value>` (`-c <key>` for a value-less key,
+ * git's boolean true) for every driver key of `effective` set last by a user scope, except the keys of a filter with a key in
+ * `blank`, a merge driver in `blank`, and every key of a filter with a `refused` key. `refused`: the user keys whose key or
+ * value matches {@link UNFORWARDABLE}. Throws (fail closed) for a key with a `=` in its name, which `-c` would split.
+ */
+function forwardedUserDrivers(effective: ReadonlyMap<string, { scope: string; value: string | undefined }>,
+  blank: ReadonlySet<string>): { args: string[]; refused: string[] } {
+  const blankedFilters = new Set<string>();
+  for (const key of blank) {
+    const name = PROGRAM_KEY.exec(key)?.[1];
+    if (name !== undefined) blankedFilters.add(name);
+  }
+  const candidates: { key: string; value: string | undefined; filter: string | undefined }[] = [];
+  const refused: string[] = [];
+  const refusedFilters = new Set<string>();
+  for (const [key, { scope, value }] of effective) {
+    if (!USER_SCOPES.has(scope) || blank.has(key)) continue;
+    const filter = DRIVER_KEY.exec(key)?.[1];
+    if (filter !== undefined && blankedFilters.has(filter)) continue;
+    if (key.includes("=")) throw new Error(`Refusing to run git: the user's ${key} cannot be passed with -c (its name contains '=')`);
+    if (UNFORWARDABLE.test(key) || (value !== undefined && UNFORWARDABLE.test(value))) {
+      refused.push(key);
+      if (filter !== undefined) refusedFilters.add(filter);
+      continue;
+    }
+    candidates.push({ key, value, filter });
+  }
+  const args: string[] = [];
+  for (const { key, value, filter } of candidates) {
+    if (filter === undefined || !refusedFilters.has(filter)) args.push("-c", value === undefined ? key : `${key}=${value}`);
+  }
+  return { args, refused };
 }
 
 /** One `git config` query, run where and as the protected command runs: its exit code and stdout. */
@@ -314,10 +388,13 @@ function includeTarget(value: string | undefined, base: string | undefined): str
  * is resolved against it). A missing target is skipped, as git skips it, and so is a dangling link on every platform (as
  * POSIX git does; Git for Windows may fail on one instead); an unreadable, network or device target (on win32 also a
  * reserved device name such as `NUL` or `com1.cfg`), or more than {@link MAX_INCLUDE_TARGETS} targets or
- * {@link MAX_INCLUDE_DEPTH} levels, throws (fail closed).
+ * {@link MAX_INCLUDE_DEPTH} levels, throws (fail closed). `deadline` (a `performance.now()` value, the queries' own) also
+ * bounds the existence check of every target: one still pending then throws. `forwardUser`: the listing also reads
+ * `filter.<name>.required`, see {@link repositoryOnlyDriverArgs}.
  */
-export async function collectRepositoryDriverArgs(query: DriverQuery, cwd: string, options: { required?: boolean } = {}): Promise<string[]> {
-  const listed = await query(DRIVER_SCOPE_ARGS);
+export async function collectRepositoryDriverArgs(query: DriverQuery, cwd: string,
+  options: { required?: boolean; forwardUser?: boolean; deadline?: number } = {}): Promise<string[]> {
+  const listed = await query(options.forwardUser === true ? FORWARD_SCOPE_ARGS : DRIVER_SCOPE_ARGS);
   if (listed.code === 1) return []; // nothing set anywhere
   if (listed.code !== 0) throw new Error(`Cannot read the repository's driver configuration (exit ${listed.code})`);
   const pending: { path: string; depth: number }[] = [];
@@ -344,7 +421,7 @@ export async function collectRepositoryDriverArgs(query: DriverQuery, cwd: strin
     }
     // Links are followed: a dangling link is skipped like a missing include, on every platform. POSIX git skips it too (its
     // access() follows the link); Git for Windows' access() may not, so it may fail on the link instead (not tested).
-    if (statOrUndefined(path) === undefined) continue;
+    if (!(await includeTargetExists(path, options.deadline))) continue;
     const read = await query(["config", "--file", path, "-z", "--get-regexp", REPOSITORY_DRIVER_QUERY]);
     if (read.code === 1) continue;
     if (read.code !== 0) throw new Error(`Cannot read the config include ${path} (exit ${read.code})`);
@@ -359,7 +436,7 @@ export async function collectRepositoryDriverArgs(query: DriverQuery, cwd: strin
       if (target !== undefined) pending.push({ path: target, depth: depth + 1 });
     }
   }
-  return repositoryOnlyDriverArgs(listed.stdout, { required: options.required === true, included });
+  return repositoryOnlyDriverArgs(listed.stdout, { required: options.required === true, forwardUser: options.forwardUser === true, included });
 }
 
 /** The user's own configuration locations, which plain git honours (git-tools strips every other GIT_* variable). */
@@ -390,25 +467,27 @@ export function driverListingEnvironment(runEnv?: NodeJS.ProcessEnv): NodeJS.Pro
 /**
  * {@link collectRepositoryDriverArgs} for a router-run git in `root`, spawned directly: `executable` (default the router's git
  * outside the work-root guards of `root`), `location` (the command's `--git-dir=`/`--work-tree=` options), `env` (the
- * command's environment, see {@link driverListingEnvironment}), `required` (see {@link repositoryOnlyDriverArgs}). Throws when
- * the configuration cannot be read: the caller has no run (fail closed).
+ * command's environment, see {@link driverListingEnvironment}), `required` and `forwardUser` (see
+ * {@link repositoryOnlyDriverArgs}; `forwardUser` only for the executor). `timeoutMs` bounds the whole listing, include-target
+ * checks included. Throws when the configuration cannot be read: the caller has no run (fail closed).
  */
 export async function repositoryDriverArgs(root: string, options: {
-  executable?: string; signal?: AbortSignal; timeoutMs?: number; required?: boolean; location?: readonly string[]; env?: NodeJS.ProcessEnv;
+  executable?: string; signal?: AbortSignal; timeoutMs?: number; required?: boolean; forwardUser?: boolean; location?: readonly string[];
+  env?: NodeJS.ProcessEnv;
 } = {}): Promise<string[]> {
   const executable = options.executable ?? gitExecutable(workRootGuards(root));
   const env = driverListingEnvironment(options.env);
   const deadline = performance.now() + (options.timeoutMs ?? DEADLINE_MS);
   const query: DriverQuery = async (args) => {
     const remaining = deadline - performance.now();
-    if (remaining <= 0) throw new Error("Git driver configuration query timed out");
+    if (remaining <= 0) throw new Error(DRIVER_QUERY_TIMEOUT);
     const result = await spawnBounded(executable, [...hardeningArgs(), ...(options.location ?? []), ...args], root,
       { env, signal: options.signal, timeoutMs: remaining, maxBytes: 1024 * 1024 });
     if (result.truncated) throw new Error("Git driver configuration exceeds its size bound");
     if (result.code !== 0 && result.code !== 1) throw queryFailure("Cannot read the repository's driver configuration", result);
     return { code: result.code, stdout: result.output.toString("utf8") };
   };
-  return collectRepositoryDriverArgs(query, root, { required: options.required === true });
+  return collectRepositoryDriverArgs(query, root, { required: options.required === true, forwardUser: options.forwardUser === true, deadline });
 }
 
 function validateInput(operation: GitOperation, input: GitInput): { ref?: string } {

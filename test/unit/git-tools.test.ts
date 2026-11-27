@@ -4,13 +4,14 @@ import * as childProcess from "node:child_process";
 import { PassThrough } from "node:stream";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, delimiter, dirname, join, relative } from "node:path";
 import {
   dropPartialCredential, errorMessage, quoteGitPath, GIT_OPERATIONS, gitArgv, gitCandidates, gitEnvironment, gitExecutable, gitTools, hardeningArgs, inspectGit,
   linkedTrackedDirectories, numstatNames, parseInheritedConfig, PROTOCOL_HARDENING, repositoryDriverArgs, repositoryOnlyDriverArgs, runBoundedProcess,
   selectGitExecutable, stripUrlUserinfo, validatePath, validateRef, workRootReadArgs, driverListingEnvironment, collectRepositoryDriverArgs,
-  type DriverQuery, type GitInput, type GitInspectOptions, type GitOperation,
+  DRIVER_SCOPE_ARGS, type DriverQuery, type GitInput, type GitInspectOptions, type GitOperation,
 } from "../../src/router/git-tools";
 import { sensitiveGitPathspecs, SENSITIVE_PATH_PATTERNS } from "../../src/router/sensitive-paths";
 import { createGitRunner, withRepositoryDrivers } from "../../src/executor/git";
@@ -18,6 +19,11 @@ import { createGitRunner, withRepositoryDrivers } from "../../src/executor/git";
 vi.mock("node:child_process", async importOriginal => {
   const actual = await importOriginal<typeof import("node:child_process")>();
   return { ...actual, spawn: vi.fn(actual.spawn) };
+});
+// Pass-through: one test holds the include-target check (an async stat) past the listing's deadline.
+vi.mock("node:fs/promises", async importOriginal => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...actual, stat: vi.fn(actual.stat) };
 });
 
 const WIN = process.platform === "win32";
@@ -136,6 +142,15 @@ function alive(pid: number): boolean {
   return true;
 }
 const OLD = new Date(Date.now() - 86_400_000);
+/** Real Git LFS on this machine (`git lfs version` succeeds); the test that needs it is skipped otherwise. */
+const HAS_GIT_LFS = (() => {
+  try {
+    execFileSync(gitExecutable(), ["lfs", "version"], { env: gitEnvironment(), stdio: "ignore", timeout: 30_000 });
+    return true;
+  } catch {
+    return false;
+  }
+})();
 
 /** Deterministic transport faults without executing a replacement Git binary. */
 function fakeGit(reply: (args: readonly string[]) => { code?: number; stdout?: string | Buffer; stderr?: string }) {
@@ -599,6 +614,63 @@ describe("shell-free git inspection", () => {
         { key: "protocol.baz.allow", value: "always" }, { key: "core.pager", value: "evil" }],
     })).toEqual(["-c", "filter.inc.smudge=", "-c", "merge.m.driver=", "-c", "filter.inc.required=false", "-c", "protocol.baz.allow=never"]);
   });
+  it("repositoryOnlyDriverArgs forwardUser (#162): the user's effective drivers are passed on; nothing of the repository's is", () => {
+    const entry = (scope: string, key: string, value?: string) => `${scope}\0file:x\0${key}${value === undefined ? "" : `\n${value}`}\0`;
+    const lfs = entry("global", "filter.lfs.clean", "git-lfs clean -- %f") + entry("global", "filter.lfs.smudge", "git-lfs smudge -- %f")
+      + entry("global", "filter.lfs.process", "git-lfs filter-process") + entry("global", "filter.lfs.required", "true");
+    // Off (the snapshot, the reference): exactly as before, a user-only filter gets no argument.
+    expect(repositoryOnlyDriverArgs(lfs)).toEqual([]);
+    expect(repositoryOnlyDriverArgs(lfs, { required: true })).toEqual([]);
+    // On (the executor): every user-only key, `required` included, as plain git sees it (system, global, command line).
+    expect(repositoryOnlyDriverArgs(lfs + entry("system", "merge.m.driver", "mine %A") + entry("command", "filter.c.smudge", "cmd"),
+      { required: true, forwardUser: true })).toEqual([
+      "-c", "filter.lfs.clean=git-lfs clean -- %f", "-c", "filter.lfs.smudge=git-lfs smudge -- %f", "-c", "filter.lfs.process=git-lfs filter-process",
+      "-c", "filter.lfs.required=true", "-c", "merge.m.driver=mine %A", "-c", "filter.c.smudge=cmd",
+    ]);
+    // The effective value only: a later global value wins over a system one; a value-less key is git's boolean true (`-c <key>`).
+    expect(repositoryOnlyDriverArgs(entry("system", "filter.x.clean", "old") + entry("global", "filter.x.clean", "new") + entry("global", "filter.v.required"),
+      { forwardUser: true })).toEqual(["-c", "filter.x.clean=new", "-c", "filter.v.required"]);
+    // An identical repository copy (`git lfs install --local`) is the effective value, which git reads itself: no argument.
+    const local = lfs.replaceAll("global\0", "local\0");
+    expect(repositoryOnlyDriverArgs(lfs + local, { required: true, forwardUser: true })).toEqual([]);
+    // A partial copy: git reads the copied key, the others are still the user's and are passed on.
+    expect(repositoryOnlyDriverArgs(lfs + entry("local", "filter.lfs.clean", "git-lfs clean -- %f"), { required: true, forwardUser: true })).toEqual([
+      "-c", "filter.lfs.smudge=git-lfs smudge -- %f", "-c", "filter.lfs.process=git-lfs filter-process", "-c", "filter.lfs.required=true",
+    ]);
+    // Repository-only drivers: still blanked; a repository `required` is neither blanked nor forwarded; protocols are never forwarded.
+    expect(repositoryOnlyDriverArgs(entry("local", "filter.evil.clean", "evil") + entry("local", "filter.evil.required", "false")
+      + entry("worktree", "merge.w.driver", "evil") + entry("global", "protocol.foo.allow", "always"), { required: true, forwardUser: true }))
+      .toEqual(["-c", "filter.evil.clean=", "-c", "merge.w.driver=", "-c", "filter.evil.required=true"]);
+    // A filter with a blanked key: none of its user keys is passed on (its blank and required=true stand); a blanked merge driver neither.
+    expect(repositoryOnlyDriverArgs(entry("global", "filter.x.clean", "mine") + entry("global", "filter.x.smudge", "mine-s")
+      + entry("global", "filter.x.required", "false") + entry("local", "filter.x.clean", "evil")
+      + entry("global", "merge.m.driver", "mine") + entry("local", "merge.m.driver", "evil"), { required: true, forwardUser: true }))
+      .toEqual(["-c", "filter.x.clean=", "-c", "merge.m.driver=", "-c", "filter.x.required=true"]);
+    // An include target's key (whatever its condition) blanks the user's value unless identical, which is then forwarded.
+    expect(repositoryOnlyDriverArgs(entry("global", "filter.i.clean", "mine"), { required: true, forwardUser: true, included: [{ key: "filter.i.clean", value: "evil" }] }))
+      .toEqual(["-c", "filter.i.clean=", "-c", "filter.i.required=true"]);
+    expect(repositoryOnlyDriverArgs(entry("global", "filter.i.clean", "mine"), { required: true, forwardUser: true, included: [{ key: "filter.i.clean", value: "mine" }] }))
+      .toEqual(["-c", "filter.i.clean=mine"]);
+    // A value `-c` would not pass on as git read it (a line break, CR included, or U+FFFD: a byte that is not UTF-8 in the
+    // decoded listing) blanks that key and requires its filter, even with required=false; no other key of that filter is
+    // forwarded, and every other filter still is (one bad value never breaks every call).
+    for (const value of ["a\nb", "a\rb", "cat \uFFFD"]) {
+      expect(repositoryOnlyDriverArgs(entry("global", "filter.n.clean", value) + entry("global", "filter.n.smudge", "ok")
+        + entry("global", "filter.n.required", "false") + entry("global", "filter.ok.clean", "fine"), { forwardUser: true }), JSON.stringify(value))
+        .toEqual(["-c", "filter.ok.clean=fine", "-c", "filter.n.clean=", "-c", "filter.n.required=true"]);
+    }
+    // An unforwardable `required` is not blanked (a blank reads as false): its filter is required, its program not forwarded.
+    expect(repositoryOnlyDriverArgs(entry("global", "filter.r.clean", "ok") + entry("global", "filter.r.required", "tr\nue"), { forwardUser: true }))
+      .toEqual(["-c", "filter.r.required=true"]);
+    // An unforwardable merge driver is blanked; a name holding U+FFFD is not forwarded under that other name either.
+    expect(repositoryOnlyDriverArgs(entry("global", "merge.m.driver", "x\ny") + entry("global", "filter.caf\uFFFD.clean", "cat"), { forwardUser: true }))
+      .toEqual(["-c", "merge.m.driver=", "-c", "filter.caf\uFFFD.clean=", "-c", "filter.caf\uFFFD.required=true"]);
+    // A name `-c` would split still refuses the call.
+    expect(() => repositoryOnlyDriverArgs(entry("global", "filter.a=b.clean", "x"), { forwardUser: true })).toThrow(/its name contains '='/);
+    // Off, the same user keys are not this helper's, as before.
+    expect(repositoryOnlyDriverArgs(entry("global", "filter.n.clean", "a\nb") + entry("global", "filter.a=b.clean", "x")
+      + entry("global", "filter.f.clean", "cat \uFFFD"))).toEqual([]);
+  });
   it("driverListingEnvironment: the run's own variables, the user's config locations, never the legacy GIT_CONFIG", () => {
     const user = process.env.GIT_CONFIG_GLOBAL;
     const env = driverListingEnvironment({ PATH: "p", GIT_DIR: "/d", GIT_CONFIG_PARAMETERS: "'a.b'='c'", GIT_CONFIG: "/evil",
@@ -682,6 +754,156 @@ describe("shell-free git inspection", () => {
     await expect(collectRepositoryDriverArgs(query, root)).rejects.toThrow(/Cannot read the config include/);
     expect(reads).toEqual([link]);
   }, 30_000);
+  it("collectRepositoryDriverArgs: the listing reads filter.<name>.required only with forwardUser (the snapshot's and reference's is unchanged)", async () => {
+    const asked: string[][] = [];
+    const query: DriverQuery = async (args) => {
+      asked.push([...args]);
+      return { code: 0, stdout: "global\0file:x\0filter.lfs.clean\ngit-lfs clean -- %f\0global\0file:x\0filter.lfs.required\ntrue\0" };
+    };
+    expect(await collectRepositoryDriverArgs(query, root, { required: true })).toEqual([]);
+    expect(asked).toEqual([[...DRIVER_SCOPE_ARGS]]);
+    expect(DRIVER_SCOPE_ARGS.at(-1)).toBe("^(filter\\..+\\.(clean|smudge|process)|merge\\..+\\.driver|protocol\\..+\\.allow|include\\.path|includeif\\..+\\.path)$");
+    expect(await collectRepositoryDriverArgs(query, root, { required: true, forwardUser: true }))
+      .toEqual(["-c", "filter.lfs.clean=git-lfs clean -- %f", "-c", "filter.lfs.required=true"]);
+    expect(asked[1]).toEqual([...DRIVER_SCOPE_ARGS.slice(0, -1),
+      "^(filter\\..+\\.(clean|smudge|process|required)|merge\\..+\\.driver|protocol\\..+\\.allow|include\\.path|includeif\\..+\\.path)$"]);
+  });
+  it("collectRepositoryDriverArgs: the include-target check is an async stat bounded by the listing's deadline", async () => {
+    const target = join(outside, "inc.gitconfig");
+    writeFileSync(target, "");
+    const reads: string[] = [];
+    const query = fakeDriverQuery([`include.path\n${target}`, "filter.x.clean\nevil"], reads, { [target]: { code: 1, stdout: "" } });
+    const blanked = ["-c", "filter.x.clean=", "-c", "filter.x.required=false"];
+    // Time left: as before, the existing target is checked (asynchronously) and read; without a deadline (the reference) too.
+    const stat = vi.mocked(fsPromises.stat);
+    stat.mockClear();
+    expect(await collectRepositoryDriverArgs(query, root, { deadline: performance.now() + 30_000 })).toEqual(blanked);
+    expect(await collectRepositoryDriverArgs(query, root)).toEqual(blanked);
+    expect(stat.mock.calls.map(call => call[0])).toEqual([target, target]);
+    expect(reads).toEqual([target, target]);
+    // A check still pending at the deadline fails the listing closed; the target is not read.
+    stat.mockImplementationOnce(() => new Promise<never>(() => undefined));
+    const started = performance.now();
+    await expect(collectRepositoryDriverArgs(query, root, { deadline: started + 300 })).rejects.toThrow(/timed out/);
+    const elapsed = performance.now() - started;
+    expect(elapsed).toBeGreaterThanOrEqual(250);
+    expect(elapsed).toBeLessThan(10_000);
+    // A deadline already past: no check, no read.
+    await expect(collectRepositoryDriverArgs(query, root, { deadline: performance.now() - 1 })).rejects.toThrow(/timed out/);
+    expect(stat).toHaveBeenCalledTimes(3);
+    expect(reads).toEqual([target, target]);
+    // A missing target is still skipped within the deadline, and a failing check (not a missing path) still fails closed.
+    rmSync(target);
+    expect(await collectRepositoryDriverArgs(query, root, { deadline: performance.now() + 30_000 })).toEqual(blanked);
+    stat.mockImplementationOnce(() => Promise.reject(Object.assign(new Error("denied"), { code: "EACCES" })));
+    await expect(collectRepositoryDriverArgs(query, root, { deadline: performance.now() + 30_000 })).rejects.toThrow(/denied/);
+    expect(reads).toEqual([target, target]);
+  });
+  it("withRepositoryDrivers (real git, #162): a filter set only in the user's global config is applied: clean on commit, smudge on checkout", async () => {
+    repository();
+    writeFileSync(join(root, ".gitattributes"), "*.bin filter=omr -text\n");
+    git("add", ".gitattributes"); git("commit", "-qm", "attributes");
+    // A deterministic, reversible filter (no git-lfs needed): clean stores `OMR-CLEAN <hex>`, smudge decodes it.
+    const filter = join(outside, "omr-filter.cjs");
+    writeFileSync(filter, [
+      "const chunks = [];",
+      "process.stdin.on('data', chunk => chunks.push(chunk));",
+      "process.stdin.on('end', () => {",
+      "  const input = Buffer.concat(chunks);",
+      "  if (process.argv[2] === 'clean') { process.stdout.write('OMR-CLEAN ' + input.toString('hex') + '\\n'); return; }",
+      "  const text = input.toString('latin1');",
+      "  process.stdout.write(text.startsWith('OMR-CLEAN ') ? Buffer.from(text.slice(10).trim(), 'hex') : input);",
+      "});",
+    ].join("\n"));
+    const command = (mode: string) => `"${slash(process.execPath)}" "${slash(filter)}" ${mode}`;
+    const global = process.env.GIT_CONFIG_GLOBAL ?? "";
+    const setGlobal = (key: string, value: string) => execFileSync(gitExecutable(), ["config", "--file", global, key, value], { cwd: outside, env: gitEnvironment() });
+    setGlobal("filter.omr.clean", command("clean"));
+    setGlobal("filter.omr.smudge", command("smudge"));
+    setGlobal("filter.omr.required", "true");
+    // The snapshot's and the reference's listing (no forwarding) is unchanged: nothing of the user's is passed on.
+    expect(await repositoryDriverArgs(root)).toEqual([]);
+    expect(await repositoryDriverArgs(root, { required: true })).toEqual([]);
+    expect(await repositoryDriverArgs(root, { required: true, forwardUser: true })).toEqual([
+      "-c", `filter.omr.clean=${command("clean")}`, "-c", `filter.omr.smudge=${command("smudge")}`, "-c", "filter.omr.required=true",
+    ]);
+    const content = "hello executor\n";
+    const cleaned = `OMR-CLEAN ${Buffer.from(content).toString("hex")}\n`;
+    writeFileSync(join(root, "data.bin"), content);
+    const call = { cwd: root, timeoutMs: 30_000 };
+    // Control (the bug): the hardened git alone hides the global filter and would store the raw content.
+    const bare = createGitRunner({ mode: "hardened", toplevel: root });
+    const rawId = await bare.run([...hardeningArgs(), "hash-object", "--path=data.bin", "data.bin"], call);
+    expect(rawId.stdout.trim()).toBe(git("hash-object", "--no-filters", "data.bin").trim());
+    const runner = withRepositoryDrivers(createGitRunner({ mode: "hardened", toplevel: root }), root);
+    const added = await runner.run([...hardeningArgs(), "add", "data.bin"], call);
+    expect(added.code, added.stderr).toBe(0);
+    const committed = await runner.run([...hardeningArgs(), "commit", "-qm", "data"], call);
+    expect(committed.code, committed.stderr).toBe(0);
+    expect(git("cat-file", "blob", "HEAD:data.bin")).toBe(cleaned);
+    // The checkout runs the user's smudge: the working file is the original content again.
+    rmSync(join(root, "data.bin"));
+    const checkout = await runner.run([...hardeningArgs(), "checkout", "HEAD", "--", "data.bin"], call);
+    expect(checkout.code, checkout.stderr).toBe(0);
+    expect(readFileSync(join(root, "data.bin"), "utf8")).toBe(content);
+    // `required` is passed on too: a failing clean makes git refuse instead of storing the raw content.
+    setGlobal("filter.omr.clean", "false");
+    writeFileSync(join(root, "data.bin"), "changed\n");
+    const refused = await runner.run([...hardeningArgs(), "add", "data.bin"], call);
+    expect(refused.code).not.toBe(0);
+    expect(refused.stderr).toMatch(/clean filter 'omr' failed/);
+    expect(git("cat-file", "blob", ":data.bin")).toBe(cleaned);
+  }, 60_000);
+  it("withRepositoryDrivers (real git, #162): a user value -c cannot carry (a byte that is not UTF-8) blanks only that filter, required", async () => {
+    repository();
+    writeFileSync(join(root, ".gitattributes"), "*.bin filter=omr -text\n");
+    git("add", ".gitattributes"); git("commit", "-qm", "attributes");
+    // `cat \xE9` in the user's global config: the UTF-8-decoded listing reads `cat \uFFFD`, which would name another command.
+    writeFileSync(process.env.GIT_CONFIG_GLOBAL ?? "", Buffer.concat([Buffer.from("[filter \"omr\"]\n\tclean = cat "), Buffer.from([0xe9]),
+      Buffer.from("\n\tsmudge = cat\n[filter \"ok\"]\n\tclean = cat\n")]));
+    expect(await repositoryDriverArgs(root, { required: true, forwardUser: true }))
+      .toEqual(["-c", "filter.ok.clean=cat", "-c", "filter.omr.clean=", "-c", "filter.omr.required=true"]);
+    const runner = withRepositoryDrivers(createGitRunner({ mode: "hardened", toplevel: root }), root);
+    const call = { cwd: root, timeoutMs: 30_000 };
+    // Where the filter is used, git refuses instead of storing the raw content.
+    writeFileSync(join(root, "data.bin"), "raw\n");
+    const refused = await runner.run([...hardeningArgs(), "add", "data.bin"], call);
+    expect(refused.code).not.toBe(0);
+    expect(refused.stderr).toMatch(/clean filter 'omr' failed/);
+    // Every other call still runs.
+    writeFileSync(join(root, "other.txt"), "other\n");
+    const added = await runner.run([...hardeningArgs(), "add", "other.txt"], call);
+    expect(added.code, added.stderr).toBe(0);
+    const status = await runner.run([...hardeningArgs(), "status", "--porcelain"], call);
+    expect(status.code, status.stderr).toBe(0);
+    expect(git("ls-files", "--", "data.bin", "other.txt").trim().split(/\r?\n/)).toEqual(["other.txt"]);
+  }, 60_000);
+  it.skipIf(!HAS_GIT_LFS)("withRepositoryDrivers (real git-lfs, #162): Git LFS configured only globally stores a pointer and smudges it back", async () => {
+    repository();
+    writeFileSync(join(root, ".gitattributes"), "*.bin filter=lfs diff=lfs merge=lfs -text\n");
+    git("add", ".gitattributes"); git("commit", "-qm", "attributes");
+    const global = process.env.GIT_CONFIG_GLOBAL ?? "";
+    for (const [key, value] of [["filter.lfs.clean", "git-lfs clean -- %f"], ["filter.lfs.smudge", "git-lfs smudge -- %f"],
+      ["filter.lfs.process", "git-lfs filter-process"], ["filter.lfs.required", "true"]] as const) {
+      execFileSync(gitExecutable(), ["config", "--file", global, key, value], { cwd: outside, env: gitEnvironment() });
+    }
+    const content = Buffer.alloc(4096, 0x5a);
+    writeFileSync(join(root, "data.bin"), content);
+    const call = { cwd: root, timeoutMs: 60_000 };
+    const runner = withRepositoryDrivers(createGitRunner({ mode: "hardened", toplevel: root }), root);
+    const added = await runner.run([...hardeningArgs(), "add", "data.bin"], call);
+    expect(added.code, added.stderr).toBe(0);
+    const committed = await runner.run([...hardeningArgs(), "commit", "-qm", "data"], call);
+    expect(committed.code, committed.stderr).toBe(0);
+    const pointer = git("cat-file", "blob", "HEAD:data.bin");
+    expect(pointer).toMatch(/^version https:\/\/git-lfs\.github\.com\/spec\/v1\noid sha256:[0-9a-f]{64}\nsize 4096\n$/);
+    const oid = /oid sha256:([0-9a-f]{64})/.exec(pointer)?.[1] ?? "";
+    expect(existsSync(join(root, ".git", "lfs", "objects", oid.slice(0, 2), oid.slice(2, 4), oid))).toBe(true);
+    rmSync(join(root, "data.bin"));
+    const checkout = await runner.run([...hardeningArgs(), "checkout", "HEAD", "--", "data.bin"], call);
+    expect(checkout.code, checkout.stderr).toBe(0);
+    expect(readFileSync(join(root, "data.bin")).equals(content)).toBe(true);
+  }, 120_000);
   it("withRepositoryDrivers (real git): a write under a repository-only filter fails closed; the global filter's copy still runs", async () => {
     repository();
     const evil = join(outside, "EVIL_RAN");
