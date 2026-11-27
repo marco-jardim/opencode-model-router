@@ -142,7 +142,8 @@ const DRIVER_LISTING_TIMEOUT_MS = 15_000;
 
 /**
  * Where an executor git call runs: `cwd` after a leading `-C <dir>`, and the `--git-dir=`/`--work-tree=` options it passes
- * (in-slot calls), read from the global options before the subcommand.
+ * (in-slot calls), read from the global options before the subcommand. A bare `--git-dir`/`--work-tree` (the value as the
+ * next argument) throws `E_GIT`: only the `=` form is located.
  */
 export function gitCallLocation(args: readonly string[], cwd: string): { cwd: string; location: string[] } {
   let at = cwd;
@@ -152,6 +153,10 @@ export function gitCallLocation(args: readonly string[], cwd: string): { cwd: st
     if (arg === "-c") { index++; continue; }
     if (arg === "-C") { at = resolve(at, args[++index] ?? ""); continue; }
     if (arg.startsWith("--git-dir=") || arg.startsWith("--work-tree=")) { location.push(arg); continue; }
+    // The separate-value form would be skipped as a flag and its value read as the subcommand: the listing would run elsewhere.
+    if (arg === "--git-dir" || arg === "--work-tree") {
+      throw new ExecutorError("E_GIT", `git ${arg} must carry its value after '=' (${arg}=<path>)`, { op: "config", code: null, stderr: "" });
+    }
     if (arg.startsWith("-")) continue; // another global option (--no-pager, --no-optional-locks, --literal-pathspecs)
     break;
   }

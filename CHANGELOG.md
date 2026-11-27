@@ -12,15 +12,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **OpenCode v2: plans in different repositories can run at the same time in one Claude Code process.** Executor
   ownership is scoped to the repository's shared git common-directory home, not the whole process. A second plugin
   copy for the same repository (including linked worktrees) still waits for the owner to dispose before taking over.
-- **OpenCode v2: a filter defined only in a repository's own configuration now stops the plan executor and the
-  verification reference instead of being skipped.** Where git writes (executor commits, WIP saves and restores,
-  checkouts, resets, cleans, the reference's `stash create` and checkout), a filter that only the repository's local,
-  worktree or included configuration defines is blanked and marked required, so git refuses rather than storing or
-  checking out unfiltered content. Repositories whose filter lives only in local config (git-crypt, `nbstripout
-  --install`, a local-only Git LFS) now get an executor error or no reference. Remedy: define the filter in global
-  config (`git config --global filter.<name>.clean …`); a repository copy identical to the global one keeps working.
-  The executor also refuses to land into an owner checkout with populated submodules (land manually), because the
-  cleanliness check would run git inside them with their own configuration.
+- **A filter defined only in a repository's own configuration now stops the verification reference (OpenCode v1 and
+  v2) and the plan executor (OpenCode v2) instead of being skipped.** Where git writes (executor commits, WIP saves
+  and restores, checkouts, resets, cleans, the reference's `stash create` and checkout), a filter that only the
+  repository's local, worktree or included configuration defines is blanked and marked required, so git refuses rather
+  than storing or checking out unfiltered content. Repositories whose filter lives only in local config (git-crypt,
+  `nbstripout --install`, a local-only Git LFS) now get an executor error or no reference. Remedy: define the filter in
+  global config (`git config --global filter.<name>.clean …`); a repository copy identical to the global one keeps
+  working, and the plan executor currently needs that copy: with the filter only in global config, the executor's git
+  does not see it and commits the content unfiltered (see Fixed). The executor also refuses to land into an owner
+  checkout with populated submodules (land manually), because the cleanliness check would run git inside them with
+  their own configuration.
 
 ### Fixed
 
@@ -33,12 +35,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runs. The snapshot (default and hardened), the reference worktree and every executor git call (GitOps, the
   runtime's commits, WIP saves and restores, resets and cleans, the integration git and the landing probes) also blank
   the filter (`clean`, `smudge`, `process`) and merge drivers that only the repository's own configuration names,
-  include files of any condition too; the executor reads them again for every git call. A driver set identically in
-  system or global configuration keeps working, so global Git LFS and its `git lfs install --local` copy are
-  unaffected. The listing runs in the environment of the command it protects. The router's other hardened git calls
-  now blank `gpg.ssh.defaultKeyCommand` and refuse `ftp`/`ftps` too. Reading driver scopes needs git 2.26 or newer. If
-  the driver configuration cannot be read (or the legacy `GIT_CONFIG` variable is set, for the reference), there is no
-  snapshot or reference, and no executor git call runs.
+  including the drivers its include files set, whatever the include's condition (a missing include target is skipped,
+  as git skips it, and so is a dangling include link; on Windows one naming a reserved device such as `NUL` is
+  refused); the executor reads them again for every git call. A driver set identically in system or global
+  configuration keeps working, so for the default snapshot and the reference a global Git LFS and its
+  `git lfs install --local` copy are unaffected (the hardened snapshot reads no system or global configuration and
+  sees only the repository's copy, read-only, as before). The plan executor's hardened git does not read system or
+  global configuration either, so it currently needs the filter in the repository's local configuration too (for Git
+  LFS, `git lfs install --local`): a filter set only globally is not applied by the executor, so it stores and checks
+  out that content unfiltered (tracked in #162). The listing runs in the environment of the command it protects. The
+  router's other hardened git calls now blank `gpg.ssh.defaultKeyCommand` and refuse `ftp`/`ftps` too. Reading driver
+  scopes needs git 2.26 or newer. If the driver configuration cannot be read (or the legacy `GIT_CONFIG` variable is
+  set, for the reference), there is no snapshot or reference, and no executor git call runs.
 - **One invalid value in an overrides file no longer drops the whole file (#80).** A bad tier `effort`, an
   `activePreset` naming no preset or an out-of-range `routing` key used to discard every other key of that file too,
   `routing` included. Now only the offending key path goes: the top-level key it sits under, or inside `presets` the
