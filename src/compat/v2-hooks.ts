@@ -6,6 +6,7 @@ import type { SessionContext } from "@opencode/plugin/promise/session";
 import type { SystemPart } from "@opencode/ai";
 import type { V2Runtime } from "./v2-client";
 import { V2_GRADER_AGENT } from "./v2-client";
+import { assistantStepCompleted, lastAssistantReply, messageText } from "./child-history";
 import { DEPTH_BANNER, SESSION_DIRECTORY, TASK_VERIFICATION, type SessionDirectory } from "./child-session";
 import { realpathSync, statSync } from "node:fs";
 import { basename, isAbsolute, join, posix, resolve, win32 } from "node:path";
@@ -280,19 +281,6 @@ function translateAdded(before: string, after: string): string {
 // ---------------------------------------------------------------------------
 // #84 P2.1 (T2.1.3, T2.1.4): role-dispatch helpers of the adapter. Roles mode on v2 only; tiers mode never reaches them.
 // ---------------------------------------------------------------------------
-
-/** The text of one session-context message: its `text`, else its text parts (`content` or `parts`) joined. */
-function messageText(message: unknown): string | undefined {
-  if (!message || typeof message !== "object") return undefined;
-  const m = message as Record<string, unknown>;
-  if (typeof m.text === "string") return m.text;
-  if (typeof m.content === "string") return m.content;
-  const parts = Array.isArray(m.content) ? m.content : Array.isArray(m.parts) ? m.parts : undefined;
-  if (parts === undefined) return undefined;
-  const texts = parts.flatMap((part) => part && typeof part === "object" && (part as Record<string, unknown>).type === "text"
-    && typeof (part as Record<string, unknown>).text === "string" ? [(part as Record<string, unknown>).text as string] : []);
-  return texts.length > 0 ? texts.join("\n") : undefined;
-}
 
 /**
  * Handoff 32: `SessionLookup.firstText` — the text parts of the session's first user message, joined (the binding reads the
@@ -987,32 +975,6 @@ export function resumeTargetsOf(tool: string, args: unknown, caller: string): st
 type ChildEndState =
   | { outcome: "succeeded" | "failed" | "interrupted"; text?: string }
   | { outcome: "lost"; text?: undefined; incomplete?: boolean };
-
-/**
- * QA-2.1-18: whether an assistant entry of a child's history ended its step (top level or under `info`): a finish reason other
- * than a tool-call continuation, or a completed time; and no tool part still `pending` or `running`. A step cut mid-stream has
- * none of these, and a `tool-calls` finish means the child meant to go on: neither is an end, whatever text it already has.
- */
-function assistantStepCompleted(message: unknown): boolean {
-  if (message === null || typeof message !== "object") return false;
-  const m = message as Record<string, unknown>;
-  const info = m.info !== null && typeof m.info === "object" ? m.info as Record<string, unknown> : undefined;
-  const parts: readonly unknown[] = Array.isArray(m.content) ? m.content : Array.isArray(m.parts) ? m.parts : [];
-  const toolOpen = parts.some((part) => {
-    if (part === null || typeof part !== "object" || (part as Record<string, unknown>).type !== "tool") return false;
-    const state = (part as Record<string, unknown>).state;
-    const status = state !== null && typeof state === "object" ? (state as Record<string, unknown>).status : state ?? (part as Record<string, unknown>).status;
-    // The v2 tool state is `streaming` | `running` | `completed` | `error` (`pending` is the v1 name of the first).
-    return status === "streaming" || status === "pending" || status === "running";
-  });
-  if (toolOpen) return false;
-  const finish = m.finish ?? info?.finish;
-  if (typeof finish === "string" && finish !== "") return finish !== "tool-calls" && finish !== "unknown";
-  const time = m.time ?? info?.time;
-  // `time.completed` is set once the step ended: epoch millis on the wire, a DateTime once decoded; either counts.
-  const completed = time !== null && typeof time === "object" ? (time as Record<string, unknown>).completed : undefined;
-  return completed !== undefined && completed !== null && completed !== "" && completed !== false;
-}
 
 /**
  * QA-2.1-11: a failed session-directory lookup is not repeated for this long (the lease guard calls it per tool call).
@@ -3875,17 +3837,9 @@ export async function registerV2Hooks(
     const lastAssistantText = async (child: string): Promise<{ text: string } | undefined> => {
       const history = await ctx.session.context({ sessionID: child } as Parameters<typeof ctx.session.context>[0]);
       const messages: readonly unknown[] = Array.isArray(history) ? history : [];
-      for (let index = messages.length - 1; index >= 0; index--) {
-        // The host's context entries are discriminated by `type` ("user" | "assistant" | "synthetic", see the instruction filter in
-        // the system hook); the model-facing messages of the context hook use `role`. Both name the assistant the same way.
-        const message = messages[index] as { type?: unknown; role?: unknown } | undefined;
-        if (message?.type === "assistant" || message?.role === "assistant") {
-          const text = messageText(message);
-          if (text !== undefined) return { text };
-        }
-        // DF-1-4: the newest user prompt opens the current turn; an answer before it belongs to an earlier turn (a resume).
-        if (message?.type === "user" || message?.role === "user") break;
-      }
+      // The shared reader (`child-history.ts`, also the native runner's after a pending result, #167).
+      const reply = lastAssistantReply(history);
+      if (reply !== undefined) return { text: reply.text };
       ingestLogger.warn("[router] background: the child's context holds no assistant message", {
         child,
         shape: Array.isArray(history) ? `array(${messages.length})` : typeof history,

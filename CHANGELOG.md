@@ -26,6 +26,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **OpenCode v2: the router's own child runs work again on OpenCode 2.3.0 and later (#167, reported on 2.4.1).** Those
+  hosts answer every native `subagent` call at once with a running result, so every child the router runs itself (an
+  LLM grader, a `router_delegate` producer, a plan-executor task) was refused as pending and interrupted: verification
+  came out UNVERIFIABLE, and delegations and plan tasks failed. The router now waits for its own running child
+  (`session.wait`; the wait ends with the run's deadline or cancellation even where the host does not cancel it) and
+  uses the child's final answer: the newest assistant entry of its current turn, only when that step ended and has
+  text. A child whose run ended on a step without a final answer (cut mid-stream, or stopped after a tool call) is not
+  used, and the text of an earlier step is never taken instead. A resumed child (delegate producer or plan task) is
+  read only from what its new run added after a marker taken before the run, and only from an answer that follows this
+  run's own prompt there; otherwise the previous turn's answer could be taken. A child that ends with no answer, an
+  empty one or an error, a run that ended failed or interrupted, a failed, aborted or timed-out result, or a cancelled
+  wait is not used: the run fails as before and the child is interrupted. The grading service span reports `completed`
+  only once the child really completed.
 - **Router-run git commands in the work root no longer run repository-configured programs.** The verification
   snapshot of the work root and the reference worktree's git calls now turn off `core.fsmonitor`, hooks (including
   `post-index-change` on an index write), `gpg.ssh.defaultKeyCommand` and the external diff, refuse the `ext`, `file`,

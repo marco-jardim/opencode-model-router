@@ -7,12 +7,12 @@ import { createVerificationWiring } from "../../src/verify/wiring";
 import type { RouterConfig } from "../../src/router/config";
 import * as routerConfig from "../../src/router/config";
 import ModelRouterPlugin from "../../src/index";
-import { ResumeRejectedError, type RouterPluginInput } from "../../src/compat/child-session";
+import { ResumeRejectedError, type ChildSessionRequest, type RouterPluginInput } from "../../src/compat/child-session";
 import { createV2Observations } from "../../src/compat/v2-observations";
 import { servicePairs } from "../helpers/service-observations";
 
 function fixture() {
-  const execute = vi.fn(async (_input: unknown, context: ToolContext) => {
+  const execute = vi.fn(async (_input: unknown, context: ToolContext): Promise<{ output: { sessionID: string; status: string; output?: unknown } }> => {
     await context.progress({ sessionID: "child", status: "running" });
     return { output: { sessionID: "child", status: "completed", output: "verified result" } };
   });
@@ -23,6 +23,8 @@ function fixture() {
       interrupt: vi.fn(async () => ({ interrupted: true })),
       remove: vi.fn(async () => {}),
       move: vi.fn(async () => {}),
+      wait: vi.fn(async (_input: unknown, _options?: { signal?: AbortSignal }) => {}),
+      context: vi.fn(async (_input: unknown, _options?: { signal?: AbortSignal }): Promise<unknown[]> => []),
     },
     tool: { list: vi.fn(async () => [{ id: "subagent", execute }]) },
     provider: { list: vi.fn(async () => ({ data: [{ id: "p", name: "Provider" }] })) },
@@ -457,16 +459,379 @@ describe("native v2 child runner", () => {
     expect(context.session.interrupt).toHaveBeenCalledWith({ sessionID: "child" });
   });
 
-  it("rejects a native background response rather than verifying unfinished work", async () => {
-    const { runtime, toolContext, execute, context } = fixture();
-    execute.mockImplementationOnce(async (_input, context) => {
-      await context.progress({ sessionID: "child", status: "running" });
-      return { output: { sessionID: "child", status: "running", output: "still working" } };
+  describe("#167: a native background response (since OpenCode 2.3.0 every subagent result is running)", () => {
+    const backgrounded = (status = "running", sessionID = "child") => async (_input: unknown, native: ToolContext) => {
+      await native.progress({ sessionID: "child", status: "running" });
+      return { output: { sessionID, status, output: `The subagent is working in the background (sessionID: ${sessionID})` } };
+    };
+    const serviceSpy = (order: string[] = []) => {
+      const end = vi.fn((result: string) => { order.push(`end:${result}`); });
+      const service = { start: vi.fn(() => ({ end })) } as unknown as NonNullable<ChildSessionRequest["service"]>;
+      return { end, service };
+    };
+    // Shaped like the installed typings (SessionMessageUser / SessionMessageAssistant): tool calls are parts of the assistant
+    // entry's `content`, and a step's end is its `finish` or `time.completed`.
+    const user = (text: string) => ({ type: "user", text });
+    const answer = (text: string, more: Record<string, unknown> = {}) =>
+      ({ type: "assistant", content: [{ type: "text", text }], finish: "stop", time: { created: 1, completed: 2 }, ...more });
+    const toolStep = (text: string, status = "completed") => ({
+      type: "assistant", finish: "tool-calls", time: { created: 1, completed: 2 },
+      content: [{ type: "text", text }, { type: "tool", id: "call-1", name: "read", state: { status }, time: { created: 1 } }],
     });
-    await expect(runtime.withToolContext(toolContext, () => runtime.childRunner.run({
-      prompt: "work", onCreated: async () => {},
-    }))).rejects.toThrow("cannot use a pending result");
-    expect(context.session.interrupt).toHaveBeenCalledWith({ sessionID: "child" });
+
+    it.each([
+      { label: "a succeeded end marker", end: { type: "idle", outcome: "succeeded" } },
+      { label: "an end marker without outcome", end: { type: "idle" } },
+    ])("waits for its own running child, then returns the child's last assistant text ($label)", async ({ end: marker }) => {
+      const { runtime, toolContext, execute, context } = fixture();
+      const order: string[] = [];
+      const { end, service } = serviceSpy(order);
+      const onConfirmed = vi.fn(async () => {});
+      execute.mockImplementationOnce(backgrounded());
+      context.session.wait.mockImplementationOnce(async () => { order.push("wait"); });
+      context.session.context.mockImplementationOnce(async () => {
+        order.push("context");
+        return [
+          // An earlier round's failed end belongs to that round only.
+          user("an earlier round"), answer("an earlier verdict"), { type: "idle", outcome: "failed" },
+          user("inspect"), toolStep("Reading the diff"), answer("verified result"), marker,
+        ];
+      });
+      await expect(runtime.withToolContext(toolContext, () => runtime.childRunner.run({
+        prompt: "inspect", onCreated: async () => {}, onConfirmed, service,
+      }))).resolves.toEqual({ sessionID: "child", text: "verified result" });
+      expect(context.session.wait).toHaveBeenCalledExactlyOnceWith({ sessionID: "child" }, { signal: expect.any(AbortSignal) });
+      expect(context.session.context).toHaveBeenCalledExactlyOnceWith({ sessionID: "child" }, { signal: expect.any(AbortSignal) });
+      // The span reports "completed" once, after the child really completed.
+      expect(order).toEqual(["wait", "context", "end:completed"]);
+      expect(end).toHaveBeenCalledOnce();
+      expect(onConfirmed).toHaveBeenCalledExactlyOnceWith("child");
+      expect(context.session.interrupt).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      { label: "finish: stop", final: answer("the final verdict") },
+      { label: "only time.completed", final: { type: "assistant", content: [{ type: "text", text: "the final verdict" }], time: { created: 3, completed: 4 } } },
+    ])("an earlier tool-call step with text, then a completed final entry ($label): returns the final text only", async ({ final }) => {
+      const { runtime, toolContext, execute, context } = fixture();
+      execute.mockImplementationOnce(backgrounded());
+      context.session.context.mockResolvedValueOnce([user("inspect"), toolStep("Draft: looks fine, checking one more file"), final]);
+      await expect(runtime.withToolContext(toolContext, () => runtime.childRunner.run({
+        prompt: "inspect", onCreated: async () => {},
+      }))).resolves.toEqual({ sessionID: "child", text: "the final verdict" });
+      expect(context.session.interrupt).not.toHaveBeenCalled();
+    });
+
+    it("a rejected wait fails the run and interrupts the child, without reading its history", async () => {
+      const { runtime, toolContext, execute, context } = fixture();
+      const { end, service } = serviceSpy();
+      execute.mockImplementationOnce(backgrounded());
+      context.session.wait.mockRejectedValueOnce(new Error("wait failed"));
+      await expect(runtime.withToolContext(toolContext, () => runtime.childRunner.run({
+        prompt: "inspect", onCreated: async () => {}, service,
+      }))).rejects.toThrow("wait failed");
+      expect(context.session.context).not.toHaveBeenCalled();
+      expect(context.session.interrupt).toHaveBeenCalledWith({ sessionID: "child" });
+      expect(end).toHaveBeenCalledExactlyOnceWith("error");
+    });
+
+    it("an abort during the wait fails the run with the abort reason and interrupts the child", async () => {
+      const { runtime, toolContext, execute, context } = fixture();
+      const { end, service } = serviceSpy();
+      const deadline = new AbortController();
+      let waitSignal: AbortSignal | undefined;
+      execute.mockImplementationOnce(backgrounded());
+      // A host whose wait settles normally once the call is aborted: the runner still checks its signal afterwards.
+      context.session.wait.mockImplementationOnce(async (_input, options) => {
+        waitSignal = options?.signal;
+        deadline.abort(new Error("grader deadline"));
+      });
+      await expect(runtime.withToolContext(toolContext, () => runtime.childRunner.run({
+        prompt: "inspect", signal: deadline.signal, onCreated: async () => {}, service,
+      }))).rejects.toThrow("grader deadline");
+      expect(waitSignal?.aborted).toBe(true);
+      expect(context.session.context).not.toHaveBeenCalled();
+      expect(context.session.interrupt).toHaveBeenCalledWith({ sessionID: "child" });
+      expect(end).toHaveBeenCalledExactlyOnceWith("interrupted");
+    });
+
+    it("a wait that never settles and ignores its signal is still ended by an abort, and the child is interrupted", async () => {
+      const { runtime, toolContext, execute, context } = fixture();
+      const { end, service } = serviceSpy();
+      const deadline = new AbortController();
+      let waiting!: () => void;
+      const waited = new Promise<void>((resolve) => { waiting = resolve; });
+      execute.mockImplementationOnce(backgrounded());
+      // `@opencode/plugin` up to 2.4.1: the promise adapter drops request options, so the host never sees the signal.
+      context.session.wait.mockImplementationOnce(() => { waiting(); return new Promise<void>(() => {}); });
+      const run = runtime.withToolContext(toolContext, () => runtime.childRunner.run({
+        prompt: "inspect", signal: deadline.signal, onCreated: async () => {}, service,
+      }));
+      const rejected = expect(run).rejects.toThrow("grader deadline");
+      await waited;
+      expect(context.session.interrupt).not.toHaveBeenCalled();
+      deadline.abort(new Error("grader deadline"));
+      await rejected;
+      expect(context.session.context).not.toHaveBeenCalled();
+      expect(context.session.interrupt).toHaveBeenCalledWith({ sessionID: "child" });
+      expect(end).toHaveBeenCalledExactlyOnceWith("interrupted");
+    });
+
+    it("a history read that never settles is ended by an abort too", async () => {
+      const { runtime, toolContext, execute, context } = fixture();
+      const { end, service } = serviceSpy();
+      const deadline = new AbortController();
+      let reading!: () => void;
+      const read = new Promise<void>((resolve) => { reading = resolve; });
+      execute.mockImplementationOnce(backgrounded());
+      context.session.context.mockImplementationOnce(() => { reading(); return new Promise<unknown[]>(() => {}); });
+      const run = runtime.withToolContext(toolContext, () => runtime.childRunner.run({
+        prompt: "inspect", signal: deadline.signal, onCreated: async () => {}, service,
+      }));
+      const rejected = expect(run).rejects.toThrow("grader deadline");
+      await read;
+      deadline.abort(new Error("grader deadline"));
+      await rejected;
+      expect(context.session.interrupt).toHaveBeenCalledWith({ sessionID: "child" });
+      expect(end).toHaveBeenCalledExactlyOnceWith("interrupted");
+    });
+
+    it.each([
+      { label: "no history", history: [] },
+      { label: "no assistant message", history: [user("inspect")] },
+      { label: "only an earlier round's answer", history: [user("first"), answer("an earlier verdict"), user("inspect")] },
+      { label: "an empty answer", history: [user("inspect"), answer("  ")] },
+      { label: "a turn that ended in an error", history: [user("inspect"), answer('{"pass":tr', { finish: "error", error: { name: "APIError" } })] },
+      // `session.wait` resolves for a run that failed or was interrupted too: its end marker says how it ended.
+      { label: "an answer and a failed run", history: [user("inspect"), answer('{"pass":true,"reasons":[]}'),
+        { type: "idle", outcome: "failed", error: { type: "provider", message: "overloaded" } }] },
+      { label: "an answer and an interrupted run", history: [user("inspect"), answer('{"pass":true,"reasons":[]}'),
+        { type: "idle", outcome: "interrupted" }] },
+      // QA-2.1-18 (text alone is not an end): only the turn's newest assistant entry, completed and with text, is the answer.
+      { label: "a draft before a tool call, then a final step without text", history: [user("inspect"),
+        toolStep('Draft: {"pass":true,"reasons":[]} — let me confirm by reading X'),
+        { type: "assistant", content: [{ type: "reasoning", text: "done reading" }], finish: "stop", time: { created: 3, completed: 4 } },
+        { type: "idle", outcome: "succeeded" }] },
+      { label: "a newest answer whose step did not end", history: [user("inspect"),
+        { type: "assistant", content: [{ type: "text", text: '{"pass":true,"reasons":[]}' }], time: { created: 1 } }] },
+      { label: "a newest answer whose step is still in a tool call", history: [user("inspect"),
+        toolStep('{"pass":true,"reasons":[]}', "running")] },
+      { label: "a newest answer that finished on an error (no error field)", history: [user("inspect"),
+        answer('{"pass":true,"reasons":[]}', { finish: "error" })] },
+    ])("a waited child with $label is not a verdict: throws and interrupts the child", async ({ history }) => {
+      const { runtime, toolContext, execute, context } = fixture();
+      const { end, service } = serviceSpy();
+      execute.mockImplementationOnce(backgrounded());
+      context.session.context.mockResolvedValueOnce(history);
+      // A fresh child's failure keeps the plain message: the resume reasons are for resumes only.
+      await expect(runtime.withToolContext(toolContext, () => runtime.childRunner.run({
+        prompt: "inspect", onCreated: async () => {}, service,
+      }))).rejects.toThrow(/verification cannot use a pending result$/);
+      expect(context.session.wait).toHaveBeenCalledOnce();
+      expect(context.session.interrupt).toHaveBeenCalledWith({ sessionID: "child" });
+      expect(end).toHaveBeenCalledExactlyOnceWith("error");
+    });
+
+    it.each([
+      { label: "failed", status: "failed", output: "", sessionID: "child" },
+      { label: "aborted", status: "aborted", output: "", sessionID: "child" },
+      { label: "timeout", status: "timeout", output: "", sessionID: "child" },
+      { label: "error", status: "error", output: "", sessionID: "child" },
+      { label: "completed without text", status: "completed", output: undefined, sessionID: "child" },
+      { label: "running for another session", status: "running", output: "working", sessionID: "another" },
+    ])("a $label result is final: throws without waiting and interrupts the child", async ({ status, output, sessionID }) => {
+      const { runtime, toolContext, execute, context } = fixture();
+      const { end, service } = serviceSpy();
+      execute.mockImplementationOnce(async (_input, native) => {
+        await native.progress({ sessionID: "child", status: "running" });
+        return { output: { sessionID, status, output } };
+      });
+      await expect(runtime.withToolContext(toolContext, () => runtime.childRunner.run({
+        prompt: "inspect", onCreated: async () => {}, service,
+      }))).rejects.toThrow("cannot use a pending result");
+      expect(context.session.wait).not.toHaveBeenCalled();
+      expect(context.session.context).not.toHaveBeenCalled();
+      expect(context.session.interrupt).toHaveBeenCalledWith({ sessionID: "child" });
+      // A span ends once (the first end wins); the catch repeats "error" into the spy.
+      expect(end).toHaveBeenNthCalledWith(1, "error");
+      expect(end).not.toHaveBeenCalledWith("completed");
+    });
+
+    describe("a resume's result comes only from what its own run added (the previous turn's answer stays in the history)", () => {
+      const stalePass = '{"pass":true,"reasons":[]}';
+      // The resume reasons appended to the unchanged pending-result message.
+      const NO_MARKER = "(resume: no history marker could be read before the run)";
+      const MARKER_GONE = "(resume: the history marker is gone)";
+      const NO_OWN_ANSWER = "(resume: no answer to this run's prompt after the marker)";
+      const before = [
+        { id: "m1", ...user("first round") }, { id: "m2", ...answer(stalePass) }, { id: "m3", type: "idle", outcome: "succeeded" },
+      ];
+      const resume = (runtime: ReturnType<typeof createV2Runtime>, toolContext: ToolContext, service?: NonNullable<ChildSessionRequest["service"]>) =>
+        runtime.withToolContext(toolContext, () => runtime.childRunner.run({
+          prompt: "continue", resumeSessionID: "child", onCreated: async () => {}, ...(service ? { service } : {}),
+        }));
+
+      it.each([
+        { label: "unchanged (the old answer is still newest)", after: before },
+        { label: "ended without taking the new prompt", after: [...before, { id: "m4", type: "idle", outcome: "succeeded" }] },
+      ])("a history $label after the wait gives no verdict: throws and interrupts the child", async ({ after }) => {
+        const { runtime, toolContext, execute, context } = fixture();
+        const { end, service } = serviceSpy();
+        execute.mockImplementationOnce(backgrounded());
+        context.session.context.mockResolvedValueOnce(before).mockResolvedValueOnce(after);
+        await expect(resume(runtime, toolContext, service)).rejects.toThrow("cannot use a pending result");
+        expect(context.session.wait).toHaveBeenCalledOnce();
+        expect(context.session.context).toHaveBeenCalledTimes(2);
+        expect(context.session.interrupt).toHaveBeenCalledWith({ sessionID: "child" });
+        expect(end).toHaveBeenCalledExactlyOnceWith("error");
+      });
+
+      it("a new prompt and a new answer after the marker: returns the new answer, not the old one", async () => {
+        const { runtime, toolContext, execute, context } = fixture();
+        const order: string[] = [];
+        const fresh = '{"pass":false,"reasons":["still broken"]}';
+        context.session.get.mockImplementationOnce(async () => { order.push("get"); return { id: "child", parentID: "parent", agent: "fast" }; });
+        context.session.context
+          .mockImplementationOnce(async () => { order.push("context"); return before; })
+          .mockImplementationOnce(async () => {
+            order.push("context");
+            // The host may put its subagent preamble line before the prompt: the entry contains the prompt.
+            return [...before, { id: "m4", ...user("You are a subagent spawned by another session.\ncontinue") }, { id: "m5", ...answer(fresh) },
+              { id: "m6", type: "idle", outcome: "succeeded" }];
+          });
+        execute.mockImplementationOnce(async (input, native) => { order.push("execute"); return backgrounded()(input, native); });
+        context.session.wait.mockImplementationOnce(async () => { order.push("wait"); });
+        await expect(resume(runtime, toolContext)).resolves.toEqual({ sessionID: "child", text: fresh });
+        expect(order).toEqual(["get", "context", "execute", "wait", "context"]);
+        expect(context.session.context).toHaveBeenNthCalledWith(1, { sessionID: "child" }, { signal: expect.any(AbortSignal) });
+        expect(context.session.interrupt).not.toHaveBeenCalled();
+      });
+
+      it("an unreadable history before the run and a pending result: throws at once and interrupts the child", async () => {
+        const { runtime, toolContext, execute, context } = fixture();
+        const { end, service } = serviceSpy();
+        execute.mockImplementationOnce(backgrounded());
+        context.session.context.mockRejectedValueOnce(new Error("context unavailable"));
+        await expect(resume(runtime, toolContext, service)).rejects.toThrow(`cannot use a pending result ${NO_MARKER}`);
+        // Without a marker no answer can be told new, so the run is not waited for.
+        expect(context.session.wait).not.toHaveBeenCalled();
+        expect(context.session.context).toHaveBeenCalledOnce();
+        expect(context.session.interrupt).toHaveBeenCalledWith({ sessionID: "child" });
+        expect(end).toHaveBeenCalledExactlyOnceWith("error");
+      });
+
+      it("an unreadable history before the run and a foreground completed result: returns its output as before", async () => {
+        const { runtime, toolContext, execute, context } = fixture();
+        const onCreated = vi.fn(async () => {});
+        context.session.context.mockRejectedValueOnce(new Error("context unavailable"));
+        execute.mockImplementationOnce(async (_input, native) => {
+          await native.progress({ sessionID: "child", status: "running" });
+          return { output: { sessionID: "child", status: "completed", output: "resumed verdict" } };
+        });
+        await expect(runtime.withToolContext(toolContext, () => runtime.childRunner.run({
+          prompt: "continue", resumeSessionID: "child", onCreated,
+        }))).resolves.toEqual({ sessionID: "child", text: "resumed verdict" });
+        expect(onCreated).toHaveBeenCalledExactlyOnceWith("child");
+        expect(context.session.wait).not.toHaveBeenCalled();
+        expect(context.session.context).toHaveBeenCalledOnce();
+        expect(context.session.interrupt).not.toHaveBeenCalled();
+      });
+
+      it("a marker that is gone after the wait (compacted history) gives no verdict: throws and interrupts the child", async () => {
+        const { runtime, toolContext, execute, context } = fixture();
+        execute.mockImplementationOnce(backgrounded());
+        context.session.context.mockResolvedValueOnce(before).mockResolvedValueOnce([
+          { id: "c1", type: "compaction", status: "completed", summary: "earlier rounds" },
+          { id: "m4", ...user("continue") }, { id: "m5", ...answer('{"pass":true,"reasons":[]}') },
+        ]);
+        await expect(resume(runtime, toolContext)).rejects.toThrow(`cannot use a pending result ${MARKER_GONE}`);
+        expect(context.session.wait).toHaveBeenCalledOnce();
+        expect(context.session.interrupt).toHaveBeenCalledWith({ sessionID: "child" });
+      });
+
+      it("an aborted read before the run fails the resume with the abort reason, before anything is sent", async () => {
+        const { runtime, toolContext, execute, context } = fixture();
+        const deadline = new AbortController();
+        context.session.context.mockImplementationOnce(() => { deadline.abort(new Error("grader deadline")); return new Promise<unknown[]>(() => {}); });
+        await expect(runtime.withToolContext(toolContext, () => runtime.childRunner.run({
+          prompt: "continue", resumeSessionID: "child", signal: deadline.signal, onCreated: async () => {},
+        }))).rejects.toThrow("grader deadline");
+        expect(execute).not.toHaveBeenCalled();
+      });
+
+      it("an answer to another user entry after the marker (not this run's prompt) gives no result", async () => {
+        const { runtime, toolContext, execute, context } = fixture();
+        execute.mockImplementationOnce(backgrounded());
+        context.session.context.mockResolvedValueOnce(before).mockResolvedValueOnce([
+          ...before, { id: "m4", ...user("a prompt an earlier run left queued") }, { id: "m5", ...answer(stalePass) },
+        ]);
+        await expect(resume(runtime, toolContext)).rejects.toThrow(`cannot use a pending result ${NO_OWN_ANSWER}`);
+        expect(context.session.interrupt).toHaveBeenCalledWith({ sessionID: "child" });
+      });
+
+      it("our run ended (interrupted) after taking our prompt; a later run's answer to another prompt is not ours", async () => {
+        const { runtime, toolContext, execute, context } = fixture();
+        execute.mockImplementationOnce(backgrounded());
+        context.session.context.mockResolvedValueOnce(before).mockResolvedValueOnce([
+          ...before, { id: "m4", ...user("continue") }, { id: "m5", type: "idle", outcome: "interrupted" },
+          { id: "m6", ...user("something else") }, { id: "m7", ...answer(stalePass) }, { id: "m8", type: "idle", outcome: "succeeded" },
+        ]);
+        await expect(resume(runtime, toolContext)).rejects.toThrow(`cannot use a pending result ${NO_OWN_ANSWER}`);
+        expect(context.session.interrupt).toHaveBeenCalledWith({ sessionID: "child" });
+      });
+
+      describe("a resume that repeats the previous turn's prompt", () => {
+        const repeated = [
+          { id: "m1", ...user("continue") }, { id: "m2", ...answer(stalePass) }, { id: "m3", type: "idle", outcome: "succeeded" },
+        ];
+
+        it("new entries after the marker: returns the new answer", async () => {
+          const { runtime, toolContext, execute, context } = fixture();
+          execute.mockImplementationOnce(backgrounded());
+          context.session.context.mockResolvedValueOnce(repeated).mockResolvedValueOnce([
+            ...repeated, { id: "m4", ...user("continue") }, { id: "m5", ...answer('{"pass":false,"reasons":["new"]}') },
+          ]);
+          await expect(resume(runtime, toolContext)).resolves.toEqual({ sessionID: "child", text: '{"pass":false,"reasons":["new"]}' });
+        });
+
+        it("a run that ended without taking the prompt: the identical earlier prompt and its answer give no result", async () => {
+          const { runtime, toolContext, execute, context } = fixture();
+          execute.mockImplementationOnce(backgrounded());
+          context.session.context.mockResolvedValueOnce(repeated).mockResolvedValueOnce([
+            ...repeated, { id: "m4", type: "idle", outcome: "succeeded" },
+          ]);
+          await expect(resume(runtime, toolContext)).rejects.toThrow(`cannot use a pending result ${NO_OWN_ANSWER}`);
+          expect(context.session.interrupt).toHaveBeenCalledWith({ sessionID: "child" });
+        });
+      });
+
+      describe("a history read before the run that outlasts RESUME_MARKER_TIMEOUT_MS (the executor's 30 s confirmation window)", () => {
+        const slowMarker = () => {
+          const f = fixture();
+          f.context.session.context.mockImplementationOnce(() => new Promise<unknown[]>(() => {}));
+          return { ...f, runtime: createV2Runtime(f.context as unknown as Plugin.Context, { resumeMarkerTimeoutMs: 20 }) };
+        };
+
+        it("goes on without a marker: a foreground completed result is returned as before", async () => {
+          const { runtime, toolContext, execute, context } = slowMarker();
+          execute.mockImplementationOnce(async (_input, native) => {
+            await native.progress({ sessionID: "child", status: "running" });
+            return { output: { sessionID: "child", status: "completed", output: "resumed verdict" } };
+          });
+          await expect(resume(runtime, toolContext)).resolves.toEqual({ sessionID: "child", text: "resumed verdict" });
+          expect(execute).toHaveBeenCalledOnce();
+          expect(context.session.interrupt).not.toHaveBeenCalled();
+        });
+
+        it("goes on without a marker: a pending result throws without waiting", async () => {
+          const { runtime, toolContext, execute, context } = slowMarker();
+          execute.mockImplementationOnce(backgrounded());
+          await expect(resume(runtime, toolContext)).rejects.toThrow(`cannot use a pending result ${NO_MARKER}`);
+          expect(context.session.wait).not.toHaveBeenCalled();
+          expect(context.session.interrupt).toHaveBeenCalledWith({ sessionID: "child" });
+        });
+      });
+    });
   });
 
   it("registers grader identity before model requests and always disposes the real session", async () => {
