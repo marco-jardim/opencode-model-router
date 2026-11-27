@@ -12,3 +12,11 @@ updates:
         patterns:
           - "vitest"
           - "@vitest/*"
+    ignore:
+      # test/unit/packaging.test.ts pins these three to exact versions: the
+      # TUI unit tests load solid-js by its dist paths and the TUI smoke
+      # depends on this pty/terminal pair. A bump always fails CI unless the
+      # pin moves with it, so they are updated by hand, together with the pin.
+      - dependency-name: "solid-js"
+      - dependency-name: "@lydell/node-pty"
+      - dependency-name: "@xterm/headless"
