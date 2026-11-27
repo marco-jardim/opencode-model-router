@@ -114,6 +114,50 @@ describe("v1 legacy hooks: delegated agents never write git metadata", () => {
     await expect(before(hooks, "SUB", "edit", { filePath: "a.ts" })).resolves.toBeUndefined();
   });
 
+  it("#161: OpenCode opened at a bare repository: its config, hooks and HEAD are refused, its worktree's files pass", async () => {
+    const hooks = await plugin(fx.proj);
+    await child(hooks, "SUB", "medium");
+    for (const path of ["config", "hooks/x", "HEAD", join(fx.proj, "refs", "heads", "main")]) {
+      await expect(before(hooks, "SUB", "write", { filePath: path, content: "x" }), path).rejects.toThrow(REFUSED);
+      await expect(before(hooks, "SUB", "patch", writeCall("patch", path, "")), path).rejects.toThrow(REFUSED);
+    }
+    await expect(before(hooks, "SUB", "edit", { filePath: "main/a.ts" })).resolves.toBeUndefined();
+    await expect(before(hooks, "SUB", "write", { filePath: join(fx.root, "notes.md"), content: "x" })).resolves.toBeUndefined();
+    await expect(before(hooks, "ORCH", "write", { filePath: "config", content: "x" })).resolves.toBeUndefined();
+  });
+
+  it("#161: on the v2 host a root-session lookup that never answers gives up after SESSION_INFO_LOOKUP_MS and refuses; on v1 it is not bounded", async () => {
+    const hung = { session: { get: () => new Promise<never>(() => undefined) } };
+    const start = async (v2: boolean): Promise<Hooks> => await ModelRouterPlugin({
+      directory: fx.repo, worktree: fx.repo, client: hung, ...(v2 ? { routerHost: "v2" } : {}),
+    } as unknown as RouterPluginInput) as unknown as Hooks;
+    const onV2 = await start(true);
+    const onV1 = await start(false);
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const target = { filePath: join(fx.repo, ".git", "config"), content: "x" };
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      let v2Done = false;
+      let v1Done = false;
+      const fromV2 = before(onV2, "HUNG", "write", target).finally(() => { v2Done = true; });
+      fromV2.catch(() => undefined);
+      before(onV1, "HUNG", "write", target).finally(() => { v1Done = true; }).catch(() => undefined);
+      await vi.advanceTimersByTimeAsync(9_900);
+      expect(v2Done, "the v2 lookup still waits before 10 s").toBe(false);
+      for (let waited = 0; !v2Done && waited < 5_000; waited += 100) {
+        await vi.advanceTimersByTimeAsync(100);
+        await new Promise((resolveStep) => setImmediate(resolveStep));
+      }
+      expect(v2Done, "the v2 lookup gave up once 10 s passed").toBe(true);
+      await expect(fromV2).rejects.toThrow(REFUSED); // a failed lookup: not proven root, so refused, as before
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(v1Done, "OpenCode v1 waits for its host as before").toBe(false);
+    } finally {
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+    }
+  });
+
   it("a plugin agent with edit granted (#81) is refused git metadata and keeps its ordinary edits", async () => {
     const editor = { tier: "fast", description: "Editor", permission: { read: "allow", edit: "allow" } };
     const hooks = await plugin(fx.repo, { agents: { editor } });

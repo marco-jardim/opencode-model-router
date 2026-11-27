@@ -160,9 +160,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `file_path`), and the session's repository (its git and common directories). After the host moved the session these
   were checked against the old directory. The guard now uses the call's own lookup, the one the relative path uses. The
   file leases and the role checks still use the session's first directory.
+- **OpenCode v2: a tool call's bookkeeping uses the directory its checks used (#161).** After a tool ran, the router
+  looked the session's directory up again to resolve the call's relative `read`/`write`/`edit` path for the
+  changed-file record, the session's tool history and the guard's after-call step. That lookup could wait up to about
+  12 seconds on a host that did not answer (2 seconds for its own lookup, then up to 10 for the session record when no
+  earlier directory was known), could see a session the host had moved since, and when no directory was known it
+  skipped that bookkeeping for the call. The router now keeps, per call, the directory the call was checked against
+  and reuses it, without asking the host again. So the after-call step records the directory the call was checked
+  against: a session the host moves while the call waits (for example on a permission prompt) is recorded at its old
+  location. It keeps at most 1000 calls, for up to an hour each (a call can wait that long on a permission prompt),
+  only for the session that made the call, and drops a call's entry when the call is refused and a session's entries
+  when the session is deleted. Past that, or when the call's checks needed no directory, it looks the directory up as
+  before.
+- **OpenCode v2: five more host lookups no longer wait forever on a host that does not answer (#161).** Each now gives
+  up after 10 seconds, the bound of the session record, and then counts as a failed lookup, with the same result as
+  before:
+  - reading a role child's session to bind it to its dispatch: the child stays unbound, so its role calls are refused;
+  - reading that child's first message for the binding: the child is bound by its title, as when that read fails;
+  - reading a session's first message to check a plan task: the tool call is not checked and the next call tries again;
+  - reading a resume target's first message for the stale-resume check: the target counts as one that could not be
+    checked, so the resume is not refused as stale;
+  - checking whether a session is the root (the legacy plugin's lookup): the session is not proven to be the root, so
+    the git metadata guard refuses only the writes it refuses for a delegated session (paths that name git metadata,
+    or any write while the session's directory is unknown), and the delegation instructions are still added to its
+    prompt. On OpenCode v1 this lookup is not bounded, as before.
 
 ### Security
 
+- **A bare repository opened as the project is protected as git metadata (#161).** When OpenCode is opened at a bare
+  repository that holds its worktrees (`proj.git`), the git metadata guard did not see a repository there (it looks
+  for `.git`), so delegated agents could write the repository's own files: `config`, `hooks/`, `HEAD`, `objects/`,
+  `refs/`. The guard now recognises git's bare shape (a `HEAD` file and `objects` and `refs` directories, which may be
+  links to local directories) in the session directory or the nearest directory above it with that shape, unless a
+  checkout comes first, and refuses writes into that repository with the usual refusal. The files of its linked
+  worktrees inside it stay writable, if the worktree's admin directory and its `.git` file point at each other and the
+  admin directory's `commondir` names the repository (the `.git` file itself stays refused); a worktree inside one of
+  git's own directories (`hooks`, `objects`, `refs`, `lfs`, …) never is. A session in a linked worktree is checked as
+  before. OpenCode v1 and v2.
 - **A patch call whose extra patch text cannot be read is refused (#161).** The host reads the first string among
   `patchText`, `patch_text`, `patch` and `input`; the git metadata guard also reads the others. One of those with a file
   header that names no path (`*** Add File:` and nothing after it) was skipped, and now makes the call refused like an

@@ -2118,6 +2118,43 @@ describe("QA round 1 (P2.3)", () => {
     }
   });
 
+  it("#161: a binding lookup gives up after SESSION_INFO_LOOKUP_MS: a session read that never answers leaves the child unbound, a first message that never answers binds by the title", async () => {
+    const { dir, cfg, v2, sessions } = await started();
+    const route = "[route class=search risk=low scope=single]\nfind the parser";
+    await dispatch(v2, sessions, "b1", "hungget", "explorer", route, dir);
+    await dispatch(v2, sessions, "b2", "hungctx", "explorer", route, dir);
+    const get = v2.ctx.session.get.getMockImplementation()!;
+    v2.ctx.session.get.mockImplementation(async (request: { sessionID: string }) =>
+      (request.sessionID === "hungget" ? new Promise<never>(() => undefined) : get(request)));
+    const context = v2.ctx.session.context.getMockImplementation()!;
+    v2.ctx.session.context.mockImplementation(async (request: { sessionID: string }) =>
+      (request.sessionID === "hungctx" ? new Promise<never>(() => undefined) : context(request)));
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "debug").mockImplementation(() => {});
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      /** Advances fake time until `pending` settles; fails at once past `limit` fake milliseconds. */
+      const settles = async (pending: Promise<unknown>, limit = 60_000): Promise<void> => {
+        let done = false;
+        const settled = pending.finally(() => { done = true; });
+        settled.catch(() => undefined);
+        for (let waited = 0; !done && waited < limit; waited += 100) {
+          await vi.advanceTimersByTimeAsync(100);
+          await new Promise((resolveStep) => setImmediate(resolveStep));
+        }
+        expect(done, `settled within ${limit} ms of fake time`).toBe(true);
+        await settled;
+      };
+      // Bound through their catalogs (the context hook's binding): before #161 both waited for the host for good.
+      await settles(catalog(v2, "hungget", "explorer"));
+      expect(kindOf(cfg, "hungget")).toBeUndefined(); // lookupFailed: not cached, so not bound (fail closed)
+      await settles(catalog(v2, "hungctx", "explorer"));
+      expect(kindOf(cfg, "hungctx")).toBe("exact"); // the nonce in its title still binds, as for a failed first-message read
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("A7: a role session's call to any tool outside the role classes is refused — subagent, shell, todowrite, MCP tools", async () => {
     const { dir, v2, sessions } = await started();
     await dispatch(v2, sessions, "g1", "y1", "general", "[route class=implement risk=low scope=single needs=edit]\nfix the parser", dir);

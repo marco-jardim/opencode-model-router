@@ -11,7 +11,7 @@ import { join } from "node:path";
 
 export interface GitMetadataFixture {
   readonly root: string;
-  /** A repository: `.git/` (HEAD, objects, config, hooks), `src/a.ts`, `.gitattributes`, and a nested repository `sub/`. */
+  /** A repository: `.git/` (HEAD, objects, refs, config, hooks), `src/a.ts`, `.gitattributes`, and a nested repository `sub/`. */
   readonly repo: string;
   /** A linked worktree of `repo` (its `.git` is a file). */
   readonly wt: string;
@@ -36,6 +36,7 @@ export interface GitMetadataFixture {
 
 function gitDirectory(dir: string): void {
   mkdirSync(join(dir, "objects"), { recursive: true });
+  mkdirSync(join(dir, "refs", "heads"), { recursive: true });
   mkdirSync(join(dir, "hooks"), { recursive: true });
   writeFileSync(join(dir, "HEAD"), "ref: refs/heads/main\n");
   writeFileSync(join(dir, "config"), "[core]\n");

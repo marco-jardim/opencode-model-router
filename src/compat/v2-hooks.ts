@@ -70,6 +70,7 @@ import type { TimingRecorderHolder } from "../routing/outcomes/timings";
 import { createSideLogs, durationSeamsFor, nodePersistDeps, resolveOutcomesDir } from "../routing/outcomes/persist";
 import { homedir, tmpdir } from "node:os";
 import { installGitSearchFilter, nearestRepository, repositoryIdentity } from "../router/git-tools";
+import { SESSION_INFO_LOOKUP_MS, sessionLookupWithin } from "./session-lookup";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { resolveRouting } from "../router/config";
@@ -984,26 +985,20 @@ type ChildEndState =
  * QA-2.1-25: a failed directory means no lease check and no lease for that call, like a failed kind, so the window is as short.
  */
 export const SESSION_DIR_NEGATIVE_TTL_MS = 2_000;
-/**
- * #161: how long the shared session record (`sessionInfoOf`: the directory, parent and agent the role checks, the file leases and
- * the stale-resume check read) waits for the host's `session.get`; past it the lookup counts as failed. Long on purpose, above
- * background.ts's 5 s LOOKUP_TIMEOUT_MS: a miss refuses a role agent's call, so a slow but healthy host must not cause one.
- */
-export const SESSION_INFO_LOOKUP_MS = 10_000;
+/** #161: SESSION_INFO_LOOKUP_MS and `sessionLookupWithin` live in a leaf module, so index.ts bounds its v2 lookups without this one. */
+export { SESSION_INFO_LOOKUP_MS };
 /**
  * #161: how long a tool call waits for the session's current location (its one fresh `session.get`, shared by `scopedArgs` and
  * the git metadata guard). Short: a miss falls back to the session record's directory.
  */
 export const CALL_DIRECTORY_LOOKUP_MS = 2_000;
-/** #161: `lookup`'s answer, or a rejection once `ms` pass without one (the host call itself is left running). */
-function sessionLookupWithin<T>(lookup: PromiseLike<T>, ms: number): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => reject(new Error(`session lookup timed out after ${ms} ms`)), ms);
-    if (typeof timer === "object" && typeof timer.unref === "function") timer.unref();
-  });
-  return Promise.race([lookup, timeout]).finally(() => clearTimeout(timer));
-}
+/**
+ * #161: how long `execute.after` may still take the directory its call's `execute.before` used. Long: a write can wait on a
+ * permission prompt that long; past it (or once the store's bound drops the entry) the after-hook looks the directory up itself.
+ */
+export const CALL_DIRECTORY_STORE_TTL_MS = 60 * 60_000;
+/** #161: calls whose before-hook directory is kept for their `execute.after` (oldest first out). */
+const MAX_CALL_DIRECTORIES = 1000;
 /**
  * QA-2.1-25: a failed session-kind lookup is not repeated for this long. Short on purpose: the failure answers `unknown` (root
  * semantics, no lease), so a write in that window is unguarded; the window only spares a burst of tool calls a failing host call each.
@@ -1434,11 +1429,14 @@ export async function registerV2Hooks(
       if (sessionID !== "" && sessionKinds.get(sessionID) !== "root") {
         let check = planChildChecks.get(sessionID);
         if (check === undefined) {
-          /** True when a verdict was reached; false when the first message could not be read. */
+          /**
+           * True when a verdict was reached; false when the first message could not be read. #161: a host that has not answered
+           * within SESSION_INFO_LOOKUP_MS (the bound of the other session reads a tool call waits for) has not been read either.
+           */
           const verdict = (async (): Promise<boolean> => {
             let firstText: string | undefined;
             try {
-              firstText = firstMessageText(await ctx.session.context({ sessionID } as Parameters<typeof ctx.session.context>[0]));
+              firstText = firstMessageText(await sessionLookupWithin(ctx.session.context({ sessionID } as Parameters<typeof ctx.session.context>[0]), SESSION_INFO_LOOKUP_MS));
             } catch {
               firstText = undefined;
             }
@@ -1554,18 +1552,22 @@ export async function registerV2Hooks(
     if (takeRoleBindingLookupNotice()) ingestLogger.warn(message, extra);
     else console.debug(message, extra);
   };
-  /** Handoff 32: what the binding reads of a child session (parent, agent, title, first message text). */
+  /**
+   * Handoff 32: what the binding reads of a child session (parent, agent, title, first message text). #161: each host call gives up
+   * after SESSION_INFO_LOOKUP_MS, as the session record does (a miss refuses a role agent's call, so a slow but healthy host must
+   * not cause one), and then counts as failed: the session's as lookupFailed, the first message's as no text.
+   */
   const bindingLookup: SessionLookup = async (id) => {
     let session: Record<string, unknown>;
     try {
-      session = await ctx.session.get({ sessionID: id } as Parameters<typeof ctx.session.get>[0]) as unknown as Record<string, unknown>;
+      session = await sessionLookupWithin(ctx.session.get({ sessionID: id } as Parameters<typeof ctx.session.get>[0]), SESSION_INFO_LOOKUP_MS) as unknown as Record<string, unknown>;
     } catch (error) {
       warnBindingLookup("[router] roles: a binding session could not be read", id, error);
       throw error; // bind treats this as lookupFailed, without caching it
     }
     let firstText: string | undefined;
     try {
-      firstText = firstMessageText(await ctx.session.context({ sessionID: id } as Parameters<typeof ctx.session.context>[0]));
+      firstText = firstMessageText(await sessionLookupWithin(ctx.session.context({ sessionID: id } as Parameters<typeof ctx.session.context>[0]), SESSION_INFO_LOOKUP_MS));
     } catch (error) {
       warnBindingLookup("[router] roles: a child's first message could not be read", id, error);
       firstText = undefined; // the title marker still binds
@@ -1730,6 +1732,29 @@ export async function registerV2Hooks(
     } catch {
       return { known: false, error: failure };
     }
+  };
+  /**
+   * #161: per tool call (its id), the known directory its `execute.before` used ({@link callDirectoryOf}), so its `execute.after`
+   * resolves the call's paths (the changed-file record, the trajectory, the guard's after-call) against that same answer instead
+   * of a lookup of its own, which can fail and skip that bookkeeping, or see a session moved since. Taken once; bounded
+   * (MAX_CALL_DIRECTORIES, oldest first out), ignored past CALL_DIRECTORY_STORE_TTL_MS, and forgotten with the session.
+   */
+  const callDirectories = new Map<string, { readonly at: number; readonly sessionID: string; readonly found: CallDirectory }>();
+  const rememberCallDirectory = (callID: string, sessionID: string, found: CallDirectory): void => {
+    if (!found.known || callID === "") return; // an unknown directory: the after-hook tries its own lookup, as before
+    callDirectories.delete(callID);
+    callDirectories.set(callID, { at: Date.now(), sessionID, found });
+    while (callDirectories.size > MAX_CALL_DIRECTORIES) callDirectories.delete(callDirectories.keys().next().value!);
+  };
+  /** Takes (and drops) the entry of `callID`; undefined when there is none, it expired, or another session stored it. */
+  const takeCallDirectory = (callID: string, sessionID: string): CallDirectory | undefined => {
+    const stored = callDirectories.get(callID);
+    callDirectories.delete(callID);
+    if (stored === undefined || stored.sessionID !== sessionID) return undefined;
+    return Date.now() - stored.at >= CALL_DIRECTORY_STORE_TTL_MS ? undefined : stored.found;
+  };
+  const forgetCallDirectories = (sessionID: string): void => {
+    for (const [callID, stored] of callDirectories) if (stored.sessionID === sessionID) callDirectories.delete(callID);
   };
   /**
    * Cross-repo P1.5: the read set R of a role session beyond its work root (`routing/roles/read-set.ts`) — the worktrees of its
@@ -3538,12 +3563,17 @@ export async function registerV2Hooks(
         sessionID: event.sessionID, tool: event.tool,
         input: handed !== null && typeof handed === "object" && !Array.isArray(handed) ? { ...(handed as Record<string, unknown>) } : handed,
       };
+      const callID = typeof event.id === "string" ? event.id : "";
       // 3.1.7 M41 (always on): a plan child without its plan binding is refused every tool call (fail closed). The context hook
       // checks a session's first user message; a first tool call that comes before that hook performs the same check here.
       await planChildGuard.assertToolAllowed(String(event.sessionID));
-      // #161: one session-directory answer per call, taken when first needed: `scopedArgs` and the git metadata guard below share it.
+      // #161: one session-directory answer per call, taken when first needed: `scopedArgs` and the git metadata guard below share it,
+      // and the call's `execute.after` takes it too (a known one).
       let callDirectory: Promise<CallDirectory> | undefined;
-      const directoryOfCall = (): Promise<CallDirectory> => (callDirectory ??= callDirectoryOf(String(call.sessionID)));
+      const directoryOfCall = (): Promise<CallDirectory> => (callDirectory ??= callDirectoryOf(String(call.sessionID)).then((found) => {
+        rememberCallDirectory(callID, String(call.sessionID), found);
+        return found;
+      }));
       const args = await scopedArgs(call, directoryOfCall);
       // #84 P2.1 (P-2, handoffs 11/32/33): a role child binds to its dispatch before its tool runs, so `router_run` and
       // `router_git_*` resolve the bound work root and the guard reads the dispatch budget. Tiers mode: no role table, no call.
@@ -3561,6 +3591,7 @@ export async function registerV2Hooks(
       // QA-G-A3-2: a refusal here is thrown before the legacy hook (and its guard) sees the call: the plugin counts it on the
       // child's guard state, and the guard's stop (denied_cap) or advisory banner is added to the refusal the child sees.
       const refused = (message: string, agent: string | undefined): Error => {
+        takeCallDirectory(callID, String(call.sessionID)); // #161: a refused call never reaches execute.after
         const guard = options.recordRefusal?.(String(event.sessionID), agent, call.tool, args);
         return new Error(guard === undefined ? message : `${message}\n${guard}`);
       };
@@ -3633,7 +3664,9 @@ export async function registerV2Hooks(
               if (cached?.plan !== undefined) continue;
               if (cached === undefined) {
                 // A restarted plan child may have lost its binding too; its launcher protocol belongs to the executor.
-                const first = withoutHostPreamble(firstMessageText(await ctx.session.context({ sessionID: child } as Parameters<typeof ctx.session.context>[0])) ?? "");
+                // #161: a host that has not answered within SESSION_INFO_LOOKUP_MS is a target that could not be checked (below).
+                const context = ctx.session.context({ sessionID: child } as Parameters<typeof ctx.session.context>[0]);
+                const first = withoutHostPreamble(firstMessageText(await sessionLookupWithin(context, SESSION_INFO_LOOKUP_MS)) ?? "");
                 if (first.startsWith(PLAN_CONTEXT_PREFIX) || LAUNCH_HEADER_PATTERN.test(first)) continue;
               }
               const binding = cached ?? await bind(child, bindingLookup, { maxOf: maxOfRoles(callerRoles) });
@@ -3646,6 +3679,7 @@ export async function registerV2Hooks(
               if (recordRoleOrphan(child, "refused")) ingestLogger.warn(message);
               else console.debug(message);
               const agent = typeof args?.agent === "string" ? args.agent : String(event.agent ?? "unknown");
+              takeCallDirectory(callID, String(call.sessionID)); // #161: a refused call never reaches execute.after
               throw new RoleDispatchRefusal(agent, ROLE_REFUSALS.staleResume(child));
             }
           }
@@ -3817,6 +3851,7 @@ export async function registerV2Hooks(
       } catch (error) {
         dispatchRouter.onCallFinished(event.id); // the hook chain rejected the call: it will never reach execute.after (2.2)
         inflight.cancel(event.id);
+        takeCallDirectory(callID, String(call.sessionID)); // #161: nor take its directory
         throw error;
       }
       // The input the host will execute (after the legacy hook): the dispatch is registered for ingestion from it, not from what the engine decided (2.2).
@@ -4332,6 +4367,8 @@ export async function registerV2Hooks(
       dispatchRouter.onCallResult(event.id, resultChild);
       const runNote = runNotes.get(event.id);
       runNotes.delete(event.id);
+      // #161: the directory this call's `execute.before` used, taken (and dropped) on every path, used by the legacy hook below.
+      const beforeDirectory = takeCallDirectory(typeof event.id === "string" ? event.id : "", String(event.sessionID));
       // Phase 2.1 (memo §4.3 steps 1-2). Timing: a non-null child binds the open start; a null child drops it.
       let ackText: string | undefined;
       if (event.tool === "subagent") {
@@ -4542,11 +4579,12 @@ export async function registerV2Hooks(
         },
       };
       await within(hookContext(event), async () => {
-        // #161: no store keeps the before-hook's directory per call, so this is a lookup of its own; an unknown directory makes
-        // `scopedArgs` throw before the legacy hook runs, so no changed file is recorded against the plugin's directory.
+        // #161: the directory the call's `execute.before` used, so the bookkeeping does not depend on a lookup of its own; without
+        // one (none was needed or known, or it expired) a lookup of its own, where an unknown directory makes `scopedArgs` throw
+        // before the legacy hook runs, so no changed file is recorded against the plugin's directory.
         await legacy["tool.execute.after"]?.({
           ...event, tool: legacyToolName(event.tool),
-          callID: event.id, args: await scopedArgs(event),
+          callID: event.id, args: await scopedArgs(event, beforeDirectory === undefined ? undefined : () => Promise.resolve(beforeDirectory)),
         }, output);
       });
       const changed = output.output !== text;
@@ -4739,6 +4777,7 @@ export async function registerV2Hooks(
               // QA-2.1-11 / QA-2.1-13: the cached directory, the failed kind lookup and the adoption mark go with the session.
               sessionDirs.delete(data.sessionID);
               lastCallDirs.delete(data.sessionID); // #161: and its last per-call directory
+              forgetCallDirectories(data.sessionID); // #161: and its calls' before-hook directories
               failedKinds.delete(data.sessionID);
               adoptedSessions.delete(data.sessionID);
               refusedAdoptions.delete(data.sessionID);

@@ -2,6 +2,7 @@ import type { Plugin } from "@opencode-ai/plugin";
 import { completionIdentity, observeV2 } from "./compat/v2-observations";
 import type { RouterPluginInput } from "./compat/child-session";
 import { DEPTH_BANNER, ResumeRejectedError, SESSION_DIRECTORY, TASK_VERIFICATION } from "./compat/child-session";
+import { SESSION_INFO_LOOKUP_MS, sessionLookupWithin } from "./compat/session-lookup";
 
 // Imports for internal use within this module
 import {
@@ -527,6 +528,9 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
    * The lookup behind resolveIsRootSession: true (no parentID), false (a parentID), or undefined
    * when it is not known (the lookup failed, or failed recently and is throttled). QA-2.4-2 treats
    * undefined as NOT root (isProvenRootCaller), where the protocol injection treats it as root.
+   * #161: on the OpenCode v2 host a lookup the host has not answered within SESSION_INFO_LOOKUP_MS
+   * is a failed one (the guard's refusals wait for it, as for the v2 session record); on v1 it is
+   * not bounded.
    */
   const lookupRootSession = async (sessionID: string): Promise<boolean | undefined> => {
     const memo = sessionRootMemo.get(sessionID);
@@ -540,7 +544,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       return undefined;
     }
     try {
-      const res = await ctx.client.session.get({ path: { id: sessionID } });
+      const lookup = ctx.client.session.get({ path: { id: sessionID } });
+      const res = ctx.routerHost === "v2" ? await sessionLookupWithin(lookup, SESSION_INFO_LOOKUP_MS) : await lookup;
       if (!res || (res as { error?: unknown }).error || !res.data) {
         throw new Error("session.get returned no session data");
       }
