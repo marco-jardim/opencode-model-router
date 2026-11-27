@@ -1262,6 +1262,70 @@ describe("held results: placeholder, matcher, refusal, verdict delivery (memo 5,
     expect(r.held.applyText(PARENT, twice)).toBe(`x ${PH} y ${PH} z`);
   });
 
+  // #174: OpenCode 2.3+ reports a finished child as `<background-result kind="subagent" …>`, a synthetic entry whose description
+  // the host repeats after the closing tag (verbatim shape from a 2.4.2 probe).
+  it("#174: a whole 2.3+ <background-result> completion becomes the placeholder, in any attribute order, and stays it", async () => {
+    const r = await heldRig();
+    const probe = `<background-result kind="subagent" sessionID="${CHILD}" state="completed" description="Router fast delegation">\n{"secret":true}\n</background-result>\nRouter fast delegation`;
+    expect(r.held.applyText(PARENT, probe)).toBe(PH);
+    const reordered = `<background-result state="completed" description="x" sessionID="${CHILD}" kind="subagent">secret output</background-result>`;
+    expect(r.held.applyText(PARENT, reordered)).toBe(PH);
+    const cancelled = `<background-result kind="subagent" sessionID="${CHILD}" state="cancelled" description="x">\nSubagent cancelled\n</background-result>`;
+    expect(r.held.applyText(PARENT, cancelled)).toBe(PH);
+    expect(r.held.applyText(PARENT, r.held.applyText(PARENT, probe))).toBe(PH);
+    expect(r.held.applyText("ses_other", probe)).toBe(probe);
+    const otherChild = `<background-result kind="subagent" sessionID="ses_other_child" state="completed">not held</background-result>`;
+    expect(r.held.applyText(PARENT, otherChild)).toBe(otherChild);
+    // A released hold keeps its placeholder for the new envelope too.
+    await r.held.verdict(HANDLE, { verdict: "PASS", text: "ok" });
+    expect(r.held.applyText(PARENT, probe)).toBe(PH);
+  });
+
+  it("#174: an embedded <background-result> record is cut at its own closing tag when the known body follows verbatim, else through the end", async () => {
+    const r = await heldRig("the body");
+    // A quoted `>` in an attribute does not end the opening tag.
+    const exact = `before <background-result kind="subagent" sessionID="${CHILD}" state="completed" description="a -> b">the body</background-result> after`;
+    expect(r.held.applyText(PARENT, exact)).toBe(`before ${PH} after`);
+    const unknown = `before <background-result kind="subagent" sessionID="${CHILD}" state="completed">other body</background-result> after`;
+    expect(r.held.applyText(PARENT, unknown)).toBe(`before ${PH}`);
+    // No closing tag: through the end, as for `<subagent>`.
+    const unclosed = `before <background-result sessionID="${CHILD}" kind="subagent" state="completed">the body and more`;
+    expect(r.held.applyText(PARENT, unclosed)).toBe(`before ${PH}`);
+    // The other envelope's closing tag does not close it.
+    const crossed = `before <background-result kind="subagent" sessionID="${CHILD}" state="completed">the body</subagent> after`;
+    expect(r.held.applyText(PARENT, crossed)).toBe(`before ${PH}`);
+    const both = `x <subagent sessionID="${CHILD}" state="completed">the body</subagent> y <background-result kind="subagent" sessionID="${CHILD}" state="completed">the body</background-result> z`;
+    expect(r.held.applyText(PARENT, both)).toBe(`x ${PH} y ${PH} z`);
+  });
+
+  it("#174: a lone quote in an attribute does not move the cut: the known body is cut precisely, the element alone is the placeholder", async () => {
+    const r = await heldRig('he said "hi"');
+    const open = `<background-result kind="subagent" sessionID="${CHILD}" state="completed" description="Fix 3" bug">`;
+    expect(r.held.applyText(PARENT, `before ${open}he said "hi"</background-result> after`)).toBe(`before ${PH} after`);
+    expect(r.held.applyText(PARENT, `${open}\nhe said "hi"\n</background-result>\nFix 3" bug`)).toBe(PH);
+  });
+
+  it("#174: a held child's opening tag with no `>` after it is cut through the end, as the old substring search did", async () => {
+    const r = await heldRig("the body");
+    expect(r.held.applyText(PARENT, `before <subagent sessionID="${CHILD}" state="completed`)).toBe(`before ${PH}`);
+    expect(r.held.applyText(PARENT, `<background-result kind="subagent" sessionID="${CHILD}"`)).toBe(PH);
+  });
+
+  it("#174: in a part with several records, another child's tag cannot hide the held child's body", async () => {
+    const r = await heldRig();
+    const text = `<subagent sessionID="Z" note="</subagent>\n<subagent sessionID="${CHILD}" state="completed">SECRET</subagent>`;
+    const out = r.held.applyText(PARENT, text);
+    expect(out).not.toContain("SECRET");
+    expect(out).toBe(`<subagent sessionID="Z" note="</subagent>\n${PH}`);
+  });
+
+  it("#174: apply hides a held child's <background-result> message, the description line after it included", async () => {
+    const r = await heldRig();
+    const text = `<background-result kind="subagent" sessionID="${CHILD}" state="completed" description="Fix it">\nsecret\n</background-result>\nFix it`;
+    const out = r.held.apply(PARENT, [{ id: "m1", parts: [{ type: "text", text }] }]);
+    expect(out).toEqual([{ id: "m1", parts: [{ type: "text", text: PH }] }]);
+  });
+
   it("a verdict entry is never rewritten", async () => {
     const r = await heldRig();
     const verdict = `<router-verdict handle="${HANDLE}" sessionID="${CHILD}" verdict="PASS">\n<subagent sessionID="${CHILD}">x</subagent>\n</router-verdict>`;

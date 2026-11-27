@@ -33,7 +33,7 @@ export type V2ChildRunner = ChildSessionRunner & ChildRunner & {
 export interface V2RuntimeOptions {
   /** Tests only: fixes the process identity (16 lowercase hex). */
   bootID?: string;
-  /** Tests only: the clock behind `RetainedContextInfo.capturedAt`. */
+  /** Tests only: the clock behind `RetainedContextInfo.capturedAt` and the runner-child registry's expiry. */
   now?: () => number;
   /** Tests only: overrides {@link RESUME_MARKER_TIMEOUT_MS}. */
   resumeMarkerTimeoutMs?: number;
@@ -50,6 +50,13 @@ const PENDING_RESULT_ERROR = "[model-router] native subagent did not return a co
  * settled by the resumed child's first step), so a slow read must not spend it.
  */
 export const RESUME_MARKER_TIMEOUT_MS = 5_000;
+/**
+ * #174: how long, and how many, of the children this runner started (or resumed) stay known after their run ends. Since
+ * OpenCode 2.3.0 the host reports every finished child to its parent, after the runner removed it too; the context hook asks
+ * `isRunnerChild` so that report never shows the orchestrator the child's raw text.
+ */
+export const RUNNER_CHILD_TTL_MS = 60 * 60 * 1000;
+export const MAX_RUNNER_CHILDREN = 1000;
 
 /**
  * #167: `promise`, or a rejection with `signal.reason` as soon as `signal` aborts. The promise adapter of `@opencode/plugin`
@@ -89,6 +96,20 @@ export function createV2Runtime(ctx: Plugin.Context, options: V2RuntimeOptions =
   /** Sessions whose retained context the LRU must not evict (M23); a count per session so pins nest. */
   const pinned = new Map<string, number>();
   const captureListeners = new Set<(info: RetainedContextInfo) => void>();
+  /**
+   * #174: the children this runner started or resumed (a stray the host started instead too), each until when it is known.
+   * Noted when the runner learns the id and again when the run ends; never dropped by the child's removal or deletion (the
+   * host reports it to the parent after that). Bounded: RUNNER_CHILD_TTL_MS after the last note, MAX_RUNNER_CHILDREN oldest first out.
+   */
+  const runnerChildren = new Map<string, number>();
+  const noteRunnerChild = (sessionID: string): void => {
+    runnerChildren.delete(sessionID);
+    runnerChildren.set(sessionID, nowMs() + RUNNER_CHILD_TTL_MS);
+    for (const old of runnerChildren.keys()) {
+      if (runnerChildren.size <= MAX_RUNNER_CHILDREN) break;
+      runnerChildren.delete(old);
+    }
+  };
 
   const interrupt = async (sessionID: string, signal?: AbortSignal) => {
     activeChildren.get(sessionID)?.abort();
@@ -263,6 +284,7 @@ export function createV2Runtime(ctx: Plugin.Context, options: V2RuntimeOptions =
       /** Set when the host answered a resume with another child; thrown from `run` whatever the host made of the progress error. */
       let strayResume: ResumeRejectedError | undefined;
       if (resumeID !== undefined) {
+        noteRunnerChild(resumeID);
         activeChildren.set(resumeID, controller);
         if (request.system) childSystems.set(resumeID, request.system);
       }
@@ -305,6 +327,7 @@ export function createV2Runtime(ctx: Plugin.Context, options: V2RuntimeOptions =
           async progress(metadata) {
             const sessionID = metadata.sessionID;
             if (typeof sessionID === "string" && sessionID !== childID) {
+              noteRunnerChild(sessionID);
               if (childID) {
                 // The host started another child than the one this call is about (a resume that did not resume, or a
                 // second child): no caller knows its id, so it is stopped and removed here before the error, or it
@@ -343,6 +366,8 @@ export function createV2Runtime(ctx: Plugin.Context, options: V2RuntimeOptions =
           },
         });
         const output = result.output as { sessionID?: unknown; status?: unknown; output?: unknown } | undefined;
+        // #174: whatever the result says, a child it names was started by this call (also one no progress event announced).
+        if (typeof output?.sessionID === "string" && output.sessionID !== "") noteRunnerChild(output.sessionID);
         const named = childID !== undefined && output?.sessionID === childID;
         let text = named && output?.status === "completed" && typeof output.output === "string" ? output.output : undefined;
         // #167: our child, still at work. Since OpenCode 2.3.0 the native subagent always answers at once with `status: "running"`
@@ -399,6 +424,7 @@ export function createV2Runtime(ctx: Plugin.Context, options: V2RuntimeOptions =
         throw strayResume ?? error;
       } finally {
         withdrawMark?.(); // a hook that never fired must not leave a mark behind
+        if (childID) noteRunnerChild(childID); // #174: known for RUNNER_CHILD_TTL_MS after the run, whatever its end
         if (childID && activeChildren.get(childID) === controller) {
           childSystems.delete(childID);
           activeChildren.delete(childID);
@@ -461,6 +487,17 @@ export function createV2Runtime(ctx: Plugin.Context, options: V2RuntimeOptions =
       const text = childSystems.get(sessionID);
       if (text && !system.some(part => part.text === text)) system.push({ type: "text", text });
     },
+    /**
+     * #174: whether `sessionID` is a child this runner started or resumed, within RUNNER_CHILD_TTL_MS of its run (also after the
+     * child was removed or deleted: `forgetSession` and `childRunner.dispose` leave it known).
+     */
+    isRunnerChild(sessionID: string): boolean {
+      const until = runnerChildren.get(sessionID);
+      if (until === undefined) return false;
+      if (nowMs() <= until) return true;
+      runnerChildren.delete(sessionID);
+      return false;
+    },
     forgetSession(sessionID: string): void {
       retainedContexts.delete(sessionID);
       childSystems.delete(sessionID);
@@ -470,6 +507,7 @@ export function createV2Runtime(ctx: Plugin.Context, options: V2RuntimeOptions =
       lifetime.abort();
       captureListeners.clear();
       pinned.clear();
+      runnerChildren.clear();
       const sessions = [...activeChildren.keys()];
       retainedContexts.clear();
       childSystems.clear();

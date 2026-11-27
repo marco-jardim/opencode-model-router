@@ -140,9 +140,10 @@ prompt line goes. The v1 protocol is unchanged.
 **When a call runs in the background.** `routing.background.mode` selects the policy (v2 only;
 v1 ignores it):
 
-- `off` keeps the previous behavior byte for byte: a verified or role-routed `subagent` call
-  runs in the foreground and every other call keeps whatever `background` argument the model
-  sent.
+- `off` keeps the previous dispatch behavior byte for byte: a verified or role-routed `subagent`
+  call runs in the foreground and every other call keeps whatever `background` argument the
+  model sent. (The host's reports about the router's own children are rewritten in every mode,
+  `off` included; see [Child sessions](#child-sessions-cancellation-and-verification).)
 - `model` backgrounds only what the model asks for with `background: true`; a call that does
   not set it is left as under `off`.
 - `auto` also backgrounds, on its own, a call the router expects to be long: one whose
@@ -162,9 +163,13 @@ background it: an `auto` selection falls back to the foreground, and an explicit
 `background: true` is turned into `background: false`.
 
 **Held results.** When a backgrounded call has `required` verification, its result is held:
-the orchestrator does not see the child's output until the verdict exists. While a result is
-held, every request (and every compaction) shows the orchestrator this in place of the
-completion text, whether the text is a whole message or sits inside a compaction record:
+the orchestrator does not see the child's output until the verdict exists. The host reports a
+finished child as a `<subagent sessionID=… state=…>` element (OpenCode 2.0.x) or as a
+`<background-result kind="subagent" sessionID=… state=…>` element (OpenCode 2.3 and later,
+followed by the call's description); the router reads both, attributes in any order. While a
+result is held, every request (and every compaction) shows the orchestrator this in place of
+the completion text, in either form, whether the text is a whole message or sits inside a
+compaction record:
 
 ```
 <subagent sessionID="<child>" state="held">held — verdict pending (vrf_…)</subagent>
@@ -194,10 +199,10 @@ The guarantee covers the result text the orchestrator receives. The terminal UI 
 as soon as its file leases end (see [ROLES.md](ROLES.md#file-leases)).
 
 **Child text that looks like a router line.** Under `auto` and `model`, every line of a
-child's text inside a `<subagent>` element that starts with `[router` (after blanks and
-markdown quote, list or emphasis marks; any case) is shown to the orchestrator as `(router`,
-so a child cannot pass its own text off as a router line, placeholder or verdict. Role
-dispatches get the same rewrite in every mode (see
+child's text inside a `<subagent>` or `<background-result>` element that starts with
+`[router` (after blanks and markdown quote, list or emphasis marks; any case) is shown to the
+orchestrator as `(router`, so a child cannot pass its own text off as a router line,
+placeholder or verdict. Role dispatches get the same rewrite in every mode (see
 [ROLES.md](ROLES.md#observability)).
 
 **Calls a child session backgrounds.** The running notice, holds and completion guarantees
@@ -210,10 +215,13 @@ written to `pending.jsonl` in a per-user state directory, so a held result is st
 its verdict is still delivered after the host restarts (see
 [VERIFICATION.md](VERIFICATION.md#pending-handles-survive-restarts)). If that file cannot be
 read, the router stops holding new results and redacts every `<subagent>` element it has not
-seen processed until a retry succeeds.
+seen processed until a retry succeeds; a `<background-result>` element is redacted alike.
 
 **`off` and v1.** `routing.background.mode: "off"` reproduces the previous request, system
-prompt, running-ack text and results byte for byte, and renders none of the three sections.
+prompt, running-ack text and results byte for byte, and renders none of the three sections,
+with one exception: the host's reports about the router's own children carry one neutral line
+in place of the child's text in every mode (see
+[Child sessions](#child-sessions-cancellation-and-verification)).
 It does not turn off file leases (`routing.leases.mode`) or the restart persistence. OpenCode
 v1 is unchanged: none of this runs there, its protocol has no background block, and the
 `routing.background` and `routing.leases` keys have no effect (see
@@ -257,6 +265,18 @@ their children. Cleanup is best-effort. On 2.0.20, removal is unavailable and ch
 history remains attached to its parent. V1 still aborts and deletes its temporary
 sessions. V2's immutable completed-text events require anti-narration warnings
 to appear as separate synthetic entries rather than mutating completed text.
+
+On OpenCode 2.3 and later the host reports every finished child to the session that ran
+it, the router's own producer, grader and plan-executor children too, as a
+`<background-result kind="subagent" …>` entry. The child's text in such a report is not
+for the orchestrator: in every request and every compaction, in every
+`routing.background.mode`, the router shows the report's envelope with one line in place
+of the text, `[router] internal child finished; its result is handled by the router.`
+(the stored history keeps the original). The router knows a child it ran for an hour
+after the run (at most 1000), also after removing it; a report naming no child it knows
+gets the line only when its description is the router's own (`Router <agent>
+delegation`, `Router result verification`) and the child is no dispatch it tracks. The
+extra turn the host may start for such a report is not suppressed.
 
 The adapter awaits native subagent completion when the router verifies that dispatch
 and the call is not backgrounded under the background policy (see

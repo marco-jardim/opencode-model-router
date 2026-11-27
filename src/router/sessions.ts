@@ -989,6 +989,15 @@ export function runnerDescription(agent: string | undefined): string {
   return agent ? `Router ${agent} delegation` : RUNNER_VERIFICATION_DESCRIPTION;
 }
 
+/**
+ * #174: whether `description` has the shape {@link runnerDescription} gives. A shape only: an orchestrator may give its own
+ * dispatch the same text, so a caller treats it as a fallback signal, never as proof that the child is the runner's.
+ */
+export function isRunnerDescription(description: string): boolean {
+  // An agent name is one word (`[\w.-]+`): a longer title such as "Router fix the parser delegation" is never the runner's.
+  return /^Router (?:[\w.-]+ delegation|result verification)$/.test(description);
+}
+
 interface RunnerMark {
   /** Unique per announcement: a withdrawal removes exactly its own mark (QA-INT-3). */
   readonly id: number;

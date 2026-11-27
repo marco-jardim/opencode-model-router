@@ -16,7 +16,7 @@ import { vi } from "vitest";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import type { Hooks } from "@opencode-ai/plugin";
 import { ROUTER_FINISH_ATTACH, type HeldResults } from "../../src/compat/background";
-import { createV2Runtime } from "../../src/compat/v2-client";
+import { createV2Runtime, type V2Runtime } from "../../src/compat/v2-client";
 import { registerV2Hooks, V2_BACKGROUND_SETTLED } from "../../src/compat/v2-hooks";
 import ModelRouterPlugin from "../../src/index";
 import { invalidateConfigCache, overridePath } from "../../src/router/config";
@@ -74,6 +74,8 @@ export interface BgHost {
   sessionHooks: Record<string, (event: never) => Promise<void>>;
   toolHooks: Record<string, (event: never) => Promise<void>>;
   hooks: Hooks;
+  /** #174: the real v2 runtime the plugin and the adapter were given (only with `nativeSubagent`). */
+  runtime: V2Runtime | undefined;
   /** Queue a host event for the adapter's event loop. */
   emit(event: unknown): void;
   /** Resolves when the event loop consumed everything queued and settled its async work (bounded microtask turns). */
@@ -119,6 +121,8 @@ export interface NativeSubagentCall {
   /** QA-PDF12-5: the message and call ids of the tool context (what a host attaches a permission prompt to). */
   messageID: unknown;
   callID: unknown;
+  /** #174: the tool context's `progress` (the host reports the child it created through it); absent when the context has none. */
+  progress?: (metadata: Record<string, unknown>) => Promise<void>;
 }
 
 export interface NativeSubagentStub {
@@ -217,9 +221,13 @@ export async function bootBgHost(options: BootOptions = {}): Promise<BgHost> {
   const nativeTools = stub === undefined ? {} : {
     list: async () => [{
       id: "subagent",
-      execute: async (args: Record<string, unknown>, toolContext: { agent?: unknown; sessionID?: unknown; messageID?: unknown; id?: unknown }) => {
+      execute: async (args: Record<string, unknown>, toolContext: { agent?: unknown; sessionID?: unknown; messageID?: unknown; id?: unknown; progress?: unknown }) => {
+        const progress = toolContext.progress;
         const call: NativeSubagentCall = {
           args, agent: toolContext.agent, sessionID: toolContext.sessionID, messageID: toolContext.messageID, callID: toolContext.id,
+          ...(typeof progress === "function"
+            ? { progress: async (metadata: Record<string, unknown>) => { await Reflect.apply(progress, toolContext, [metadata]); } }
+            : {}),
         };
         stub.calls.push(call);
         if (stub.respond !== undefined) return stub.respond(call);
@@ -347,6 +355,7 @@ export async function bootBgHost(options: BootOptions = {}): Promise<BgHost> {
     sessionHooks,
     toolHooks,
     hooks,
+    runtime,
     emit(event) {
       queue.push(event);
       wake();
