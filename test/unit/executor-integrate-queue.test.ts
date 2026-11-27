@@ -1160,12 +1160,20 @@ describe("createRepoLockFactory (M5, I3)", () => {
     const ctl = new AbortController();
     const waiting = f.acquire("repo-wait", holder(), ctl.signal, info => { reports.push(info); });
     void waiting.catch(() => undefined);
+    // #175: each poll is driven only once the previous one parked in its poll sleep (the held timer). A fixed 20 ms pause lost
+    // that race on a loaded machine: fire() found no held timer (the poll was still in its file I/O), the poll was skipped, and
+    // the read after the last pause came before the reporting poll ran (`reports` empty).
+    const parked = async (): Promise<void> => {
+      const deadline = Date.now() + 20_000;
+      while (clock.heldCount() === 0 && Date.now() < deadline) await realPause(5);
+      expect(clock.heldCount()).toBe(1);
+    };
     for (let i = 0; i < 6; i++) {
-      await realPause(20);
+      await parked();
       clock.advance(1_000);
       clock.fire();
     }
-    await realPause(20);
+    await parked(); // the poll after the last advance has finished (and reported, if it would): it is asleep again
     expect(reports).toHaveLength(1);
     expect(reports[0]).toMatchObject({ file, pid: 99, hostname: "elsewhere", planId: "other" });
     expect(reports[0]?.heartbeatAgeMs ?? 0).toBeGreaterThanOrEqual(2_000);

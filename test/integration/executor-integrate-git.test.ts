@@ -14,7 +14,7 @@ import * as fsp from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
   COMMIT_SUBJECT_PATTERN, createGitOps, createGitRunner, formatCommitMessage, integrationBranchName, phaseTagName, taskBranchName,
   withRepositoryDrivers, type GitOps,
@@ -190,7 +190,10 @@ function nodeSpawner(): Spawner {
 // Repository setup (plain git, global and system config ignored)
 // ---------------------------------------------------------------------------------------------------------------
 
+/** This test's own temp dir (beforeEach), removed after it (afterEach). */
 let base = "";
+/** The file's empty git home and global config (beforeAll). */
+let shared = "";
 let emptyHome = "";
 let emptyGlobal = "";
 
@@ -332,21 +335,51 @@ function makeEnv(tag: string, toplevel: string, baseBranch: string, c0: string, 
 
 /*@@HARNESS@@*/
 
+/**
+ * #175: the queue's `settle` releases run in the background (as the host would), so each test waits for its own before its
+ * directory goes; a failed release fails that test (it was an unhandled rejection, possibly after the test ended).
+ */
+const pendingReleases = new Set<Promise<void>>();
+const releaseErrors: unknown[] = [];
+function settleInBackground(release: () => Promise<void>): void {
+  const tracked: Promise<void> = release()
+    .catch((error: unknown) => { releaseErrors.push(error); })
+    .finally(() => { pendingReleases.delete(tracked); });
+  pendingReleases.add(tracked);
+}
+
 beforeAll(() => {
-  base = realpathSync.native(mkdtempSync(join(tmpdir(), "omr-integrate-git-")));
-  emptyHome = join(base, "empty-home");
+  shared = realpathSync.native(mkdtempSync(join(tmpdir(), "omr-integrate-git-cfg-")));
+  emptyHome = join(shared, "empty-home");
   mkdirSync(emptyHome);
-  emptyGlobal = join(base, "empty.gitconfig");
+  emptyGlobal = join(shared, "empty.gitconfig");
   writeFileSync(emptyGlobal, "");
 });
 
-afterAll(async () => {
-  await removeDirWhenReleased(base);
+// #175: each test removes its own repositories, worktrees and ledgers. The whole file's tree used to be removed by one
+// afterAll, under vitest's 10 s hook timeout, with work that outlived its test still running in it: on a loaded Windows
+// runner that failed the file with no failing test.
+beforeEach(() => {
+  base = realpathSync.native(mkdtempSync(join(tmpdir(), "omr-integrate-git-")));
 });
 
-afterEach(() => {
-  const registry: unknown = Reflect.get(globalThis, Symbol.for("omr.executor.slots"));
-  if (registry instanceof Map) registry.clear();
+afterAll(async () => {
+  await removeDirWhenReleased(shared);
+});
+
+afterEach(async () => {
+  try {
+    while (pendingReleases.size > 0) await Promise.all([...pendingReleases]);
+  } finally {
+    const registry: unknown = Reflect.get(globalThis, Symbol.for("omr.executor.slots"));
+    if (registry instanceof Map) registry.clear();
+    const dir = base;
+    base = "";
+    if (dir !== "") await removeDirWhenReleased(dir);
+  }
+  const errors = releaseErrors.splice(0);
+  if (errors.length === 1) throw errors[0];
+  if (errors.length > 1) throw new AggregateError(errors, `${errors.length} settle releases failed`);
 });
 
 interface Calls { commands: Array<{ file: string; args: readonly string[]; cwd: string }> }
@@ -1020,7 +1053,7 @@ async function queueSetup(spec: QueueSpec) {
   const historyExtra: IntegrationStepEvent[] = [];
   const newQueue = (writer: LedgerWriter) => createIntegrationQueue({
     planId: PLAN, writer, history: { steps: async () => [...historyExtra, ...(await historySteps(store, PLAN))] }, git: env.ops, igit: env.igit, pool: env.pool,
-    leases: recordingLeases(released), checks, suite, lander, listener, settle: (_id, release) => { void release(); },
+    leases: recordingLeases(released), checks, suite, lander, listener, settle: (_id, release) => { settleInBackground(release); },
     releaseSlot: (_id, slot) => env.pool.release(slot),
     locks: createRepoLockFactory({ stateRoot: lockRoot, clock: realClock(), pid: process.pid, hostname: hostname(), isPidAlive: (pid) => nodeSpawner().isAlive(pid) }),
     guard: env.guard, clock: realClock(), logger: { warn: (m) => { warnings.push(m); } },

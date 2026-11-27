@@ -327,8 +327,11 @@ describe("slot: stale detection", () => {
     expect(await acquireSlot({ max: 1, waitMs: 400, meta }, deps)).toEqual({ busy: true });
     setAge(p, 6_000);
     // One look is not enough: the same (token, mtime) must be seen for 2 heartbeats (2 x 500 ms, plus the slack).
-    expect(await acquireSlot({ max: 1, waitMs: 0, meta }, deps)).toEqual({ busy: true });
+    // #175: that window opens at the first look at the old (token, mtime), inside this busy call (which also leaves a background
+    // watcher on it), so it is timed from before the call: timed from its return, the call's own I/O on a loaded runner ate
+    // into the 950 ms (the window had been open for that long already).
     const t0 = Date.now();
+    expect(await acquireSlot({ max: 1, waitMs: 0, meta }, deps)).toEqual({ busy: true });
     held(await acquireSlot({ max: 1, waitMs: 5_000, meta }, deps));
     expect(Date.now() - t0).toBeGreaterThanOrEqual(950);
   }, 20_000);
