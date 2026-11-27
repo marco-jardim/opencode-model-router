@@ -25,7 +25,7 @@ import {
 import type { RouterConfig, TierConfig, Preset, ModeConfig, EffortLevel } from "./router/config";
 import { buildAgentOptions, warnAgentOptionsEffortOnce } from "./router/agent-options";
 import { gitTools, nearestCheckout, type GitRootResolver } from "./router/git-tools";
-import { gitMetadataWriteRefusal } from "./router/git-metadata-guard";
+import { gitMetadataUnknownDirectoryRefusal, gitMetadataWriteRefusal } from "./router/git-metadata-guard";
 import { isReadOnlyTier, legacyReadOnlyTools, mergePermissions, readOnlyPermissions } from "./router/read-only";
 import { buildPluginAgentDefinition, mergeHostAgentEntry, pluginAgentMarker } from "./router/plugin-agents";
 import { filterSensitiveGrep } from "./router/sensitive-paths";
@@ -2820,13 +2820,18 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       // not proven to be the root is checked (`isProvenRootCaller`: a tracked child, a grader, a session with a parentID, an unknown
       // or unresolvable one): the orchestrator is the user's own agent, acting under the host's permissions. The paths are checked
       // first, so a call that writes no git metadata never costs a session lookup. Relative paths and the session's repository are
-      // resolved against the session's own location on v2 (the bridge's SESSION_DIRECTORY), else the instance directory (v1).
+      // resolved against the session's own location on v2 (the bridge's SESSION_DIRECTORY), else the instance directory (v1, which
+      // never sets it). #161: a `null` SESSION_DIRECTORY (v2: the session's directory is unknown) refuses every write-class call
+      // (fail closed), with the path refusal's own text when the paths alone already refuse it; the root exemption below still
+      // applies, so in that state every write-class call costs the root check (no host call for a session already proven root).
       if (typeof input?.tool === "string") {
         let gitRefusal: string | undefined;
         try {
           const sessionDirectory: unknown = input?.[SESSION_DIRECTORY];
           const base = typeof sessionDirectory === "string" && isAbsolute(sessionDirectory) ? sessionDirectory : projectDir ?? process.cwd();
-          gitRefusal = gitMetadataWriteRefusal(input.tool, output?.args, base);
+          gitRefusal = sessionDirectory === null
+            ? gitMetadataUnknownDirectoryRefusal(input.tool, output?.args, base)
+            : gitMetadataWriteRefusal(input.tool, output?.args, base);
         } catch {
           // Unreachable (the guard never throws); a delegated session is still refused (fail closed).
           gitRefusal = "[router] Refused: the router could not check this write for git metadata, which delegated agents may not write (fail closed).";

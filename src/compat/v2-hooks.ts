@@ -6,7 +6,8 @@ import type { SessionContext } from "@opencode/plugin/promise/session";
 import type { SystemPart } from "@opencode/ai";
 import type { V2Runtime } from "./v2-client";
 import { V2_GRADER_AGENT } from "./v2-client";
-import { DEPTH_BANNER, SESSION_DIRECTORY, TASK_VERIFICATION } from "./child-session";
+import { assistantStepCompleted, lastAssistantReply, messageText } from "./child-history";
+import { DEPTH_BANNER, SESSION_DIRECTORY, TASK_VERIFICATION, type SessionDirectory } from "./child-session";
 import { realpathSync, statSync } from "node:fs";
 import { basename, isAbsolute, join, posix, resolve, win32 } from "node:path";
 import { loadConfig, resolveRolesRouting } from "../router/config";
@@ -280,19 +281,6 @@ function translateAdded(before: string, after: string): string {
 // ---------------------------------------------------------------------------
 // #84 P2.1 (T2.1.3, T2.1.4): role-dispatch helpers of the adapter. Roles mode on v2 only; tiers mode never reaches them.
 // ---------------------------------------------------------------------------
-
-/** The text of one session-context message: its `text`, else its text parts (`content` or `parts`) joined. */
-function messageText(message: unknown): string | undefined {
-  if (!message || typeof message !== "object") return undefined;
-  const m = message as Record<string, unknown>;
-  if (typeof m.text === "string") return m.text;
-  if (typeof m.content === "string") return m.content;
-  const parts = Array.isArray(m.content) ? m.content : Array.isArray(m.parts) ? m.parts : undefined;
-  if (parts === undefined) return undefined;
-  const texts = parts.flatMap((part) => part && typeof part === "object" && (part as Record<string, unknown>).type === "text"
-    && typeof (part as Record<string, unknown>).text === "string" ? [(part as Record<string, unknown>).text as string] : []);
-  return texts.length > 0 ? texts.join("\n") : undefined;
-}
 
 /**
  * Handoff 32: `SessionLookup.firstText` — the text parts of the session's first user message, joined (the binding reads the
@@ -989,36 +977,30 @@ type ChildEndState =
   | { outcome: "lost"; text?: undefined; incomplete?: boolean };
 
 /**
- * QA-2.1-18: whether an assistant entry of a child's history ended its step (top level or under `info`): a finish reason other
- * than a tool-call continuation, or a completed time; and no tool part still `pending` or `running`. A step cut mid-stream has
- * none of these, and a `tool-calls` finish means the child meant to go on: neither is an end, whatever text it already has.
- */
-function assistantStepCompleted(message: unknown): boolean {
-  if (message === null || typeof message !== "object") return false;
-  const m = message as Record<string, unknown>;
-  const info = m.info !== null && typeof m.info === "object" ? m.info as Record<string, unknown> : undefined;
-  const parts: readonly unknown[] = Array.isArray(m.content) ? m.content : Array.isArray(m.parts) ? m.parts : [];
-  const toolOpen = parts.some((part) => {
-    if (part === null || typeof part !== "object" || (part as Record<string, unknown>).type !== "tool") return false;
-    const state = (part as Record<string, unknown>).state;
-    const status = state !== null && typeof state === "object" ? (state as Record<string, unknown>).status : state ?? (part as Record<string, unknown>).status;
-    // The v2 tool state is `streaming` | `running` | `completed` | `error` (`pending` is the v1 name of the first).
-    return status === "streaming" || status === "pending" || status === "running";
-  });
-  if (toolOpen) return false;
-  const finish = m.finish ?? info?.finish;
-  if (typeof finish === "string" && finish !== "") return finish !== "tool-calls" && finish !== "unknown";
-  const time = m.time ?? info?.time;
-  // `time.completed` is set once the step ended: epoch millis on the wire, a DateTime once decoded; either counts.
-  const completed = time !== null && typeof time === "object" ? (time as Record<string, unknown>).completed : undefined;
-  return completed !== undefined && completed !== null && completed !== "" && completed !== false;
-}
-
-/**
  * QA-2.1-11: a failed session-directory lookup is not repeated for this long (the lease guard calls it per tool call).
  * QA-2.1-25: a failed directory means no lease check and no lease for that call, like a failed kind, so the window is as short.
  */
 export const SESSION_DIR_NEGATIVE_TTL_MS = 2_000;
+/**
+ * #161: how long the shared session record (`sessionInfoOf`: the directory, parent and agent the role checks, the file leases and
+ * the stale-resume check read) waits for the host's `session.get`; past it the lookup counts as failed. Long on purpose, above
+ * background.ts's 5 s LOOKUP_TIMEOUT_MS: a miss refuses a role agent's call, so a slow but healthy host must not cause one.
+ */
+export const SESSION_INFO_LOOKUP_MS = 10_000;
+/**
+ * #161: how long a tool call waits for the session's current location (its one fresh `session.get`, shared by `scopedArgs` and
+ * the git metadata guard). Short: a miss falls back to the session record's directory.
+ */
+export const CALL_DIRECTORY_LOOKUP_MS = 2_000;
+/** #161: `lookup`'s answer, or a rejection once `ms` pass without one (the host call itself is left running). */
+function sessionLookupWithin<T>(lookup: PromiseLike<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(`session lookup timed out after ${ms} ms`)), ms);
+    if (typeof timer === "object" && typeof timer.unref === "function") timer.unref();
+  });
+  return Promise.race([lookup, timeout]).finally(() => clearTimeout(timer));
+}
 /**
  * QA-2.1-25: a failed session-kind lookup is not repeated for this long. Short on purpose: the failure answers `unknown` (root
  * semantics, no lease), so a write in that window is unguarded; the window only spares a burst of tool calls a failing host call each.
@@ -1664,9 +1646,12 @@ export async function registerV2Hooks(
   };
   /**
    * The directory the host resolves a session's relative paths against (its location), else the plugin's; and the session's
-   * parent (cross-repo P1.5: the orchestrator whose working set widens R). QA-2.1-11: cached per session (a session's location
-   * and parent do not move), concurrent lookups share one host call, and a failed lookup is remembered for
-   * SESSION_DIR_NEGATIVE_TTL_MS so a tool hook does not pay a failing `ctx.session.get` per call. Bounded; forgotten with the session.
+   * parent (cross-repo P1.5: the orchestrator whose working set widens R). QA-2.1-11: cached per session — the first answer, which
+   * the role checks, the file leases and the stale-resume check keep; the host's session move can change the location later, so
+   * `scopedArgs` and the git metadata guard look it up afresh per call ({@link callDirectoryOf}) and fall back to this record.
+   * Concurrent lookups share one host call, and a failed lookup is remembered for SESSION_DIR_NEGATIVE_TTL_MS so a tool hook does
+   * not pay a failing `ctx.session.get` per call. #161: a host call that does not answer within SESSION_INFO_LOOKUP_MS is a failed
+   * lookup, so a hung one is never cached for good. Bounded; forgotten with the session.
    */
   type SessionInfo = { directory: string; parentID: string | undefined; agent?: string };
   const sessionDirs = new Map<string, { at: number; info: Promise<SessionInfo>; failed: boolean }>();
@@ -1677,15 +1662,17 @@ export async function registerV2Hooks(
       at: Date.now(), failed: false, info: Promise.resolve<SessionInfo>({ directory: ctx.location.directory, parentID: undefined }),
     };
     entry.info = (async () => {
-      const session = await ctx.session.get({ sessionID } as Parameters<typeof ctx.session.get>[0]) as unknown as {
-        location?: { directory?: unknown }; parentID?: unknown; agent?: unknown;
-      };
-      const directory = session?.location?.directory;
-      const parentID = session?.parentID;
+      const lookup = ctx.session.get({ sessionID } as Parameters<typeof ctx.session.get>[0]);
+      const answer: unknown = await sessionLookupWithin(lookup, SESSION_INFO_LOOKUP_MS);
+      // #161: an answer that is no session record is a failed lookup, never a session located in the plugin's directory.
+      if (answer === null || typeof answer !== "object") throw new Error("the host returned no session");
+      const session = answer as { location?: { directory?: unknown }; parentID?: unknown; agent?: unknown };
+      const directory = session.location?.directory;
+      const parentID = session.parentID;
       return {
         directory: typeof directory === "string" && directory !== "" ? directory : ctx.location.directory,
         parentID: typeof parentID === "string" && parentID !== "" ? parentID : undefined,
-        agent: typeof session?.agent === "string" && session.agent !== "" ? session.agent : undefined,
+        agent: typeof session.agent === "string" && session.agent !== "" ? session.agent : undefined,
       };
     })();
     entry.info.catch(() => {
@@ -1700,6 +1687,39 @@ export async function registerV2Hooks(
   };
   /** The directory half of {@link sessionInfoOf} (the work-lease wiring's `sessionDir`). */
   const sessionDirectoryOf = (sessionID: string): Promise<string> => sessionInfoOf(sessionID).then((info) => info.directory);
+  /** #161: a session's directory as one tool call sees it; `known: false` when its lookup failed and no directory is known. */
+  type CallDirectory = { readonly known: true; readonly directory: string } | { readonly known: false; readonly error: unknown };
+  /** #161: per session, the directory of its last successful {@link callDirectoryOf} lookup. Bounded; forgotten with the session. */
+  const lastCallDirs = new Map<string, string>();
+  /**
+   * #161: the session's directory for one tool call: its current location, looked up afresh within CALL_DIRECTORY_LOOKUP_MS (the
+   * host's session move changes it; a session that answers without one is in the plugin's directory, as in {@link sessionInfoOf};
+   * an answer that is no session record is a failed lookup). When that lookup fails or gives up, the last known directory: the
+   * last successful lookup's, else the session record's (no host call once it is settled; else its shared lookup, bounded by
+   * SESSION_INFO_LOOKUP_MS) — right unless the session moved since. Unknown only when none is known. Never throws.
+   */
+  const callDirectoryOf = async (sessionID: string): Promise<CallDirectory> => {
+    let failure: unknown;
+    try {
+      const session: unknown = await sessionLookupWithin(ctx.session.get({ sessionID } as Parameters<typeof ctx.session.get>[0]), CALL_DIRECTORY_LOOKUP_MS);
+      if (session === null || typeof session !== "object") throw new Error("the host returned no session");
+      const named = (session as { location?: { directory?: unknown } }).location?.directory;
+      const directory = typeof named === "string" && named !== "" ? named : ctx.location.directory;
+      lastCallDirs.delete(sessionID);
+      lastCallDirs.set(sessionID, directory);
+      while (lastCallDirs.size > MAX_SESSION_DIRS) lastCallDirs.delete(lastCallDirs.keys().next().value!);
+      return { known: true, directory };
+    } catch (error) {
+      failure = error;
+    }
+    const last = lastCallDirs.get(sessionID);
+    if (last !== undefined) return { known: true, directory: last };
+    try {
+      return { known: true, directory: await sessionDirectoryOf(sessionID) };
+    } catch {
+      return { known: false, error: failure };
+    }
+  };
   /**
    * Cross-repo P1.5: the read set R of a role session beyond its work root (`routing/roles/read-set.ts`) — the worktrees of its
    * orchestrator's working set (the session that dispatched it: its dispatch record, else the session's parent) and the
@@ -1872,11 +1892,20 @@ export async function registerV2Hooks(
   /** QA-PDF12-7: a context rebuilt from journaled data runs its operation but never becomes the parent's retained context. */
   const withinRebuilt = <T>(context: ToolContext, operation: () => Promise<T>): Promise<T> =>
     runtime ? runtime.withToolContext(context, operation, { retain: false }) : operation();
-  const scopedArgs = async (event: { tool: string; input: unknown; sessionID: any }): Promise<any> => {
+  /** `directoryOf`: the call's session directory (execute.before passes its per-call answer; default: a lookup of its own). */
+  const scopedArgs = async (
+    event: { tool: string; input: unknown; sessionID: any },
+    directoryOf: () => Promise<CallDirectory> = () => callDirectoryOf(String(event.sessionID)),
+  ): Promise<any> => {
     const args = taskArgs(event.tool, event.input);
     if (["read", "write", "edit"].includes(event.tool) && typeof args?.filePath === "string" && !isAbsolute(args.filePath)) {
-      const session = await ctx.session.get({ sessionID: event.sessionID });
-      args.filePath = resolve(session.location?.directory ?? ctx.location.directory, args.filePath);
+      // #161: the host resolves the path against the session's location; when it is unknown (the lookup failed or gave up, and no
+      // directory is known) the call fails, as a failed lookup always did, instead of resolving against the plugin's directory.
+      const found = await directoryOf();
+      if (!found.known) {
+        throw new Error(`[router] Refused: the session's location could not be read (${String(found.error)}), so a relative path cannot be resolved (fail closed).`);
+      }
+      args.filePath = resolve(found.directory, args.filePath);
     }
     return args;
   };
@@ -3440,7 +3469,10 @@ export async function registerV2Hooks(
       // 3.1.7 M41 (always on): a plan child without its plan binding is refused every tool call (fail closed). The context hook
       // checks a session's first user message; a first tool call that comes before that hook performs the same check here.
       await planChildGuard.assertToolAllowed(String(event.sessionID));
-      const args = await scopedArgs(call);
+      // #161: one session-directory answer per call, taken when first needed: `scopedArgs` and the git metadata guard below share it.
+      let callDirectory: Promise<CallDirectory> | undefined;
+      const directoryOfCall = (): Promise<CallDirectory> => (callDirectory ??= callDirectoryOf(String(call.sessionID)));
+      const args = await scopedArgs(call, directoryOfCall);
       // #84 P2.1 (P-2, handoffs 11/32/33): a role child binds to its dispatch before its tool runs, so `router_run` and
       // `router_git_*` resolve the bound work root and the guard reads the dispatch budget. Tiers mode: no role table, no call.
       const callerRoles = rolesOf(loadConfig(ctx.location.directory));
@@ -3630,10 +3662,10 @@ export async function registerV2Hooks(
         const original = args && typeof args === "object" ? { ...args } : args;
         const output = { args };
         // The git metadata guard (index.ts) resolves a write-class call's relative paths and repository against the session's own
-        // location, as the host does; a failed lookup leaves it the plugin's directory (sessionInfoOf: cached per session).
-        const sessionDirectory = roleActionOf(event.tool) === "edit"
-          ? await sessionDirectoryOf(String(event.sessionID)).catch(() => undefined)
-          : undefined;
+        // location, as the host does. #161: this call's answer (shared with `scopedArgs`), else the session's last known directory;
+        // `null` when none is known, which the guard refuses for a session it has not proven to be the root (index.ts).
+        const found = roleActionOf(event.tool) === "edit" ? await directoryOfCall() : undefined;
+        const sessionDirectory: SessionDirectory | undefined = found === undefined ? undefined : found.known ? found.directory : null;
         await within(hookContext(event), async () => {
           await legacy["tool.execute.before"]?.({
             ...event, tool: legacyToolName(event.tool), callID: event.id,
@@ -3805,17 +3837,9 @@ export async function registerV2Hooks(
     const lastAssistantText = async (child: string): Promise<{ text: string } | undefined> => {
       const history = await ctx.session.context({ sessionID: child } as Parameters<typeof ctx.session.context>[0]);
       const messages: readonly unknown[] = Array.isArray(history) ? history : [];
-      for (let index = messages.length - 1; index >= 0; index--) {
-        // The host's context entries are discriminated by `type` ("user" | "assistant" | "synthetic", see the instruction filter in
-        // the system hook); the model-facing messages of the context hook use `role`. Both name the assistant the same way.
-        const message = messages[index] as { type?: unknown; role?: unknown } | undefined;
-        if (message?.type === "assistant" || message?.role === "assistant") {
-          const text = messageText(message);
-          if (text !== undefined) return { text };
-        }
-        // DF-1-4: the newest user prompt opens the current turn; an answer before it belongs to an earlier turn (a resume).
-        if (message?.type === "user" || message?.role === "user") break;
-      }
+      // The shared reader (`child-history.ts`, also the native runner's after a pending result, #167).
+      const reply = lastAssistantReply(history);
+      if (reply !== undefined) return { text: reply.text };
       ingestLogger.warn("[router] background: the child's context holds no assistant message", {
         child,
         shape: Array.isArray(history) ? `array(${messages.length})` : typeof history,
@@ -4444,6 +4468,8 @@ export async function registerV2Hooks(
         },
       };
       await within(hookContext(event), async () => {
+        // #161: no store keeps the before-hook's directory per call, so this is a lookup of its own; an unknown directory makes
+        // `scopedArgs` throw before the legacy hook runs, so no changed file is recorded against the plugin's directory.
         await legacy["tool.execute.after"]?.({
           ...event, tool: legacyToolName(event.tool),
           callID: event.id, args: await scopedArgs(event),
@@ -4638,6 +4664,7 @@ export async function registerV2Hooks(
               sessionKinds.delete(data.sessionID);
               // QA-2.1-11 / QA-2.1-13: the cached directory, the failed kind lookup and the adoption mark go with the session.
               sessionDirs.delete(data.sessionID);
+              lastCallDirs.delete(data.sessionID); // #161: and its last per-call directory
               failedKinds.delete(data.sessionID);
               adoptedSessions.delete(data.sessionID);
               refusedAdoptions.delete(data.sessionID);

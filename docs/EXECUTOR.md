@@ -631,8 +631,8 @@ observations enabled on real plans, analysed offline by `scripts/soak-analyze.mj
 **Node >= 22.13** required). Each observable criterion
 (G1, G2, G6, G8, G9) needs at least **3 observed occurrences and zero violations**. Unobserved criteria (expected G3,
 G11) are disclosed gaps in the Phase 6.2 PR alongside G13 and G8's bound; G5 stays with 2.3 and G12's full matrix with
-6.2. The soak is also executor dogfood evidence toward G13, which remains unmet until the owner decides. The owner
-may change the soak criteria; absence of evidence is never a pass.
+6.2. G13 was waived by owner decision on 2026-11-20 rather than re-run; this soak, still pending (#140), is the
+evidence accepted in its place. The owner may change the soak criteria; absence of evidence is never a pass.
 
 ## Measured on its own implementation
 
@@ -711,13 +711,14 @@ OpenCode 2.0.27 background service, run `6d23db21`, draining/rebinding this plan
 implementation; it was not an intentional rollback. The [dogfood incident record](qa/critical-path-execution/dogfood.md#013-incidents)
 preserves the evidence and isolation recovery without erasing either incident.
 
-**G13 is UNMET — owner decision pending.** Phase 6.1 did not run through compile → launch → verify → integrate →
-phase suite → QA loop → fast-forward into `cpx/main` end to end; the owner selected the fallback after DF-2 faults.
-The §0.13 incidents also defeat the untouched-checkout and continuous-build-use claims; forced-foreground share is
-not measured. These deviations and missing aggregates are not silently treated as passes. Later fixes
-and green scripted fixtures do not retroactively complete that dogfood run. The real-use soak remains pending under
-A-6.1-3, narrowed by A-6.1-6 to observable subcases; structurally unobservable G6/G9 subcases and G3/G11 are declared
-gaps, not passes. G13 and G8's missed bound must be disclosed in Phase 6.2.
+**G13: WAIVED (owner decision, 2026-11-20).** G13 was not met: Phase 6.1 did not run through compile → launch →
+verify → integrate → phase suite → QA loop → fast-forward into `cpx/main` end to end; the owner selected the fallback
+after DF-2 faults. The §0.13 incidents also defeat the untouched-checkout and continuous-build-use claims;
+forced-foreground share is not measured. These deviations and missing aggregates are not silently treated as passes.
+Later fixes and green scripted fixtures do not retroactively complete that dogfood run. The owner waived G13 rather
+than re-running it: the A-6.1-3 real-use soak is the accepted evidence. That soak remains pending (#140), narrowed by
+A-6.1-6 to observable subcases; structurally unobservable G6/G9 subcases and G3/G11 are declared gaps, not passes.
+G13 and G8's missed bound were disclosed in Phase 6.2.
 
 ## Owner checklist for the next real plan
 
@@ -737,4 +738,5 @@ gaps, not passes. G13 and G8's missed bound must be disclosed in Phase 6.2.
   landing only into a clean checkout. Resolve dirty/diverged branches without force-resetting them; collect slots only
   once children and integration work have settled.
 - [ ] Record outcomes, idle episodes, G8 bound/ratio and evidence gaps separately from pass claims. For the soak, retain
-  the working-day window and occurrence/violation counts; carry unmet G13 and unobserved criteria to owner review.
+  the working-day window and occurrence/violation counts; carry unobserved criteria to owner review. G13 is waived
+  (owner decision, 2026-11-20); the soak is the evidence accepted in its place.

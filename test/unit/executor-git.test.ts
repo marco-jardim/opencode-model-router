@@ -53,6 +53,22 @@ describe("executorGitArgs", () => {
       .toEqual({ cwd: top, location: ["--git-dir=/s/.git", "--work-tree=/s"] });
     expect(gitCallLocation(["-C", "sub", "-C", "deeper", "ls-files"], top)).toEqual({ cwd: resolve(top, "sub", "deeper"), location: [] });
   });
+  it("gitCallLocation: a bare --git-dir/--work-tree (value as the next argument) throws instead of being skipped", () => {
+    const top = resolve("/top");
+    for (const args of [["--git-dir", "/s/.git", "status"], ["-c", "a=b", "--work-tree", "/s", "status"],
+      ["--git-dir=/s/.git", "--work-tree", "/s", "commit"]]) {
+      let thrown: unknown;
+      try { gitCallLocation(args, top); } catch (error) { thrown = error; }
+      expect(thrown, args.join(" ")).toBeInstanceOf(ExecutorError);
+      expect(thrown).toMatchObject({
+        code: "E_GIT", message: expect.stringMatching(/must carry its value after '='/), detail: { op: "config", code: null, stderr: "" },
+      });
+    }
+    // After the subcommand it is the subcommand's argument, not a location: not refused.
+    expect(gitCallLocation(["status", "--git-dir", "/x"], top)).toEqual({ cwd: top, location: [] });
+    // A `-c` value spelled like the option is a value.
+    expect(gitCallLocation(["-c", "--git-dir", "status"], top)).toEqual({ cwd: top, location: [] });
+  });
   it("has the fixed excludes content", () => {
     expect(SLOT_EXCLUDES_CONTENT.split("\n")).toContain("node_modules/");
     expect(SLOT_EXCLUDES_CONTENT.endsWith("\n")).toBe(true);

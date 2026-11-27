@@ -78,7 +78,11 @@ This directory holds design/implementation plans for `opencode-model-router`.
   file leases, dispatch telemetry, and a plan executor that compiles a plan into
   a durable dependency graph, runs ready tasks in parallel in isolated worktree
   slots and integrates them through a serial, always-green queue.
-  Phase 6.2 global QA/delivery and the A-6.1-3 real-use soak remain; this index marker is not phase acceptance.
+  Phase 6.2 global QA and delivery are done (delivered in PR #116, released in
+  2.9.0 on 2026-10-25; tracking issue #109 closed 2026-11-20), and G13 is waived
+  by owner decision (2026-11-20). Only the A-6.1-3 real-use soak (#140) and
+  close-out housekeeping (#138) remain; this index marker is not phase
+  acceptance.
   User guide: [`../EXECUTOR.md`](../EXECUTOR.md). Decision record:
   [`../adr/0007-critical-path-execution.md`](../adr/0007-critical-path-execution.md).
   - Handover: [`critical-path-execution-handover.md`](./critical-path-execution-handover.md)

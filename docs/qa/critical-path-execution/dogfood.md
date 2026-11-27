@@ -523,8 +523,9 @@ pdf2-1 QA in the copy was **not closed**:
 
 **2026-10-13T21:29:48.2039134-03:00:** the owner chose the **DF-2 fallback**: Phase 6.1 runs as a normal,
 orchestrator-managed phase in `D:\git\omr-cpx-p61` (`cpx/p61`, base `a682009`); **G13 is not met** and must be
-disclosed with the DF-2 faults. The paused plan was **aborted and purged**, lifting the freeze. pdf2-1 continued
-separately, to merge after QA, **not to be switched into dogfood for this plan**.
+disclosed with the DF-2 faults (later waived by owner decision on 2026-11-20; see [G13 status](#g13-status)). The
+paused plan was **aborted and purged**, lifting the freeze. pdf2-1 continued separately, to merge after QA,
+**not to be switched into dogfood for this plan**.
 
 Read-only salvage preserved 6.1.1's **26746-byte diff** and 6.1.2's **37 files**, without editing slots. Scratch
 commits/tags `cpx/df2-salvage-6.1.1` = `b10be70` and `cpx/df2-salvage-6.1.2` = `1b6253a` have parent `a682009`
@@ -586,10 +587,11 @@ give no numerator/denominator for those windows. The pre-feature DF-0 baseline i
 
 ## G13 status
 
-**G13: UNMET — owner decision pending.** Phase 6.1 did not complete the required executor chain
+**G13: WAIVED (owner decision, 2026-11-20).** G13 was not met: Phase 6.1 did not complete the required executor chain
 compile → launch → verify → integrate → phase suite → QA loop → fast-forward into `cpx/main`; it used the fallback.
 DF-1-1 and DF-1.1-3 also violate the untouched-checkout/isolation and continuous-build-use claims; the aggregate
 forced-foreground share is not measured, and later fixes were not a successful re-run of the DF-2 attempt. The
 later green scripted runs do not repair those gaps. Phase 6.1 was accepted on 2026-10-15 with G13 unmet,
-G8's bound not met and the real-use soak pending (**A-6.1-3**, narrowed by **A-6.1-6**). Only observable soak
-subcases are in scope; the not-observable G6/G9 subcases and G3/G11 remain declared gaps, never passes.
+G8's bound not met and the real-use soak pending (**A-6.1-3**, narrowed by **A-6.1-6**). The owner waived G13
+rather than re-running it: the A-6.1-3 real-use soak, still pending (#140), is the accepted evidence. Only observable
+soak subcases are in scope; the not-observable G6/G9 subcases and G3/G11 remain declared gaps, never passes.

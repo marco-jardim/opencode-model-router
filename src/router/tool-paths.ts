@@ -77,13 +77,28 @@ function hostPatchPaths(a: Record<string, unknown>): string[] | undefined {
 /**
  * The paths of every patch text key of `a` (the git metadata guard's widest reading: a host that took another key than the first
  * string would write those): the host's own text ({@link hostPatchPaths}) must be readable, another key's text adds its paths when
- * it is. Undefined when the host's own text is unreadable.
+ * it is and is ignored when it has no header. Undefined when the host's own text is unreadable, or (#161, fail closed) another
+ * key's text has a header line but cannot be read.
  */
 function everyPatchTextPaths(a: Record<string, unknown>): string[] | undefined {
   const host = hostPatchPaths(a);
   if (host === undefined) return undefined;
   const texts = PATCH_KEYS.map(key => a[key]).filter((value): value is string => typeof value === "string");
-  return [...host, ...texts.flatMap(text => patchTextPaths(text) ?? [])];
+  const paths = [...host];
+  for (const text of texts) {
+    const own = patchTextPaths(text);
+    if (own === undefined && hasPatchHeader(text)) return undefined;
+    paths.push(...(own ?? []));
+  }
+  return paths;
+}
+
+/** Whether a patch text has a header line as {@link patchTextPaths} reads them (leading blanks allowed). */
+function hasPatchHeader(text: string): boolean {
+  return text.split(/\r?\n/).some(raw => {
+    const line = raw.trimStart();
+    return HOST_PATCH_HEADERS.some(prefix => line.startsWith(prefix));
+  });
 }
 
 /** The header paths of one patch text; undefined when a header names no path or there is none. */
@@ -241,8 +256,8 @@ function writeTargets(tool: string, a: Record<string, unknown>, cwd: string): To
  * The files a write-class call ({@link WRITE_CLASS}) names, as written (not resolved: a link must be resolved before any `..`
  * after it), deduped, in the order {@link toolTargets} reads them — and for a patch also the headers of every other patch text key
  * (a superset of the lease targets: {@link toolTargets} reads only the text the host takes). Undefined when its targets are
- * unknown — a `patch` / `apply_patch` whose (host's) text has no header, a header without a path, or no text at all — so the
- * caller fails closed. Empty for any other tool. Never throws.
+ * unknown — a `patch` / `apply_patch` whose (host's) text has no header, a header without a path, or no text at all, or whose
+ * other patch text key has a header without a path — so the caller fails closed. Empty for any other tool. Never throws.
  */
 export function writeTargetTexts(tool: string, args: unknown): string[] | undefined {
   const name = typeof tool === "string" ? tool.toLowerCase() : "";

@@ -12,18 +12,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **OpenCode v2: plans in different repositories can run at the same time in one Claude Code process.** Executor
   ownership is scoped to the repository's shared git common-directory home, not the whole process. A second plugin
   copy for the same repository (including linked worktrees) still waits for the owner to dispose before taking over.
-- **OpenCode v2: a filter defined only in a repository's own configuration now stops the plan executor and the
-  verification reference instead of being skipped.** Where git writes (executor commits, WIP saves and restores,
-  checkouts, resets, cleans, the reference's `stash create` and checkout), a filter that only the repository's local,
-  worktree or included configuration defines is blanked and marked required, so git refuses rather than storing or
-  checking out unfiltered content. Repositories whose filter lives only in local config (git-crypt, `nbstripout
-  --install`, a local-only Git LFS) now get an executor error or no reference. Remedy: define the filter in global
-  config (`git config --global filter.<name>.clean …`); a repository copy identical to the global one keeps working.
-  The executor also refuses to land into an owner checkout with populated submodules (land manually), because the
-  cleanliness check would run git inside them with their own configuration.
+- **A filter defined only in a repository's own configuration now stops the verification reference (OpenCode v1 and
+  v2) and the plan executor (OpenCode v2) instead of being skipped.** Where git writes (executor commits, WIP saves
+  and restores, checkouts, resets, cleans, the reference's `stash create` and checkout), a filter that only the
+  repository's local, worktree or included configuration defines is blanked and marked required, so git refuses rather
+  than storing or checking out unfiltered content. Repositories whose filter lives only in local config (git-crypt,
+  `nbstripout --install`, a local-only Git LFS) now get an executor error or no reference. Remedy: define the filter in
+  global config (`git config --global filter.<name>.clean …`); a repository copy identical to the global one keeps
+  working, and the plan executor currently needs that copy: with the filter only in global config, the executor's git
+  does not see it and commits the content unfiltered (see Fixed). The executor also refuses to land into an owner
+  checkout with populated submodules (land manually), because the cleanliness check would run git inside them with
+  their own configuration.
 
 ### Fixed
 
+- **OpenCode v2: the router's own child runs work again on OpenCode 2.3.0 and later (#167, reported on 2.4.1).** Those
+  hosts answer every native `subagent` call at once with a running result, so every child the router runs itself (an
+  LLM grader, a `router_delegate` producer, a plan-executor task) was refused as pending and interrupted: verification
+  came out UNVERIFIABLE, and delegations and plan tasks failed. The router now waits for its own running child
+  (`session.wait`; the wait ends with the run's deadline or cancellation even where the host does not cancel it) and
+  uses the child's final answer: the newest assistant entry of its current turn, only when that step ended and has
+  text. A child whose run ended on a step without a final answer (cut mid-stream, or stopped after a tool call) is not
+  used, and the text of an earlier step is never taken instead. A resumed child (delegate producer or plan task) is
+  read only from what its new run added after a marker taken before the run, and only from an answer that follows this
+  run's own prompt there; otherwise the previous turn's answer could be taken. A child that ends with no answer, an
+  empty one or an error, a run that ended failed or interrupted, a failed, aborted or timed-out result, or a cancelled
+  wait is not used: the run fails as before and the child is interrupted. The grading service span reports `completed`
+  only once the child really completed.
 - **Router-run git commands in the work root no longer run repository-configured programs.** The verification
   snapshot of the work root and the reference worktree's git calls now turn off `core.fsmonitor`, hooks (including
   `post-index-change` on an index write), `gpg.ssh.defaultKeyCommand` and the external diff, refuse the `ext`, `file`,
@@ -33,12 +48,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runs. The snapshot (default and hardened), the reference worktree and every executor git call (GitOps, the
   runtime's commits, WIP saves and restores, resets and cleans, the integration git and the landing probes) also blank
   the filter (`clean`, `smudge`, `process`) and merge drivers that only the repository's own configuration names,
-  include files of any condition too; the executor reads them again for every git call. A driver set identically in
-  system or global configuration keeps working, so global Git LFS and its `git lfs install --local` copy are
-  unaffected. The listing runs in the environment of the command it protects. The router's other hardened git calls
-  now blank `gpg.ssh.defaultKeyCommand` and refuse `ftp`/`ftps` too. Reading driver scopes needs git 2.26 or newer. If
-  the driver configuration cannot be read (or the legacy `GIT_CONFIG` variable is set, for the reference), there is no
-  snapshot or reference, and no executor git call runs.
+  including the drivers its include files set, whatever the include's condition (a missing include target is skipped,
+  as git skips it, and so is a dangling include link; on Windows one naming a reserved device such as `NUL` is
+  refused); the executor reads them again for every git call. A driver set identically in system or global
+  configuration keeps working, so for the default snapshot and the reference a global Git LFS and its
+  `git lfs install --local` copy are unaffected (the hardened snapshot reads no system or global configuration and
+  sees only the repository's copy, read-only, as before). The plan executor's hardened git does not read system or
+  global configuration either, so it currently needs the filter in the repository's local configuration too (for Git
+  LFS, `git lfs install --local`): a filter set only globally is not applied by the executor, so it stores and checks
+  out that content unfiltered (tracked in #162). The listing runs in the environment of the command it protects. The
+  router's other hardened git calls now blank `gpg.ssh.defaultKeyCommand` and refuse `ftp`/`ftps` too. Reading driver
+  scopes needs git 2.26 or newer. If the driver configuration cannot be read (or the legacy `GIT_CONFIG` variable is
+  set, for the reference), there is no snapshot or reference, and no executor git call runs.
 - **One invalid value in an overrides file no longer drops the whole file (#80).** A bad tier `effort`, an
   `activePreset` naming no preset or an out-of-range `routing` key used to discard every other key of that file too,
   `routing` included. Now only the offending key path goes: the top-level key it sits under, or inside `presets` the
@@ -95,9 +116,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   there. They now run git by absolute path from outside the work root, as the router's git tools do, and refuse to run
   when the only git is inside it. The diff, the test searches and the HEAD reads also pass the router's hardening
   options (no hooks, fsmonitor, pager or signature programs, no optional locks). A security fix, on OpenCode v1 and v2.
+- **OpenCode v2: a host session lookup that never answers no longer stalls the file tools (#161).** The session
+  record (directory, parent, agent) that the role checks, the file leases and the stale-resume check read gives up
+  after 10 seconds and then counts as a failed lookup, repeated after 2 seconds. A role agent's call is then refused
+  (its check needs the record), and a resume of that session is not checked for staleness. The file leases give up at
+  their own 5-second bound and skip their check for the call. A host answer that is no session record counts as a
+  failed lookup too. The session's current directory, which a tool call looks up once for both a relative
+  `read`/`write`/`edit` path and the git metadata guard, gives up after 2 seconds; the call then uses the directory of
+  the session's last successful lookup, else the session record's. When no directory is known, a relative `read`,
+  `write` or `edit` path fails the call (`[router] Refused: the session's location could not be read (…)`), as a
+  failed lookup did before, and the git metadata guard refuses a delegated session's write (see Security).
+- **OpenCode v2: the git metadata guard checks a moved session in its current location (#161).** The `filePath` that a
+  relative `write` or `edit` `path` becomes was already resolved against a lookup made per call, but the guard resolved
+  everything else against the directory the session had at its first lookup: patch and `apply_patch` headers and their
+  path arguments, `multiedit` targets, the other path keys of a `write` or `edit` (`path` as written, `file`,
+  `file_path`), and the session's repository (its git and common directories). After the host moved the session these
+  were checked against the old directory. The guard now uses the call's own lookup, the one the relative path uses. The
+  file leases and the role checks still use the session's first directory.
 
 ### Security
 
+- **A patch call whose extra patch text cannot be read is refused (#161).** The host reads the first string among
+  `patchText`, `patch_text`, `patch` and `input`; the git metadata guard also reads the others. One of those with a file
+  header that names no path (`*** Add File:` and nothing after it) was skipped, and now makes the call refused like an
+  unreadable patch. Another key's text without file headers is still ignored. OpenCode v1 and v2.
+- **OpenCode v2: a delegated session's write is refused while its directory is unknown (#161).** When the session's
+  directory cannot be looked up and none is known, the git metadata guard cannot resolve the call's paths and the
+  session's repository. An `edit`, `write`, `multiedit`, `patch` or `apply_patch` call of a delegated session (a tier
+  or plugin agent, any session the router has not proven to be the root) is then refused: `[router] Refused: the
+  session's location could not be read, so this write cannot be checked for git metadata, which delegated agents may
+  not write (fail closed).` A path that names git metadata keeps the usual refusal. Before, the guard resolved such a
+  call against the plugin's directory and could miss the git metadata of the session's own repository (for example
+  `../<name>.git/config` from a linked worktree of a bare repository). The cost: while no lookup of that session's
+  directory has succeeded in this process (neither a tool call's own lookup nor the session record; other host
+  answers about the session do not count), its `patch`, `apply_patch` and `multiedit` calls and its `write` and
+  `edit` calls with an absolute path fail (with a relative path they fail already, see Fixed). A refused call first
+  waits for its lookups to give up: 2 seconds for the call's own lookup, and up to 10 more for the session record
+  when there is none yet. This refusal does not apply to read-class calls, but a relative `read` path fails in the
+  same state, as described under Fixed. The orchestrator is not affected once the router knows it as the root; a
+  root session not yet resolved as the root is refused like a delegated one, or waits for that lookup.
 - **Delegated agents can no longer write repository git metadata with the file tools (edit, write, multiedit,
   patch).** Role agents were already refused; tier agents, plugin agents (#81) and every other delegated session now are
   too. An `edit`, `write`, `multiedit`, `patch` or `apply_patch` call is refused when a file it names is `.git` or below

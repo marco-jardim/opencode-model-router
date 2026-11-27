@@ -59,6 +59,10 @@ export const GIT_METADATA_PATCH_UNREADABLE = "[router] Refused: the router could
   + "cannot check that none of them is git metadata, which delegated agents may not write (fail closed). Name each file in an "
   + "`*** Add File:`, `*** Update File:` or `*** Delete File:` header.";
 
+/** #161 (OpenCode v2): the refusal of a write-class call whose session directory is unknown (fail closed). */
+export const GIT_METADATA_DIRECTORY_UNKNOWN = "[router] Refused: the session's location could not be read, so this write cannot be "
+  + "checked for git metadata, which delegated agents may not write (fail closed).";
+
 /**
  * win32: `path` with each segment's NTFS stream suffix cut (`name:stream`, `name::$DATA`, `name::$INDEX_ALLOCATION` all name the
  * entry `name`), a leading drive's `X:` kept, so the entry is what gets resolved.
@@ -163,4 +167,14 @@ export function gitMetadataWriteRefusal(tool: string, args: unknown, base: strin
     }
   }
   return undefined;
+}
+
+/**
+ * #161 (OpenCode v2): the refusal of the write-class call `tool(args)` of a delegated session whose own directory is unknown (the
+ * v2 bridge could not look it up and knows none): a path refusal against `fallback` (the plugin's directory) keeps its text, any
+ * other write-class call gets GIT_METADATA_DIRECTORY_UNKNOWN; undefined for every other tool. Never throws.
+ */
+export function gitMetadataUnknownDirectoryRefusal(tool: string, args: unknown, fallback: string, deps: GitMetadataGuardDeps = {}): string | undefined {
+  if (typeof tool !== "string" || !WRITE_CLASS.has(tool.toLowerCase())) return undefined;
+  return gitMetadataWriteRefusal(tool, args, fallback, deps) ?? GIT_METADATA_DIRECTORY_UNKNOWN;
 }
