@@ -6,7 +6,7 @@ the module's default export as an object with an `id` and `setup` or `effect`.
 The old function fails with `Expected object at ["default"]` before any routing
 code runs. Merely wrapping it in `{ server }` does not satisfy v2.
 
-The adapter typechecks against `@opencode/plugin` **2.0.31**, supports hosts
+The adapter typechecks against `@opencode/plugin` **2.3.2**, supports hosts
 **2.0.20 or later**, and was originally based on the official
 [`v2` source at 74dbc509](https://github.com/anomalyco/opencode/tree/74dbc509d74df46a2523676dd4068225c4f0c9b0).
 The old `@opencode-ai/plugin/v2` types bundled with v1 are a different, obsolete
