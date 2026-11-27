@@ -2,7 +2,7 @@
 
 The `enforcement` block in `tiers.json`. Every field is optional; each one falls back to the default listed below, and the bundled `tiers.json` now **ships those defaults explicitly** so they are visible in the file rather than implicit in code — see [What the bundled `tiers.json` ships](#what-the-bundled-tiersjson-ships). Effective mode `off` disables enforcement guards and skips native-task verification; `MODEL_ROUTER_ENFORCE=0` forces that mode. It does not disable the opt-in `delegate` tool: whenever enabled, its produce → verify → accept/escalate pipeline runs in every mode, subject to its verification policy and attempt/cost limits.
 
-> These settings (like anything in `tiers.json`) can also be placed in an overrides file — `~/.config/opencode/opencode-model-router.overrides.jsonc` (global) or `<repo>/.opencode/opencode-model-router.overrides.jsonc` (project) — and are deep-merged over the bundled defaults, so you don't have to edit the cached `tiers.json`. See the **Configuration** section of the README.
+> These settings (like anything in `tiers.json`) can also be placed in an overrides file — `~/.config/opencode/opencode-model-router.overrides.jsonc` (global) or `<repo>/.opencode/opencode-model-router.overrides.jsonc` (project) — and are deep-merged over the bundled defaults, so you don't have to edit the cached `tiers.json`. See the **Configuration** section of the README. On OpenCode v2 a `null` inside `presets` removes the key it inherits (see [Removing an inherited key with `null`](#removing-an-inherited-key-with-null-opencode-v2)).
 
 **Cross-references:** [ENFORCEMENT.md](./ENFORCEMENT.md) · [VERIFICATION.md](./VERIFICATION.md) · [ESCALATION.md](./ESCALATION.md) · [ENFORCEMENT_PRESETS.md](./ENFORCEMENT_PRESETS.md)
 
@@ -1084,7 +1084,7 @@ How the variant ladder is built and bounded:
 - **Source.** The ladder of a tier is its explicit [`candidates`](#tier-candidates) when it has any, otherwise the variants the live catalog lists for the tier's model, in catalog order.
 - **`effortBumpMax` caps catalog ladders.** `enforcement.escalate.effortBumpMax` (default `xhigh`) caps a **catalog** ladder on v2 **independently of `effortBump`**: with `effortBump: false` the cap still applies. With the default, a model whose catalog ladder is `[high, max]` (the live `claude-haiku-4-5`) loses `max` and has the single rung `high`. Set `effortBumpMax: "max"`, or list `max` in `candidates`, to use it. **Explicit `candidates` are not capped.**
 - **`variantSteps: "none"` disables both** the variant steps **and** the session resume that goes with them: every attempt starts a fresh child, as in `2.2.0`.
-- **A tier that sets both `variant` and `effort`/`thinking`/`reasoning`** has an empty variant ladder (effort is never delivered twice) and stays on the effort-bump path; list `candidates` and drop `effort` if you want variant steps on it. The cost doctor reports it as `variant-effort`.
+- **A tier that sets both `variant` and `effort`/`thinking`/`reasoning`** has an empty variant ladder (effort is never delivered twice) and stays on the effort-bump path; list `candidates` and drop `effort` if you want variant steps on it. The cost doctor reports it as `variant-effort`. When the `effort` comes from the bundled `tiers.json` (every tier of the bundled `anthropic` preset), an overrides file drops it with `"effort": null`, on OpenCode v2 only: see [Removing an inherited key with `null`](#removing-an-inherited-key-with-null-opencode-v2).
 - **A same-model tier is skipped on escalation** only when the tier already tried covered its base **and** it has no variant above the one reached; a covered tier with headroom is entered at the reached variant. The ladder never re-runs a `(model, variant)` that already failed in the same ladder.
 - **Budget reserve.** With variant steps on, a variant step or a plain retry is taken only if `maxTotalAttempts − totalAttempts − 1` is at least the number of tiers above the current one; otherwise the ladder escalates.
 - **Resume.** A retry or escalation resumes the child instead of starting a new one while the next model's input budget has room under [`sessionReuse.maxContextFraction`](#keys); the reasons a resume is refused are in [the ladder guide](./ROUTING_ENGINE.md#the-session-aware-ladder).
@@ -1275,6 +1275,48 @@ key of a file has to go, the file is dropped as a whole, as before #80 and witho
 notices: `ignoring <file>: <reason>` when it is invalid on its own, and `dropped override layer
 <file>` when another overrides file still applies. A reload that makes an overrides file invalid
 keeps serving the last valid config and logs why.
+
+### Removing an inherited key with `null` (OpenCode v2)
+
+On OpenCode v2 an overrides file can remove a key it inherits, from the bundled `tiers.json` or,
+for the project-local file, from the global override too: **inside `presets`, a key set to
+`null` is removed from the merged config**, as if no layer had set it. It works at any depth: a
+preset (`"presets": { "google": null }`), a tier (`"presets": { "mine": { "heavy": null } }`), a
+tier key (`"effort": null`) or a key inside one (`"reasoning": { "summary": null }`). A `null` for
+a key that nothing set is a no-op, without a notice.
+
+The removal happens while the layers are merged, before validation. A removal that leaves the
+config invalid (a tier without its `model`, the active preset gone) is dropped like any invalid
+value above, with its `ignoring <path> from <file>: …` notice, and the inherited value stays. The
+project-local file may remove only what it may set: the [trust rules](#trust-which-file-may-set-what)
+drop a global-only key from it, `null` or not, with the same notice as before.
+
+Example: the bundled `anthropic` preset sets `effort` on every tier, so none of its tiers has
+variant steps and the cost doctor reports `variant-effort` for each. To follow its advice (drop
+`effort`, list `candidates`) on the `medium` tier:
+
+```jsonc
+{
+  "routing": {},
+  "presets": {
+    "anthropic": {
+      "medium": {
+        "effort": null,
+        "candidates": [{ "variant": "high" }, { "variant": "xhigh", "costRatio": 8 }]
+      }
+    }
+  }
+}
+```
+
+(`routing: {}` only matters if you have no `routing` block yet: variant steps need one, see
+[`escalate.variantSteps`](#escalatevariantsteps).)
+
+Outside `presets` a `null` is a value, as before: several keys take `null` as a setting
+(`enforcement.maxDelegationDepth: null` turns the depth guard off,
+`enforcement.verify.graderTemperature: null` sends no temperature), so a `null` there never removes anything. OpenCode v1 (feature
+freeze) keeps the old meaning everywhere: inside `presets` a `null` is an invalid value, so its
+key path is dropped with the notice above and the inherited value stays.
 
 ---
 

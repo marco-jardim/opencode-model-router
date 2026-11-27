@@ -16,7 +16,9 @@ import {
   getConfigReloadError,
   getConfigNotices,
   routerStatusLines,
+  setConfigBuildHost,
 } from "../../src/router/config";
+import { runAdvisor } from "../../src/routing/advisor";
 
 // Switch used by the "cannot be read" test below to make exactly one path fail
 // at the fs boundary. `vi.mock` factories are hoisted above the imports, so the
@@ -143,6 +145,17 @@ describe("deepMerge", () => {
     const base = { a: { x: 1 } };
     deepMerge(base, { a: { x: 2 } });
     expect(base.a.x).toBe(1);
+  });
+
+  it("#80: a null replaces like any scalar by default", () => {
+    expect(deepMerge({ a: { x: 1, y: 2 } }, { a: { x: null } })).toEqual({ a: { x: null, y: 2 } });
+  });
+
+  it("#80: with nullRemoves, a null removes the key at any depth and leaves no trace when there is nothing to remove", () => {
+    const base = { a: { x: 1, y: { p: 1, q: 2 } }, b: 2, list: [1] };
+    const out = deepMerge(base, { a: { x: null, y: { q: null }, z: null }, b: null, c: { d: null, e: 1 }, list: [null] }, { nullRemoves: true });
+    expect(out).toEqual({ a: { y: { p: 1 } }, c: { e: 1 }, list: [null] });
+    expect(base).toEqual({ a: { x: 1, y: { p: 1, q: 2 } }, b: 2, list: [1] }); // not mutated
   });
 });
 
@@ -1016,6 +1029,146 @@ describe("loadConfig — global + project override hierarchy", () => {
       expect(cfg.routing?.margin).toBe(0.1);
       expect(cfg.tierCaps?.fast).toBe(3);
       expect(keyNotices()).toEqual([]);
+      expect(warnSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("#80: a null inside presets removes the inherited key (OpenCode v2 only)", () => {
+    const BUNDLED = JSON.parse(readFileSync(join(__dirname, "../../tiers.json"), "utf-8")).presets.anthropic as Record<
+      string,
+      { model: string; variant?: string; effort?: string; description?: string }
+    >;
+    const keyNotices = () => getConfigNotices().filter((n) => n.message.startsWith("ignoring "));
+    const effortTiers = (cfg: ReturnType<typeof loadConfig>): string[] =>
+      runAdvisor(cfg, null, null).filter((f) => f.id === "variant-effort").map((f) => f.subject).sort();
+
+    afterEach(() => {
+      setConfigBuildHost(undefined);
+    });
+
+    it("on v2, `\"effort\": null` drops the bundled tier's effort: no notice, the rest of the tier stays, and the tier is no longer effort-configured", () => {
+      setConfigBuildHost("v2");
+      // The example of docs/CONFIG_REFERENCE.md; `routing: {}` turns variant steps on, so the cost doctor's `variant-effort` check runs.
+      writeGlobal({
+        routing: {},
+        presets: { anthropic: { medium: { effort: null, candidates: [{ variant: "high" }, { variant: "xhigh", costRatio: 8 }] } } },
+      });
+      const cfg = loadConfig();
+      const medium = cfg.presets.anthropic!.medium!;
+      expect(Object.hasOwn(medium, "effort")).toBe(false);
+      expect(medium.candidates).toEqual([{ variant: "high" }, { variant: "xhigh", costRatio: 8 }]);
+      expect(medium.model).toBe(BUNDLED.medium!.model);
+      expect(medium.variant).toBe(BUNDLED.medium!.variant);
+      expect(medium.description).toBe(BUNDLED.medium!.description);
+      expect(cfg.presets.anthropic!.fast!.effort).toBe(BUNDLED.fast!.effort);
+      expect(cfg.presets.anthropic!.heavy!.effort).toBe(BUNDLED.heavy!.effort);
+      expect(keyNotices()).toEqual([]);
+      expect(warnSpy).not.toHaveBeenCalled();
+      // The cost doctor's advice (drop `effort`) is followed: only the tiers that still carry effort are reported.
+      expect(effortTiers(cfg)).toEqual(["fast", "heavy"]);
+    });
+
+    it.each([undefined, "v1"] as const)("with host %s (v1), `\"effort\": null` is still invalid: its key path is dropped with the notice and the bundled effort stays", (host) => {
+      setConfigBuildHost(host);
+      writeGlobal({ presets: { anthropic: { medium: { effort: null } } }, routing: { margin: 0.1 } });
+      const cfg = loadConfig();
+      expect(cfg.presets.anthropic!.medium!.effort).toBe(BUNDLED.medium!.effort);
+      expect(cfg.routing?.margin).toBe(0.1);
+      expect(keyNotices()).toEqual([
+        {
+          source: overridePath(),
+          message: `ignoring presets.anthropic.medium.effort from ${overridePath()}: tiers.json: preset 'anthropic' tier 'medium': effort must be one of low, medium, high, xhigh, max; the rest of the file applies`,
+        },
+      ]);
+      expect(effortTiers(cfg)).toEqual(["fast", "heavy", "medium"]);
+    });
+
+    it("a host change rebuilds the cached config", () => {
+      writeGlobal({ presets: { anthropic: { medium: { effort: null } } } });
+      const before = loadConfig();
+      expect(before.presets.anthropic!.medium!.effort).toBe(BUNDLED.medium!.effort);
+      setConfigBuildHost("v2");
+      const after = loadConfig();
+      expect(after).not.toBe(before);
+      expect(Object.hasOwn(after.presets.anthropic!.medium!, "effort")).toBe(false);
+    });
+
+    it("on v2, a null removes a preset, a tier or a nested tier key, from the project layer too", () => {
+      setConfigBuildHost("v2");
+      writeGlobal({
+        presets: {
+          mine: {
+            fast: { model: "anthropic/mine-fast", reasoning: { effort: "high", summary: "auto" } },
+            medium: { model: "anthropic/mine-medium" },
+            heavy: { model: "anthropic/mine-heavy" },
+          },
+        },
+      });
+      writeLocal({ presets: { mine: { fast: { reasoning: { summary: null } }, heavy: null }, google: null } });
+      const cfg = loadConfig();
+      expect(cfg.presets.mine!.fast!.reasoning).toEqual({ effort: "high" });
+      expect(cfg.presets.mine!.medium!.model).toBe("anthropic/mine-medium");
+      expect(Object.hasOwn(cfg.presets.mine!, "heavy")).toBe(false);
+      expect(Object.hasOwn(cfg.presets, "google")).toBe(false);
+      expect(cfg.presets.anthropic!.medium!.effort).toBe(BUNDLED.medium!.effort);
+      expect(keyNotices()).toEqual([]);
+      expect(warnSpy).not.toHaveBeenCalled();
+    });
+
+    it("on v2, a null with nothing to remove (an unset or unknown key, a key of a new tier) is a no-op without a notice", () => {
+      setConfigBuildHost("v2");
+      writeGlobal({
+        presets: {
+          anthropic: { medium: { thinking: null, noSuchKey: null } },
+          mine: { fast: { model: "anthropic/mine-fast", effort: null } },
+        },
+      });
+      const cfg = loadConfig();
+      const medium = cfg.presets.anthropic!.medium!;
+      expect(Object.hasOwn(medium, "thinking")).toBe(false);
+      expect(Object.hasOwn(medium, "noSuchKey")).toBe(false);
+      expect(medium.effort).toBe(BUNDLED.medium!.effort);
+      expect(cfg.presets.mine!.fast!.model).toBe("anthropic/mine-fast");
+      expect(Object.hasOwn(cfg.presets.mine!.fast!, "effort")).toBe(false);
+      expect(keyNotices()).toEqual([]);
+      expect(warnSpy).not.toHaveBeenCalled();
+    });
+
+    it("on v2, a null that would leave the config invalid is dropped with its key-path notice; the rest of the file applies", () => {
+      setConfigBuildHost("v2");
+      writeGlobal({ presets: { anthropic: { medium: { model: null, effort: null } } } });
+      const cfg = loadConfig();
+      expect(cfg.presets.anthropic!.medium!.model).toBe(BUNDLED.medium!.model);
+      expect(Object.hasOwn(cfg.presets.anthropic!.medium!, "effort")).toBe(false);
+      expect(keyNotices()).toEqual([
+        {
+          source: overridePath(),
+          message: `ignoring presets.anthropic.medium.model from ${overridePath()}: tiers.json: 'anthropic.medium.model' must be a non-empty string; the rest of the file applies`,
+        },
+      ]);
+    });
+
+    it("on v2, a project null for a global-only key is dropped with the existing notice and the global value stays", () => {
+      setConfigBuildHost("v2");
+      const outcomesPath = join(tmpHome, "outcomes");
+      writeGlobal({ routing: { outcomes: { path: outcomesPath } } });
+      writeLocal({ routing: { outcomes: { path: null } }, roleAgents: null, presets: { anthropic: { medium: { effort: null } } } });
+      const cfg = loadConfig();
+      const projectFile = findProjectOverride()!;
+      expect(cfg.routing?.outcomes?.path).toBe(outcomesPath);
+      expect(Object.hasOwn(cfg.presets.anthropic!.medium!, "effort")).toBe(false); // the rest of the project layer applies
+      expect(getConfigNotices().map((n) => n.message)).toEqual(expect.arrayContaining([
+        `ignoring routing.outcomes.path from ${projectFile}: only the global override may set it`,
+        `ignoring roleAgents from ${projectFile}: only tiers.json or the global override may set it`,
+      ]));
+    });
+
+    it("on v2, a null outside presets keeps its meaning (maxDelegationDepth, graderTemperature)", () => {
+      setConfigBuildHost("v2");
+      writeGlobal({ enforcement: { maxDelegationDepth: null, verify: { graderTemperature: null } } });
+      const cfg = loadConfig();
+      expect(cfg.enforcement?.maxDelegationDepth).toBeNull();
+      expect(cfg.enforcement?.verify?.graderTemperature).toBeNull();
       expect(warnSpy).not.toHaveBeenCalled();
     });
   });
