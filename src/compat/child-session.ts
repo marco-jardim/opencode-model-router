@@ -13,9 +13,13 @@ export const DEPTH_BANNER = Symbol.for("opencode-model-router.depth-banner");
 
 /**
  * v2: the calling session's own directory (its location, where the host resolves its relative paths), set by the v2 bridge on
- * the legacy tool.execute.before INPUT of a write-class call; the git metadata guard resolves against it. V1 hosts never set it.
+ * the legacy tool.execute.before INPUT of a write-class call; the git metadata guard resolves against it. `null` (#161): the
+ * bridge could not learn it (its lookup failed and no directory is known), so the guard refuses the write for a session it has
+ * not proven to be the root. V1 hosts never set it.
  */
 export const SESSION_DIRECTORY = Symbol.for("opencode-model-router.session-directory");
+/** The value under {@link SESSION_DIRECTORY}: the session's directory, or `null` when it is unknown. */
+export type SessionDirectory = string | null;
 
 /** A host-owned child lifecycle, so v2 never fabricates REST sessions or IDs. */
 export interface ChildSessionRequest {
