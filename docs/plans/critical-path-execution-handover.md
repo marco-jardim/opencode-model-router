@@ -380,6 +380,25 @@ Everything else is work: resolve it, record it, continue.
 
 ## 7. Live state (§0.11 — keep current)
 
+**2026-11-27 close-out (#138), newest entry; the entries below it are historical:**
+- Phase 6.2 delivered in PR #116 and released in 2.9.0 (2026-10-25). #109 closed 2026-11-20. G13 waived by owner
+  decision (#139; docs in #171). The 6.2.3/6.2.4 record kept on `cpx/main` was brought to `master` in #171.
+- Leaving dogfood (6.2.5), done 2026-11-27: the six `omr-cpx-dogfood-*` worktrees removed with `git worktree remove`
+  (each clean first); the eight `cpx/df*` tags deleted locally and the six pushed ones deleted remotely. The live
+  OpenCode config already loads the plugin from `D:\git\opencode-model-router`; the dogfood config
+  `%LOCALAPPDATA%\omr-cpx\opencode-config\opencode.json` was repointed from `D:\git\omr-cpx-dogfood-df2` to
+  `D:\git\opencode-model-router` (backup `opencode.json.df2.bak`), and the owner restarted OpenCode.
+- The two DF-2 executor slots (`D:\git\.omr-cpx-slots\critical-path-execution-plan-6-1-db-6-1\slot-1` and `slot-2`)
+  were already empty directories whose `.git` files were gone. The plan had no ledger left (`router_plan status`
+  answers `E_LEDGER_NOT_FOUND`) and `router_plan action=gc` found nothing to remove. The locked worktree entries were
+  unlocked and pruned with `git worktree unlock` / `git worktree prune` (git reported "gitdir file points to
+  non-existent location"), and the empty slot and pool directories were removed. The other slot pools under
+  `D:\git\.omr-cpx-slots` (`plan-escritura-v2*`) belong to another project and were not touched.
+- Kept until the owner removes them: `D:\git\omr-cpx-main` and `cpx/main` (6.2.5 step 4).
+- Every bullet of #138 is done; the plan's §5.2 dogfood box is checked. Still pending: the A-6.1-3 real-use soak
+  (#140). The deferred findings of every phase report are triaged in
+  `docs\qa\critical-path-execution\deferred-findings.md` (#142).
+
 **origin/master sync state (2026-10-13):** synced with v2.8.0 (`6ec3faa`) — sync phase `cpx/sync1`, two heavy QA
 rounds, fast-forwarded into `cpx/main` at `a7889e2` (report `docs\qa\critical-path-execution\sync-1.md`). The p51
 worktree created before the sync is recreated from the synced `cpx/main`; the 5.1 pre-flight is redone.

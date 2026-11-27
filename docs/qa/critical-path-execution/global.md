@@ -504,6 +504,8 @@ unmerged) and locally on Windows and on Linux (WSL Ubuntu, clean clone with the 
 - **QA-62C-19 (info):** wording cleanups (double log prefix, one 5 s in-flight wait, Windows leases-off asymmetry).
 - **Phase 6.1 deferrals:** the [Phase 6.1 consolidated table](phase-6.1.md#deferred-findings) remains authoritative,
   by reference under **A-6.2-2**; m-A from that queue was fixed here (folded into G-1).
+- **Triaged backlog (2026-11-27, #142):** every deferred finding of the phase reports, of the Phase 6.1 table and of
+  this section, with its current status and triage outcome, is listed in [deferred-findings.md](deferred-findings.md).
 
 ## Handoffs
 
