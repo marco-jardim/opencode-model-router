@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.10.0] - 2026-11-27
+
 ### Changed
 
 - **OpenCode v2: plans in different repositories can run at the same time in one Claude Code process.** Executor
