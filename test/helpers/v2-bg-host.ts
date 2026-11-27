@@ -130,11 +130,13 @@ export interface NativeSubagentStub {
 
 const saved = {
   HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, ENFORCE: process.env.MODEL_ROUTER_ENFORCE, XDG_STATE_HOME: process.env.XDG_STATE_HOME,
+  BACKGROUND: process.env.MODEL_ROUTER_BACKGROUND,
 };
 
 export function restoreEnv(): void {
   for (const [key, value] of [
     ["HOME", saved.HOME], ["USERPROFILE", saved.USERPROFILE], ["MODEL_ROUTER_ENFORCE", saved.ENFORCE], ["XDG_STATE_HOME", saved.XDG_STATE_HOME],
+    ["MODEL_ROUTER_BACKGROUND", saved.BACKGROUND],
   ] as const) {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
