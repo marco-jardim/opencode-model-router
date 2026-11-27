@@ -573,6 +573,20 @@ export function setConfigNoticeHost(host: RouterHost | undefined): void {
   configNoticeHost = host;
 }
 
+/** The host the configs of this process are built for (#80); `undefined` until the v2 entry sets it, built as on v1. */
+let configBuildHost: RouterHost | undefined;
+
+/**
+ * #80: set by the OpenCode v2 entry (src/v2.ts) before its first loadConfig(). On `v2` a `null` inside an override layer's
+ * `presets` removes the inherited key (see {@link mergeLayerData}); otherwise, as on v1, that `null` is a value, which
+ * validation refuses and the key-path drop removes with a notice. A change marks every cached config stale.
+ */
+export function setConfigBuildHost(host: RouterHost | undefined): void {
+  if (host === configBuildHost) return;
+  configBuildHost = host;
+  invalidateConfigCache();
+}
+
 /**
  * The notices of the config last built for `dir` (default: the working
  * directory): keys dropped from the project layer, unknown `routing` keys, and
@@ -2538,9 +2552,12 @@ export function validateConfig(raw: unknown): RouterConfig {
  * Recursively merge `override` onto `base`. Plain objects merge key-by-key;
  * arrays and scalars are replaced wholesale (so e.g. an overridden `rules` or
  * `whenToUse` list replaces rather than appends). `undefined` values in the
- * override are skipped so they never blow away a base value.
+ * override are skipped so they never blow away a base value. With
+ * `nullRemoves` (#80), a `null` in the override removes the key from the
+ * result instead, at every depth, and one with nothing to remove leaves no
+ * trace; an array is still replaced as a whole, `null` entries included.
  */
-export function deepMerge(base: unknown, override: unknown): unknown {
+export function deepMerge(base: unknown, override: unknown, options: { nullRemoves?: boolean } = {}): unknown {
   if (!isPlainObject(base) || !isPlainObject(override)) {
     return override;
   }
@@ -2553,6 +2570,14 @@ export function deepMerge(base: unknown, override: unknown): unknown {
     // already do worse, so this is tidiness rather than a boundary, but a merge
     // helper should not be the thing that reparents an object.
     if (key === "__proto__" || key === "constructor") continue;
+    if (options.nullRemoves === true) {
+      const inherited = Object.hasOwn(result, key) ? result[key] : undefined;
+      if (value === null) delete result[key];
+      // An object with nothing to merge into is merged into `{}`, so a `null` inside it is dropped as well.
+      else if (isPlainObject(value)) result[key] = deepMerge(isPlainObject(inherited) ? inherited : {}, value, options);
+      else result[key] = value;
+      continue;
+    }
     result[key] =
       key in result && isPlainObject(result[key]) && isPlainObject(value)
         ? deepMerge(result[key], value)
@@ -3253,9 +3278,23 @@ function boundProjectExecutor(
   return out;
 }
 
+/**
+ * #80: `data` deep-merged onto `lower`. On OpenCode v2 ({@link setConfigBuildHost}) a `null` inside the layer's `presets` (a
+ * preset, a tier, a tier key, at any depth) removes that key from the result, so a layer can drop what it inherits
+ * (`"effort": null` on a bundled tier); validation and the key-path drop then judge the result like any other. Outside
+ * `presets`, and on v1, a `null` is a value as before: several keys take `null` as a setting
+ * (`enforcement.maxDelegationDepth`, `enforcement.verify.graderTemperature`, …), and inside `presets` no key does.
+ */
+function mergeLayerData(lower: unknown, data: Record<string, unknown>): unknown {
+  const merged = deepMerge(lower, data);
+  if (configBuildHost !== "v2" || !isPlainObject(merged) || !isPlainObject(data.presets)) return merged;
+  const lowerPresets = isPlainObject(lower) ? lower.presets : undefined;
+  return { ...merged, presets: deepMerge(isPlainObject(lowerPresets) ? lowerPresets : {}, data.presets, { nullRemoves: true }) };
+}
+
 /** Merge an override while keeping project classifier budgets and executor keys within the lower layers' bounds. */
 function mergeOverrideLayer(lower: unknown, layer: OverrideLayer, notices: ConfigNotice[]): unknown {
-  const merged = deepMerge(lower, layer.data);
+  const merged = mergeLayerData(lower, layer.data);
   if (!layer.project || !isPlainObject(merged) || !isPlainObject(merged.routing)) return merged;
   const projectRouting = layer.data.routing;
   const lowerRouting = isPlainObject(lower) ? lower.routing : undefined;

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **OpenCode v2: an overrides file can remove a key it inherits inside `presets` by setting it to `null` (#80).** The
+  bundled `anthropic` preset sets `effort` on every tier and no overrides file could take it away, so the cost doctor's
+  `variant-effort` advice (drop `effort`, list `candidates`) could not be followed: `"effort": null` was an invalid
+  value, and its key path was dropped with a notice. On OpenCode v2 a `null` at any depth inside `presets` (a preset, a
+  tier, a tier key) now removes that key from the merged config before validation, as if no layer had set it; a `null`
+  with nothing to remove is a no-op. A removal that leaves the config invalid (a tier without `model`) is dropped with
+  its key-path notice like any invalid value, and the project-local file still cannot touch a global-only key. Outside
+  `presets` a `null` keeps its meaning as a value (`enforcement.maxDelegationDepth: null`,
+  `enforcement.verify.graderTemperature: null`). OpenCode v1 is unchanged. See "Removing an inherited key with
+  `null`" in docs/CONFIG_REFERENCE.md.
+
 ## [2.10.0] - 2026-11-27
 
 ### Changed

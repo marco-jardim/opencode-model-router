@@ -66,6 +66,18 @@ describe("src/v2.ts: the host objects the plugin receives", () => {
     expect(spawn).not.toHaveBeenCalled();
   });
 
+  it("#80: sets the config build host to v2 before its first loadConfig", async () => {
+    const order: string[] = [];
+    vi.spyOn(configModule, "setConfigBuildHost").mockImplementation((host) => { order.push(`host:${String(host)}`); });
+    vi.mocked(configModule.loadConfig).mockImplementation(() => {
+      order.push("load");
+      return configuration();
+    });
+    await v2Plugin.setup(context() as unknown as Plugin.Context);
+    expect(order[0]).toBe("host:v2");
+    expect(order).toContain("load");
+  });
+
   it("discovers an eligible roles/enforce location inside workRoots", async () => {
     const root = process.platform === "win32" ? "D:/project" : "/project";
     const directory = `${root}/sub`;

@@ -9,7 +9,7 @@ import type { PlanTaskVerifier } from "./executor/runtime";
 import type { ExecutorChildGuardPort } from "./executor/types";
 import { createExecutor, createExecutorAccess, prepareExecutor, type CreateExecutorOptions, type PreparedExecutor } from "./executor/create";
 import { EXECUTOR_PLATFORM_REASON, executorPlatformSupported } from "./executor/platform";
-import { loadConfig, resolveRolesRouting, resolveRouting } from "./router/config";
+import { loadConfig, resolveRolesRouting, resolveRouting, setConfigBuildHost } from "./router/config";
 import { locationOutsideWorkRoots } from "./router/work-roots";
 import { openV2Observations } from "./compat/v2-observations";
 
@@ -18,6 +18,8 @@ export default {
   id: "opencode-model-router",
   server: ModelRouterPlugin,
   async setup(ctx: Plugin.Context) {
+    // #80: before the first loadConfig(): on v2 a `null` inside an override's `presets` removes the inherited key.
+    setConfigBuildHost("v2");
     const observations = openV2Observations();
     try {
       const runtime = createV2Runtime(ctx);
