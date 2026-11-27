@@ -853,8 +853,9 @@ Phases 2.2, 2.3, 2.4 and 3.2 have no host-contract branch. All hooks are registe
 `src/compat/v2-hooks.ts`: 2.1 adds the context, compaction, tool and event wiring, and 3.1 adds the retry hook and the
 launch wiring. Phase 5.1 assembles and registers the executor. The ADR is Accepted as of 2026-10-15; this accepts the
 decisions, not every global criterion. Phase 6.2.0 records the measured results below, including the absence of a
-maximum successful DF-2 retained-context age. The Phase 6.2 PR discloses G8's measured bound, unmet G13 and the
-real-use soak's evidence and gaps under plan amendment A-6.1-3, narrowed by A-6.1-6; absence of evidence is not a pass.
+maximum successful DF-2 retained-context age. The Phase 6.2 PR discloses G8's measured bound, G13 (not met; waived by
+owner decision on 2026-11-20) and the real-use soak's evidence and gaps under plan amendment A-6.1-3, narrowed by
+A-6.1-6; absence of evidence is not a pass.
 
 ## Measured results — 2026-10-16
 
@@ -909,12 +910,14 @@ The supplied DF-2 handover copy ends at smoke run 7, not 6.1.4; final run 24–2
 recorded for DF-2. **D14 guard 4 / O7 therefore gains no longer-lifetime claim** from this attempt; the host-contract
 proof remains **60 s with an idle parent**. Missing metrics are not reconstructed from fixture timings.
 
-**G13: UNMET — owner decision pending.** The **2026-10-13 owner fallback** replaced the required repository-plan
-executor chain (compile → launch → verify → integrate → phase suite → QA loop → fast-forward into `cpx/main`)
-with a normal orchestrated phase after DF-2 faults. Green scripted fixtures and later pdf2-1 fixes are not a
-retroactive dogfood pass. Phase 6.1 was accepted on **2026-10-15** with these disclosures; the real-use soak remains
-pending under **A-6.1-3**, narrowed by **A-6.1-6** to observable subcases. Unobserved G3/G11 and structurally
-not-observable G6/G9 subcases are declared gaps, not passes. Global verification remains Phase 6.2's obligation.
+**G13: WAIVED (owner decision, 2026-11-20).** G13 was not met: the **2026-10-13 owner fallback** replaced the
+required repository-plan executor chain (compile → launch → verify → integrate → phase suite → QA loop →
+fast-forward into `cpx/main`) with a normal orchestrated phase after DF-2 faults. Green scripted fixtures and later
+pdf2-1 fixes are not a retroactive dogfood pass. Phase 6.1 was accepted on **2026-10-15** with these disclosures. The
+owner waived G13 rather than re-running it: the **A-6.1-3** real-use soak, narrowed by **A-6.1-6** to observable
+subcases and still pending (#140), is the accepted evidence. Unobserved G3/G11 and structurally not-observable G6/G9
+subcases are declared gaps, not passes. Global verification was Phase 6.2's obligation; see the
+[global QA record](../qa/critical-path-execution/global.md).
 
 ## Open observations
 
@@ -1073,3 +1076,5 @@ O11(b), recorded against the real provider).
 - **2026-10-16** — Phase 6.2.0 measured results: runs 24–26 (6.1.4 clean-checkout run 26), per-fixture makespan,
   g8Ratio and max idle; G8 bound not met, measured/disclosed under A-6.1-2. Dogfood time windows record the DF-2
   fallback, unmet G13, missing aggregate/retained-context-age evidence and pending soak with declared gaps.
+- **2026-11-26** — G13 recorded as **WAIVED** by owner decision of 2026-11-20 (#139): it was not met by the dogfood
+  run and is not re-run; the A-6.1-3 real-use soak, still pending (#140), is the accepted evidence.

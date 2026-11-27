@@ -54,7 +54,7 @@ Severities and statuses as recorded below in this file; "not stated" where the f
 | N-2 (input, pdf2-1 Round 5) | major impact, low likelihood | running dependent absent from `launcher.inFlight` vs its slot's release | fixed under G-1 (see note) | Smoke gate and carried inputs; Fixes, G-1 |
 | G-1 | major | executor: adopted child stopped before its slot goes back | fixed | Fixes |
 | G-2 | major, P-1 | executor help gating in `/router` | fixed | Fixes |
-| G-3 | major, docs | dogfood disclosure | fixed (disclosure completed; G13 remains UNMET, owner decision pending) | Fixes |
+| G-3 | major, docs | dogfood disclosure | fixed (disclosure completed; G13 not met, WAIVED by owner decision 2026-11-20) | Fixes |
 | G-4 | minor, security | guarded check executables, full-environment replacement | fixed (`verify/wiring.ts` bare git recorded for follow-up) | Fixes |
 | G-5 | minor, registration | `router_plan` / `/plan` registration | fixed (owner decision 2026-10-16, option (a)) | Fixes; Orchestrator validation of G-5 and G-9 |
 | G-6 | minor, P-2 | serial process-lifecycle project | fixed | Fixes |
@@ -146,8 +146,9 @@ Notes:
   under-DF-2 self-check alongside the existing attempt/fallback history; DF-2-1..7 have individual dispositions,
   including pdf2-1's merge into `cpx/main` `992816b` and its remaining N-2 handoff. Rollback paths are distinguished
   from executed rollbacks; the forced-foreground share is **not measured**, not invented. Dedicated §0.13 incidents
-  disclose DF-1-1's orchestrator read and DF-1.1-3's base-build service interference. **G13 remains UNMET, owner
-  decision pending**; later fixes/scripted fixtures are not a dogfood pass. The opening executor/landing claim in
+  disclose DF-1-1's orchestrator read and DF-1.1-3's base-build service interference. **G13 was not met**; later
+  fixes/scripted fixtures are not a dogfood pass. **G13: WAIVED (owner decision, 2026-11-20)**: it is not re-run, and
+  the A-6.1-3 real-use soak, still pending (#140), is the accepted evidence. The opening executor/landing claim in
   `phase-6.1.md` is marked superseded without deleting history. Sources: committed handover §7, `pdf2-1.md` and
   `phase-6.1.md`; no new measurements or check results claimed. EXECUTOR.md's measured-results section now agrees
   on all windows, DF-2-1..7 dispositions, rollback paths, fallback and the §0.13 incidents. The orchestrator runs
@@ -492,7 +493,8 @@ unmerged) and locally on Windows and on Linux (WSL Ubuntu, clean clone with the 
 - `smoke:cpx:e2e` py-pip cases need `CPX_E2E_PYTHON` pointing at an interpreter with pytest when `py -3` has none
   visible to the executor's venv.
 - G-4 follow-up: ordinary verification's `verify/wiring.ts` test search and committed-diff call still use bare git.
-- G-3: G13 remains UNMET, owner decision pending.
+- G-3: G13 was not met; **WAIVED (owner decision, 2026-11-20)**. The A-6.1-3 real-use soak, still pending (#140), is
+  the accepted evidence.
 - G-16: POSIX support for the plan executor (slots root, provision, environments) in a separate change.
 - G-21: the Windows CI job runs only on master pushes; a Windows regression first shows there. Watch its first run
   after the #116 merge.
