@@ -104,14 +104,14 @@ let editCounter = 0;
  * The producer edits index.ts (reported through the write tool's after hook), then runs `after` (a checkout, for a switch
  * during the dispatch), then the tree it left is pinned for the gate-time (or deferred-finish) snapshot.
  */
-async function produce(hooks: any, sessionID: string, after?: () => void): Promise<void> {
+async function produce(hooks: any, sessionID: string, after?: () => void | Promise<void>): Promise<void> {
   const file = path.join(repo, "index.ts");
   fs.writeFileSync(file, `export const v = ${++editCounter};\n`);
   await hooks["tool.execute.after"](
     { tool: "write", sessionID, callID: `w${editCounter}`, args: { filePath: file } },
     { title: "", output: "", metadata: {} },
   );
-  after?.();
+  await after?.();
   await pinTree();
 }
 
@@ -150,7 +150,7 @@ async function makePlugin(onProducer: (hooks: any, sessionID: string) => Promise
 }
 
 /** Runs one native `task` dispatch whose child session does the producer's work between the before and after hooks. */
-async function runTask(hooks: any, prompt: string, after?: () => void): Promise<string> {
+async function runTask(hooks: any, prompt: string, after?: () => void | Promise<void>): Promise<string> {
   const input: any = { tool: "task", sessionID: "orch", callID: "call1", args: { subagent_type: "fast", prompt, description: "the work" } };
   const before = { args: { ...input.args } };
   await hooks["tool.execute.before"](input, before);
@@ -381,8 +381,23 @@ describe("a branch switch is decided from the head state, before the commit diff
     it("the producer creates the repository and its first commit during the dispatch: no branch reason, no \"cannot confirm\"", async () => {
       fs.rmSync(path.join(repo, ".git"), { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
       if (start === "an unborn repository") git("init", "-q");
+      // #175: the dispatch-time head read (real git, unpinned here) runs in the background once the before hook's bounded
+      // capture wait gives up, as it may on a loaded runner. The producer's git commands then raced it (and blocked the event
+      // loop it settles on), so the read could see the repository mid-creation or time out. The producer starts only once that
+      // read has settled, on the state the dispatch started with: no branch ("none").
+      const actualReadHead = headModule.readHead;
+      const dispatchReads: Array<Promise<headModule.HeadRead>> = [];
+      vi.spyOn(headModule, "readHead").mockImplementation((cwd, opts) => {
+        const read = actualReadHead(cwd, opts);
+        dispatchReads.push(read);
+        return read;
+      });
       const hooks = await makePlugin(async () => undefined, { pin: false });
-      const out = await runTask(hooks, `Implement it.\n${SYNC_DOD}`, () => {
+      const out = await runTask(hooks, `Implement it.\n${SYNC_DOD}`, async () => {
+        const deadline = Date.now() + 30_000;
+        while (dispatchReads.length === 0 && Date.now() < deadline) await new Promise<void>(resolve => setTimeout(resolve, 10));
+        expect(dispatchReads).toHaveLength(1);
+        expect(await dispatchReads[0]).toBe("none");
         if (start === "no repository") git("init", "-q");
         git("add", "-A");
         git("commit", "-q", "-m", "first");

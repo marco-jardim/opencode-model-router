@@ -152,9 +152,18 @@ vi.setConfig({ testTimeout: 60_000 });
 
 const temps: string[] = [];
 const cleanups: Array<() => Promise<void>> = [];
+// #175: every step runs whatever an earlier one threw, and the shared registries are reset before the temp dirs are removed.
+// A throwing dispose or rmSync (EBUSY/EPERM on Windows) used to skip the resets, so the next tests started with this test's
+// role orphans, bindings and dispatches (`expected 3 to be +0` on the orphan refusal counter). Errors still fail the test.
 afterEach(async () => {
-  for (const cleanup of cleanups.splice(0)) await cleanup();
-  for (const dir of temps.splice(0)) rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  const errors: unknown[] = [];
+  for (const cleanup of cleanups.splice(0)) {
+    try {
+      await cleanup();
+    } catch (error) {
+      errors.push(error);
+    }
+  }
   vi.unstubAllEnvs();
   vi.restoreAllMocks();
   invalidateConfigCache();
@@ -168,6 +177,15 @@ afterEach(async () => {
   noted.beforeRoute = undefined;
   gated.inputs.length = 0;
   gated.failNext = false;
+  for (const dir of temps.splice(0)) {
+    try {
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  if (errors.length === 1) throw errors[0];
+  if (errors.length > 1) throw new AggregateError(errors, `afterEach: ${errors.length} cleanup steps failed`);
 });
 
 function temp(prefix = "omr-p23-"): string {

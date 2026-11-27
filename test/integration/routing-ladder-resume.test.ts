@@ -60,7 +60,8 @@ interface Scenario {
   readonly failUnconfirmedResume?: boolean;
   /**
    * When the host's `session.execution.*` event for a producer reaches the plugin: right after its last step event
-   * (default), 300 ms after the producer returned (the runner has to wait for it), or never.
+   * (default), once the runner has armed its bounded wait for it after the producer returned (still queued when the gate
+   * finishes), or never.
    */
   readonly executionEnd?: "immediate" | "late" | "never";
 }
@@ -90,14 +91,35 @@ describe("delegate ladder: resume on v2 (Phase 2.3, D10/D11)", { timeout: 20_000
   let savedProfile: string | undefined;
   const instances: Hooks[] = [];
   const dirs: string[] = [];
-  /** Delayed `session.execution.*` events still pending; cleared per test so one never lands in the next. */
-  const lateEnds: Array<ReturnType<typeof setTimeout>> = [];
+  /** Cancels the delayed `session.execution.*` events still pending; called per test so one never lands in the next. */
+  const lateEnds: Array<() => void> = [];
   /** Counts the 1 s timers (`RESUME_END_WAIT_MS`) the runner arms to wait for a child's execution end; restored per test. */
   const timerSpies: Array<{ mockRestore(): void }> = [];
+  /** The test's one counter of those timers (a "late" execution end needs it too). */
+  let endWaits: (() => number) | undefined;
   function spyOnEndWaits(): () => number {
+    if (endWaits !== undefined) return endWaits;
     const spy = vi.spyOn(globalThis, "setTimeout");
     timerSpies.push(spy);
-    return () => spy.mock.calls.filter(([, ms]) => ms === 1_000).length;
+    endWaits = () => spy.mock.calls.filter(([, ms]) => ms === 1_000).length;
+    return endWaits;
+  }
+  /**
+   * #175: a "late" execution end reaches the plugin only once the runner waits for it, i.e. right after it armed its bounded
+   * 1 s wait (`awaitExecutionEnd`). The end used to come 300 ms after the producer returned: on a loaded machine the gate ran
+   * longer than that, the end was already there when the runner looked, no wait was armed (`expected +0 to be 1`). The poll
+   * timer pending when the wait is armed expires before that 1 s timer, so the end always lands inside the wait.
+   */
+  function deliverWhenAwaited(deliver: () => void): void {
+    const waits = spyOnEndWaits();
+    const before = waits();
+    let cancelled = false;
+    lateEnds.push(() => { cancelled = true; });
+    void (async () => {
+      const deadline = Date.now() + 15_000;
+      while (!cancelled && waits() === before && Date.now() < deadline) await new Promise<void>((resolve) => setTimeout(resolve, 5));
+      if (!cancelled && waits() > before) deliver();
+    })();
   }
   let counter = 0;
 
@@ -116,8 +138,9 @@ describe("delegate ladder: resume on v2 (Phase 2.3, D10/D11)", { timeout: 20_000
   });
 
   afterEach(async () => {
-    for (const timer of lateEnds.splice(0)) clearTimeout(timer);
+    for (const cancel of lateEnds.splice(0)) cancel();
     for (const spy of timerSpies.splice(0)) spy.mockRestore();
+    endWaits = undefined;
     for (const hooks of instances.splice(0)) await hooks.dispose();
     if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
     if (savedProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = savedProfile;
@@ -199,7 +222,7 @@ describe("delegate ladder: resume on v2 (Phase 2.3, D10/D11)", { timeout: 20_000
         });
         const endMode = s.executionEnd ?? "immediate";
         if (endMode === "immediate") ingest?.onExecutionEnded(sid);
-        else if (endMode === "late") lateEnds.push(setTimeout(() => ingest?.onExecutionEnded(sid), 300));
+        else if (endMode === "late") deliverWhenAwaited(() => ingest?.onExecutionEnded(sid));
         return { sessionID: sid, text: "producer output" };
       },
       async dispose(sid: string) {
