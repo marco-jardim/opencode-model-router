@@ -265,7 +265,8 @@ Then install and configure model-router to handle the rest.
 ### OpenCode v2
 
 The v2 adapter supports OpenCode hosts **2.0.20 or later** and typechecks against
-`@opencode/plugin` **2.3.2**. Use the v2 `plugins` key:
+`@opencode/plugin` **2.3.2**; hosts 2.3 and later were checked live on 2.4.2. Use
+the v2 `plugins` key:
 
 ```json
 {

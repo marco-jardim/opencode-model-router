@@ -6,8 +6,9 @@ the module's default export as an object with an `id` and `setup` or `effect`.
 The old function fails with `Expected object at ["default"]` before any routing
 code runs. Merely wrapping it in `{ server }` does not satisfy v2.
 
-The adapter typechecks against `@opencode/plugin` **2.3.2**, supports hosts
-**2.0.20 or later**, and was originally based on the official
+The adapter typechecks against `@opencode/plugin` **2.3.2** and supports hosts
+**2.0.20 or later**; hosts 2.3 and later were checked live on 2.4.2. It was
+originally based on the official
 [`v2` source at 74dbc509](https://github.com/anomalyco/opencode/tree/74dbc509d74df46a2523676dd4068225c4f0c9b0).
 The old `@opencode-ai/plugin/v2` types bundled with v1 are a different, obsolete
 API; they should not be used to assess current v2 capabilities.
@@ -155,12 +156,16 @@ v1 ignores it):
 
 `routing.background.mode` defaults to `auto` and `routing.background.minPredictedMs` to
 `45000` (an integer from 0 to 3600000). An invalid value warns once and the default applies.
-An explicit `background: false` is always honored. A child session never gets the router's
-background policy (only a root orchestrator session does), and neither does a call made while
-1000 attempts are already in flight; both keep the `off` behavior. When the call needs
-required verification but a held result cannot be offered (see below), the router does not
-background it: an `auto` selection falls back to the foreground, and an explicit
-`background: true` is turned into `background: false`.
+An explicit `background: false` is always honored by the router's policy, which never moves
+that call to the background; the host may still do so: since OpenCode 2.3.0 it runs every
+native `subagent` child in the background whatever `background` says. On those hosts the
+router waits for its own children (#167, #172) and handles held results and the host's child
+reports (#174, #178). A child session never gets the router's background policy (only a root
+orchestrator session does), and neither does a call made while 1000 attempts are already in
+flight; both keep the `off` behavior. When the call needs required verification but a held
+result cannot be offered (see below), the router does not background it: an `auto` selection
+falls back to the foreground, and an explicit `background: true` is turned into
+`background: false`.
 
 **Held results.** When a backgrounded call has `required` verification, its result is held:
 the orchestrator does not see the child's output until the verdict exists. The host reports a
