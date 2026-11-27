@@ -80,11 +80,13 @@ This directory holds design/implementation plans for `opencode-model-router`.
   slots and integrates them through a serial, always-green queue.
   Phase 6.2 global QA and delivery are done (delivered in PR #116, released in
   2.9.0 on 2026-10-25; tracking issue #109 closed 2026-11-20), and G13 is waived
-  by owner decision (2026-11-20). Only the A-6.1-3 real-use soak (#140) and
-  close-out housekeeping (#138) remain; this index marker is not phase
-  acceptance.
+  by owner decision (2026-11-20). Close-out housekeeping (#138) was done on
+  2026-11-27; only the A-6.1-3 real-use soak (#140) remains. This index marker
+  is not phase acceptance.
   User guide: [`../EXECUTOR.md`](../EXECUTOR.md). Decision record:
   [`../adr/0007-critical-path-execution.md`](../adr/0007-critical-path-execution.md).
+  Deferred findings of every phase report, triaged (#142):
+  [`../qa/critical-path-execution/deferred-findings.md`](../qa/critical-path-execution/deferred-findings.md).
   - Handover: [`critical-path-execution-handover.md`](./critical-path-execution-handover.md)
     — kickoff prompt, worktrees, operating rules, troubleshooting and live state.
 

@@ -4281,8 +4281,12 @@ Edge cases are those listed in 6.1.2.
       output of `router_plan action=export`) and the integration history.
 - [ ] No `root=`, `cwd:`, tool argument or shell command in the handover, the reports or the dispatch logs names
       `D:\git\opencode-model-router`.
-- [ ] The dogfood plugin entry is restored and the dogfood worktree removed (6.2.5), or the owner's decision to keep
-      them is recorded.
+- [x] The dogfood plugin entry is restored and the dogfood worktree removed (6.2.5), or the owner's decision to keep
+      them is recorded. *Done 2026-11-27 (#138):* the live and the dogfood OpenCode configs load the plugin from
+      `D:\git\opencode-model-router` (owner restarted OpenCode); the six `omr-cpx-dogfood-*` worktrees are removed,
+      the `cpx/df*` tags deleted locally and remotely, and the two locked DF-2 executor slots pruned.
+      `D:\git\omr-cpx-main` and `cpx/main` are kept until the owner removes them (6.2.5 step 4). Record: the
+      handover's §7, "2026-11-27 close-out".
 - [ ] Every command in the Phase 6.2 pre-flight is green; coverage thresholds are met; PR CI is green on every job.
 - [ ] ADR 0007 is Accepted with measured results.
 - [ ] These are updated:
