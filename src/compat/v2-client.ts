@@ -4,6 +4,7 @@ import type { Plugin } from "@opencode/plugin";
 import type { ToolContext } from "@opencode/plugin/promise/tool";
 import type { SessionContext } from "@opencode/plugin/promise/session";
 import { ResumeRejectedError, type ChildSessionRequest, type ChildSessionRunner } from "./child-session";
+import { historyHasEntry, lastAssistantReply, newestEntryId } from "./child-history";
 import { markRunnerDispatch, runnerDescription } from "../router/sessions";
 import {
   ContextSupersededError,
@@ -34,18 +35,48 @@ export interface V2RuntimeOptions {
   bootID?: string;
   /** Tests only: the clock behind `RetainedContextInfo.capturedAt`. */
   now?: () => number;
+  /** Tests only: overrides {@link RESUME_MARKER_TIMEOUT_MS}. */
+  resumeMarkerTimeoutMs?: number;
 }
 
 export const V2_GRADER_AGENT = "model-router-grader";
 const RETAINED_CONTEXT_LIMIT = 500;
 /** How long a delegation waits for the host to remove a child it started by mistake before it reports the error. */
 export const STRAY_CLEANUP_TIMEOUT_MS = 2_000;
+const PENDING_RESULT_ERROR = "[model-router] native subagent did not return a completed child result; verification cannot use a pending result";
+/**
+ * #167: how long a resume reads its child's history for the marker before it goes on without one. A plan-executor resume
+ * runs inside the executor's 30 s confirmation window (LAUNCH_CONFIRM_TIMEOUT_MS, armed before the runner is called and
+ * settled by the resumed child's first step), so a slow read must not spend it.
+ */
+export const RESUME_MARKER_TIMEOUT_MS = 5_000;
+
+/**
+ * #167: `promise`, or a rejection with `signal.reason` as soon as `signal` aborts. The promise adapter of `@opencode/plugin`
+ * (2.0.31 to 2.4.1) ignores request options, so a host call given `{ signal }` is not cancelled there; this ends the wait for it
+ * anyway. A later settlement of the abandoned promise is absorbed (no unhandled rejection), and the listener is removed.
+ */
+function untilAborted<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) {
+    promise.catch(() => {});
+    return Promise.reject(signal.reason);
+  }
+  return new Promise<T>((resolve, reject) => {
+    const abort = (): void => reject(signal.reason);
+    signal.addEventListener("abort", abort, { once: true });
+    promise.then(
+      (value) => { signal.removeEventListener("abort", abort); resolve(value); },
+      (error: unknown) => { signal.removeEventListener("abort", abort); reject(error); },
+    );
+  });
+}
 
 /** The small v1 client surface still used by the shared hooks. */
 export function createV2Runtime(ctx: Plugin.Context, options: V2RuntimeOptions = {}) {
   type ToolScope = { context: ToolContext; active: boolean; info: RetainedContextInfo };
   const refOf = (info: RetainedContextInfo): ContextRef => ({ bootID: info.bootID, epoch: info.epoch, callID: info.callID });
   const nowMs = options.now ?? Date.now;
+  const markerTimeoutMs = options.resumeMarkerTimeoutMs ?? RESUME_MARKER_TIMEOUT_MS;
   const currentTool = new AsyncLocalStorage<ToolScope>();
   const retainedContexts = new Map<string, ToolScope>();
   const lifetime = new AbortController();
@@ -192,6 +223,7 @@ export function createV2Runtime(ctx: Plugin.Context, options: V2RuntimeOptions =
       ]);
       signal.throwIfAborted();
       const resumeID = request.resumeSessionID;
+      let resumeMarker: string | undefined;
       if (resumeID !== undefined) {
         // The host resumes any session id it is given, so ours checks that the child exists and belongs to the
         // calling session before anything is sent. Whatever the lookup says other than "my child", the caller
@@ -205,6 +237,20 @@ export function createV2Runtime(ctx: Plugin.Context, options: V2RuntimeOptions =
           throw new ResumeRejectedError(resumeID, `session lookup failed (${error instanceof Error ? error.message : String(error)})`);
         }
         if (info?.parentID !== parent) throw new ResumeRejectedError(resumeID, `it is not a child of session ${parent}`);
+        // #167: the newest entry before this run, so a waited result is read only from what the run adds (the previous
+        // turn's answer stays in the history). Unreadable, or not read within RESUME_MARKER_TIMEOUT_MS, means no marker: a
+        // foreground result does not need one.
+        const markerDeadline = new AbortController();
+        const markerTimer = setTimeout(() => markerDeadline.abort(new Error("[model-router] the resumed child's history was not read in time")), markerTimeoutMs);
+        if (typeof markerTimer === "object" && typeof markerTimer.unref === "function") markerTimer.unref();
+        const markerSignal = AbortSignal.any([signal, markerDeadline.signal]);
+        try {
+          resumeMarker = newestEntryId(await untilAborted(ctx.session.context({ sessionID: resumeID }, { signal: markerSignal }), markerSignal));
+        } catch {
+          signal.throwIfAborted();
+        } finally {
+          clearTimeout(markerTimer);
+        }
       }
       // A resumed child is known up front: the host does not create one, and a progress event for another id is an error.
       let childID: string | undefined = resumeID;
@@ -297,19 +343,53 @@ export function createV2Runtime(ctx: Plugin.Context, options: V2RuntimeOptions =
           },
         });
         const output = result.output as { sessionID?: unknown; status?: unknown; output?: unknown } | undefined;
-        service?.end(signal.aborted ? "interrupted" : output?.status === "completed" ? "completed" : "error");
+        const named = childID !== undefined && output?.sessionID === childID;
+        let text = named && output?.status === "completed" && typeof output.output === "string" ? output.output : undefined;
+        // #167: our child, still at work. Since OpenCode 2.3.0 the native subagent always answers at once with `status: "running"`
+        // (reported on 2.4.1), whatever `background: false` says. It is waited for below; any other result is final.
+        const pending = named && text === undefined && output?.status === "running";
+        // The span ends "completed" only for a child that really completed; a pending child's span ends after its wait, or in the catch.
+        if (!pending) service?.end(signal.aborted ? "interrupted" : text !== undefined ? "completed" : "error");
         // A named child confirms an attempted resume even when its result failed or was aborted.
-        if (childID && output?.sessionID === childID) await confirmChild(childID);
+        if (childID && named) await confirmChild(childID);
         signal.throwIfAborted();
         if (resumeID !== undefined && typeof output?.sessionID === "string" && output.sessionID !== resumeID) {
           const cleanup = await removeStray(output.sessionID);
           throw new ResumeRejectedError(resumeID, `the host started another child (${output.sessionID}) instead${cleanup}`);
         }
-        if (!childID || output?.sessionID !== childID || output.status !== "completed" || typeof output.output !== "string") {
-          throw new Error("[model-router] native subagent did not return a completed child result; verification cannot use a pending result");
+        let resumeMiss: string | undefined;
+        if (childID && pending) {
+          // Bounded by the combined signal (the grader's deadline and cancellation), even on a host whose `wait` ignores it;
+          // a rejected or aborted wait reaches the catch, which interrupts the child. `{ signal }` is passed for hosts that honour it.
+          // A resume without its marker can never be graded (see below): it fails at once rather than after the wait.
+          if (typeof ctx.session.wait !== "function") throw new Error(PENDING_RESULT_ERROR);
+          if (resumeID !== undefined && resumeMarker === undefined) {
+            throw new Error(`${PENDING_RESULT_ERROR} (resume: no history marker could be read before the run)`);
+          }
+          await untilAborted(ctx.session.wait({ sessionID: childID }, { signal }), signal);
+          signal.throwIfAborted();
+          const history = await untilAborted(ctx.session.context({ sessionID: childID }, { signal }), signal);
+          signal.throwIfAborted();
+          // Only the turn's newest assistant entry, with text and a completed step, is the answer (`final`): a draft before a
+          // tool call never is. A resume reads only entries after its marker, and only an answer to its own prompt there: a run
+          // that ended before taking its prompt leaves the previous turn's answer newest. A marker that is gone gives no answer.
+          const reply = resumeID === undefined ? lastAssistantReply(history, { final: true })
+            : resumeMarker === undefined ? undefined
+            : lastAssistantReply(history, { final: true, after: { id: resumeMarker, prompt: request.prompt } });
+          // A resume without an answer says which of its own checks failed (a host that rewrites the prompt shows up here).
+          if (reply === undefined && resumeMarker !== undefined) {
+            resumeMiss = historyHasEntry(history, resumeMarker) ? "no answer to this run's prompt after the marker" : "the history marker is gone";
+          }
+          // No answer, an empty one, or a turn that ended in an error or whose run ended failed or interrupted (`wait` resolves
+          // for those too) is never a result.
+          if (reply !== undefined && !reply.failed && reply.text.trim() !== "") text = reply.text;
         }
+        if (!childID || text === undefined) {
+          throw new Error(resumeMiss === undefined ? PENDING_RESULT_ERROR : `${PENDING_RESULT_ERROR} (resume: ${resumeMiss})`);
+        }
+        if (pending) service?.end("completed");
         await confirmChild(childID);
-        return { sessionID: childID, text: output.output };
+        return { sessionID: childID, text };
       } catch (error) {
         service?.end(signal.aborted ? "interrupted" : "error");
         controller.abort();
