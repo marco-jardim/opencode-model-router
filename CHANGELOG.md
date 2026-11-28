@@ -73,6 +73,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `router_verify` on its handle waited for that run until its deadline. The entry now settles exactly once as
   `UNVERIFIABLE` with the scrubbed error as its reason, the verdict is posted to the parent session, and the error is
   logged. OpenCode v1 is unchanged.
+- **OpenCode v2: plan executor integration lineage, regression runs and breaker window (#188).** When a reverted
+  task's retry branch is reused, it is rebased from the newest journaled upstream its tip contains (also when its retry
+  landed as a rebased copy), so it does not replay other tasks' reverted changes. A revert whose culprit has no failing
+  test ids is no longer landed without its regression run: the phase suite commands are resolved once more, and if they
+  still do not resolve the revert is not built and the item gives the reason; a suite setting pauses only that phase
+  (unpausing reruns the suite), a resolver error pauses the plan (unpausing rebuilds the revert). After a restart, a
+  completed task's commit is looked up on its task branch, whose tip its slot is then re-provisioned from; a commit only
+  another ref reaches raises the blocking item, naming it. A commit failure cancelled by an abort stays in the
+  circuit-breaker window.
 
 ### Security
 

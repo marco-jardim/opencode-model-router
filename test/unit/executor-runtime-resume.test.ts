@@ -274,6 +274,19 @@ describe("executor commit identity under the production hardening", () => {
     expect(h.queue.enqueue).not.toHaveBeenCalled();
   }, TEST_MS);
 
+  it("QA-4.2-38 (#188): a commit failure with an empty error text journals a non-empty context (it stays a breaker sample once cancelled)", async () => {
+    const h = await rig();
+    await h.start();
+    const first = await h.launched(1);
+    await h.child(first, "observe-child");
+    await h.runtime.pause(PLAN, ORCH);
+    h.deps.verifier.observe = async () => { throw new Error(""); };
+    await h.end(first, "observe-child", "DONE: finished");
+    await untilState(h, "ready");
+    const a = (await h.ledger()).tasks.T1?.attempts[0];
+    expect(a).toMatchObject({ outcome: "succeeded", verdict: null, context: "commit failed" });
+  }, TEST_MS);
+
   it("sanitizes credentials and control characters before bounding the stderr tail", () => {
     const tail = gitStderrTail(`${"prefix ".repeat(200)}\n\x1b[31mfatal: https://user:pass@example.com/repo?token=query-secret\npassword=local-secret Bearer bearer-secret\tend`);
     expect(tail.length).toBeLessThanOrEqual(500);

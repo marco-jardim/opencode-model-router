@@ -113,10 +113,15 @@ const NOT_COMMIT_FAILED_STATES: readonly TaskState[] =
  * with no verdict was followed by a retry, which only `commit-failed` allows (`completed` leaves for `failed` only
  * that way). The latest one counts whenever the task is outside `NOT_COMMIT_FAILED_STATES` (QA-4.2-19): `failed`, or
  * the `ready`/`parked`/`blocked` the retry decision moves it to right after the feed, so the sample outlives the move.
+ * QA-4.2-38 (#188): `cancelled` (abort) follows `completed`/`verifying` (no commit failure) or the states above. A
+ * succeeded, verdict-less attempt gets a context only in the commit-failed batch (or the park/answer that follows it),
+ * so a cancelled task whose latest such attempt has one keeps its commit failure in the breaker window.
  */
 export function isCommitFailure(t: Readonly<LedgerV1["tasks"][string]>, a: Attempt): boolean {
   if (a.outcome !== "succeeded" || a.verdict !== null) return false;
-  return a !== t.attempts[t.attempts.length - 1] || !NOT_COMMIT_FAILED_STATES.includes(t.state);
+  if (a !== t.attempts[t.attempts.length - 1]) return true;
+  if (t.state === "cancelled") return a.context !== "";
+  return !NOT_COMMIT_FAILED_STATES.includes(t.state);
 }
 
 /**
