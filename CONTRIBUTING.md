@@ -19,6 +19,24 @@ The coverage gate requires Linux unit and e2e inputs and merges Windows unit cov
 when present. Without the Windows input, only `src/verify/exec.ts` and the `src/executor/`
 prefix are warn-only; every other gate still blocks. With it, all gates block.
 
+### Node versions
+
+`engines.node` (`>=22`) describes the published plugin (`server.ts`, `tui.ts`, `src/`), which
+OpenCode loads; it is not the floor for working on this repository. The repository tools
+import TypeScript files directly with Node's type stripping, so development needs a newer
+Node 22:
+
+- **Node 22.18 / 23.6 or newer** (type stripping on by default) for the coverage merge
+  (`scripts/coverage-merge.mjs` imports `vitest.config.ts` and `scripts/coverage-gate.ts`)
+  and `npm run routing:stats`. This is the development floor; CI's `node-version: 22`
+  installs the latest 22.x, which is above it.
+- **Node 22.13 or newer** for `npm run soak:analyze`, whose loader strips types with
+  `module.stripTypeScriptTypes` in strip mode (Node 26 removed the transform mode).
+
+Type stripping only erases types, so every TypeScript module these tools import, including
+the product modules the soak analyzer reads, must use erasable syntax only: no parameter
+properties, enums or namespaces.
+
 ## Golden snapshots
 
 The golden tests are parameterized over **every** preset in `tiers.json`. Any edit to

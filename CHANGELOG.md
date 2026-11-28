@@ -37,6 +37,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on: that filter is blanked and marked required, so git refuses only where it is used. The verification snapshot and
   reference pass nothing on and send the same git commands as before; one change reaches them: an include target
   whose existence check hangs now fails the snapshot closed after its own 10 s timeout (OpenCode v1 and v2).
+- **Repository tools: `npm run soak:analyze` runs on Node 26, and the development Node floor is documented (#195).**
+  The analyzer's loader called `module.stripTypeScriptTypes` with `mode: "transform"`, which Node 26 removed, so every
+  run exited 2 with `The property 'options.mode' must be one of: 'strip'`. It now uses strip mode (Node 22.13 and
+  later); the product modules it imports already use erasable syntax only. `engines.node` stays `>=22`: it describes
+  the published plugin, not the repository tools. CONTRIBUTING.md now states the development floor separately: Node
+  22.18 / 23.6 or newer for the coverage merge and `npm run routing:stats`, Node 22.13 or newer for the soak analyzer.
 
 ### Security
 
