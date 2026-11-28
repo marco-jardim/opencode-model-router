@@ -1333,7 +1333,7 @@ These are character counts of the prompts the shipped config actually produces, 
 ## Requirements
 
 - [OpenCode](https://opencode.ai) v1 (`>=1.0.0 <2.0.0`) or v2 **2.0.20+** (TUI status: 2.0.24+)
-- Node.js 22+
+- Node.js 22+ (developing the plugin itself needs Node 22.18+, see [CONTRIBUTING.md](CONTRIBUTING.md#node-versions))
 - Provider API keys configured in OpenCode
 
 ## License

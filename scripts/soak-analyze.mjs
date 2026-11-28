@@ -8,7 +8,8 @@
  * Missing evidence is never a pass. JSON defaults to ./soak-analysis.json, outside input trees.
  * A-6.1-6: criterion status checks observable subcases only. Not-observable subcases
  * remain unobserved declared gaps, never ok and never counted as observations.
- * Node >=22.13 (stripTypeScriptTypes); imports product TS through an extensionless-import loader.
+ * Node >=22.13 (stripTypeScriptTypes); imports product TS through an extensionless-import loader
+ * in strip mode (Node 26 has no transform mode), so the imported TS must be erasable syntax.
  * Exit codes: 0 only for verdict pass; 1 for any violation; 2 for unreadable input
  * or a non-passing verdict due to insufficient or missing observable evidence.
  * Also reads this checkout's git-common-dir/omr-executor. Optional archived journal copies:
