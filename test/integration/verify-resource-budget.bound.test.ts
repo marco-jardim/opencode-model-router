@@ -212,7 +212,7 @@ function overBound(census: CappedCensus[], bound: number): string[] {
       const parent = byPid.get(w.ppid);
       const mark = c.excused.has(w.pid) ? " (exiting, excused)" : c.retiring.has(w.pid) ? " (retiring, over the cap: counted)" : "";
       out.push(
-        `    worker ${w.pid}${mark} ppid=${w.ppid} created=${w.createdMs ?? "?"}` +
+        `    worker ${w.pid}${mark} ppid=${w.ppid} created=${w.createdMs ?? (w.startTicks === undefined ? "?" : `tick ${w.startTicks}`)}` +
           ` seen ${x === undefined ? "?" : `${x.first - c.snapshot.t}..+${x.last - c.snapshot.t}ms`}` +
           ` parent: ${parent === undefined ? "(not in snapshot)" : `${isMainArgs(parent.args) ? "runner main" : "other"} ${parent.args.slice(0, 160)}`}`,
       );
