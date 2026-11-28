@@ -4235,6 +4235,93 @@ describe("checkPhase and suite gates", () => {
     env.assertInvariants();
   });
 
+  it("3.2-m4 (#188): a culprit with no ids rebuilt from history without suite commands is not reverted unchecked", async () => {
+    const env = await setup({ tasks: 2, batchMax: 1 });
+    // A full-command bisect: the culprit carries no failing ids and no files.
+    env.suite.onRun = req => {
+      const range = req.ranges.find(r => r.taskId === "T2");
+      return range === undefined ? { kind: "passed" } : { kind: "culprit", range: { ...range }, ids: [], files: [] };
+    };
+    let calls = 0;
+    let crashAt = 3; // the resolver call right after the closing batch of the failed suite
+    let down = false;
+    env.suite.resolve = async () => {
+      calls++;
+      if (calls === crashAt) {
+        env.w.dead = true;
+        throw new CrashError("crash after the suite closed");
+      }
+      if (down) throw new Error("resolver down after the restart");
+      return RUNS;
+    };
+    env.queue.enqueue(["T1", "T2"]);
+    await env.until(() => env.w.dead && env.phase().gate === "suite-failed", "the crash");
+    await env.restart();
+    crashAt = -1;
+    down = true;
+    await env.queue.resume();
+    await env.until(() => env.ledger.status === "paused", "the fail-closed pause");
+    expect(env.suite.reverts).toHaveLength(0);
+    // The resolver is asked once more before the pause; its reason is in the item.
+    expect(env.ledger.inbox.at(-1)?.text).toContain("only the phase suite commands can check the revert, and they do not resolve");
+    expect(env.ledger.inbox.at(-1)?.text).toContain("resolver down after the restart");
+    expect(env.writer.openIntegration().map(o => o.entry.kind)).toEqual(["revert"]);
+    expect(env.w.tasksAt(env.w.tip())).toEqual(["T1", "T2"]);
+    // The owner restores the suite commands and unpauses: the revert is rebuilt with them and their full run checks it.
+    down = false;
+    await env.writer.append([{ type: "status-changed", from: "paused", to: "running", reason: "unpause" }]);
+    env.queue.enqueue([]); // wakes the lanes
+    await env.until(() => env.state("T2") === "reverted" && env.phase().gate === "pending" && env.quiet(), "the checked revert");
+    expect(env.suite.reverts).toHaveLength(1);
+    expect(env.suite.reverts[0]?.regression).toEqual({ ids: [], files: [], commands: RUNS.kind === "runs" ? RUNS.commands : [] });
+    expect(env.w.tasksAt(env.w.tip())).toEqual(["T1"]);
+    env.assertInvariants();
+  });
+
+  it("3.2-m4 (#188): a culprit with no ids whose phase suite now resolves to none pauses only its phase; the unpause reruns the suite", async () => {
+    const env = await setup({ tasks: 2, batchMax: 1 });
+    env.suite.onRun = req => {
+      const range = req.ranges.find(r => r.taskId === "T2");
+      return range === undefined ? { kind: "passed" } : { kind: "culprit", range: { ...range }, ids: [], files: [] };
+    };
+    let calls = 0;
+    let crashAt = 3; // the resolver call right after the closing batch of the failed suite
+    let resolution: SuiteResolution = RUNS;
+    env.suite.resolve = async () => {
+      calls++;
+      if (calls === crashAt) {
+        env.w.dead = true;
+        throw new CrashError("crash after the suite closed");
+      }
+      return resolution;
+    };
+    env.queue.enqueue(["T1", "T2"]);
+    await env.until(() => env.w.dead && env.phase().gate === "suite-failed", "the crash");
+    await env.restart();
+    crashAt = -1;
+    resolution = { kind: "none" };
+    await env.queue.resume();
+    await env.until(() => env.phase().paused && env.quiet(), "the phase pause");
+    expect(env.ledger.status).toBe("running");
+    expect(env.phase().gate).toBe("suite-failed");
+    expect(env.suite.reverts).toHaveLength(0);
+    expect(env.writer.openIntegration()).toEqual([]);
+    expect(await env.steps("revert")).toEqual(["revert:revert-build:start", "revert:revert-build:end/refused"]);
+    const item = env.ledger.inbox.at(-1);
+    expect(item).toMatchObject({ kind: "failure", severity: "critical", taskId: "T2" });
+    expect(item?.text).toContain("the suite resolves to \"none\"");
+    expect(env.w.tasksAt(env.w.tip())).toEqual(["T1", "T2"]);
+    // The owner restores the suite and unpauses the phase: the suite runs again and its revert is checked by the commands.
+    resolution = RUNS;
+    await env.writer.append([{ type: "phase-paused", phaseId: "p1", paused: false, reason: "unpause" }]);
+    await env.queue.checkPhase("p1");
+    await env.until(() => env.state("T2") === "reverted" && env.phase().gate === "pending" && env.quiet(), "the checked revert");
+    expect(env.suite.reverts).toHaveLength(1);
+    expect(env.suite.reverts[0]?.regression).toEqual({ ids: [], files: [], commands: RUNS.kind === "runs" ? RUNS.commands : [] });
+    expect(env.w.tasksAt(env.w.tip())).toEqual(["T1"]);
+    env.assertInvariants();
+  });
+
   it("tasks that depend on a reverted task are blocked; a live one is settled, its slot and lease released", async () => {
     // The dependents start `pending` (a valid draft); they become ready / running through journaled transitions once T1 is
     // integrated, while the phase suite of p1 is held.
@@ -5189,6 +5276,107 @@ describe("QA-3.2 round 2", () => {
     env.queue.enqueue(["T1"]);
     await env.until(() => env.state("T1") === "integrated" && env.quiet(), "T1 re-integrated");
     expect(upstreams).toEqual([F]);
+    env.assertInvariants();
+  });
+
+  it("3.2-m2 (#188): a reused retry branch rebuilt on a head rebases from its newest journaled upstream, not the oldest", async () => {
+    let F = "";
+    let C1 = "";
+    let R1 = "";
+    let Y = "";
+    let Z1 = "";
+    let R2 = "";
+    const env = await setup({ tasks: 1, resume: false, mutate: (l, w) => {
+      F = w.base;
+      C1 = w.branches.get(`refs/heads/omr/${PLAN_ID}/t/T1`) ?? ""; // integrated as is (no rebase)
+      R1 = w.commit(C1, null, "T1").sha; // first revert of T1
+      Y = w.commit(R1, "T2").sha; // another task's change lands on top
+      Z1 = w.commit(Y, "T1").sha; // the retry rebuilt on the head Y (it contains R1), fast-forwarded as is
+      R2 = w.commit(Z1, null, "T1").sha; // second revert of T1
+      const RY = w.commit(R2, null, "T2").sha; // the other task's change is reverted too: the head
+      const Z2 = w.commit(Z1, "T1").sha; // the retry branch reused: Z1 plus a fix
+      w.branches.set(`refs/heads/omr/${PLAN_ID}/t/T1`, Z2);
+      w.slotCommit.set("slot-1", Z2);
+      w.branches.set(INT_REF, RY);
+      w.passed.add(RY);
+      l.integration.head = RY;
+    } });
+    const t1: IntegrationEntry = { id: "i-840", kind: "task", phaseId: "p1", taskIds: ["T1"], slot: "slot-1", baseHead: F, candidate: null };
+    const rv1: IntegrationEntry = { id: "i-850", kind: "revert", phaseId: "p1", taskIds: ["T1"], slot: "integration", baseHead: C1, candidate: R1 };
+    const t2: IntegrationEntry = { id: "i-860", kind: "task", phaseId: "p1", taskIds: ["T1"], slot: "slot-1", baseHead: Y, candidate: null };
+    const rv2: IntegrationEntry = { id: "i-870", kind: "revert", phaseId: "p1", taskIds: ["T1"], slot: "integration", baseHead: Z1, candidate: R2 };
+    const revertFf = (e: IntegrationEntry, from: string, to: string): IntegrationStepEvent[] => [
+      stepEvent(e, { step: "revert-fast-forward", edge: "start", detail: JSON.stringify({ v: 1, from: e.baseHead, to: e.candidate, culprit: { taskId: "T1", from, to }, suiteCommit: e.baseHead }) }),
+      stepEvent(e, { step: "revert-fast-forward", edge: "end", result: "ok", closes: true, detail: "{}" }),
+    ];
+    env.historyExtra = [
+      stepEvent(t1, { step: "rebase", edge: "start", detail: JSON.stringify({ v: 1, onto: F, tasks: [{ taskId: "T1", tip: C1, upstream: F }] }) }),
+      ...revertFf(rv1, F, C1),
+      stepEvent(t2, { step: "rebase", edge: "start", detail: JSON.stringify({ v: 1, onto: Y, tasks: [{ taskId: "T1", tip: Z1, upstream: Y }] }) }),
+      ...revertFf(rv2, Y, Z1),
+    ];
+    const upstreams: string[] = [];
+    const g: GitOps = env.git;
+    const real = env.git.rebaseOnto.bind(env.git);
+    g.rebaseOnto = async (cwd, onto, upstream) => { upstreams.push(upstream); return real(cwd, onto); };
+    env.igit.mergeBase = async () => Z1; // merge-base(head, Z2) = Z1
+    await env.queue.resume();
+    env.queue.enqueue(["T1"]);
+    await env.until(() => env.state("T1") === "integrated" && env.quiet(), "T1 re-integrated");
+    // From F the rebase would replay T2's change (Y), reverted on the head; from Y it replays only Z1 and the fix.
+    expect(upstreams).toEqual([Y]);
+    env.assertInvariants();
+  });
+
+  it("3.2-m2 (#188): a reused retry branch whose retry landed as a rebased copy rebases from its journaled upstream, the merge base", async () => {
+    let F = "";
+    let C1 = "";
+    let R1 = "";
+    let H2 = "";
+    let H3 = "";
+    let Z1 = "";
+    let Z1r = "";
+    let R2 = "";
+    const env = await setup({ tasks: 1, resume: false, mutate: (l, w) => {
+      F = w.base;
+      C1 = w.branches.get(`refs/heads/omr/${PLAN_ID}/t/T1`) ?? ""; // integrated as is (no rebase)
+      R1 = w.commit(C1, null, "T1").sha; // first revert of T1
+      H2 = w.commit(R1, "T2").sha; // another task's change lands on top
+      Z1 = w.commit(H2, "T1").sha; // the retry rebuilt on the head H2 (it contains R1)
+      H3 = w.commit(H2, "T3").sha; // the head moves on before the retry integrates
+      Z1r = w.commit(H3, "T1").sha; // the retry lands as a rebased copy Z1' (Z1 itself is not on the branch)
+      R2 = w.commit(Z1r, null, "T1").sha; // second revert of T1: the head
+      const Z2 = w.commit(Z1, "T1").sha; // the retry branch reused: Z1 plus a fix
+      w.branches.set(`refs/heads/omr/${PLAN_ID}/t/T1`, Z2);
+      w.slotCommit.set("slot-1", Z2);
+      w.branches.set(INT_REF, R2);
+      w.passed.add(R2);
+      l.integration.head = R2;
+    } });
+    const t1: IntegrationEntry = { id: "i-880", kind: "task", phaseId: "p1", taskIds: ["T1"], slot: "slot-1", baseHead: F, candidate: null };
+    const rv1: IntegrationEntry = { id: "i-890", kind: "revert", phaseId: "p1", taskIds: ["T1"], slot: "integration", baseHead: C1, candidate: R1 };
+    const t2: IntegrationEntry = { id: "i-900", kind: "task", phaseId: "p1", taskIds: ["T1"], slot: "slot-1", baseHead: H3, candidate: null };
+    const rv2: IntegrationEntry = { id: "i-910", kind: "revert", phaseId: "p1", taskIds: ["T1"], slot: "integration", baseHead: Z1r, candidate: R2 };
+    const revertFf = (e: IntegrationEntry, from: string, to: string): IntegrationStepEvent[] => [
+      stepEvent(e, { step: "revert-fast-forward", edge: "start", detail: JSON.stringify({ v: 1, from: e.baseHead, to: e.candidate, culprit: { taskId: "T1", from, to }, suiteCommit: e.baseHead }) }),
+      stepEvent(e, { step: "revert-fast-forward", edge: "end", result: "ok", closes: true, detail: "{}" }),
+    ];
+    env.historyExtra = [
+      stepEvent(t1, { step: "rebase", edge: "start", detail: JSON.stringify({ v: 1, onto: F, tasks: [{ taskId: "T1", tip: C1, upstream: F }] }) }),
+      ...revertFf(rv1, F, C1),
+      stepEvent(t2, { step: "rebase", edge: "start", detail: JSON.stringify({ v: 1, onto: H3, tasks: [{ taskId: "T1", tip: Z1, upstream: H2 }] }) }),
+      ...revertFf(rv2, H3, Z1r),
+    ];
+    const upstreams: string[] = [];
+    const g: GitOps = env.git;
+    const real = env.git.rebaseOnto.bind(env.git);
+    g.rebaseOnto = async (cwd, onto, upstream) => { upstreams.push(upstream); return real(cwd, onto); };
+    env.igit.mergeBase = async () => H2; // merge-base(R2, Z2) = H2: the journaled upstream of the rebased landing
+    await env.queue.resume();
+    env.queue.enqueue(["T1"]);
+    await env.until(() => env.state("T1") === "integrated" && env.quiet(), "T1 re-integrated");
+    // The revert-range fallback would answer F and replay T2's change; H2..Z2 is only Z1 and the fix.
+    expect(upstreams).toEqual([H2]);
     env.assertInvariants();
   });
 

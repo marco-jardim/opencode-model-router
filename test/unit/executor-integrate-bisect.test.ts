@@ -1086,6 +1086,35 @@ describe("phase suite execution cwd", () => {
       .toMatchObject({ verdict: "pass" });
     expect(spawned[0]).toMatchObject({ cwd: override.cwd, c: override });
   });
+
+  it("Scope-P3 (#188): a failing full run of a command with an explicit cwd reports its failing files under that cwd", async () => {
+    const override = { ...cmd, cwd: nodePath.resolve("/slot/pkg") };
+    const { checks } = checksEnv({ spawn: () => noneOut(1, { stdout: " FAIL  t/a.test.ts > s > t\n Tests  1 failed (1)\n" }) });
+    const r = await checks.runCommands({ slot, commit: "c3", commands: [override], mode: "full", priority: "background",
+      signal: new AbortController().signal, prepare: true });
+    expect(r).toMatchObject({ verdict: "fail", files: [nodePath.resolve("/slot/pkg", "t/a.test.ts")] });
+  });
+
+  it("Scope-P3 (#188): a rerun of a command with an explicit cwd runs the full command there, never a slot-root rerun skipped as passing", async () => {
+    const pkg = nodePath.resolve("/slot/pkg");
+    const override = { ...cmd, cwd: pkg };
+    const { checks, spawned } = checksEnv({ spawn: () => noneOut(1, { stdout: " FAIL  t/a.test.ts > s > t\n Tests  1 failed (1)\n" }) });
+    const r = await checks.runCommands({ slot, commit: "c3", commands: [override], mode: { rerun: ["t/a.test.ts > s > t"] },
+      priority: "background", signal: new AbortController().signal, prepare: true });
+    expect(r).toMatchObject({ verdict: "fail", scope: "full", files: [nodePath.resolve(pkg, "t/a.test.ts")] });
+    expect(spawned).toHaveLength(1);
+    expect(spawned[0]).toMatchObject({ cwd: pkg, c: { args: override.args, cwd: pkg } });
+  });
+
+  it("Scope-P3 (#188): an integration-check test command with an explicit cwd reports its failing files under that cwd (runFull)", async () => {
+    const pkg = nodePath.resolve("/slot/pkg");
+    const { checks } = checksEnv({
+      files: { "package.json": JSON.stringify({ scripts: { test: "vitest run" } }) },
+      resolve: ref => ({ ok: true, command: { label: ref.script, file: "npm", args: ["run", ref.script], source: "package-script", ref, cwd: pkg } }),
+      spawn: () => noneOut(1, { stdout: " FAIL  t/a.test.ts > s > t\n Tests  1 failed (1)\n" }),
+    });
+    expect(await checks.run(checkReq())).toMatchObject({ verdict: "fail", failingFiles: [nodePath.resolve(pkg, "t/a.test.ts")] });
+  });
 });
 
 describe("integration checks: prepare and select", () => {

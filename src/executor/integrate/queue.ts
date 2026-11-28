@@ -1273,9 +1273,11 @@ class Queue implements IntegrationQueue {
   /**
    * QA-3.2-10 / QA-3.2-25: the rebase upstream of a task that was reverted. A retry built on the old task branch whose
    * original change lies below the merge base (fast-forwarded as is, then reverted) would replay only its fixes. Unless the
-   * tip already contains the latest revert (a retry rebuilt on the head keeps the merge base), the upstream is the one
-   * journaled in the task's first rebase step (its original base, ancestor of the tip), else the `from` of the OLDEST revert
-   * whose `to` is below the merge base. Any number of reverts keeps the original change.
+   * tip already contains the latest revert (a retry rebuilt on the head keeps the merge base), the upstream is the NEWEST
+   * one journaled in the task's rebase steps that is an ancestor of the tip (3.2-m2, #188: a retry branch rebuilt on a head
+   * and then reused must not replay from an older base, which would replay other tasks' reverted changes), even when it is
+   * the merge base (a retry that landed as a rebased copy: its own commits are not on the branch), else the `from` of the
+   * OLDEST revert whose `to` is below the merge base. Any number of reverts keeps the original change.
    */
   private async reintegrationUpstream(id: TaskId, tip: string, mergeBase: string): Promise<string> {
     const reverts = await this.revertedRanges(id);
@@ -1283,8 +1285,13 @@ class Queue implements IntegrationQueue {
     if (latest === undefined) return mergeBase;
     const top = this.ledger.repo.toplevel;
     if (latest.revertHead !== null && await this.d.igit.isAncestor(top, latest.revertHead, tip)) return mergeBase;
-    const first = await this.firstUpstream(id);
-    if (first !== null && first !== mergeBase && await this.d.igit.isAncestor(top, first, tip)) return first;
+    const journaled = await this.journaledUpstreams(id);
+    let newest: string | null = null;
+    for (let i = journaled.length - 1; i >= 0 && newest === null; i--) {
+      const u = journaled[i];
+      if (u !== undefined && await this.d.igit.isAncestor(top, u, tip)) newest = u;
+    }
+    if (newest !== null) return newest;
     for (const rv of reverts) {
       if (rv.to !== rv.from && await this.d.igit.isAncestor(top, rv.to, mergeBase)) return rv.from;
     }
@@ -1311,18 +1318,22 @@ class Queue implements IntegrationQueue {
     return out;
   }
 
-  /** The `upstream` journaled for `id` in the first rebase step that planned it (its original base), or null. */
-  private async firstUpstream(id: TaskId): Promise<string | null> {
+  /** Every distinct `upstream` journaled for `id` in the rebase steps that planned it, oldest first (first = original base). */
+  private async journaledUpstreams(id: TaskId): Promise<string[]> {
+    const out: string[] = [];
     for (const ev of await this.loadSteps()) {
       if (ev.step !== "rebase" || ev.edge !== "start" || (ev.entry.kind !== "task" && ev.entry.kind !== "batch")) continue;
       const tasks = parseDetail(ev.detail)?.tasks;
       if (!Array.isArray(tasks)) continue;
       for (const t of tasks as unknown[]) {
         const x = t as { taskId?: unknown; upstream?: unknown } | null;
-        if (x !== null && typeof x === "object" && x.taskId === id && typeof x.upstream === "string") return x.upstream;
+        if (x === null || typeof x !== "object" || x.taskId !== id || typeof x.upstream !== "string") continue;
+        const i = out.indexOf(x.upstream);
+        if (i >= 0) out.splice(i, 1);
+        out.push(x.upstream);
       }
     }
-    return null;
+    return out;
   }
 
   private async runTaskEntry(ids: TaskId[], requeue: boolean): Promise<void> {
@@ -2284,14 +2295,49 @@ class Queue implements IntegrationQueue {
       "revert-build", { v: 1, culprit: { ...rv.culprit }, suiteCommit: rv.suiteCommit, head, files: [...rv.files] }, NONE, rv.ids);
     this.serial = live;
     const slot = await this.integrationSlot();
+    const p = rv.phaseId;
+    let commands = rv.commands;
+    if (rv.ids.length === 0 && commands.length === 0) {
+      // 3.2-m4 (#188): a culprit with no ids (a full-command bisect), rebuilt from history or rerun after the suite commands
+      // failed to resolve, has only the suite commands to re-check the regression with. They are resolved once more; still
+      // none: fail closed, never a revert without its regression run.
+      let why: string;
+      let phaseCause = false;
+      try {
+        const res = await this.d.suite.resolve(this.ledger, p, rv.suiteCommit);
+        if (res.kind === "runs") commands = res.commands;
+        phaseCause = res.kind !== "runs" || res.commands.length === 0;
+        why = res.kind === "refused" ? res.reason : res.kind === "runs" ? "the suite resolves to no command" : `the suite resolves to "${res.kind}"`;
+      } catch (e) {
+        why = message(e);
+      }
+      if (commands.length === 0) {
+        const text = `The revert of ${rv.culprit.taskId} was not built: the culprit has no failing test ids, so only the phase suite commands can check the revert, and they do not resolve at ${rv.suiteCommit} (${clipText(why, 500)}).`;
+        if (!phaseCause) {
+          // The resolver failed: the entry stays open (M36); unpause rolls it back and rebuilds the revert, resolving again.
+          if (live.open !== null) await this.end(live, "refused", { v: 1, reason: "resolve", message: clipText(why, 1000) }, false);
+          return this.infraPause(live, text);
+        }
+        // The phase's suite setting (refused/none/off): as `suiteRefused`, only the phase pauses. The entry closes, so the
+        // unpause reruns the suite (M25: no revert pending), which resolves the commands again.
+        const now = this.d.clock.iso();
+        const before = this.ledger.inbox.length;
+        if (live.open === null) await this.start(live, "revert-build", { v: 1, culprit: { ...rv.culprit }, suiteCommit: rv.suiteCommit, head: this.ledger.integration.head, files: [...rv.files] });
+        const next = await this.end(live, "refused", { v: 1, reason: "resolve", message: clipText(why, 1000) }, true, [],
+          lg => [{ type: "phase-paused", phaseId: p, paused: true, reason: "suite-unresolvable" },
+            this.inboxEvent(lg, "failure", "critical", rv.culprit.taskId,
+              `${text} Phase ${p} is paused; fix its suite, then unpause phase ${p} to run the suite again.`, now)]);
+        this.notifyInbox(this.newInbox(next, before));
+        return;
+      }
+    }
     // M26: built at the current head (a rerun entry may have been journaled before requeued tasks integrated).
     const buildHead = this.ledger.integration.head;
     const v = await this.d.suite.revert({ planId: this.d.planId, phaseId: rv.phaseId, culprit: { ...rv.culprit }, suiteCommit: rv.suiteCommit,
-      head: buildHead, regression: { ids: [...rv.ids], files: [...rv.files], commands: [...rv.commands] }, slot },
+      head: buildHead, regression: { ids: [...rv.ids], files: [...rv.files], commands: [...commands] }, slot },
       this.journal(live, this.ctl.signal));
     const now = this.d.clock.iso();
     const before = this.ledger.inbox.length;
-    const p = rv.phaseId;
     if (v.kind === "interrupted") throw new LaneStop(`revert interrupted by ${v.by}`);
     if (v.kind === "error") {
       if (live.open !== null) await this.end(live, "refused", { v: 1, reason: v.reason, message: clipText(v.message, 1000) }, false);

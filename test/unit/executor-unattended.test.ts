@@ -1010,6 +1010,29 @@ describe("recordAttempt: when the breaker trips", () => {
     expect(breakerSamples(await env.reopen(), "p1")).toEqual(before);
   });
 
+  it("QA-4.2-38 (#188): a commit failure cancelled by an abort stays a sample; a cancelled completed task does not become one", async () => {
+    const why = "commit failed: no git identity";
+    // The commit-failed batch writes the attempt context with the transition (runtime `commitFailed`).
+    const c0 = task("C0", "failed", { attempts: [closed(1, { endSec: 1, verdict: null, context: why })] });
+    const c1 = task("C1", "completed", { slot: "slot-C1", attempts: [closed(1, { endSec: 2, verdict: null })] });
+    const env = await setup({ tasks: [c0, c1], config: { minAttempts: 50 } });
+    await env.writer.append([{ type: "task-transition", taskId: "C0", from: "failed", to: "ready", trigger: "retry", detail: null }]);
+    const before = breakerSamples(env.l(), "p1");
+    expect(before.map((s) => `${s.taskId}:${s.failure}`)).toEqual(["C0:true"]);
+    // The abort batch (runtime `abort`): every unfinished task cancelled, its slot released, the plan aborted.
+    await env.writer.append([
+      { type: "task-transition", taskId: "C0", from: "ready", to: "cancelled", trigger: "abort", detail: null },
+      { type: "task-transition", taskId: "C1", from: "completed", to: "cancelled", trigger: "abort", detail: null },
+      { type: "task-slot", taskId: "C1", slot: null, branch: null },
+      { type: "status-changed", from: env.l().status, to: "aborted", reason: "user-abort" },
+    ]);
+    expect([env.state("C0"), env.state("C1")]).toEqual(["cancelled", "cancelled"]);
+    expect(breakerSamples(env.l(), "p1")).toEqual(before);
+    expect(breakerSamples(await env.reopen(), "p1")).toEqual(before);
+    const ok = closed(1, { endSec: 1, verdict: null });
+    expect(isCommitFailure(task("X", "cancelled", { attempts: [ok] }), ok)).toBe(false);
+  });
+
   it("QA-4.2-19: maxAttempts = 1 and three tasks failing their commit trip the breaker (consecutive 3)", async () => {
     // Only C0's commit has failed yet; C1 and C2 are `completed` (verification pending: not samples). The breaker reads
     // the whole ledger (B1), so a ledger with all three failures already settled would trip at the first feed.

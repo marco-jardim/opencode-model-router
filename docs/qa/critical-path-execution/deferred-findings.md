@@ -15,27 +15,27 @@ nothing; phase 1.4 defers nothing but records one pre-existing item in its Hando
 
 ## Summary
 
-118 findings. 18 are fixed since they were deferred, 15 are obsolete or superseded, 85 are open (12 of them re-checked
-in the code or docs today, 73 not re-verified).
+118 findings. 23 are fixed since they were deferred (the five N2 rows by #188), 15 are obsolete or superseded, 80 are
+open (11 of them re-checked in the code or docs today, 69 not re-verified).
 
 | Area | Findings | Open | Fixed since | Obsolete / superseded |
 |---|---|---|---|---|
-| Executor fail-closed | 34 | 28 | 4 | 2 |
-| Observation accuracy | 15 | 13 | 1 | 1 |
+| Executor fail-closed | 34 | 24 | 8 | 2 |
+| Observation accuracy | 15 | 12 | 2 | 1 |
 | POSIX | 2 | 2 | 0 | 0 |
 | Test hygiene | 18 | 14 | 4 | 0 |
 | Docs | 24 | 9 | 6 | 9 |
 | Other | 25 | 19 | 3 | 3 |
-| **Total** | **118** | **85** | **18** | **15** |
+| **Total** | **118** | **80** | **23** | **15** |
 
 | Triage outcome | Findings |
 |---|---|
-| `file issue` (in nine proposed issues, below) | 49 |
+| `file issue` (in eight open proposed issues, below) | 44 |
 | `fold into #140` (A-6.1-3 soak) | 5 |
 | `fold into #162` (executor and repository-only filters) | 1 |
 | `fold into #80` (override layer drop) | 1 |
 | `won't fix` (reason in the row) | 44 |
-| none: already fixed | 18 |
+| none: already fixed | 23 |
 | **Total** | **118** |
 
 Proposed issues (the `file issue (Nx)` tag in the table):
@@ -43,7 +43,7 @@ Proposed issues (the `file issue (Nx)` tag in the table):
 | Tag | Proposed issue | Findings |
 |---|---|---|
 | N1 | Executor: slot release, lock release and purge fail open | 5 |
-| N2 | Executor: integration lineage, regression runs, breaker window and failing-file reporting | 5 |
+| N2 | Executor: integration lineage, regression runs, breaker window and failing-file reporting | 0 (filed as #188; its 5 findings are fixed) |
 | N3 | Executor: restart and recovery edge cases | 10 |
 | N4 | Executor: start, adopt, hot reload and dispose lifecycle | 6 |
 | N5 | Re-probe the host contract on OpenCode 2.3+ (C16, turn-state tail, role spikes) | 4 |
@@ -61,8 +61,8 @@ Most worth an issue:
    native child handling (#167, #174), so the hypothesis is now worth testing.
 3. **R2-pre-3 (N1):** `resetSlotContents` logs a failed `reset`/`clean` and returns, so the relaunched attempt starts in
    a slot that was not reset. Checked in `src/executor/runtime.ts:4798-4805`.
-4. **3.2-m2 (N2):** `firstUpstream` still takes the oldest journaled upstream
-   (`src/executor/integrate/queue.ts:1314-1326`), so a reused retry branch could replay another task's reverted change.
+4. **3.2-m2 (N2):** fixed in #188. `firstUpstream` took the oldest journaled upstream, so a reused retry branch could
+   replay another task's reverted change; the newest journaled upstream its tip contains is used now.
 5. **N-3 (N1):** `slotHeldBy` answers "held" when the pool lookup throws (`src/executor/runtime.ts:1489-1495`), so a
    release gate fails open.
 6. **QA-4.2-42 (N3):** `sameToplevel` uses plain `realpathSync` (`src/executor/recovery.ts:120-123`). An 8.3 short-name
@@ -119,21 +119,21 @@ Status: `open` (with `checked: file:line` when re-checked today, else "not verif
 | 3.1-r3-c | phase-3.1.md:613 | The capture key is `callID` only, not boot id or epoch. | observation accuracy | minor (round 3) | open, not verified | file issue (N8) |
 | 3.1-r3-d | phase-3.1.md:614 | Test gaps: the streak's ignore branch, the parallel test's second-round count, an M41 fallback test with `{type:"user", text}`. | test hygiene | minor (round 3) | open, not verified | file issue (N7) |
 | 3.1-wake | phase-3.1.md:616 | `WakeReason` has no `plan-refused`; the refusal wake goes out as `inbox`. | other | not recorded | open: checked `src/executor/runtime.ts:818-819` | won't fix (works through the inbox wake; type cleanup only) |
-| 3.2-m2 | phase-3.2.md:892 | `firstUpstream` takes the oldest journaled upstream; a reused retry branch could replay another task's reverted change. | executor fail-closed | minor (round 3) | open: checked `src/executor/integrate/queue.ts:1314-1326` | file issue (N2) |
+| 3.2-m2 | phase-3.2.md:892 | `firstUpstream` takes the oldest journaled upstream; a reused retry branch could replay another task's reverted change. | executor fail-closed | minor (round 3) | fixed since #188: the newest journaled upstream the tip contains, also when it is the merge base (`reintegrationUpstream` in `src/executor/integrate/queue.ts`) | none |
 | 3.2-m3 | phase-3.2.md:894 | `release()` swallows a failed compare-and-delete and leaves its lock file; same-host waiters wait for the process to exit. | executor fail-closed | minor (round 3) | open, not verified | file issue (N1) |
-| 3.2-m4 | phase-3.2.md:896 | A culprit with no ids, rebuilt from history after the suite commands failed to resolve, gets no regression run. | executor fail-closed | minor (round 3) | open, not verified | file issue (N2) |
+| 3.2-m4 | phase-3.2.md:896 | A culprit with no ids, rebuilt from history after the suite commands failed to resolve, gets no regression run. | executor fail-closed | minor (round 3) | fixed since #188: the suite commands are resolved once more, else the revert is not built and the phase (suite setting) or the plan (resolver error) pauses with the reason (`runRevert` in `src/executor/integrate/queue.ts`) | none |
 | 3.2-cov | phase-3.2.md:897 | A task cancelled between the post-lock re-check and the `openEntry` batch only logs `not-verified-at-batch`. | executor fail-closed | not recorded (coverage note) | open, not reproduced, not verified | won't fix (no reproduction; revisit with one) |
 | QA-4.1-r3-a | phase-4.1.md:65 | The `router_plan` tool description is shorter than the result text. | docs | minor (round 3) | open, not verified | won't fix (mitigated: the result text always precedes approval) |
 | QA-4.1-r3-b | phase-4.1.md:66 | The auto-approve failure hint names `action=approve`. | docs | minor (round 3) | open, not verified | won't fix (correct for configured consent; `auto` is global-only) |
 | 4.1-realpath | phase-4.1.md:67 | `realpathOfExistingPrefix` mangles a bare `C:` tail, consistently on both sides. | other | not recorded (no effect) | open: function unchanged at `src/router/config.ts:1984`; behaviour not re-checked | won't fix (no effect: both sides are mangled alike) |
 | QA-4.2-31 | phase-4.2.md:435 | A held task whose slot record vanished while its leases are held elsewhere loses the hold and gets a misleading item; stuck until a restart. | executor fail-closed | minor (round 3) | open, not verified | file issue (N3) |
-| QA-4.2-32 | phase-4.2.md:437 | The trailer search uses `log --all` but re-provisions from the task branch tip. | executor fail-closed | minor (round 3) | open, not verified | file issue (N2) |
+| QA-4.2-32 | phase-4.2.md:437 | The trailer search uses `log --all` but re-provisions from the task branch tip. | executor fail-closed | minor (round 3) | fixed since #188: searched in the history of the task branch tip, which is then re-provisioned from; a commit only another ref reaches raises the blocking item naming it (`attemptCommitted` in `src/executor/runtime.ts`) | none |
 | QA-4.2-33 | phase-4.2.md:439 | The takeover gate in `start` uses `recoverable`; a same-repo plan with a stale lock is not attached until adopt or restart. | executor fail-closed | minor (round 3) | open, not verified (executor ownership was re-scoped per repository since, CHANGELOG [Unreleased]) | file issue (N3) |
 | QA-4.2-34 | phase-4.2.md:441 | The qa-unparsable park marker is not added to `p.fed`. | other | minor (round 3) | open, not verified | won't fix (one extra, harmless evaluation) |
 | QA-4.2-35 | phase-4.2.md:442 | `reattachAfterFailedAdopt` attaches without the foreign flag. | executor fail-closed | minor (round 3) | superseded: A-5.1-14 decides foreignness of the failed-adopt re-attach from a read-only snapshot (phase-5.1.md:243); not verified in code | won't fix (superseded by A-5.1-14) |
 | QA-4.2-36 | phase-4.2.md:443 | `RecoveryDeps.toplevel` and `RuntimeDeps.toplevel` are two sources of truth. | other | minor (round 3) | superseded: handed to the 5.1 assembly to derive one from the other (phase-4.2.md:460); not verified | won't fix (handled in 5.1 assembly per handoff) |
 | QA-4.2-37 | phase-4.2.md:445 | Compile and approve never check foreignness; a plan file of another repo runs here. | executor fail-closed | minor (round 3), pre-existing | superseded: A-5.1-14 makes compile decide foreignness and refuses every mutation of a foreign plan (phase-5.1.md:243); not verified in code | won't fix (superseded by A-5.1-14) |
-| QA-4.2-38 | phase-4.2.md:446 | A cancelled commit failure drops out of the circuit-breaker window. | executor fail-closed | minor (round 3) | open, not verified | file issue (N2) |
+| QA-4.2-38 | phase-4.2.md:446 | A cancelled commit failure drops out of the circuit-breaker window. | executor fail-closed | minor (round 3) | fixed since #188: a cancelled task's verdict-less success with a commit-failure context stays a sample, and that context is never empty (`isCommitFailure` in `src/executor/unattended.ts`) | none |
 | QA-4.2-39 | phase-4.2.md:447 | `executor-runtime-coverage.test.ts` keeps a stale skip list and an unused `mk` harness. | test hygiene | minor (re-check) | open, not verified | file issue (N7) |
 | QA-4.2-40 | phase-4.2.md:449 | `adoptChild` re-binds a child the attempt does not record before probation drops the watch. | executor fail-closed | minor (re-check) | open, not verified | file issue (N3) |
 | QA-4.2-41 | phase-4.2.md:451 | Negative assertions after a fixed `pause(20)` or `pause(50)` can pass vacuously on a slow runner. | test hygiene | minor (re-check) | open, not verified | file issue (N7) |
@@ -162,7 +162,7 @@ Status: `open` (with `checked: file:line` when re-checked today, else "not verif
 | relaunch-during-sweep | pdf2-1.md:125 | A blocked task relaunched while `sweepBlocked` is still saving would share the slot. | executor fail-closed | minor | open per the report; G-1's re-check just before `launcher.launch` (global.md:98-101) may cover it; not verified | won't fix (not reachable through row 34) |
 | N-3 | pdf2-1.md:126 | `slotHeldBy` returns true when the pool lookup fails; as a release gate it should fail closed. | executor fail-closed | nit, pre-existing | open: checked `src/executor/runtime.ts:1489-1495` | file issue (N1) |
 | N-4 | pdf2-1.md:127 | `blockedSweeps` entries are not removed when the queue's release never runs. | other | nit | open, not verified | won't fix (at most one entry per task) |
-| Scope-P3 | phase-6.1.md:644 | `failingFiles` reporting is wrong for explicit `cwd` overrides. | observation accuracy | P3 | open, not verified | file issue (N2) |
+| Scope-P3 | phase-6.1.md:644 | `failingFiles` reporting is wrong for explicit `cwd` overrides. | observation accuracy | P3 | fixed since `f802e9a`: full runs resolve failing files at the command's cwd (`src/executor/integrate/checks.ts:802`, `:1066`) and a command with its own cwd is never scoped or rerun from the slot root (`:756`); re-checked and pinned by tests in #188 | none |
 | Oracle-R3-P2-1 | phase-6.1.md:645 | The oracle does not correlate the verification candidate with the checked candidate. | observation accuracy | P2 | open, not verified; the soak analyzer loads the smoke oracles (`scripts/soak-analyze.mjs:94, :671`) | fold into #140 |
 | Oracle-R3-P2-2 | phase-6.1.md:646 | Required-service coverage is component-level, not operation-level. | observation accuracy | P2 | open, not verified | fold into #140 |
 | Oracle-R3-P2-3 | phase-6.1.md:647 | Abnormal service spans can include post-exit drain/kill tails. | observation accuracy | P2 | open, not verified | fold into #140 |

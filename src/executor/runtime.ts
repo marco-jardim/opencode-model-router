@@ -820,6 +820,12 @@ export function planTagsSettled(l: Readonly<LedgerV1>): boolean {
 const SLOT_LOST_BEFORE_COMMIT = "slot lost before commit";
 
 /**
+ * QA-4.2-13/-32: where attempt `n`'s commit (its trailer) is: in the history of the task branch at `tip`, nowhere, or
+ * unknown (git cannot tell, or `elsewhere`: a commit only another ref reaches).
+ */
+type AttemptCommit = { kind: "on-branch"; tip: string } | { kind: "none" } | { kind: "unknown"; elsewhere: string | null };
+
+/**
  * Wake reason of the refused plan's one wake (QA-3.1-19). `WakeReason` (types.ts, owned elsewhere) has no `plan-refused`
  * member yet; the wake goes out as an inbox wake under the state key `plan-refused:<planId>:<active>` until it does.
  */
@@ -3352,7 +3358,10 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     // QA-4.2-16: held until the leases are back (`retryHeldLeases` resumes it).
     if (p.leaseHeld.has(taskId)) return;
     const slotName = t.slot;
-    const commitFailed = async (msg: string): Promise<void> => {
+    const commitFailed = async (error: string): Promise<void> => {
+      // QA-4.2-38 (#188): never an empty context; it marks the commit failure of a task an abort cancels later
+      // (`isCommitFailure`).
+      const msg = error.trim() === "" ? "commit failed" : error;
       const applied = await appendIf(p, (cur) => {
         const c = own(cur, taskId);
         if (c === null || c.state !== "completed") return [];
@@ -4698,18 +4707,21 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
    * (released and re-taken, as `rebuild` does) and the slot is journaled (state re-checked, D2). False when the branch
    * does not exist (nothing touched) or a later step fails (the new slot is returned); the caller raises the blocking item.
    */
-  async function reprovisionSlot(p: PlanRt, taskId: TaskId): Promise<boolean> {
+  async function reprovisionSlot(p: PlanRt, taskId: TaskId, knownTip?: string): Promise<boolean> {
     const t0 = own(p.writer.ledger, taskId);
     if (t0 === null || (t0.state !== "completed" && t0.state !== "verifying" && t0.state !== "verified")) return false;
     const from = t0.state;
     const branch = taskBranchName(p.planId, taskId);
     const o = { cwd: p.writer.ledger.repo.toplevel, timeoutMs: GIT_TIMEOUT_MS };
-    let tip = "";
-    try {
-      const r = await d.git.run(["rev-parse", "--verify", "--quiet", `refs/heads/${branch}^{commit}`], o);
-      tip = r.code === 0 ? r.stdout.trim() : "";
-    } catch (e) {
-      d.log("warn", `task branch of ${taskId} unreadable`, errorText(e));
+    // QA-4.2-32 (#188): the tip whose history the trailer search read, when there was one.
+    let tip = knownTip ?? "";
+    if (tip === "") {
+      try {
+        const r = await d.git.run(["rev-parse", "--verify", "--quiet", `refs/heads/${branch}^{commit}`], o);
+        tip = r.code === 0 ? r.stdout.trim() : "";
+      } catch (e) {
+        d.log("warn", `task branch of ${taskId} unreadable`, errorText(e));
+      }
     }
     if (tip === "") return false;
     const stale = t0.slot;
@@ -4784,20 +4796,38 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
   }
 
   /**
-   * QA-4.2-13: whether a commit of the repository carries attempt `n`'s trailer (D11); null when git cannot tell. On
-   * attempt 1 the task branch is created by the commit itself, so a missing branch usually means "never committed".
+   * QA-4.2-13: whether the task branch carries attempt `n`'s trailer (D11); null when git cannot tell. On attempt 1 the
+   * task branch is created by the commit itself, so a missing branch usually means "never committed". QA-4.2-32 (#188):
+   * `on-branch` (with the tip read, which R2 re-provisions from) only when the history of the task branch carries it. A
+   * commit with the trailer that only another ref reaches is work R2 cannot re-provision: `unknown` naming it (fail
+   * closed, the blocking item, a human decides), as when git cannot tell (`elsewhere` null).
    */
-  async function attemptCommitted(p: PlanRt, taskId: TaskId, a: Attempt): Promise<boolean | null> {
+  async function attemptCommitted(p: PlanRt, taskId: TaskId, a: Attempt): Promise<AttemptCommit> {
     const trailer = attemptTrailer(p.planId, taskId, a.n, a.nonce);
+    const o = { cwd: p.writer.ledger.repo.toplevel, timeoutMs: GIT_TIMEOUT_MS };
+    const unknown: AttemptCommit = { kind: "unknown", elsewhere: null };
+    /** The first commit `revs` reach that carries the trailer, "" for none, null when git cannot tell. */
+    const search = async (revs: readonly string[]): Promise<string | null> => {
+      const r = await d.git.run(["log", "--fixed-strings", `--grep=${trailer}`, "--format=%H", "-n", "1", ...revs, "--"], o);
+      return r.code === 0 ? r.stdout.trim() : null;
+    };
     try {
-      const r = await d.git.run(["log", "--all", "--fixed-strings", `--grep=${trailer}`, "--format=%H", "-n", "1"], {
-        cwd: p.writer.ledger.repo.toplevel,
-        timeoutMs: GIT_TIMEOUT_MS,
-      });
-      return r.code === 0 ? r.stdout.trim() !== "" : null;
+      const ref = await d.git.run(["rev-parse", "--verify", "--quiet", `refs/heads/${taskBranchName(p.planId, taskId)}^{commit}`], o);
+      const tip = ref.stdout.trim();
+      const missing = ref.code === 1 && tip === "";
+      if (!missing && (ref.code !== 0 || tip === "")) return unknown;
+      if (!missing) {
+        const onBranch = await search([tip]);
+        if (onBranch === null) return unknown;
+        if (onBranch !== "") return { kind: "on-branch", tip };
+      }
+      // One pass over the history the task branch does not reach.
+      const elsewhere = await search(missing ? ["--all"] : ["--all", "--not", tip]);
+      if (elsewhere === null) return unknown;
+      return elsewhere === "" ? { kind: "none" } : { kind: "unknown", elsewhere };
     } catch (e) {
       d.log("warn", `trailer search for ${taskId} failed`, errorText(e));
-      return null;
+      return unknown;
     }
   }
 
@@ -4823,13 +4853,17 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     await clearBadSlot(p, taskId);
   }
 
-  /** R2: the blocking item of a task whose slot cannot be re-provisioned and whose work may exist (a human decides). */
-  async function raiseSlotLost(p: PlanRt, t: TaskNode): Promise<void> {
+  /**
+   * R2: the blocking item of a task whose slot cannot be re-provisioned and whose work may exist (a human decides).
+   * QA-4.2-32 (#188): `elsewhere` names this attempt's commit when only another ref reaches it.
+   */
+  async function raiseSlotLost(p: PlanRt, t: TaskNode, elsewhere: string | null = null): Promise<void> {
+    const found = elsewhere === null ? "" : `; this attempt's commit ${elsewhere} is reachable only from another ref, not from the task branch`;
     await raiseSafe(p, {
       kind: "failure",
       severity: "blocking",
       taskId: t.id,
-      text: `the slot of ${t.id} (${t.slot ?? "none"}) no longer carries its marker after a restart and it could not be re-provisioned from ${taskBranchName(p.planId, t.id)}; restore the task branch or abort the task`,
+      text: `the slot of ${t.id} (${t.slot ?? "none"}) no longer carries its marker after a restart and it could not be re-provisioned from ${taskBranchName(p.planId, t.id)}${found}; restore the task branch or abort the task`,
       options: [],
     });
   }
@@ -4862,18 +4896,20 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       // QA-4.2-20: the branch tip may hold an EARLIER attempt's commit, so a `completed` task is re-provisioned only once
       // this attempt's own commit is known to exist. QA-4.2-13: none -> its work went with the slot: failed, retried.
       // git cannot tell -> the blocking item (a human decides).
+      let tip: string | undefined;
       if (t0.state === "completed") {
         const committed = await attemptCommitted(p, taskId, a);
-        if (committed === false) {
+        if (committed.kind === "none") {
           await slotLostBeforeCommit(p, taskId, n);
           return;
         }
-        if (committed === null) {
-          await raiseSlotLost(p, t0);
+        if (committed.kind === "unknown") {
+          await raiseSlotLost(p, t0, committed.elsewhere);
           return;
         }
+        tip = committed.tip; // QA-4.2-32 (#188): re-provisioned from the very tip whose history carries the commit
       }
-      if (!(await reprovisionSlot(p, taskId))) {
+      if (!(await reprovisionSlot(p, taskId, tip))) {
         await raiseSlotLost(p, t0);
         return;
       }

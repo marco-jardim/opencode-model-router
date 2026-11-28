@@ -474,8 +474,10 @@ class GitDouble implements GitRunner {
   dirty: (cwd: string) => boolean = () => true;
   headBody = "base\n";
   head = HEAD_SHA;
-  /** QA-4.2-13: what `git log --all --grep=<trailer>` finds (a commit id, or "" for none). */
+  /** QA-4.2-13: what `git log --grep=<trailer>` finds (a commit id, or "" for none). */
   trailerCommit = "";
+  /** QA-4.2-32: the trailer commit is reachable from another ref only: the task-branch search misses it, `--all` finds it. */
+  trailerOffBranch = false;
   async run(args: readonly string[], o: ProcOpts): Promise<ProcessResult> {
     this.calls.push({ args: [...args], cwd: o.cwd });
     const verb = args[0] ?? "";
@@ -483,7 +485,10 @@ class GitDouble implements GitRunner {
     if (verb === "worktree") return ok(`worktree ${REPO}\nHEAD ${SHA}\nbranch refs/heads/main\n`);
     if (verb === "config") return { ...ok(), code: 1 };
     if (verb === "status") return ok(this.dirty(o.cwd) ? " M src/a.ts\n" : "");
-    if (verb === "log" && args.includes("--all")) return ok(this.trailerCommit === "" ? "" : `${this.trailerCommit}\n`);
+    if (verb === "log" && args.some((a) => a.startsWith("--grep="))) {
+      const found = this.trailerCommit !== "" && (args.includes("--all") || !this.trailerOffBranch);
+      return ok(found ? `${this.trailerCommit}\n` : "");
+    }
     if (verb === "log") return ok(this.headBody);
     if (verb === "rev-parse") return ok(`${this.head}\n`);
     if (verb === "commit") this.headBody = `${args.filter((_, i) => args[i - 1] === "-m").join("\n\n")}\n`;
@@ -953,7 +958,7 @@ describe("QA-4.2 round 3: held-slot R2, binding eviction, failed re-attach", () 
     expect(h.verifier.calls).toEqual(["T1#1"]);
     // A trailer check would have found no commit (trailerCommit "") and failed the attempt instead.
     expect(h.task("T1").attempts[0]?.context).not.toBe("slot lost before commit");
-    expect(h.git.calls.slice(mark).some((c) => c.args[0] === "log" && c.args.includes("--all"))).toBe(false);
+    expect(h.git.calls.slice(mark).some((c) => c.args[0] === "log" && c.args.some((a) => a.startsWith("--grep=")))).toBe(false);
   });
 
   it("an adopt that fails after the old attachment closed, with the plan taken by a live holder meanwhile: the re-attach fails, logged, nothing attached here", async () => {
@@ -2610,7 +2615,9 @@ describe("R2: a completed/verifying/verified task whose slot lost its marker", (
     expect(t.branch).toBe(BRANCH);
     const fresh = need(t.slot, "new slot");
     const calls = h.git.calls.slice(mark);
-    expect(calls.some((c) => c.args[0] === "rev-parse" && c.args.includes(verifyRef) && c.cwd === REPO)).toBe(true);
+    // QA-4.2-32 (#188): the tip is read once; the trailer is searched in its history and the slot re-provisioned from it.
+    expect(calls.filter((c) => c.args[0] === "rev-parse" && c.args.includes(verifyRef) && c.cwd === REPO)).toHaveLength(1);
+    expect(trailerSearches(calls)).toEqual([[HEAD_SHA, "--"]]);
     expect(calls.some((c) => c.args.join(" ") === `switch --detach ${HEAD_SHA}` && c.cwd === slotPathOf(fresh))).toBe(true);
     expect(h.log.slice(logMark)).toContain(`slots.reset:${fresh}`);
     expect(h.slots.released).toContain(old);
@@ -2700,7 +2707,97 @@ describe("R2: a completed/verifying/verified task whose slot lost its marker", (
     expect(items[0]?.text).toContain("marker");
     expect(items[0]?.text).toContain(BRANCH);
   });
+
+  it("QA-4.2-32 (#188): completed, marker missing, the attempt's commit reachable from another ref only: not re-provisioned from the branch tip, one blocking item", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await completedThenCrash(h);
+    const old = need(h.task("T1").slot, "slot of T1");
+    dropMarker(h, old);
+    h.git.trailerCommit = "f".repeat(40);
+    h.git.trailerOffBranch = true; // the task branch exists (its tip is HEAD_SHA) but does not hold the attempt's commit
+    const mark = h.git.calls.length;
+    const logMark = h.log.length;
+    await h.restart();
+    await until(() => openFailures(h).length > 0, "the blocking item");
+    await h.runtime.settled();
+
+    expect(h.state("T1")).toBe("completed");
+    expect(h.task("T1").slot).toBe(old);
+    const calls = h.git.calls.slice(mark);
+    // One pass over what the task branch does not reach.
+    expect(trailerSearches(calls)).toEqual([[HEAD_SHA, "--"], ["--all", "--not", HEAD_SHA, "--"]]);
+    expect(h.log.slice(logMark).filter((l) => l.startsWith("slots.acquire:"))).toEqual([]);
+    expect(calls.some((c) => c.args[0] === "switch" || c.args[0] === "commit")).toBe(false);
+    expect(h.verifier.calls).toEqual([]);
+    const items = openFailures(h);
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({ severity: "blocking", options: [] });
+    expect(items[0]?.text).toContain(BRANCH);
+    expect(items[0]?.text).toContain(`this attempt's commit ${"f".repeat(40)} is reachable only from another ref`);
+  });
+
+  /** Git answers `code` (and `stderr`) to the calls `match` selects; the rest go to the double. */
+  function gitFails(h: Harness, match: (args: readonly string[]) => boolean, code: number, stderr: string): void {
+    const run = h.git.run.bind(h.git);
+    h.git.run = async (args, o) => {
+      if (!match(args)) return run(args, o);
+      h.git.calls.push({ args: [...args], cwd: o.cwd });
+      return { code, signal: null, stdout: "", stderr, truncated: false, durationMs: 0 };
+    };
+  }
+
+  it("QA-4.2-32 (#188): completed, marker missing, the task branch cannot be read (rev-parse exits 128): no search, nothing re-provisioned, one blocking item", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await completedThenCrash(h);
+    const old = need(h.task("T1").slot, "slot of T1");
+    dropMarker(h, old);
+    h.git.trailerCommit = HEAD_SHA; // a search would find it
+    gitFails(h, (args) => args[0] === "rev-parse" && args.includes(verifyRef), 128, "fatal: not a git repository");
+    const mark = h.git.calls.length;
+    const logMark = h.log.length;
+    await h.restart();
+    await until(() => openFailures(h).length > 0, "the blocking item");
+    await h.runtime.settled();
+
+    expect(h.state("T1")).toBe("completed");
+    expect(h.task("T1").slot).toBe(old);
+    const calls = h.git.calls.slice(mark);
+    expect(trailerSearches(calls)).toEqual([]);
+    expect(h.log.slice(logMark).filter((l) => l.startsWith("slots.acquire:"))).toEqual([]);
+    expect(calls.some((c) => c.args[0] === "switch" || c.args[0] === "commit")).toBe(false);
+    expect(h.task("T1").attempts[0]?.context).not.toBe("slot lost before commit");
+    expect(openFailures(h)).toHaveLength(1);
+  });
+
+  it("QA-4.2-32 (#188): completed, marker missing, not on the task branch and the search beyond it fails: nothing re-provisioned, one blocking item", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await completedThenCrash(h);
+    const old = need(h.task("T1").slot, "slot of T1");
+    dropMarker(h, old);
+    h.git.trailerCommit = ""; // the task-branch search finds nothing
+    gitFails(h, (args) => args[0] === "log" && args.includes("--all"), 128, "fatal: bad object");
+    const mark = h.git.calls.length;
+    const logMark = h.log.length;
+    await h.restart();
+    await until(() => openFailures(h).length > 0, "the blocking item");
+    await h.runtime.settled();
+
+    expect(h.state("T1")).toBe("completed");
+    expect(h.task("T1").slot).toBe(old);
+    expect(trailerSearches(h.git.calls.slice(mark))).toEqual([[HEAD_SHA, "--"], ["--all", "--not", HEAD_SHA, "--"]]);
+    expect(h.log.slice(logMark).filter((l) => l.startsWith("slots.acquire:"))).toEqual([]);
+    expect(h.task("T1").attempts[0]?.context).not.toBe("slot lost before commit");
+    const items = openFailures(h);
+    expect(items).toHaveLength(1);
+    expect(items[0]?.text).not.toContain("reachable only from another ref");
+  });
 });
+
+/** The revisions of every trailer search (`git log --grep=<trailer> … -n 1 <revs…>`) in `calls`, in order. */
+function trailerSearches(calls: ReadonlyArray<{ args: readonly string[] }>): string[][] {
+  return calls.filter((c) => c.args[0] === "log" && c.args.some((a) => a.startsWith("--grep=")))
+    .map((c) => c.args.slice(c.args.indexOf("-n") + 2));
+}
 
 describe("breaker at activation (B5)", () => {
   it("a counted failure whose breaker feed was missed by a crash is fed once when the plan is recovered", async () => {
@@ -3213,11 +3310,11 @@ function dropSlotMarker(h: Harness, name: string): void {
   for (const [owner, l] of [...h.slots.byOwner]) if (l.slot === name) h.slots.byOwner.delete(owner);
 }
 
-/** `git log --all --grep=<trailer>` fails (git cannot tell whether the attempt committed). */
+/** `git log --grep=<trailer>` fails (git cannot tell whether the attempt committed). */
 function trailerSearchFails(h: Harness): void {
   const run0 = h.git.run.bind(h.git);
   h.git.run = async (args, o) => {
-    if (args[0] !== "log" || !args.includes("--all")) return run0(args, o);
+    if (args[0] !== "log" || !args.some((a) => a.startsWith("--grep="))) return run0(args, o);
     h.git.calls.push({ args: [...args], cwd: o.cwd });
     return { code: 128, signal: null, stdout: "", stderr: "fatal: bad object", truncated: false, durationMs: 0 };
   };
