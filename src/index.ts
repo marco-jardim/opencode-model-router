@@ -4397,7 +4397,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   const HELD_HEAD_READ_MS = 2_000;
   /** QA-2.1-31: handles whose restored pending entry the adapter settled after posting the verdict itself (no second post). */
   const directlySettled = new Set<string>();
-  type HeldClaim = Extract<ReturnType<typeof pending.markVerifying>, { kind: "claimed" }>;
+  type HeldClaimResult = ReturnType<typeof pending.markVerifying>;
+  type HeldClaim = Extract<HeldClaimResult, { kind: "claimed" }>;
   type HeldSettlement = Parameters<HeldClaim["settle"]>[0];
   type HeldScratch = { output: string; title: string; metadata: Record<string, unknown> };
   /**
@@ -4481,22 +4482,46 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     } | undefined,
     preClaim: HeldClaim | undefined,
   ): void {
-    const settleHeld = (outcome: FinishOutcome): Promise<void> | undefined => {
-      // QA-SYNC1-14: the held finish settled; its call's arguments and routed-role copy are no longer needed.
-      forgetTaskArgs(fin.callID);
-      const claim = preClaim ?? pending.markVerifying(fin.parentSessionID, handle);
-      // QA-2.1-1: only a gate verdict is a verdict; none/deferred/skipped/error post UNVERIFIABLE with their reason.
-      const held = heldOutcomeOf(outcome);
-      const text = held.line === undefined ? scratch.output : `${scratch.output.trimEnd()}\n\n${held.line}`;
-      const reason = held.reasons[0];
-      if (claim.kind !== "claimed") return postHeldDirect(handle, held.verdict, text, reason);
-      rememberHeldText(handle, fin.parentSessionID, text, { verdict: held.verdict, ...(reason !== undefined ? { reason } : {}) });
-      // QA-DF1-16: a gate verdict settles as the gate reached it (method, outcome, reasons, caveats, notes).
-      observeV2(isV2Host ? ctx.routerObservations : undefined, () => ({ family: "completion-effect", effect: "verification-settle", source: "held-gate", handle,
+    /** #193 (2.1-r3-c): the settlement of `settleHeld` could not be built; the claim settles UNVERIFIABLE with the scrubbed error. */
+    const settleHeldUnavailable = (claim: HeldClaimResult | undefined, error: unknown): Promise<void> | undefined => {
+      const reason = `verification unavailable: ${describeError(error)}`;
+      const text = `${scratch.output.trimEnd()}\n\n[router] UNVERIFIABLE — ${reason}`;
+      if (claim?.kind !== "claimed") return postHeldDirect(handle, "UNVERIFIABLE", text, reason);
+      rememberHeldText(handle, fin.parentSessionID, text, { verdict: "UNVERIFIABLE", reason });
+      observeV2(isV2Host ? ctx.routerObservations : undefined, () => ({ family: "completion-effect", effect: "verification-settle", source: "held-error", handle,
         parentSessionID: fin.parentSessionID, callID: fin.callID, childSessionID: fin.childSessionID }));
-      claim.settle(heldSettlementOf(outcome, held));
-      // onVerdict posts only for an entry that carries its hold.
-      return claim.entry.hold === undefined ? postHeldDirect(handle, held.verdict, text, reason) : undefined;
+      claim.settle(heldVerification("UNVERIFIABLE", [reason]));
+      return claim.entry.hold === undefined ? postHeldDirect(handle, "UNVERIFIABLE", text, reason) : undefined;
+    };
+    const settleHeld = (outcome: FinishOutcome): Promise<void> | undefined => {
+      // #193 (2.1-r3-c): a claim settles exactly once. A step before its settle that throws settles it UNVERIFIABLE instead
+      // of leaving it `verifying` (router_verify would join that run until its deadline); a settle that threw is not repeated.
+      let claim: HeldClaimResult | undefined = preClaim;
+      let settleCalled = false;
+      try {
+        // QA-SYNC1-14: the held finish settled; its call's arguments and routed-role copy are no longer needed.
+        forgetTaskArgs(fin.callID);
+        claim ??= pending.markVerifying(fin.parentSessionID, handle);
+        // QA-2.1-1: only a gate verdict is a verdict; none/deferred/skipped/error post UNVERIFIABLE with their reason.
+        const held = heldOutcomeOf(outcome);
+        const text = held.line === undefined ? scratch.output : `${scratch.output.trimEnd()}\n\n${held.line}`;
+        const reason = held.reasons[0];
+        if (claim.kind !== "claimed") return postHeldDirect(handle, held.verdict, text, reason);
+        rememberHeldText(handle, fin.parentSessionID, text, { verdict: held.verdict, ...(reason !== undefined ? { reason } : {}) });
+        // QA-DF1-16: a gate verdict settles as the gate reached it (method, outcome, reasons, caveats, notes).
+        observeV2(isV2Host ? ctx.routerObservations : undefined, () => ({ family: "completion-effect", effect: "verification-settle", source: "held-gate", handle,
+          parentSessionID: fin.parentSessionID, callID: fin.callID, childSessionID: fin.childSessionID }));
+        const settlement = heldSettlementOf(outcome, held);
+        settleCalled = true;
+        claim.settle(settlement);
+        // onVerdict posts only for an entry that carries its hold.
+        return claim.entry.hold === undefined ? postHeldDirect(handle, held.verdict, text, reason) : undefined;
+      } catch (error) {
+        // The settle itself (or what followed it) threw: never a second settle; trackHeldGate logs the error.
+        if (settleCalled) throw error;
+        logger.warn("[router] held verification could not be settled; settling UNVERIFIABLE", { handle, error: describeError(error) });
+        return settleHeldUnavailable(claim, error);
+      }
     };
     // DF-1-3: the held gate's grader launches from the orchestrator's retained context too (C14 launcher A).
     observeV2(isV2Host ? ctx.routerObservations : undefined, () => ({ family: "completion-effect", effect: "verification-enqueue", source: "held-gate", handle,
