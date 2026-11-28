@@ -1210,6 +1210,19 @@ export const MAX_ARGV_CHARS = 30000;
 /** Report files: `${tmpdir}/omr-verify-<uuid>.json|.xml`. readResult touches nothing else. */
 export const REPORT_NAME_RE = /^omr-verify-[0-9a-f-]{36}\.(json|xml)$/;
 
+/**
+ * readResult's report-path guard: `path` names a file directly in `tmpdir` (both absolute; compared case-folded on win32)
+ * whose name matches `name`. Nothing else is read or unlinked. `router_run`'s `summary: "failures"` (#108) uses it with
+ * its own report names.
+ */
+export function reportPathAllowed(path: string, tmpdir: string, platform: NodeJS.Platform = process.platform,
+  name: RegExp = REPORT_NAME_RE): boolean {
+  const win = platform === "win32";
+  const P = win ? nodePath.win32 : nodePath.posix;
+  const key = (p: string) => (win ? p.toLowerCase() : p);
+  return P.isAbsolute(tmpdir) && P.isAbsolute(path) && key(P.dirname(P.resolve(path))) === key(P.resolve(tmpdir)) && name.test(P.basename(path));
+}
+
 // ---------------------------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------------------------
@@ -5491,12 +5504,7 @@ export async function readResult(
   host?: Partial<RunnerHost>,
 ): Promise<RunResult> {
   const ctx = makeCtx(host);
-  const P = ctx.P;
-  const allowed =
-    P.isAbsolute(ctx.host.tmpdir) &&
-    P.isAbsolute(spec.reportPath) &&
-    ctx.key(P.dirname(P.resolve(spec.reportPath))) === ctx.key(P.resolve(ctx.host.tmpdir)) &&
-    REPORT_NAME_RE.test(P.basename(spec.reportPath));
+  const allowed = reportPathAllowed(spec.reportPath, ctx.host.tmpdir, ctx.host.platform);
   try {
     if (!allowed) return crossLinkCompleteness(ctx, spec, textResult(ctx, spec, execResult, `report path rejected: ${spec.reportPath}`));
     let text: string | undefined;

@@ -759,11 +759,12 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
       // (d) own truncated output. Run 2: the host's grep caps itself at 100 matches ("Found 100 matches") and nothing was truncated. Now the
       //     child also calls `router_git_diff` on a rewritten tracked file: the router bounds that plugin tool's text at 64 KiB (git-tools.ts
       //     MAX_BYTES), i.e. ~10 000 lines, above the host's tool-output bound in lines and bytes, so the HOST must truncate and save it.
+      //     #108: a role's diff without `path` is a summary above 8 KiB, so the probe names the file to get its whole patch.
       await writeFile(path.join(w.wt1, "needles.txt"), `${Array.from({ length: 400 }, (_, i) => `needle ${i} ${"x".repeat(1900)}`).join("\n")}\n`);
       await writeFile(path.join(w.wt1, "big.txt"), `${Array.from({ length: 6000 }, (_, i) => `L${i}`).join("\n")}\n`);
       const big = await runChild(host, root, roleInput("explorer", "roots big output", explorerIn(w.wt1), ["TASK: find every needle and show the changes", scriptLine([
         { tool: "grep", input: { pattern: "needle", path: w.wt1 } },
-        { tool: "router_git_diff", input: {} },
+        { tool: "router_git_diff", input: { path: "big.txt" } },
       ], "DONE: needles.txt:1 big.txt:1")]), "big output");
       const events = await host.events();
       const successTypes = [...new Set(events.filter(e => /tool\.success/.test(e.type)).map(e => e.type))];

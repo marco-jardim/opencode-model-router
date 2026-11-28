@@ -59,9 +59,9 @@
  *   absolute, drive, UNC or URL path or a `..` segment, but a symlink or junction inside
  *   the work root, and the contents of an `@response` file, are repository content.
  */
-import { lstatSync, realpathSync, statSync } from "node:fs";
+import { lstatSync, realpathSync, statSync, unlinkSync } from "node:fs";
 import { createRequire } from "node:module";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { posix, win32 } from "node:path";
 import { tool } from "@opencode-ai/plugin";
 import { applySlotEnv, slotEnvFor, type SlotBin, type SlotEnv } from "../executor/slots/env";
@@ -70,6 +70,10 @@ import {
   checkWorkRootAnswer, dropPartialCredential, envLookup, errorMessage, firstOutside, isFullPath, readBoundedRegularFile as readBounded,
   realFileOrUndefined, spawnBounded, stripUrlUserinfo, workRootGuards, type BoundedLabel, type BoundedResult, type WorkRootAnswer,
 } from "./git-tools";
+import {
+  newRunReportPath, parseVitestReport, renderFailureSummary, renderSummaryUnavailable, REPORTER_OPTION_RE, RUN_REPORT_MAX_BYTES, runReportPathAllowed,
+  vitestScriptRefusal,
+} from "./run-summary";
 
 export { isFullPath } from "./git-tools";
 export type { WorkRootAnswer } from "./git-tools";
@@ -159,6 +163,16 @@ export interface RunToolDeps {
 }
 
 export interface RunInput { script: string; args?: readonly string[]; cwd: string }
+
+/** Options of {@link planRun} beyond the call itself. */
+export interface RunPlanOptions {
+  /**
+   * #108 `summary: "failures"`: the vitest JSON report the run writes (absolute, router-named, in the OS temp directory). The
+   * entry must run a vitest npm script; `--reporter=json --outputFile=<path>` is appended to the script's arguments. Absent
+   * (every other caller, the plan executor's checks included): the plan is unchanged.
+   */
+  failuresReport?: string;
+}
 
 /** A resolved, spawnable run. `executable` is absolute; argv never passes through a shell. */
 export interface RunPlan {
@@ -797,15 +811,34 @@ function checkNpmArgv(fixed: readonly string[], scripts: Record<string, unknown>
 }
 
 /**
+ * #108: the arguments `summary: "failures"` appends to an npm run of `script` (undefined: the entry runs npm start, stop or
+ * restart, which name no single script). The script must be a vitest command ({@link vitestScriptRefusal}), and neither the
+ * entry's fixed arguments after `--` nor the caller's (`passed`) may set the reporter or output file. A `--` is added first
+ * when the argv has none, so npm hands the options to the script.
+ */
+function failuresReportArgs(report: string, scripts: Record<string, unknown>, script: string | undefined, name: string,
+  passed: readonly string[], separated: boolean): string[] {
+  const needs = 'summary "failures" needs a vitest npm script';
+  if (script === undefined) throw refuse(`${needs}; "${name}" does not run one package.json script`);
+  const why = vitestScriptRefusal(String(scripts[script]));
+  if (why !== undefined) throw refuse(`${needs}: script "${script}" ${why}`);
+  const set = passed.find(arg => REPORTER_OPTION_RE.test(arg));
+  if (set !== undefined) throw refuse(`summary "failures" sets vitest's reporter and output file itself; ${set} is not accepted with it`);
+  if (passed.includes("--")) throw refuse('summary "failures" does not accept a "--" argument (vitest would read the appended options as file filters)');
+  return [...(separated ? [] : ["--"]), "--reporter=json", `--outputFile=${report}`];
+}
+
+/**
  * Resolve a call into a spawnable plan. `root` must come from authorizeCwd. Commands
  * win over scripts of the same name. Package.json scripts take no caller arguments
  * (`RunConfig` has no per-script knob): parameterised runs need a `commands` entry
  * declaring `args`, e.g. `{ "argv": ["npm", "run", "test", "--"], "args": ["test/*"] }`.
  * Caller arguments never name a path outside the work root, and an option-like one
  * (`-`, `@`, `+`) needs a pattern with the same lead; a `node` entry takes option-like
- * caller arguments only when its fixed argv starts with the script (QA-P13-1-1).
+ * caller arguments only when its fixed argv starts with the script (QA-P13-1-1). `options.failuresReport` (#108): see
+ * {@link RunPlanOptions}; any other entry is refused.
  */
-export function planRun(input: RunInput, root: string, config: RunConfig, host: RunHost): RunPlan {
+export function planRun(input: RunInput, root: string, config: RunConfig, host: RunHost, options: RunPlanOptions = {}): RunPlan {
   const name = input.script;
   if (typeof name !== "string" || !RUN_NAME_RE.test(name)) throw refuse("invalid entry name");
   const args = validateRunArgs(input.args ?? []);
@@ -830,6 +863,9 @@ export function planRun(input: RunInput, root: string, config: RunConfig, host: 
     });
     const [program, ...fixed] = command.argv as string[];
     const pinned = pinnedProgram(program!);
+    if (options.failuresReport !== undefined && pinned !== "npm") {
+      throw refuse(`summary "failures" needs a vitest npm script; "${name}" is not an npm entry`);
+    }
     if (pinned === "node") {
       if (args.some(arg => optionLead(arg) !== undefined) && (fixed.length === 0 || optionLead(fixed[0]!) !== undefined)) {
         throw refuse(`option-like arguments to the node command "${name}" need a fixed script first in its argv`);
@@ -838,13 +874,18 @@ export function planRun(input: RunInput, root: string, config: RunConfig, host: 
       argv = [...fixed, ...args];
     } else if (pinned === "npm") {
       refuseUncForShell(root, host.platform);
-      checkNpmArgv(fixed, packageScripts(root, host.platform), name);
+      const scripts = packageScripts(root, host.platform);
+      checkNpmArgv(fixed, scripts, name);
       // Caller options before `--` would be npm flags and could undo the hardening flags.
       if (!fixed.includes("--") && args.some(arg => arg.startsWith("-"))) throw refuse(`option-like arguments to the npm command "${name}" need a "--" in its argv`);
+      const separator = fixed.indexOf("--");
+      const report = options.failuresReport === undefined ? [] : failuresReportArgs(options.failuresReport, scripts,
+        fixed[0] === "run" || fixed[0] === "run-script" ? fixed[1] : fixed[0] === "test" ? "test" : undefined, name,
+        [...(separator === -1 ? [] : fixed.slice(separator + 1)), ...args], separator !== -1);
       const launch = npmLaunch(root, host, guarded());
       executable = launch.node;
       shell = launch.shell;
-      argv = [launch.cli, ...launch.flags, ...fixed, ...args];
+      argv = [launch.cli, ...launch.flags, ...fixed, ...args, ...report];
     } else {
       executable = slotToolExecutable(program!, slotEnv, host, guarded) ?? resolveCommandExecutable(program!, host, guarded());
       argv = [...fixed, ...args];
@@ -852,11 +893,13 @@ export function planRun(input: RunInput, root: string, config: RunConfig, host: 
   } else if (scriptAllowed(config.scripts ?? [], name)) {
     if (args.length > 0) throw refuse(`package.json scripts take no caller arguments; ${scriptArgumentsHint(config, name)}`);
     refuseUncForShell(root, host.platform);
-    requireScript(packageScripts(root, host.platform), name);
+    const scripts = packageScripts(root, host.platform);
+    requireScript(scripts, name);
+    const report = options.failuresReport === undefined ? [] : failuresReportArgs(options.failuresReport, scripts, name, name, [], false);
     const launch = npmLaunch(root, host, guarded());
     executable = launch.node;
     shell = launch.shell;
-    argv = [launch.cli, ...launch.flags, "run", name];
+    argv = [launch.cli, ...launch.flags, "run", name, ...report];
   } else {
     throw refuse(`"${name}" is not in routing.run.scripts or routing.run.commands`);
   }
@@ -930,8 +973,11 @@ function statusLine(plan: RunPlan, result: BoundedResult, ms: number): string {
   return `[router_run] ${what}: exit code: ${result.code ?? "none (killed by a signal)"}; duration ${duration}`;
 }
 
-/** Spawn a plan (shell: false), bounded by time, abort and 64 KiB of output; never rejects on a timeout or abort. */
-export async function executeRunPlan(plan: RunPlan, signal?: AbortSignal): Promise<{ result: BoundedResult; text: string; ms: number }> {
+/**
+ * Spawn a plan (shell: false), bounded by time, abort and 64 KiB of output; never rejects on a timeout or abort. `text` is the
+ * tool's answer; `status` (its first line) and `output` (the bounded output) are its parts, for a summary (#108).
+ */
+export async function executeRunPlan(plan: RunPlan, signal?: AbortSignal): Promise<{ result: BoundedResult; text: string; ms: number; status: string; output: string }> {
   const started = performance.now();
   const result = await spawnBounded(plan.executable, plan.argv, plan.cwd, {
     env: plan.env, timeoutMs: plan.timeoutMs, signal, maxBytes: RUN_HEAD_BYTES, tailBytes: RUN_TAIL_BYTES,
@@ -939,7 +985,34 @@ export async function executeRunPlan(plan: RunPlan, signal?: AbortSignal): Promi
   });
   const ms = performance.now() - started;
   const output = renderRunOutput(result);
-  return { result, ms, text: `${statusLine(plan, result, ms)}\n${output}${output.endsWith("\n") || output === "" ? "" : "\n"}` };
+  const status = statusLine(plan, result, ms);
+  return { result, ms, status, output, text: `${status}\n${output}${output.endsWith("\n") || output === "" ? "" : "\n"}` };
+}
+
+/** #108: a `summary: "failures"` report: its path and the OS temp directory read once for it (`os.tmpdir()` at the call). */
+interface RunReport { readonly path: string; readonly tmp: string }
+
+/**
+ * #108: the answer of a `summary: "failures"` run: the report (only when the guard admits its path; its size is checked before
+ * it is read, at most {@link RUN_REPORT_MAX_BYTES}) summarized, or why it could not be, with the output's last lines. The caller
+ * deletes the report.
+ */
+function failuresAnswer(report: RunReport, cwd: string, run: { result: BoundedResult; status: string; output: string }): string {
+  let text: string | undefined;
+  let reason = "vitest wrote no report (it did not start, was stopped, or failed before reporting)";
+  if (!runReportPathAllowed(report.path, report.tmp)) reason = "the report path was rejected";
+  else {
+    try {
+      const size = statSync(report.path, { throwIfNoEntry: false })?.size;
+      if (size !== undefined && size > RUN_REPORT_MAX_BYTES) reason = `the vitest report is larger than ${RUN_REPORT_MAX_BYTES / (1024 * 1024)} MiB`;
+      else if (size !== undefined) text = readBounded(report.path, Math.max(1, size), "the vitest report");
+    } catch (error) {
+      reason = errorMessage(error);
+    }
+  }
+  const parsed = text === undefined ? undefined : parseVitestReport(text, cwd);
+  if (parsed !== undefined) return renderFailureSummary(run.status, parsed, run.result.failure === undefined ? run.result.code : null, run.output);
+  return renderSummaryUnavailable(run.status, text === undefined ? reason : "the vitest report is not a vitest JSON report", run.output);
 }
 
 /**
@@ -953,6 +1026,7 @@ export function routerRunTool(deps: RunToolDeps) {
     script: tool.schema.string().min(1).max(200),
     args: tool.schema.array(tool.schema.string().max(200)).max(RUN_MAX_ARGS).optional(),
     cwd: tool.schema.string().min(1).max(4096),
+    summary: tool.schema.enum(["failures"]).optional(),
   }).strict();
   return tool({
     description: "Run one allowlisted package.json script or configured command in this dispatch's work root and report its exit code. "
@@ -960,11 +1034,14 @@ export function routerRunTool(deps: RunToolDeps) {
       + "cwd must be the dispatch's work root. Output (stdout and stderr) is bounded to 64 KiB; URL credentials in it are redacted (best effort, not a secret scanner) "
       + "and credential-like environment variables are not passed to the run; agents and credential stores (ssh-agent, git credential helpers, "
       + "cloud CLI caches in the home directory) stay reachable to scripts. The run is time-limited."
+      + " With summary \"failures\" (vitest npm scripts only) the answer is the test counts and the failing tests grouped by file, within 4 KiB."
       + argumentCommandsDescription(deps.config()),
     args: {
       script: tool.schema.string().describe("Entry name: a script listed in routing.run.scripts (e.g. test, typecheck) or a routing.run.commands entry"),
       args: tool.schema.array(tool.schema.string()).optional().describe("Arguments, only for command entries that declare them"),
       cwd: tool.schema.string().describe("Absolute path of the dispatch's work root"),
+      summary: tool.schema.enum(["failures"]).optional()
+        .describe("failures: for an entry running a vitest npm script, return the counts and each failing test (first error block) instead of the raw output"),
     },
     async execute(input, context) {
       try {
@@ -975,17 +1052,33 @@ export function routerRunTool(deps: RunToolDeps) {
         if (answer.root === null) throw refuse("this session has no bound work root (I9); router_run only runs in a dispatch's work root");
         const root = authorizeCwd(answer.root, (input as { cwd?: unknown } | undefined)?.cwd, platform);
         const parsed = inputSchema.parse(input);
-        const plan = planRun(parsed, root, deps.config(), {
-          platform, env: deps.env ?? process.env,
-          ...(deps.nodeExecPath !== undefined ? { nodeExecPath: deps.nodeExecPath } : {}),
-        });
-        const at = Date.now();
-        const { result, text } = await executeRunPlan(plan, context.abort);
-        const exitCode = result.failure === undefined ? result.code : null;
-        try { deps.recordRun?.({ sessionID: context.sessionID, script: plan.name, exitCode, at }); } catch (error) {
-          console.warn(`[model-router] router_run: could not record the run (${errorMessage(error)})`);
+        // #108: opt-in; the report path is router-named in the OS temp directory (read once) and deleted once the run settles. A path
+        // the guard would not admit (a relative TEMP/TMPDIR) is refused before planning, so no report can land in the work root.
+        let report: RunReport | undefined;
+        if (parsed.summary === "failures") {
+          const tmp = tmpdir();
+          report = { path: newRunReportPath(tmp), tmp };
+          if (!runReportPathAllowed(report.path, tmp)) {
+            throw refuse(`summary "failures" needs an absolute OS temp directory for its report (it is "${tmp}"; check TEMP, TMP or TMPDIR)`);
+          }
         }
-        return text;
+        try {
+          const plan = planRun(parsed, root, deps.config(), {
+            platform, env: deps.env ?? process.env,
+            ...(deps.nodeExecPath !== undefined ? { nodeExecPath: deps.nodeExecPath } : {}),
+          }, report === undefined ? {} : { failuresReport: report.path });
+          const at = Date.now();
+          const run = await executeRunPlan(plan, context.abort);
+          const exitCode = run.result.failure === undefined ? run.result.code : null;
+          try { deps.recordRun?.({ sessionID: context.sessionID, script: plan.name, exitCode, at }); } catch (error) {
+            console.warn(`[model-router] router_run: could not record the run (${errorMessage(error)})`);
+          }
+          return report === undefined ? run.text : failuresAnswer(report, plan.cwd, run);
+        } finally {
+          if (report !== undefined && runReportPathAllowed(report.path, report.tmp)) {
+            try { unlinkSync(report.path); } catch { /* missing (no report written) or already gone */ }
+          }
+        }
       } catch (error) {
         const prefix = error instanceof RunRefused ? "refused: " : "";
         return `[router_run] error: ${prefix}${stripUrlUserinfo(errorMessage(error))}`;

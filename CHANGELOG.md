@@ -19,6 +19,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `presets` a `null` keeps its meaning as a value (`enforcement.maxDelegationDepth: null`,
   `enforcement.verify.graderTemperature: null`). OpenCode v1 is unchanged. See "Removing an inherited key with
   `null`" in docs/CONFIG_REFERENCE.md.
+- **OpenCode v2 roles mode: a role agent's `router_git_diff` is stat-first (#108).** Without `path`, in mode `patch`
+  or `cached`, lockfiles, snapshots, goldens and fixtures (a fixed list, by a file's new path; goldens and fixtures
+  never include code or tests) are left out of the patch and listed after it as `content excluded (<kind>, +a/-b)`.
+  When the rest of the patch exceeds 8 KiB, or the excluded paths cannot be left out of it (more than 200, or a git
+  command line above 30000 characters), the answer is a summary instead: one `+added -removed` line per file,
+  excluded files marked, sensitive files (either name of a rename) by name only as `sensitive: content withheld`,
+  at most 4096 bytes, with the exact count of entries left out. `path`, `mode: "stat"` and `mode: "name-only"` answer
+  as before; tiers mode, the root session and OpenCode v1 are unchanged. See docs/ROLES.md.
+- **OpenCode v2 roles mode: `router_run({ summary: "failures" })` for vitest npm scripts (#108).** Opt-in. The router
+  appends `--reporter=json --outputFile=<OS temp file>` to the script, reads the report (up to 8 MiB, its size
+  checked first) and deletes it, also after a timeout or a failed start, and answers with the counts and the failing
+  tests grouped by file, each with the first block of its error, within 4096 bytes (names first, then error blocks
+  while they fit, then the exact count of what was left out). Names and paths are kept on one line with URL
+  credentials redacted. Without a usable report it gives the reason and the output's last lines. Another entry, a
+  script body that is not one plain `vitest` command, a caller `--reporter`, `--outputFile` or `--`, and a relative
+  OS temp directory are refused before anything runs; without `summary` nothing changes. See docs/ROLES.md.
 
 ### Fixed
 

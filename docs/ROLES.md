@@ -229,6 +229,31 @@ parent's directory.
   a `.git` pointer (or a directory git reports) names a network or device path. With cross-repo configured, a role
   agent may pass `root` to read another repository of its read set instead (see **`router_git_*` in other
   repositories** below); the work root's limits above still apply to every call without it.
+- **A role agent's `router_git_diff` is stat-first (#108).** With roles mode selected at start (OpenCode v2), a role
+  agent's `router_git_diff` without `path` in mode `patch` (the default) or `cached`, in its work root or with `root`,
+  changes in two ways. Tiers mode, the root session and OpenCode v1 keep the plain patch, and no tool's schema or
+  description changes.
+  - **Excluded content.** Lockfiles (`package-lock.json`, `npm-shrinkwrap.json`, `pnpm-lock.yaml`, `yarn.lock`,
+    `bun.lock`, `bun.lockb`, `Cargo.lock`, `poetry.lock`, `uv.lock`, `Pipfile.lock`, `composer.lock`, `Gemfile.lock`,
+    `go.sum`, at any depth), snapshots (`**/__snapshots__/**`, `*.snap`), goldens (`test/golden/**`) and fixtures
+    (`**/fixtures/**`) are left out of the patch and listed after it as `<path> | content excluded (<kind>, +a/-b)`.
+    A file is classified by its new path only, so a file renamed out of a fixture directory is shown. Goldens and
+    fixtures never exclude code or tests: a `*.test.*` or `*.spec.*` file, or one with a code extension (`.ts`,
+    `.tsx`, `.mts`, `.cts`, `.js`, `.jsx`, `.mjs`, `.cjs`, `.vue`, `.svelte`, `.py`, `.pyi`, `.go`, `.rs`, `.java`,
+    `.kt`, `.kts`, `.scala`, `.groovy`, `.rb`, `.php`, `.cs`, `.fs`, `.vb`, `.c`, `.h`, `.cc`, `.cpp`, `.cxx`, `.hpp`,
+    `.hh`, `.m`, `.mm`, `.swift`, `.dart`, `.lua`, `.pl`, `.pm`, `.r`, `.ex`, `.exs`, `.erl`, `.clj`, `.zig`, `.nim`,
+    `.sh`, `.bash`, `.zsh`, `.fish`, `.ps1`, `.psm1`, `.psd1`, `.bat`, `.cmd`, any case), is shown in full. An excluded
+    file whose name is sensitive is listed as `<path> | sensitive: content withheld`. Their presence is never
+    dropped; call again with `path` to get one file's patch.
+  - **Summary above 8 KiB.** When the rest of the patch exceeds 8 KiB, or the excluded paths cannot be left out of it
+    (more than 200 of them, or a git command line above 30000 characters with them), the answer is a summary with no
+    hunks: a header with the totals, then one line per file in git's order, `<path> | +a -b` (`binary` for a binary
+    file, `<old> => <new>` for a rename), excluded files as above, and sensitive files by name only,
+    `<path> | sensitive: content withheld` (never their counts or content; a rename with a sensitive name on either
+    side counts as sensitive). A summary is at most 4096 bytes; the line with the exact number of entries it leaves
+    out, by category, may be followed by notes of at most 1 KiB (git's warnings, the skipped-links notice). The
+    excluded list after a small patch has the same bound. Neither carries a content hash. `path`, `mode: "stat"` and
+    `mode: "name-only"` answer as before.
 - The `git worktree list` runs that validate work roots inherit the user's system and global `safe.directory` values
   (only those), so a repository trusted that way does not fail with "dubious ownership".
 - **Acceptance checks run in the work root.** The deterministic checks of a role dispatch's `[acceptance]` block run in
@@ -788,8 +813,8 @@ practice a `general` dispatch classed `review` whose grant holds no `edit`.
 
 ## `router_run`
 
-`router_run({ script, args?, cwd })` runs **one** allowlisted entry in the dispatch's work root and returns its exit
-code. It never spawns a shell itself (fixed argv, `shell: false`).
+`router_run({ script, args?, cwd, summary? })` runs **one** allowlisted entry in the dispatch's work root and returns
+its exit code. It never spawns a shell itself (fixed argv, `shell: false`).
 
 - **Entries.** A `package.json` script named in `routing.run.scripts` (exact names; default
   `["test", "typecheck", "lint", "build"]`), or a `routing.run.commands` entry; a command wins over a script of the
@@ -827,6 +852,25 @@ code. It never spawns a shell itself (fixed argv, `shell: false`).
   `~/.docker/config.json`, …) and credentials carried by variables with other names. A script can use them as you can.
 - **Bounds.** Timeout `routing.run.timeoutMs` (default 600000 ms) with a process-tree kill; output bounded to 64 KiB
   with a notice; best-effort redaction of URL userinfo and credential-like query parameters (not a secret scanner).
+- **Failure summary (#108).** `summary: "failures"` (opt-in) is for an entry that runs a vitest npm script: a script
+  entry, or an npm `run`/`run-script`/`test` command, whose `package.json` body is one `vitest` command. Its first
+  word is `vitest`, and it has no `;`, `&`, `|`, `<`, `>`, backquote, `$(`, `#`, line break or trailing backslash, no
+  `--` argument, no quote, backslash, `$`, `%` or `^` inside an option name, and no `--reporter` or `--outputFile` of
+  its own. The router appends `--reporter=json --outputFile=<OS temp>/omr-run-<uuid>.json` to the script's arguments
+  (after a `--` it adds when the entry has none), reads that report after the run and deletes it, also when the run
+  times out or fails to start. The OS temp directory is read once per call; only a file of that name directly in it
+  is read or deleted (the verification runner's report-path check), and a relative temp directory (`TEMP`, `TMP` or
+  `TMPDIR`) is refused before anything runs. A report above 8 MiB is not read (its size is checked first). The answer
+  is the status line, the counts, then the failing tests grouped by file (`FAIL <file>`, `× <suite> > <test>`, a file
+  that fails without a failing test as `× (file error)`), each with the first block of its error message (at most 4
+  lines). Names and paths from the report are shown on one line (control characters and line breaks become spaces,
+  ANSI escapes are removed) with URL credentials redacted, like the raw output. It is at most 4096 bytes: failure
+  names come first, then error blocks in order while they fit, and a last line gives the exact number of failures
+  (and files) and error blocks left out. Without a usable report (vitest did not start, timed out before reporting,
+  the report is too large or is not a vitest JSON report), or when the run fails although the report lists no
+  failure, the answer gives the reason and the output's last lines instead. Any other entry, a caller or fixed
+  `--reporter`, `--reporters`, `--outputFile` or `--output-file` argument, and a caller or extra fixed `--`, are
+  refused before anything runs. Without `summary`, and for the plan executor's checks, nothing changes.
 
 ## Background dispatches
 
