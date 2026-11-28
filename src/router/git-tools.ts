@@ -4,6 +4,10 @@ import { lstat, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, win32 } from "node:path";
 import { tool } from "@opencode-ai/plugin";
+import {
+  DIFF_SUMMARY_THRESHOLD_BYTES, entryExcludedKind, parseNumstat, renderDiffSummary, renderExcludedList, type NumstatEntry, type SummaryEntry,
+  type SummaryReason,
+} from "./diff-summary";
 import { filterSensitiveDiff, isSensitivePath, sensitiveGitPathspecs } from "./sensitive-paths";
 
 export const GIT_OPERATIONS = ["status", "log", "diff", "show", "blame", "ls_files"] as const;
@@ -29,6 +33,11 @@ export interface GitInspectOptions {
   filterSearch?: (root: string, paths: readonly string[]) => { kept: readonly string[]; note?: string };
   /** Absolute `Date.now()` deadline shared with the caller (a `root` resolution, SD-3b-8); without it a fresh 15 s budget starts. */
   deadlineAt?: number;
+  /**
+   * #108 (OpenCode v2 roles mode, role sessions only): a `diff` without `path` in mode `patch` or `cached` lists the files whose
+   * content is excluded (diff-summary.ts) instead of their hunks, and is summarized when its patch exceeds 8 KiB. Absent: unchanged.
+   */
+  summary?: boolean;
 }
 
 const MAX_BYTES = 64 * 1024;
@@ -1292,14 +1301,116 @@ export function quoteGitPath(name: string, quoteHigh = true): string {
  * so name-only output is derived from it instead.
  */
 async function diffNames(executable: string, argv: string[], root: string, env: NodeJS.ProcessEnv, budget: Budget): Promise<string> {
-  const quoting = await query(executable, [...argv.slice(0, argv.indexOf("diff")), "config", "--type=bool", "--get", "core.quotePath"], root, env, budget);
-  if (quoting.code !== 0 && quoting.code !== 1) throw queryFailure("Cannot read path quoting configuration", quoting);
+  const quoteHigh = await quotePathSetting(executable, argv, root, env, budget);
   const args = argv.flatMap(arg => arg === "--name-only" ? ["--numstat", "-z"] : [arg]);
   const result = await spawnBounded(executable, args, root, { env, signal: budget.signal, timeoutMs: budget.timeoutMs() });
   if (!result.truncated && result.code !== 0) throw queryFailure("Git inspection failed", result);
   const names = numstatNames(result.output.toString("utf8"), !result.truncated);
-  const text = stripUrlUserinfo(names.map(name => `${quoteGitPath(name, quoting.output.toString("utf8").trim() !== "false")}\n`).join(""));
+  const text = stripUrlUserinfo(names.map(name => `${quoteGitPath(name, quoteHigh)}\n`).join(""));
   return withWarnings(result.truncated ? `${text}[truncated: output exceeds ${MAX_BYTES} bytes]` : text, result);
+}
+
+/** `core.quotePath` as git reads it for this diff argv (default true): how a name read from `-z` output is shown, as git would. */
+async function quotePathSetting(executable: string, argv: readonly string[], root: string, env: NodeJS.ProcessEnv, budget: Budget): Promise<boolean> {
+  const quoting = await query(executable, [...argv.slice(0, argv.indexOf("diff")), "config", "--type=bool", "--get", "core.quotePath"], root, env, budget);
+  if (quoting.code !== 0 && quoting.code !== 1) throw queryFailure("Cannot read path quoting configuration", quoting);
+  return quoting.output.toString("utf8").trim() !== "false";
+}
+
+/** #108: bound of a summary's `--numstat -z` listing (about 40 000 files); a larger one fails the call. */
+const DIFF_LISTING_BYTES = 4 * 1024 * 1024;
+/** #108: at most this many paths are left out of a role's patch by literal exclude; past it, a summary. */
+const MAX_EXCLUDED_PATHSPECS = 200;
+/**
+ * #108: bound of the patch argv with those excludes, summed as `arg.length + 1` (as the verify runner's MAX_ARGV_CHARS; Windows
+ * CreateProcess takes 32767); past it, a summary instead of a spawn error.
+ */
+const MAX_DIFF_ARGV_CHARS = 30_000;
+
+/** #108 P4: an entry either of whose names is sensitive (sensitive-paths.ts). */
+function sensitiveEntry(entry: NumstatEntry): boolean {
+  return isSensitivePath(entry.path) || (entry.from !== undefined && isSensitivePath(entry.from));
+}
+
+/** #108 P4: a sensitive entry as listed: its names only, never its counts. */
+function withheldEntry(entry: NumstatEntry): SummaryEntry {
+  return { path: entry.path, ...(entry.from === undefined ? {} : { from: entry.from }), sensitive: true };
+}
+
+/** A diff argv with `--numstat -z` right after the subcommand (its first `diff`: refs and pathspecs come later). */
+function numstatArgv(argv: readonly string[]): string[] {
+  const at = argv.indexOf("diff");
+  return [...argv.slice(0, at + 1), "--numstat", "-z", ...argv.slice(at + 1)];
+}
+
+/** The listing of a summary's diff argv, parsed. */
+async function diffListing(executable: string, argv: readonly string[], root: string, env: NodeJS.ProcessEnv, budget: Budget) {
+  const listing = await spawnBounded(executable, numstatArgv(argv), root, { env, signal: budget.signal, timeoutMs: budget.timeoutMs(), maxBytes: DIFF_LISTING_BYTES });
+  if (listing.truncated) throw new Error(`Git diff listing exceeds ${DIFF_LISTING_BYTES / (1024 * 1024)} MiB; call router_git_diff with path, or mode stat`);
+  if (listing.code !== 0) throw queryFailure("Git inspection failed", listing);
+  return { entries: parseNumstat(listing.output.toString("utf8")), result: listing };
+}
+
+/**
+ * #108 slice 1 (OpenCode v2 roles mode, role sessions): a `patch`/`cached` diff without `path`. `argv` is the diff's own (sensitive
+ * paths, links replaced by directories and the work-root scope already excluded); `note` is the skipped-links note, if any.
+ * 1. The files of the diff are listed (`--numstat -z`); those of an excluded kind (lockfiles, snapshots, goldens, fixtures, by
+ *    the new path) are left out of the patch by literal pathspec (and a rename's old name, unless a listed file still has that
+ *    name, as a copy's source does).
+ * 2. A patch of at most 8 KiB is returned as before (credentials redacted, sensitive sections withheld), followed by the list
+ *    of excluded files with their kind and counts, when there are any; an excluded file with a sensitive name is listed by name
+ *    only (`sensitive: content withheld`).
+ * 3. Otherwise (or with more than {@link MAX_EXCLUDED_PATHSPECS} excluded files, or a patch argv above
+ *    {@link MAX_DIFF_ARGV_CHARS}) the answer is a summary: every file in git's order, its counts, excluded files marked, and
+ *    sensitive files by name only. Sensitive files are found by listing the same diff without the sensitive exclusions: a file
+ *    found only there, or one sensitive-paths.ts flags, is never shown with counts. At most 4 KiB, with the exact count of what
+ *    it leaves out.
+ */
+async function summarizedDiff(executable: string, argv: string[], root: string, env: NodeJS.ProcessEnv, budget: Budget, note: string): Promise<string> {
+  const visible = await diffListing(executable, argv, root, env, budget);
+  const excluded: SummaryEntry[] = visible.entries.flatMap(entry => {
+    const kind = entryExcludedKind(entry);
+    return kind === undefined ? [] : [sensitiveEntry(entry) ? withheldEntry(entry) : { ...entry, excluded: kind }];
+  });
+  const quoteHigh = await quotePathSetting(executable, argv, root, env, budget);
+  const display = (path: string) => stripUrlUserinfo(quoteGitPath(path, quoteHigh));
+  // An excluded entry's old name is left out too (a rename's deletion side), unless a listed file still has that name: a copy's
+  // source (`diff.renames=copies`) keeps its own hunks.
+  const listed = new Set(visible.entries.map(entry => entry.path));
+  const pathspecs = [...new Set(excluded.flatMap(entry => entry.from === undefined || listed.has(entry.from) ? [entry.path] : [entry.from, entry.path]))]
+    .map(path => `:(exclude,literal)${path}`);
+  const argvChars = [...argv, ...pathspecs].reduce((sum, arg) => sum + arg.length + 1, 0);
+  let reason: SummaryReason = "many-excluded";
+  // The argv bound only decides for the excludes added here; a base argv that is too long by itself fails as before.
+  if (pathspecs.length === 0 || (pathspecs.length <= MAX_EXCLUDED_PATHSPECS && argvChars <= MAX_DIFF_ARGV_CHARS)) {
+    const patch = await spawnBounded(executable, [...argv, ...pathspecs], root,
+      { env, signal: budget.signal, timeoutMs: budget.timeoutMs(), maxBytes: DIFF_SUMMARY_THRESHOLD_BYTES });
+    if (!patch.truncated) {
+      if (patch.code !== 0) throw queryFailure("Git inspection failed", patch);
+      const output = filterSensitiveDiff(withWarnings(stripUrlUserinfo(patch.output.toString("utf8")), patch));
+      const list = renderExcludedList(excluded, display);
+      const parts = [output, list, note].filter(part => part !== "");
+      return parts.map((part, index) => index < parts.length - 1 && !part.endsWith("\n") ? `${part}\n` : part).join("");
+    }
+    reason = "large";
+  }
+  const sensitive = new Set(sensitiveGitPathspecs());
+  const dash = argv.indexOf("--");
+  const everything = await diffListing(executable, argv.filter((arg, index) => index < dash || !sensitive.has(arg)), root, env, budget);
+  const shown = new Set(visible.entries.map(entry => entry.path));
+  const entries: SummaryEntry[] = everything.entries.map(entry => {
+    if (!shown.has(entry.path) || sensitiveEntry(entry)) return withheldEntry(entry);
+    const kind = entryExcludedKind(entry);
+    return kind === undefined ? entry : { ...entry, excluded: kind };
+  });
+  const warnings = withWarnings("", visible.result);
+  return renderDiffSummary(entries, display, { reason, footer: [warnings, note].filter(part => part !== "").join(warnings.endsWith("\n") ? "" : "\n") });
+}
+
+/** The note appended when tracked directories replaced by links were left out of an inspection. */
+function linkedNote(linked: readonly string[]): string {
+  return linked.length === 0 ? ""
+    : `[router_git] skipped tracked directories replaced by symlinks/junctions: ${linked.slice(0, 20).join(", ")}${linked.length > 20 ? ", ..." : ""}`;
 }
 
 /**
@@ -1476,6 +1587,10 @@ export async function inspectGit(operation: GitOperation, input: GitInput, direc
     inspected = { ...input, ref: oid };
   }
   const argv = gitArgv(operation, inspected, root, { config, exclude: linked, ...(scope === undefined ? {} : { scope }) });
+  // #108 (v2 roles mode, role sessions): a patch without `path` lists excluded content and is summarized above 8 KiB.
+  if (operation === "diff" && options.summary === true && input.path === undefined && (input.mode === undefined || input.mode === "patch" || input.mode === "cached")) {
+    return await summarizedDiff(executable, argv, root, env, budget, linkedNote(linked));
+  }
   const searchFilter = operation === "ls_files" ? options.filterSearch : undefined;
   const raw = searchFilter !== undefined
     ? await filteredListing(executable, argv, root, env, budget, searchFilter)
@@ -1485,7 +1600,7 @@ export async function inspectGit(operation: GitOperation, input: GitInput, direc
   let output = ["show", "diff", "log"].includes(operation) ? filterSensitiveDiff(raw) : raw;
   if (operation === "show" || operation === "log") output = await annotateWithheld(output, executable, base, root, env, budget, scopeSpec);
   if (linked.length === 0) return output;
-  return `${output}${output.endsWith("\n") || output === "" ? "" : "\n"}[router_git] skipped tracked directories replaced by symlinks/junctions: ${linked.slice(0, 20).join(", ")}${linked.length > 20 ? ", ..." : ""}`;
+  return `${output}${output.endsWith("\n") || output === "" ? "" : "\n"}${linkedNote(linked)}`;
 }
 
 /**
@@ -1522,6 +1637,11 @@ export interface GitToolsOptions {
    * Only when set do the tools declare `root` and the longer description (SD-3b-1); absent, schema and behaviour are unchanged.
    */
   resolveRoot?: GitRootResolver;
+  /**
+   * #108 slice 1 (OpenCode v2, roles mode at start only): a role session's `router_git_diff` (in its work root or with `root`) is
+   * stat-first, see {@link GitInspectOptions.summary}. Other sessions, and every tool's schema and description, are unchanged.
+   */
+  summarizeDiffs?: boolean;
 }
 
 /**
@@ -1613,11 +1733,11 @@ function displayRoot(text: string): string {
 /**
  * 3b.3: one call with `root` (SD-3b-4, SD-3b-6 to SD-3b-8). Undefined: `root` names the work root, inspect as without it.
  * `root` is only the git cwd, never a git argument; a refusal or a malformed answer spawns nothing. `filtering` (leases, Phase 2.1)
- * applies to the other repository's listing as to the work root's.
+ * applies to the other repository's listing as to the work root's, and `summary` (#108) to its diff.
  */
 async function inspectRoot(operation: GitOperation, input: GitInput, value: unknown, resolveRoot: GitRootResolver,
   executables: readonly string[], sessionID: string, signal: AbortSignal, deadlineAt: number,
-  filtering: Pick<GitInspectOptions, "filterSearch"> = {}): Promise<string | undefined> {
+  filtering: Pick<GitInspectOptions, "filterSearch" | "summary"> = {}): Promise<string | undefined> {
   if (typeof value !== "string") return "[router_git] error: refused: root must be a string; nothing ran";
   try {
     const answer = checkGitRootAnswer(await resolveRoot(value, { sessionID, signal, deadlineAt }));
@@ -1671,6 +1791,8 @@ export function gitTools(opts: GitToolsOptions = {}) {
         const searchFilter = installedSearchFilter;
         const filtering: Pick<GitInspectOptions, "filterSearch"> = searchFilter === undefined ? {}
           : { filterSearch: (root, paths) => searchFilter({ sessionID: context.sessionID, root, paths }) };
+        // #108: role sessions only (a `root` is only ever admitted for one; the work-root branch below checks the binding).
+        const roleShaping: Pick<GitInspectOptions, "filterSearch" | "summary"> = opts.summarizeDiffs === true ? { ...filtering, summary: true } : filtering;
         // 3b.3: `root` is stripped before the strict parse; without a resolver the input is parsed as given (unchanged, I9).
         let args: unknown = input;
         let deadline: { deadlineAt?: number } = {};
@@ -1681,7 +1803,7 @@ export function gitTools(opts: GitToolsOptions = {}) {
             // SD-3b-8: one 15 s deadline covers resolution and inspection.
             const deadlineAt = Date.now() + DEADLINE_MS;
             deadline = { deadlineAt };
-            const other = await inspectRoot(operation, inputSchema.parse(rest), root, resolveRoot, executables, context.sessionID, context.abort, deadlineAt, filtering);
+            const other = await inspectRoot(operation, inputSchema.parse(rest), root, resolveRoot, executables, context.sessionID, context.abort, deadlineAt, roleShaping);
             if (other !== undefined) return other;
           }
         }
@@ -1694,7 +1816,7 @@ export function gitTools(opts: GitToolsOptions = {}) {
             return await inspectGit(operation, inputSchema.parse(args), answer.root, context.abort, {
               executables, guards: workRootGuards(answer.root),
               role: expected ? { dispatchRepository: expected } : {}, ...deadline,
-              ...filtering,
+              ...roleShaping,
             });
           }
         }

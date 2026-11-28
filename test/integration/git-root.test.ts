@@ -333,4 +333,30 @@ describe("router_git root through junctions and worktrees (3b.5)", { timeout: 60
     expect(readFileSync(index).equals(before.bytes)).toBe(true);
     expect(porcelain()).toBe(before.status);
   });
+
+  it("#108: through the plugin, a role session's large router_git_diff is a summary; the root session's is the raw patch", async () => {
+    const { work, parent, repo } = fixture();
+    const body = (prefix: string): string => `${Array.from({ length: 12 }, (_, i) => `${prefix} line ${i} ${"x".repeat(24)}`).join("\n")}\n`;
+    for (const dir of [work, repo]) {
+      for (let i = 0; i < 17; i++) writeFileSync(join(dir, `f${i}.ts`), body(`old ${i}`));
+      git(dir, "add", "-A");
+      git(dir, "commit", "-q", "-m", "base");
+      for (let i = 0; i < 17; i++) writeFileSync(join(dir, `f${i}.ts`), body(`new ${i}`));
+    }
+    const { dir } = home({ routing: { delegation: "roles", repoParents: [parent] } });
+    const hooks = await plugin(dir);
+    await bindExact(hooks, dir, work);
+    const role = await call(hooks, "router_git_diff", {});
+    expect(role).toMatch(/^\[router_git\] diff summary: 17 files \(17 changed\), \+204 -204; the patch exceeds 8 KiB/);
+    expect(role).not.toContain("@@");
+    // With root (another repository of the read set): its provenance line, then the summary.
+    const other = await call(hooks, "router_git_diff", { root: repo });
+    expect(other.split("\n")[1]).toMatch(/^\[router_git\] diff summary: 17 files \(17 changed\), \+204 -204;/);
+    // The root session (not a role session) gets the raw patch of its directory.
+    const tools = hooks.tool as Record<string, { execute: (args: unknown, ctx: unknown) => Promise<string> }>;
+    const raw = await tools.router_git_diff!.execute({}, { ...toolCtx("root"), directory: work, worktree: work });
+    expect(raw).toContain("diff --git a/f0.ts b/f0.ts");
+    expect(raw).toContain("@@");
+    expect(raw).not.toContain("diff summary");
+  });
 });

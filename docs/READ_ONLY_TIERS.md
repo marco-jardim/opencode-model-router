@@ -181,7 +181,9 @@ before setting `GIT_OPTIONAL_LOCKS=0`, `GIT_CONFIG_NOSYSTEM=1`,
 `GIT_CONFIG_GLOBAL=NUL` (or `/dev/null`), `GIT_TERMINAL_PROMPT=0`, `GIT_PAGER=cat`,
 `PAGER=cat` and `GIT_NO_LAZY_FETCH=1`. User paths use explicit `:(literal)`
 pathspecs rather than `GIT_LITERAL_PATHSPECS`, permitting router-owned exclusions.
-Output is bounded to 64 KiB with a truncation notice. Discovery and inspection
+Output is bounded to 64 KiB with a truncation notice (in roles mode on OpenCode
+v2 a role agent's patch is stat-first instead, see [ROLES.md](ROLES.md), #108).
+Discovery and inspection
 share one 15-second tool-call deadline; abort, timeout, and output overflow kill the process tree
 (taskkill `/T /F` on Windows, a detached process group elsewhere). Remote URL
 userinfo is stripped, including scp-like remotes; an incomplete trailing token

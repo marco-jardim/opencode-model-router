@@ -1981,9 +1981,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           : `[router_plan] ${planCallerRefusal}`,
       } } : {}),
       // QA-G-A2-2: a role session's work root must belong to the repository its dispatch listed the worktrees in (this directory's).
+      // #108: roles mode at start implies OpenCode v2 (`startedInRoles`); a role session's router_git_diff is then stat-first.
       ...gitTools(rolesAtStart ? {
         resolveWorkRoot: resolveWorkRootFor("router_git"), ...(ctx.directory ? { dispatchRepository: ctx.directory } : {}),
-        ...(crossRepoAtStart ? { resolveRoot: resolveGitRootFor } : {}),
+        ...(crossRepoAtStart ? { resolveRoot: resolveGitRootFor } : {}), summarizeDiffs: true,
       } : {}),
       // #84 P2.1 (handoffs 11, 13): roles mode only. `router_run` runs in the bound work root; each run feeds the `run` signal.
       ...(rolesAtStart ? {
