@@ -38,6 +38,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reference pass nothing on and send the same git commands as before; one change reaches them: an include target
   whose existence check hangs now fails the snapshot closed after its own 10 s timeout (OpenCode v1 and v2).
 
+### Security
+
+- **Development dependencies: patched `toml`, `zod`, `effect` and `minimatch`.** The lockfile resolved vulnerable
+  versions through the `@opencode-ai/plugin` peer (`effect` 4.0.0-beta.83 with `toml` 4.3.0, `zod` 4.1.8) and the
+  `@opencode/plugin` dev dependency (`minimatch` 9 and 10). `package.json` now overrides them to `effect` ^4.1.0 (which
+  no longer depends on `toml`), `zod` ^4.6.6 and `minimatch` ^11.0.1. The published package has no dependencies, so
+  installs of the plugin are not affected; this only changes what a clone of the repository installs.
+
 ## [2.10.0] - 2026-11-27
 
 ### Changed
