@@ -24,6 +24,7 @@ import {
 } from "../../src/executor/recovery.js";
 import {
   attemptTrailer,
+  COLLECT_RETRY_BASE_MS,
   commitTaskInSlot,
   createExecutorRuntime,
   realCollaborators,
@@ -110,6 +111,8 @@ class TestClock implements Clock {
   private nextId = 1;
   private rand = 0;
   private readonly timers = new Map<number, { at: number; fn: () => void }>();
+  /** The delay of every timer armed so far, in order (a deterministic signal of a deferred step). */
+  readonly armed: number[] = [];
   now(): number {
     return this.ms;
   }
@@ -118,6 +121,7 @@ class TestClock implements Clock {
   }
   setTimer(ms: number, fn: () => void): { readonly id: number } {
     const id = this.nextId++;
+    this.armed.push(ms);
     this.timers.set(id, { at: this.ms + Math.max(0, ms), fn });
     return { id };
   }
@@ -495,12 +499,15 @@ class HostsDouble implements HostSessions {
   readonly gone = new Set<string>();
   activityValue: "active" | "inactive" | "unknown" = "unknown";
   readonly interrupts: string[] = [];
+  /** `interrupt:<sid>` and `context:<sid>` in call order (the liveness reads of a stop follow its interrupt). */
+  readonly ops: string[] = [];
   interruptImpl: (sessionID: string) => Promise<void> = async () => undefined;
   readonly listeners = new Set<(e: HostSessionEvent) => void>();
   async get(sessionID: string): Promise<{ id: string; parentID: string | null } | null> {
     return this.gone.has(sessionID) ? null : { id: sessionID, parentID: ORCH };
   }
   async context(sessionID: string): Promise<HostSessionContext> {
+    this.ops.push(`context:${sessionID}`);
     return this.contexts.get(sessionID) ?? { messages: [] };
   }
   async activity(): Promise<"active" | "inactive" | "unknown"> {
@@ -508,6 +515,7 @@ class HostsDouble implements HostSessions {
   }
   async interrupt(sessionID: string): Promise<void> {
     this.interrupts.push(sessionID);
+    this.ops.push(`interrupt:${sessionID}`);
     await this.interruptImpl(sessionID);
   }
   async synthetic(): Promise<void> {}
@@ -1704,6 +1712,18 @@ describe("G-1: a child recovery adopted is stopped before its slot goes back", (
     await need(h.parts().releaseSlot, "the releaseSlot hook")("T1", slot);
   }
 
+  /**
+   * QA-4.2-41: the stop of the adopted `child` interrupted it, evicted its binding and read its context once, so it waits
+   * for the child's end (its next poll is a clock timer): the deterministic point for "nothing released yet" checks.
+   */
+  async function untilStopWaits(h: Harness, child: string, from: number): Promise<void> {
+    await until(() => {
+      const ops = h.hosts.ops.slice(from);
+      const i = ops.indexOf(`interrupt:${child}`);
+      return i >= 0 && ops.indexOf(`context:${child}`, i + 1) > i;
+    }, `the stop of ${child} waiting for its end`, () => ({ ops: h.hosts.ops.slice(from), logs: h.logs }));
+  }
+
   /** The open blocking items that hold `slot`. */
   function holds(h: Harness, slot: string): InboxItem[] {
     return h.ledger().inbox.filter((i) => i.answer === null && i.severity === "blocking" && i.text.startsWith(`the work in slot ${slot} `));
@@ -1719,8 +1739,7 @@ describe("G-1: a child recovery adopted is stopped before its slot goes back", (
     // The queue's settle polls before `onReverted`: the adopted child is reported live, nothing is released.
     expect(h.runtime.childLive?.(PLAN_ID, "T1")).toBe(true);
     h.parts().listener.onReverted("T1");
-    await until(() => h.hosts.interrupts.includes("ses-c1"), "the adopted child interrupted");
-    await pause(20);
+    await untilStopWaits(h, "ses-c1", 0);
     expect(h.bindings.evicted).toEqual(["ses-c1"]);
     expect(h.slots.released).toEqual([]);
     expect(h.runtime.childLive?.(PLAN_ID, "T1")).toBe(true);
@@ -1780,8 +1799,7 @@ describe("G-1: a child recovery adopted is stopped before its slot goes back", (
     const slot = need(h.task("T1").slot, "slot of T1");
     await h.runtime.abort(PLAN_ID, ORCH);
     expect(h.ledger().status).toBe("aborted");
-    await until(() => h.hosts.interrupts.includes("ses-c1"), "the adopted child interrupted");
-    await pause(20);
+    await untilStopWaits(h, "ses-c1", 0);
     expect(h.bindings.evicted).toEqual(["ses-c1"]);
     expect(h.slots.released).toEqual([]);
     h.hosts.emit({ type: "execution.interrupted", sessionID: "ses-c1", at: h.clock.iso() });
@@ -1855,11 +1873,13 @@ describe("G-1: a child recovery adopted is stopped before its slot goes back", (
     });
     const slot = await row34(h);
     h.parts().listener.onReverted("T1");
-    await until(() => h.hosts.interrupts.includes("ses-c1"), "the adopted child interrupted");
+    await untilStopWaits(h, "ses-c1", 0);
     // T1 is blocked: the abort registers no release of its own while the sweep's stop of the adopted child still runs.
+    const timers = h.clock.armed.length;
     await h.runtime.abort(PLAN_ID, ORCH);
     expect(h.ledger().status).toBe("aborted");
-    await pause(20);
+    // QA-4.2-41: abort awaits its own collection; that collection found the plan not idle and deferred (its retry timer).
+    expect(h.clock.armed.slice(timers)).toContain(COLLECT_RETRY_BASE_MS);
     expect(h.slots.released).toEqual([]);
     expect(h.log.slice(mark)).not.toContain("slots.gc");
     expect(h.slots.records.get(slot)?.state).toBe("leased");
@@ -2305,15 +2325,21 @@ describe("R1a probation", () => {
     const mark = h.git.calls.length;
     h.clock.advance(POLL_MS); // the poll at the deadline interrupts
     await until(() => h.hosts.interrupts.length === 1, "the interrupt");
-    await pause(20);
+    // QA-4.2-41: the poll waits on the held interrupt. That nothing of row 18 runs before it resolves is proven by the
+    // journal order and the git log below (both read at the resolution), not by a pause.
     expect(h.state("T1")).toBe("running");
     expect(h.launcher.runOf("T1", 2)).toBeUndefined();
+    const seqAtResolve = h.ledger().seq;
+    const gitAtResolve = h.git.calls.length;
 
     gate.resolve();
     await h.runOf("T1", 2);
     const a1 = need(h.task("T1").attempts[0], "attempt 1");
     expect(a1).toMatchObject({ outcome: "lost" });
-    expect(JSON.stringify(endsOf(await h.events(), "T1")[0])).toContain('"restart"');
+    const end1 = need(endsOf(await h.events(), "T1")[0], "the end of attempt 1");
+    expect(JSON.stringify(end1)).toContain('"restart"');
+    expect(end1.seq).toBeGreaterThan(seqAtResolve);
+    expect(h.git.calls.slice(mark, gitAtResolve).filter((c) => c.args[0] === "reset" || c.args[0] === "clean")).toEqual([]);
     expect(h.parts().policy.counted).toEqual([]);
     const verbs = h.git.verbsSince(mark);
     expect(verbs).toContain("reset --hard HEAD");
@@ -2465,7 +2491,8 @@ describe("same-process adopt (D12)", () => {
     h.engine();
     await h.runtime.adopt(PLAN_ID, "ses-new");
     await until(() => h.ledger().orchestrator.sessionID === "ses-new", "the new orchestrator");
-    await pause(20);
+    // QA-4.2-41: no pause: `adopt` awaits the new attachment's recovery (attach -> activate -> recoverPlan), so a
+    // reconcile that touched the tracked launch would already show here.
     expect(h.state("T1")).toBe("running");
     expect(h.hosts.interrupts).toEqual([]);
     expect(endsOf(await h.events(), "T1")).toHaveLength(0);
@@ -2487,14 +2514,14 @@ describe("same-process adopt: launch hooks resolve the live attachment", () => {
     h.engine();
     await h.runtime.adopt(PLAN_ID, "ses-new");
     await until(() => h.ledger().orchestrator.sessionID === "ses-new", "the new orchestrator");
-    await pause(20);
+    // QA-4.2-41: no pause: `adopt` awaits the new attachment's recovery before it resolves.
     expect(h.parts().writer).not.toBe(before);
     expect(h.state("T1")).toBe("dispatched");
     expect(h.hosts.interrupts).toEqual([]);
     // the child comes only now: onChildCreated must bind it through the live writer, not refuse it on the closed one
     h.hosts.contexts.set("ses-c1", { messages: [{ role: "user", text: run.req.prompt, outcome: null }] });
     await run.child("ses-c1");
-    await pause(20);
+    await until(() => h.state("T1") === "running", "T1 running on the new attachment");
     expect(h.state("T1")).toBe("running");
     expect(h.task("T1").attempts[0]?.childSessionID).toBe("ses-c1");
     run.complete("done");
@@ -2516,13 +2543,14 @@ describe("same-process adopt: launch hooks resolve the live attachment", () => {
     h.engine();
     await h.runtime.adopt(PLAN_ID, "ses-new");
     await until(() => h.ledger().orchestrator.sessionID === "ses-new", "the new orchestrator");
-    await pause(20);
+    // QA-4.2-41: no pause: `adopt` awaits the new attachment's recovery before it resolves.
     expect(h.state("T1")).toBe("dispatched");
     h.launcher.gateValue = DISPOSED_GATE; // no relaunch: only the confirmation's row 11 is under test
     // onConfirmation (L7) runs against the live writer; on the closed one row 11 would fail and T1 stay dispatched
     run.confirmation.resolve({ kind: "unconfirmed", reason: "timeout", error: null });
     await until(() => h.state("T1") === "ready", "T1 requeued by row 11");
-    await pause(20);
+    // QA-4.2-41: no pause: `ready` is row 11's batch applied on the live writer; a refusal on the closed writer would
+    // have logged "row 11 failed" before it and left T1 dispatched.
     const a = need(h.task("T1").attempts[0], "attempt 1");
     expect(a.outcome).toBe("lost");
     expect(endsOf(await h.events(), "T1")).toHaveLength(1);

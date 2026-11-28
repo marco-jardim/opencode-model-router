@@ -1,5 +1,6 @@
-// Branch coverage for src/executor/runtime.ts, lines 2562-4003 (reconcile feeds, adopt, re-provisioning, gate
-// recovery, probation). The harness is a minimal copy of the one in executor-runtime-coverage.test.ts (that file
+// Branch coverage for src/executor/runtime.ts from `reconcileFeeds` through `start` (reconcile feeds, adopt,
+// re-provisioning, gate recovery, probation). Line numbers in test titles are those of runtime.ts at fbb18a3, when these
+// tests were written. The harness is a minimal copy of the one in executor-runtime.test.ts (that file
 // exports nothing): the real LedgerStore in a temp dir, the real Scheduler and CapacityController; typed doubles for
 // every other seam, and a scripted recovery engine whose `reconcile` answers the feeds a test builds. All time comes
 // from TestClock; `until` only yields to the event loop while the real ledger files are written. Handles of the
@@ -88,7 +89,7 @@ const PROVIDER = "prov";
 const REPO = "C:/repo";
 
 // ---------------------------------------------------------------------------------------------------------------
-// Clock and small helpers (copied from executor-runtime-coverage.test.ts)
+// Clock and small helpers (copied from executor-runtime.test.ts)
 // ---------------------------------------------------------------------------------------------------------------
 
 class TestClock implements Clock {
@@ -220,7 +221,7 @@ const OK_GATE: LaunchGate = { ok: true, context: GATE_CONTEXT, ageMs: 0 };
 const DISPOSED_GATE: LaunchGate = { ok: false, reason: "disposed", wake: null };
 
 // ---------------------------------------------------------------------------------------------------------------
-// Doubles (copied from executor-runtime-coverage.test.ts, trimmed to the knobs these tests use)
+// Doubles (copied from executor-runtime.test.ts, trimmed to the knobs these tests use)
 // ---------------------------------------------------------------------------------------------------------------
 
 class SlotPoolDouble implements SlotPool {
@@ -1280,8 +1281,11 @@ describe("probation", () => {
     await until(() => reads.length === 1, "the probation poll reading the context");
     h.runtime.onHostEvent(stepEnded(h, "ses-c1"));
     read.resolve({ messages: [] });
+    // QA-4.2-41: no launch of this runtime is live (the child was adopted after the restart), so `settled` is the poll's
+    // end: the clock moves only after it decided, and a re-armed poll would fire on this advance.
+    await h.runtime.settled();
     h.clock.advance(5000);
-    await pause(50);
+    await h.runtime.settled();
     expect(reads).toEqual(["ses-c1"]);
     expect(h.hosts.interrupted).toEqual([]);
     expect(h.state("T1")).toBe("running");
@@ -1300,9 +1304,10 @@ describe("probation", () => {
       return { messages: [] };
     };
     h.clock.advance(POLL);
-    await pause(50);
+    // QA-4.2-41: no launch of this runtime is live, so `settled` is the end of each poll the advance fired.
+    await h.runtime.settled();
     h.clock.advance(5000);
-    await pause(50);
+    await h.runtime.settled();
     expect(reads).toEqual([]);
     expect(h.hosts.interrupted).toEqual([]);
     expect(h.state("T1")).toBe("running");
@@ -1412,15 +1417,25 @@ describe("applyFeed: adopt and requeue-lost arms", () => {
   });
 });
 
-// Arms in 2562-4003 left uncovered on purpose (defensive re-checks or unreachable):
-// 2562 (a tracked handle always names a journaled attempt), 2586 t === null (callers pass a task they just read),
-// 2789/2887/2894/2938/2941 (batch re-checks of a state the caller read under the task's own mutex), 2829/2975/2976/3000/3005
-// (the engine sends `reverify` only for completed/verifying tasks with a slot and an attempt), 2955 (raiseSlotLost is only
-// reached for a task holding a slot), 3022 (phases are never removed), 3034 `?? ""` arms (a done attempt always has
-// endedAt), 3148/3149 (a poll racing dispose or a second poll; the timer is single and cleared on close), 3791 (a live
-// launch always holds a slot), functions @3306/@3862 (placeholders replaced synchronously by their Promise executors),
-// 4003 equal-planId arm (plan ids are unique; store.list() returns them in id order).
-// QA gate arms the ledger's qa-gate invariant (batchEndViolation) makes illegal: 2657 true arm (a ready QA task whose
-// phase gate is not awaiting-qa), 3033 `state !== "done"` true arm and 3036 (a qa-running phase with no QA task in flight
-// and none done), 3034 if-false arm (a second finished QA task of the same phase: a draft with two QA tasks in one phase
-// is refused by `create`, E_SCHEMA_INVALID, and the QaLoop double never creates next-round tasks).
+// Arms from `reconcileFeeds` through `start` left uncovered on purpose (defensive re-checks or unreachable), by function
+// of src/executor/runtime.ts:
+// - `reconcileFeeds` (`a === undefined`): a tracked handle always names a journaled attempt.
+// - `forceToken` (`t === null`): callers pass a task they just read.
+// - Batch re-checks of a state the caller read under the task's own mutex: `requeueLost`, `reprovisionSlot` (its batch
+//   and the "the task moved" re-check) and `slotLostBeforeCommit`.
+// - `reprovisionSlot`'s entry guard and the task/attempt/slot guards of `reverify`: the engine sends `reverify` only for
+//   completed/verifying tasks with a slot and an attempt.
+// - `raiseSlotLost`: only reached for a task holding a slot.
+// - `recoverGates`: a missing phase record (phases are never removed) and the `?? ""` arms of a done attempt's `endedAt`
+//   (a done attempt always has it).
+// - `pollProbation`: its `disposed` and busy/replaced-watch arms (a poll racing dispose or a second poll; the timer is
+//   single and cleared on close).
+// - `abort`: the `?? null` slot of a live launch (a live launch always holds a slot).
+// - The placeholder functions of `disposeQueue` (`fire.timeout`) and `adopt` (`gate.open`): replaced synchronously by
+//   their Promise executors.
+// - `start`: the equal-planId arm of the plan sort (plan ids are unique; store.list() returns them in id order).
+// QA gate arms the ledger's qa-gate invariant (batchEndViolation) makes illegal: `adoptChild`'s true arm for a ready QA
+// task whose phase gate is not awaiting-qa; `recoverGates`' `state !== "done"` true arm and its no-QA-task arm (a
+// qa-running phase with no QA task in flight and none done), and its if-false arm for a second finished QA task of the
+// same phase (a draft with two QA tasks in one phase is refused by `create`, E_SCHEMA_INVALID, and the QaLoop double
+// never creates next-round tasks).

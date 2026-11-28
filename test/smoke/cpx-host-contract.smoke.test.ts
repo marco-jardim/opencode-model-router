@@ -2366,6 +2366,16 @@ const DECISIONS: Record<string, (o: Observation) => void> = {
       check(o, "C14/D14", kids.length === RETAINED_COUNT && kids.every(k => typeof at(k, "progressResolvedAt") === "number" && typeof at(k, "firstContextAt") === "number" && at(k, "resolvedBeforeFirstContext") === true),
         `batch ${batch + 1}: for every retained child the host must AWAIT \`progress\` (resolved after the probe's ${String(at(binding, "delayMs"))} ms delay) BEFORE the child's first context hook; if not, launcher A's bind / move inside onCreated races the child's first request (src/compat/v2-client.ts) and must bind in the context hook instead (per child: ${json(kids.map(k => ({ n: at(k, "n"), gapMs: at(k, "contextMinusResolvedMs") })))})`);
       check(o, "C14/D14", kids.length === RETAINED_COUNT && kids.every(k => at(k, "moveStatus") === "ok"), `batch ${batch + 1}: ctx.session.move({ sessionID, directory }) on the child from inside \`progress\` must succeed for every child (moveStatus per child: ${json(kids.map(k => at(k, "moveStatus") ?? at(k, "moveError")))})`);
+      // 0.1-r3-c: the delay really ran inside `progress` (so "resolved before the first context" covers the whole window), and the
+      // move took effect on the child session (its directory read back after the move is the moved directory).
+      const delayMs = Number(at(binding, "delayMs"));
+      check(o, "C14/D14", kids.length === RETAINED_COUNT && kids.every(k => typeof at(k, "progressTookMs") === "number" && Number(at(k, "progressTookMs")) >= delayMs),
+        `batch ${batch + 1}: every retained child's \`progress\` must take at least the probe's ${delayMs} ms delay (progressTookMs per child: ${json(kids.map(k => at(k, "progressTookMs")))})`);
+      const moveDir = String(at(binding, "moveDir"));
+      const samePath = (a: unknown): boolean => typeof a === "string" && a !== ""
+        && (process.platform === "win32" ? path.resolve(a).toLowerCase() === path.resolve(moveDir).toLowerCase() : path.resolve(a) === path.resolve(moveDir));
+      check(o, "C14/D14", kids.length === RETAINED_COUNT && kids.every(k => samePath(at(k, "moveDirectoryAfter"))),
+        `batch ${batch + 1}: after the move, every retained child's session directory must be ${moveDir} (directoryAfter per child: ${json(kids.map(k => at(k, "moveDirectoryAfter") ?? at(k, "moveGetError")))})`);
     }
     if (at(binding, "moveReadObservable") === true) {
       check(o, "C14/D14", at(binding, "allReadsInMovedDir") === true, `launcher A moves the child before its first request: every retained child's relative \`read\` must resolve inside the moved directory (file content carries the marker "${MOVED_MARKER}", never the project one); per child: ${json(list(at(binding, "reads")))}`);
