@@ -2750,8 +2750,12 @@ describe("physical slot admission", () => {
       };
       await h.begin();
       await until(() => entered, "highest-priority acquisition waiting on git");
+      // QA-4.2-41: the tick the tool call schedules decides on T1 before the check: it skips it for want of a slot.
+      const slotSkips = async (): Promise<number> => (await h.events()).filter((e) => e.type === "metric" && e.metric.name === "counter"
+        && e.metric.key === "launch-skipped" && e.metric.labels.reason === "slot-unavailable").length;
+      const skipsBefore = await slotSkips();
       h.runtime.onRouterToolCall(ORCH);
-      await pause(30);
+      await until(async () => (await slotSkips()) > skipsBefore, "the next tick skipping T1 for want of a slot");
       expect(acquire.mock.calls.map(([, owner]) => owner)).toEqual([`plan:${PLAN_ID}:T2`]);
       lookup.resolve();
       const run = await h.runOf("T2", 1);
@@ -4166,6 +4170,25 @@ describe("QA-3.1 round 1 regressions (runtime)", () => {
     expect(h.parts().policy.raised).toEqual([]);
   });
 
+  it("QA-3.1-17 (3.1-r3-d): a second round lost under the same capture counts each task lost again: the plan pauses with one item", async () => {
+    const h = await mk(planOf([task("T1"), task("T2"), task("T3")]));
+    await h.begin();
+    const first = [await h.runOf("T1", 1), await h.runOf("T2", 1), await h.runOf("T3", 1)];
+    for (const run of first) run.confirm({ kind: "unconfirmed", reason: "threw", error: "runner crashed" });
+    // Round one counted once (one capture): the plan still runs and relaunches all three under the same capture.
+    const second = [await h.runOf("T1", 2), await h.runOf("T2", 2), await h.runOf("T3", 2)];
+    expect(h.ledger().status).toBe("running");
+    expect(h.parts().policy.raised).toEqual([]);
+    expect(second.map((r) => r.req.context.callID)).toEqual(["call-1", "call-1", "call-1"]);
+    // Round two: each task is lost again within that capture, so each loss counts (1 + 2 reaches the streak of 3).
+    for (const run of second) run.confirm({ kind: "unconfirmed", reason: "threw", error: "runner crashed" });
+    await until(() => h.ledger().status === "paused", "plan paused by the second round");
+    await until(() => h.parts().policy.raised.length === 1, "one blocking item");
+    expect(h.parts().policy.raised[0]).toMatchObject({ kind: "failure", severity: "blocking" });
+    expect(h.parts().policy.raised[0]?.text).toContain("3 consecutive launches were lost before their child started");
+    expect(h.parts().policy.counted).toEqual([]);
+  });
+
   it("QA-3.1-17: three losses under three distinct captures still pause the plan (one blocking item)", async () => {
     const h = await mk(planOf([task("T1")]));
     const capture = (n: number): LaunchGate => ({ ok: true, context: { ...GATE_CONTEXT, callID: `call-${n}` }, ageMs: 0 });
@@ -4523,7 +4546,8 @@ describe("late child end synthesized from host events", () => {
   const detach = async (h: Harness, sessionID: string): Promise<RunDouble> => {
     const run = await h.running("T1", 1, sessionID);
     run.end({ kind: "interrupted", childSessionID: sessionID, reason: "dispose", endedAt: h.clock.iso() });
-    await pause(20);
+    // QA-4.2-41: the launch completion settled, so no tracked work waits for the child; its end was processed.
+    await h.runtime.settled();
     expect(h.state("T1")).toBe("running");
     return run;
   };
@@ -4582,7 +4606,7 @@ describe("late child end synthesized from host events", () => {
     expect(h.task("T1").attempts[0]).toMatchObject({ outcome: "failed", context: "provider.internal: boom" });
 
     await h.running("T1", 2, "ses-c2").then((run) => run.end({ kind: "interrupted", childSessionID: "ses-c2", reason: "dispose", endedAt: h.clock.iso() }));
-    await pause(20);
+    await h.runtime.settled();
     h.runtime.onHostEvent({ type: "execution.failed", sessionID: "ses-c2", error: ERR_RATE_LIMIT, at: h.clock.iso() });
     await h.runOf("T1", 3);
     const a2 = need(h.task("T1").attempts[1], "attempt 2");
@@ -4618,7 +4642,8 @@ describe("late child end synthesized from host events", () => {
     h.runtime.onHostEvent({ type: "step.started", sessionID: "ses-c1", providerID: PROVIDER, modelID: "model-1", at: h.clock.iso() });
     h.runtime.onHostEvent({ type: "step.started", sessionID: ORCH, providerID: PROVIDER, modelID: "model-1", at: h.clock.iso() });
     h.runtime.onHostEvent({ type: "execution.failed", sessionID: ORCH, error: { type: "provider.internal", status: 500, message: "x" }, at: h.clock.iso() });
-    await pause(30);
+    // QA-4.2-41: `detach` settled the launch, so no tracked work waits for the child; the events were processed.
+    await h.runtime.settled();
     expect(h.state("T1")).toBe("running");
   });
 });
@@ -5126,7 +5151,8 @@ describe("branch top-up: late children, ends, streaks, lease footprints", () => 
     await h.runtime.pause(PLAN_ID, ORCH);
     third.end({ kind: "lost", childSessionID: "ses-c3", reason: "unrequested-interrupt", endedAt: h.clock.iso() });
     await until(() => h.state("T1") === "ready", "T1 back to ready");
-    await pause(30);
+    // QA-4.2-41: every child ended and the paused plan launches none, so the lost end's streak check has run.
+    await h.runtime.settled();
     expect(h.ledger().status).toBe("paused");
     expect(h.parts().policy.raised).toEqual([]);
     expect(h.task("T1").attempts.map((a) => a.outcome)).toEqual(["lost", "lost", "lost"]);
@@ -5181,7 +5207,9 @@ describe("branch top-up: verification racing an abort", () => {
     held.release();
     await until(() => h.state("T1") === "verified", "T1 verified");
     await until(() => h.parts().policy.counted.length === 1, "attempt counted");
-    await pause(20);
+    // QA-4.2-41: the child completed and abort waits on the queue outside the tracked work: the verification pipeline
+    // (and any enqueue it would make) has run once this settles.
+    await h.runtime.settled();
     expect(h.parts().queue.enqueued).toEqual([]);
 
     queueAbort.resolve();
@@ -5210,7 +5238,8 @@ describe("branch top-up: verification racing an abort", () => {
     const child = await h.running("T1", 1, "ses-c1");
     child.complete("Done.");
     await until(() => h.state("T1") === "cancelled", "T1 cancelled");
-    await pause(30);
+    // QA-4.2-41: no child is live (it completed), so every tracked step has run before the negative checks.
+    await h.runtime.settled();
     expect(h.state("T1")).toBe("cancelled");
     expect(h.verifier.calls).toEqual([]);
     expect(h.parts().queue.enqueued).toEqual([]);
@@ -5232,7 +5261,8 @@ describe("branch top-up: verification racing an abort", () => {
     h.verifier.queue.push({ verdict, findings: "late findings" });
     held.release();
     await until(() => h.verifier.calls.length === 1, "verifier answered");
-    await pause(30);
+    // QA-4.2-41: no child is live (it completed), so the late verdict's pipeline has run before the negative checks.
+    await h.runtime.settled();
     expect(h.state("T1")).toBe("cancelled");
     expect(h.task("T1").attempts[0]).toMatchObject({ outcome: "succeeded", verdict: null, context: "" });
     expect(h.parts().policy.counted).toEqual([]);

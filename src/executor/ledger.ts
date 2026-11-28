@@ -301,10 +301,6 @@ function edgeEndpointExists(l: LedgerV1, id: string): boolean {
   return taskOf(l, id) !== null;
 }
 
-function sameStrings(a: readonly string[], b: readonly string[]): boolean {
-  return a.length === b.length && a.every((x, i) => x === b[i]);
-}
-
 function isSuperset(next: readonly string[], prev: readonly string[]): boolean {
   return prev.every((p) => next.includes(p));
 }

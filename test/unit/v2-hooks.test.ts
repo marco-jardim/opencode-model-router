@@ -1873,6 +1873,16 @@ describe("plan executor wiring in the v2 adapter (3.1.7: W2, W4, W5, W6, M41)", 
       expect(await refusal(w, "m41-fallback-bound")).not.toMatch(/no matching plan binding/);
     });
 
+    it("execute.before fallback: the host's recorded context entry shape { type: \"user\", text } is checked too (3.1-r3-d)", async () => {
+      const w = await startWired();
+      const recorded = (text: string): unknown[] => [{ type: "user", text }];
+      w.messagesBySession.set("m41-typed-fallback", recorded(planPrompt("plan-one", "T1")));
+      expect(await refusal(w, "m41-typed-fallback")).toMatch(/no matching plan binding/);
+      bind("m41-typed-fallback-bound", "plan-one", "T1");
+      w.messagesBySession.set("m41-typed-fallback-bound", recorded(planPrompt("plan-one", "T1")));
+      expect(await refusal(w, "m41-typed-fallback-bound")).not.toMatch(/no matching plan binding/);
+    });
+
     it("root sessions are not checked, and a prompt without a header never refuses", async () => {
       const w = await startWired();
       await w.f.sessionHooks.context(w.contextEvent("root-m41", planPrompt("plan-one", "T1")));

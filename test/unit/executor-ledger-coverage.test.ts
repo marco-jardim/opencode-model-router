@@ -1,7 +1,7 @@
 // Phase 2.2 task 2.2.3 coverage top-up: unit tests of the less travelled branches of the durable ledger store
 // (src/executor/ledger.ts). Real files in a temp dir through the FileSystem seam, an injected clock (no fixed sleeps) and an
 // injected process table, as in test/unit/executor-ledger.test.ts.
-// Not reachable from the public API, so not covered here: `sameStrings` (no caller), the `?? ""` fallbacks of `parseJournal`, the
+// Not reachable from the public API, so not covered here: the `?? ""` fallbacks of `parseJournal`, the
 // non-`ledger-init` guard of `initLedger` (its only caller checks first), a migration that advances the schema (the table is empty),
 // `ensureJournal` with no journal (every start rotates into one) and the journal-continues-later check of a snapshot load.
 import { mkdir, mkdtemp, readFile, readdir, symlink, writeFile } from "node:fs/promises";

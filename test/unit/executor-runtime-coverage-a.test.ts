@@ -1,5 +1,6 @@
-// Coverage tests for src/executor/runtime.ts, lines 493-2310 (guards, park/retry arms, held leases, route streaks).
-// The harness is a minimal copy of the one in executor-runtime-coverage.test.ts (that file exports nothing): real
+// Coverage tests for src/executor/runtime.ts from `boundedSet` through `build` (guards, park/retry arms, held leases,
+// route streaks). Line numbers in test titles are those of runtime.ts at fbb18a3, when these tests were written.
+// The harness is a minimal copy of the one in executor-runtime.test.ts (that file exports nothing): real
 // LedgerStore in a temp dir, the real Scheduler, CapacityController and expand; typed doubles for every other seam. All
 // time comes from TestClock; `until` only yields to the event loop while the real ledger files are written. Handles of
 // the launcher double stay pending until a test settles them, so tests poll `until(...)` instead of runtime.settled()
@@ -86,7 +87,7 @@ const REPO = "C:/repo";
 const T15 = 15_000;
 
 // ---------------------------------------------------------------------------------------------------------------
-// Clock and small helpers (copied from executor-runtime-coverage.test.ts)
+// Clock and small helpers (copied from executor-runtime.test.ts)
 // ---------------------------------------------------------------------------------------------------------------
 
 class TestClock implements Clock {
@@ -219,7 +220,7 @@ const OK_GATE: LaunchGate = { ok: true, context: GATE_CONTEXT, ageMs: 0 };
 const DISPOSED_GATE: LaunchGate = { ok: false, reason: "disposed", wake: null };
 
 // ---------------------------------------------------------------------------------------------------------------
-// Doubles (copied from executor-runtime-coverage.test.ts)
+// Doubles (copied from executor-runtime.test.ts)
 // ---------------------------------------------------------------------------------------------------------------
 
 class SlotPoolDouble implements SlotPool {
@@ -1013,7 +1014,7 @@ describe("runtime tick: route failures and backoff", () => {
     // The streak raises once: further rounds stay silent (the `routeRaised` arm of line 961).
     for (let i = 0; i < 6; i++) {
       h.clock.advance(60_000);
-      await pause(5);
+      await h.runtime.settled();
     }
     expect(h.parts().policy.raised).toHaveLength(1);
   }, T15);
@@ -1150,7 +1151,7 @@ describe("runtime: park without journaling and late children", () => {
     await until(() => h.ledger().status === "paused", "plan paused");
     run3.confirm({ kind: "unconfirmed", reason: "timeout", error: null });
     await until(() => h.task("T1").attempts[2]?.outcome === "lost" && h.state("T1") === "ready", "attempt 3 lost");
-    await pause(20);
+    await h.runtime.settled();
     expect(h.ledger().status).toBe("paused");
     expect(h.parts().policy.raised).toHaveLength(0);
     expect(await counterLabels(h, "launch-lost-pause")).toHaveLength(0);
@@ -1181,7 +1182,7 @@ describe("runtime: integration results", () => {
     expect(h.registry.releases.slice(releasesBefore)).toContain(`${PLAN_ID}:T1`);
     // Only the attempt the runtime holds a handle for is cancelled (T1#7 is skipped); no slot is left to release.
     expect(h.launcher.cancels.filter((c) => c.endsWith(":blocked"))).toEqual(["T1#1:blocked"]);
-    await pause(20);
+    await h.runtime.settled();
     expect(h.slots.released.length).toBe(slotReleasesBefore);
     expect(h.state("T1")).toBe("blocked");
   }, T15);
@@ -1217,7 +1218,7 @@ describe("runtime: integration results", () => {
     await until(() => h.state("T1") === "parked", "T1 parked again");
     expect(h.parts().policy.parks[1]).toEqual({ taskId: "T1", cause: "exhausted", text: "queue failure" });
     expect(h.parts().policy.counted.map((c) => c.n)).toEqual([1, 2]);
-    await pause(20);
+    await h.runtime.settled();
     expect(h.slots.released.length).toBe(releasedBefore);
   }, T15);
 });
@@ -1308,7 +1309,7 @@ describe("runtime: batch re-checks against a concurrent batch", () => {
       await untilCounter(h, "launch-failed", (l) => l.row === c.row, `${c.row} counter`);
       await need(st.p, "concurrent batch");
       await until(() => h.state("T1") === "ready", "T1 ready");
-      await pause(20);
+      await h.runtime.settled();
       noConcurrentFailure(h);
       const t = h.task("T1");
       expect(t.attempts).toHaveLength(1);
@@ -1355,7 +1356,7 @@ describe("runtime: batch re-checks against a concurrent batch", () => {
     await until(() => st.p !== null, "parse");
     await need(st.p, "concurrent batch");
     await until(() => h.state("Q1") === "ready", "Q1 requeued");
-    await pause(20);
+    await h.runtime.settled();
     noConcurrentFailure(h);
     const a = need(h.task("Q1").attempts[0], "attempt 1");
     expect(a.outcome).toBe("lost");
@@ -1378,7 +1379,7 @@ describe("runtime: batch re-checks against a concurrent batch", () => {
     await until(() => st.p !== null, "parse");
     await need(st.p, "concurrent batch");
     await until(() => h.state("Q1") === "ready", "Q1 requeued");
-    await pause(20);
+    await h.runtime.settled();
     noConcurrentFailure(h);
     expect(h.task("Q1").attempts[0]?.outcome).toBe("lost");
     expect(h.task("Q1").slot).toBe("slot-1");
@@ -1401,7 +1402,7 @@ describe("runtime: batch re-checks against a concurrent batch", () => {
     await need(st.p, "concurrent batch");
     await untilCounter(h, "learned-edge", (l) => l.result === "free", "learned-edge counter");
     await until(() => h.state("T1") === "ready", "T1 requeued");
-    await pause(20);
+    await h.runtime.settled();
     noConcurrentFailure(h);
     const t = h.task("T1");
     expect(t.attempts[0]?.outcome).toBe("lost");
@@ -1421,7 +1422,7 @@ describe("runtime: batch re-checks against a concurrent batch", () => {
     run.complete("all done");
     await concurrent;
     await until(() => h.state("T1") === "ready", "T1 requeued");
-    await pause(20);
+    await h.runtime.settled();
     noConcurrentFailure(h);
     expect(h.task("T1").attempts.map((a) => a.outcome)).toEqual(["lost"]);
     expect(h.git.calls.some((c) => c.args[0] === "commit")).toBe(false);
@@ -1437,7 +1438,7 @@ describe("runtime: batch re-checks against a concurrent batch", () => {
     run.end({ kind: "lost", childSessionID: "ses-1", reason: "runner-error", endedAt: h.clock.iso() });
     await concurrent;
     await until(() => h.state("T1") === "ready", "T1 requeued");
-    await pause(20);
+    await h.runtime.settled();
     noConcurrentFailure(h);
     const ends = (await h.events()).filter((e) => e.type === "attempt-ended" && e.taskId === "T1");
     expect(ends).toHaveLength(1);
@@ -1460,7 +1461,7 @@ describe("runtime: batch re-checks against a concurrent batch", () => {
     run.complete("all done");
     await until(() => h.state("T1") === "done", "T1 done");
     await need(st.p, "concurrent batch");
-    await pause(20);
+    await h.runtime.settled();
     noConcurrentFailure(h);
     const ev = await h.events();
     expect(ev.some((e) => e.type === "task-transition" && e.trigger === "commit-failed")).toBe(false);
@@ -1469,27 +1470,40 @@ describe("runtime: batch re-checks against a concurrent batch", () => {
   }, T15);
 });
 
-// Arms of 493-2310 left uncovered on purpose (unreachable through the public seams):
-// - 805: `retryHeldLeases` is only called by `tickOnce` with a non-empty hold, after its own `disposed` check, and a
-//   passive plan never ticks.
-// - 1041: when no retry state exists `key === baseKey`, so line 1040 already returned.
-// - 1045 #1/#2: the runtime's own waker answers `debounced` only after a journaled attempt, so `lastAttemptMs()` is set.
-// - 1178: `readySet` skips in-flight tasks before it resolves a route, so an unroutable id is never in flight.
-// - 660 (`?? null`): `phaseAdmits` never schedules a task whose phase record is missing, so no launched task has one.
-// - 964 #1, 965 null arm, 970 `??` fallbacks: `routeFailures` only runs with a non-empty `failed` map.
-// - 1605/1610 null callID: every dispatched attempt carries the gate context's callID (a string), and only dispatched
-//   attempts reach row 11.
-// - 2253: `planFor` serialises the opens of one plan and `start` skips attached plans; the re-check is a race guard.
-// - 2309: `ref.p` is set before the waker can be called (no wake happens while the plan is being built).
-// - 1583, 1663 (`a === null`): the same builder returned [] one line above when the open attempt is missing.
-// - 860, 871, 873, 874, 885: guards of the held-lease resume (QA-4.2-16/-26) re-read under the task mutex a state
-//   `retryHeldLeases` checked just before (task present, slot set, plan not disposed); 885 is never reached since every
-//   caller checks `t.slot` first.
-// - 893 (`rec.commit ?? head`), 1096 (provider limit 0 with a ready task), 1158 (plan finished then not, inside one
-//   batch), 1965 (row 15 applied, then not completed), 2151 (`?? null`: a capacity metric of an unregistered plan),
-//   2188 (unreserve without a reservation): need a restart/recovery or a timing race the public seams do not expose.
-// - 1264, 1266: the tick computes `n` and starts the step synchronously under the task's `inFlight` guard; every other
-//   writer of a ready task's attempts runs under the same task mutex and re-ticks after it, so the step never sees a
-//   stale `n` or a non-ready task without a timing race.
-// - 617, 650, 1198, 1224, 1504, 1516, 1684, 1747, 1991, 2030, 2031: lookups of a task or attempt the caller has just
-//   read (tasks and attempts are never removed from a ledger).
+// Arms from `boundedSet` through `build` left uncovered on purpose (unreachable through the public seams), by function
+// of src/executor/runtime.ts:
+// - `retryHeldLeases`: its `disposed` guard; it is only called by `tickOnce` with a non-empty hold, after the tick's own
+//   `disposed` check, and a passive plan never ticks.
+// - `wakeOnce`: the retry-key arm (with no retry state `key === baseKey`, so the call already returned) and both
+//   fallbacks of `p.waker.lastAttemptMs() ?? p.lastWakeMs ?? now` (the runtime's own waker answers `debounced` only
+//   after a journaled attempt, so `lastAttemptMs()` is set).
+// - `tickOnce`: the in-flight filter of the unroutable ids (`readySet` skips in-flight tasks before it resolves a route,
+//   so an unroutable id is never in flight).
+// - `phaseOf` (`?? null`): `phaseAdmits` never schedules a task whose phase record is missing, so no launched task has
+//   one.
+// - `routeFailures`: the undefined `first` entry (`first?.[0] ?? null`), the null-task-id label and the `??` fallbacks
+//   of its text; it only runs with a non-empty `failed` map.
+// - `preConfirmCounts` (null callID): every dispatched attempt carries the gate context's callID (a string), and only
+//   dispatched attempts reach row 11.
+// - `attach`: its re-check of an attached plan; `planFor` serialises the opens of one plan and `start` skips attached
+//   plans, so the re-check is a race guard.
+// - `build`: the waker callbacks' `ref.p === null` arm; `ref.p` is set before the waker can be called (no wake happens
+//   while the plan is being built).
+// - `rowLost` and `rowLaunchFailed` (`a === null`): the same builder returned [] one line above when the open attempt
+//   is missing.
+// - `slotVanished`, `resumeHeldTask` and `slotLeaseOf`: guards of the held-lease resume (QA-4.2-16/-26) re-read under the
+//   task mutex a state `retryHeldLeases` checked just before (task present, slot set, plan not disposed); the no-slot
+//   throw of `slotLeaseOf` is never reached since every caller checks `t.slot` first.
+// - Arms that need a restart/recovery or a timing race the public seams do not expose: `slotLeaseOf`
+//   (`rec.commit ?? head`), `updateIdle` (provider limit 0 with a ready task), `tickOnce` (plan finished then not,
+//   inside one batch), `commitAndVerify` (row 15 applied, then not completed), `makeCapacity` (`?? null`: a capacity
+//   metric of an unregistered plan), `unreserve` (unreserve without a reservation).
+// - `launchStep`: its first two guards (task not ready, `attempts.length + 1 !== n`). The tick computes `n` and starts
+//   the step synchronously under the task's `inFlight` guard; every other writer of a ready task's attempts runs under
+//   the same task mutex and re-ticks after it, so the step never sees a stale `n` or a non-ready task without a timing
+//   race.
+// - Lookups of a task or attempt the caller has just read (tasks and attempts are never removed from a ledger): `own`
+//   (`?? null`), the invariant throw of `attemptOf`, `tickOnce` (the attempt count of a ready task), `startStep`
+//   (`attemptsOf`), `launchHooks` (`onLateChild`'s task and attempt, `onChildCreated`'s "task vanished"),
+//   `countAttempt` (`a === undefined`), `handleEnd` (`t === null`), `commitAndVerify` (`att === undefined`) and
+//   `verifyAttemptNow` (the task and attempt of its entry guard).
