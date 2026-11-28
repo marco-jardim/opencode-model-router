@@ -651,8 +651,9 @@ describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
   });
 
   it("names code-derived automatic safety pause reasons in unattended operation and troubleshooting (G-8)", () => {
-    // Non-vacuity: three runtime guards, six distinct queue guards, four phase-suite/revert guards and the QA cap.
-    expect(safetyPauses.plan).toHaveLength(9);
+    // Non-vacuity: four runtime guards (#189 added reconcile-failed), six distinct queue guards, four phase-suite/revert
+    // guards and the QA cap.
+    expect(safetyPauses.plan).toHaveLength(10);
     expect(safetyPauses.phase).toHaveLength(5);
     expect(executorSafetyPauseDocProblems(doc, safetyPauses)).toEqual([]);
     expect(sectionOf(doc, "## Unattended operation").replace(/\s+/g, " ")).toContain(

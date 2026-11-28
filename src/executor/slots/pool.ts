@@ -1239,6 +1239,31 @@ export function createSlotPool(d: SlotPoolDeps): OpenSlotPool {
     }
   }
 
+  /** R2-3 (#189): the claim's base lookup, abandoned when the pool closes (rejected as closed); the original error otherwise. */
+  function lookupUntilClosed(baseLookup: Promise<string>): Promise<string> {
+    return new Promise<string>((resolve, reject) => {
+      const signal = abort.signal;
+      const onClose = (): void => {
+        reject(new ExecutorError("E_PLAN_STATE", "the slot pool is closed", { planId: d.planId }));
+      };
+      if (signal.aborted) {
+        onClose();
+        return;
+      }
+      signal.addEventListener("abort", onClose, { once: true });
+      baseLookup.then(
+        (base) => {
+          signal.removeEventListener("abort", onClose);
+          resolve(base);
+        },
+        (error: unknown) => {
+          signal.removeEventListener("abort", onClose);
+          reject(error);
+        },
+      );
+    });
+  }
+
   async function acquireSlot(
     claim: (base: string) => Promise<{ slot: string; mode: ClaimMode }>, spec: Omit<AcquireSpec, "base">,
     baseLookup: Promise<string>,
@@ -1248,7 +1273,11 @@ export function createSlotPool(d: SlotPoolDeps): OpenSlotPool {
     const scheduled = await poolLock.run(async () => {
       try {
         // Queued on the pool mutex before awaiting this caller's lookup, so lookup timing cannot reorder claims.
-        const base = await baseLookup;
+        // R2-3 (#189): once the pool closes, no claim waits on its lookup (the head one stops waiting, the queued ones
+        // never start) and none claims a slot.
+        assertLive();
+        const base = await lookupUntilClosed(baseLookup);
+        assertLive();
         const { slot, mode } = await claim(base);
         observe("slot-claim", () => ({ slot, kind: spec.kind, taskId: taskIdOf(spec.owner), mode }));
         // Queued on the slot mutex before the pool mutex is released, so nothing runs on this slot ahead of the claim.

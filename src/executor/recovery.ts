@@ -120,7 +120,8 @@ function inferSharedContext(prompt: string): string | null {
 function normalizeToplevel(p: string): string {
   let real = p;
   try {
-    real = realpathSync(p);
+    // QA-4.2-42 (#189): the native realpath expands win32 8.3 short names; the JS one keeps them.
+    real = realpathSync.native(p);
   } catch {
     // a path that cannot be resolved is compared as written
   }
