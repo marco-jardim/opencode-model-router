@@ -8,7 +8,8 @@
  * - win32: `powershell.exe` looping over `Get-CimInstance Win32_Process`, one compact JSON line
  *   per snapshot. `Priority` is the base priority: 6 is below normal, 8 normal.
  * - POSIX: `sh -c` looping over `ps -eo pid=,ppid=,ni=,args=`, framed by a timestamp line and a
- *   separator. `nice >= 10` counts as low priority.
+ *   separator. `nice >= 10` counts as low priority. On Linux each frame also carries every
+ *   `/proc/<pid>/stat` line, for the processes' start ticks (parsePosixFrame).
  *
  * The pure helpers below (descendantsOf, peak, seen, priorityViolations) work on the snapshots.
  */
@@ -24,6 +25,12 @@ export interface ProcSample {
   priority: number | undefined /* win32 base priority or POSIX nice */;
   args: string;
   createdMs?: number;
+  /**
+   * Linux: the start time from `/proc/<pid>/stat` (field 22, clock ticks since boot). It only
+   * orders processes (which fork came first, #175) and is never compared with wall-clock times:
+   * converting it needs the boot time, which /proc/stat gives in whole seconds.
+   */
+  startTicks?: number;
 }
 
 export interface Snapshot {
@@ -111,7 +118,10 @@ function windowsScript(intervalMs: number): string {
 
 function posixScript(intervalMs: number): string {
   const secs = (intervalMs / 1000).toFixed(3);
-  return `while :; do echo "@@T"; ps -eo pid=,ppid=,ni=,args=; echo "@@END"; sleep ${secs}; done`;
+  // Linux: also every process's /proc/<pid>/stat (start ticks, parseProcStat). A process gone
+  // between the glob and the read is skipped (cat's error is discarded); without /proc, no section.
+  const stat = `if [ -r /proc/self/stat ]; then echo "@@STAT"; cat /proc/[0-9]*/stat 2>/dev/null; fi`;
+  return `while :; do echo "@@T"; ps -eo pid=,ppid=,ni=,args=; ${stat}; echo "@@END"; sleep ${secs}; done`;
 }
 
 interface WinRow {
@@ -155,6 +165,48 @@ function parsePsLine(line: string): ProcSample | undefined {
   };
 }
 
+/**
+ * One `/proc/<pid>/stat` line, `pid (comm) state ppid ...`: the pid and field 22, the start time
+ * in clock ticks since boot. comm may hold spaces and parentheses, so the fields after it are
+ * counted from the last `)`. undefined for a line that is not one.
+ */
+export function parseProcStat(line: string): { pid: number; startTicks: number } | undefined {
+  const head = /^(\d+) \(/.exec(line);
+  const close = line.lastIndexOf(")");
+  if (head === null || close < head[0].length) return undefined;
+  // The fields after comm start at field 3, so field 22 is the 20th of them.
+  const start = line.slice(close + 1).trim().split(/\s+/)[22 - 3];
+  if (start === undefined || !/^\d+$/.test(start)) return undefined;
+  return { pid: Number(head[1]), startTicks: Number(start) };
+}
+
+/**
+ * One POSIX snapshot from the lines between `@@T` and `@@END`: the `ps` rows, then on Linux
+ * `@@STAT` and one /proc/<pid>/stat line per process, whose start ticks go to the ps row of the
+ * same pid. A process that exited between `ps` and the /proc read has no start ticks.
+ */
+export function parsePosixFrame(t: number, lines: readonly string[]): Snapshot {
+  const procs: ProcSample[] = [];
+  const ticks = new Map<number, number>();
+  let inStat = false;
+  for (const line of lines) {
+    if (line === "@@STAT") {
+      inStat = true;
+    } else if (inStat) {
+      const s = parseProcStat(line);
+      if (s !== undefined) ticks.set(s.pid, s.startTicks);
+    } else {
+      const p = parsePsLine(line);
+      if (p !== undefined) procs.push(p);
+    }
+  }
+  for (const p of procs) {
+    const startTicks = ticks.get(p.pid);
+    if (startTicks !== undefined) p.startTicks = startTicks;
+  }
+  return { t, procs };
+}
+
 export function startSampler(opts?: {
   intervalMs?: number /* default 100 */;
   /** The sampler child's environment; default: process.env with the real profile/temp dirs (see REAL_PROFILE_ENV). */
@@ -166,7 +218,7 @@ export function startSampler(opts?: {
   const snapshots: Snapshot[] = [];
   let parseErrors = 0;
   let buffer = "";
-  let posixCurrent: Snapshot | undefined;
+  let posixCurrent: { t: number; lines: string[] } | undefined;
 
   let child: ChildProcess;
   if (isWin) {
@@ -197,13 +249,12 @@ export function startSampler(opts?: {
       return;
     }
     if (trimmed === "@@T") {
-      posixCurrent = { t: Date.now(), procs: [] };
+      posixCurrent = { t: Date.now(), lines: [] };
     } else if (trimmed === "@@END") {
-      if (posixCurrent !== undefined) snapshots.push(posixCurrent);
+      if (posixCurrent !== undefined) snapshots.push(parsePosixFrame(posixCurrent.t, posixCurrent.lines));
       posixCurrent = undefined;
     } else if (posixCurrent !== undefined) {
-      const s = parsePsLine(trimmed);
-      if (s !== undefined) posixCurrent.procs.push(s);
+      posixCurrent.lines.push(trimmed);
     }
   };
 
@@ -398,9 +449,12 @@ export function workerKey(p: ProcSample): string {
  * Only that excess is excused. Under one parent main with more than `perRunCap` workers alive,
  * up to (alive - perRunCap) of them retire, oldest first, and only workers that are (a) in their
  * last sighting, never the final snapshot's, since a worker seen again later was not exiting, and
- * (b) older than a sibling under the same main (created later, or first seen later where creation
- * times are unknown), since a fork with no successor was not replaced. A main never counts fewer
- * than min(alive, perRunCap) running workers, so two runs at once still add up.
+ * (b) replaced: older than a sibling under the same main (by creation time on win32, start ticks
+ * on Linux, else first sighting), or seen in this snapshot only while the same main has a worker
+ * in the next one, whose pool went on without it (#175: without an order, a fork and its
+ * successor born within one interval are first seen together and tie). A fork with no successor
+ * was not replaced. A main never counts fewer than min(alive, perRunCap) running workers, so two
+ * runs at once still add up.
  */
 export function workerCensus(
   snapshots: Snapshot[],
@@ -410,31 +464,41 @@ export function workerCensus(
   perRunCap: number,
 ): WorkerCensus[] {
   const sightings = new Map<string, { first: number; last: number }>();
+  /** Start ticks per life, from any snapshot that has them (a process gone before the /proc read has none there). */
+  const ticks = new Map<string, number>();
   const perSnapshot = snapshots.map(s => ({ snapshot: s, workers: descendantsOf(s, rootPid, exclude).filter(isWorker) }));
   for (const { snapshot, workers } of perSnapshot) {
     for (const w of workers) {
-      const x = sightings.get(workerKey(w));
-      if (x === undefined) sightings.set(workerKey(w), { first: snapshot.t, last: snapshot.t });
+      const key = workerKey(w);
+      const x = sightings.get(key);
+      if (x === undefined) sightings.set(key, { first: snapshot.t, last: snapshot.t });
       else x.last = snapshot.t;
+      if (w.startTicks !== undefined && !ticks.has(key)) ticks.set(key, w.startTicks);
     }
   }
-  const age = (p: ProcSample): number => p.createdMs ?? sightings.get(workerKey(p))?.first ?? 0;
-  const newer = (a: ProcSample, b: ProcSample): boolean =>
-    a.createdMs !== undefined && b.createdMs !== undefined
-      ? a.createdMs > b.createdMs
-      : (sightings.get(workerKey(a))?.first ?? 0) > (sightings.get(workerKey(b))?.first ?? 0);
+  const firstSeen = (p: ProcSample): number => sightings.get(workerKey(p))?.first ?? 0;
+  /** Creation order, < 0 when `a` is older: creation times (win32), else start ticks (Linux), else first sightings. */
+  const order = (a: ProcSample, b: ProcSample): number => {
+    if (a.createdMs !== undefined && b.createdMs !== undefined) return a.createdMs - b.createdMs;
+    const ta = ticks.get(workerKey(a));
+    const tb = ticks.get(workerKey(b));
+    if (ta !== undefined && tb !== undefined) return ta - tb;
+    return firstSeen(a) - firstSeen(b);
+  };
   const final = snapshots[snapshots.length - 1];
-  return perSnapshot.map(({ snapshot, workers }) => {
+  return perSnapshot.map(({ snapshot, workers }, i) => {
     const retiring = new Set<number>();
     const byMain = new Map<number, ProcSample[]>();
     for (const w of workers) byMain.set(w.ppid, [...(byMain.get(w.ppid) ?? []), w]);
-    for (const siblings of byMain.values()) {
+    const next = perSnapshot[i + 1]?.workers ?? [];
+    for (const [main, siblings] of byMain) {
       const excess = siblings.length - perRunCap;
       if (excess <= 0 || snapshot === final) continue;
+      const mainGoesOn = next.some(o => o.ppid === main);
       siblings
         .filter(w => sightings.get(workerKey(w))?.last === snapshot.t)
-        .filter(w => siblings.some(o => o.pid !== w.pid && newer(o, w)))
-        .sort((a, b) => age(a) - age(b))
+        .filter(w => siblings.some(o => o.pid !== w.pid && order(o, w) > 0) || (firstSeen(w) === snapshot.t && mainGoesOn))
+        .sort(order)
         .slice(0, excess)
         .forEach(w => retiring.add(w.pid));
     }

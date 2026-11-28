@@ -8,7 +8,16 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { acceptance, createE2EPlugin } from "./harness";
-import { ancestorsOf, descendantsOf, startSampler, workerCensus, type ProcSample, type Snapshot } from "./sampler";
+import {
+  ancestorsOf,
+  descendantsOf,
+  parsePosixFrame,
+  parseProcStat,
+  startSampler,
+  workerCensus,
+  type ProcSample,
+  type Snapshot,
+} from "./sampler";
 
 const enabled = process.env.RUN_VERIFY_E2E === "1";
 const suite = enabled ? describe : describe.skip;
@@ -149,6 +158,123 @@ describe("e2e sampler helpers: workerCensus", () => {
     const census = workerCensus(snaps, 1, [], isWorker, 2);
     expect(census.map(c => c.running)).toEqual([2, 2, 2]);
     expect([...census[1].retiring]).toEqual([701]);
+  });
+
+  // #175 (CI, Linux): `3 workers alive, 3 running, 0 excused`: one main, created=?, each seen in
+  // that snapshot only. Linux samples have no creation time, so the three tie.
+  const linux = (pid: number, ppid: number, startTicks?: number): ProcSample => ({
+    ...proc(pid, ppid, undefined),
+    ...(startTicks === undefined ? {} : { startTicks }),
+  });
+
+  it("#175: excuses one of three forks seen in one snapshot only once the same main has a worker in the next", () => {
+    const snaps = [
+      snap(100, [main(10), linux(401, 10), linux(402, 10)]),
+      snap(200, [main(10), linux(38006, 10), linux(38012, 10), linux(38021, 10)]),
+      snap(300, [main(10), linux(38030, 10), linux(38041, 10)]),
+      snap(400, [main(10)]),
+    ];
+    const census = workerCensus(snaps, 1, [], isWorker, 2);
+    expect(census.map(c => [c.workers.length, c.running])).toEqual([[2, 2], [3, 2], [2, 2], [0, 0]]);
+    expect(census[1].retiring.size).toBe(1);
+  });
+
+  it("#175: without an order or a successor, three forks of one main seen together all count", () => {
+    const snaps = [
+      snap(100, [main(10), main(20)]),
+      snap(200, [main(10), main(20), linux(501, 10), linux(502, 10), linux(503, 10)]),
+      // The run of main 10 ended; a worker under another main is no successor.
+      snap(300, [main(10), main(20), linux(601, 20)]),
+      snap(400, [main(10), main(20)]),
+    ];
+    expect(workerCensus(snaps, 1, [], isWorker, 2).map(c => c.running)).toEqual([0, 3, 1, 0]);
+    // The same with Linux start ticks that tie (forked within one clock tick): still no order.
+    const tied = snaps.map(s => ({ ...s, procs: s.procs.map(p => (p.ppid === 10 ? { ...p, startTicks: 1000 } : p)) }));
+    expect(workerCensus(tied, 1, [], isWorker, 2).map(c => c.running)).toEqual([0, 3, 1, 0]);
+  });
+
+  it("#175: orders forks by Linux start ticks, so the oldest of three seen together retires even as its run ends", () => {
+    const snaps = [
+      snap(100, [main(10)]),
+      snap(200, [main(10), linux(503, 10, 1012), linux(501, 10, 1000), linux(502, 10, 1003)]),
+      snap(300, [main(10)]),
+    ];
+    const census = workerCensus(snaps, 1, [], isWorker, 2);
+    expect(census.map(c => c.running)).toEqual([0, 2, 0]);
+    expect([...census[1].retiring]).toEqual([501]);
+    // A snapshot whose /proc read missed a process (it exited after `ps`) keeps the ticks another
+    // snapshot read for that life: 501 and 502, first seen together, are still ordered.
+    const missed = [
+      snap(100, [main(10), linux(501, 10, 1000), linux(502, 10, 1003)]),
+      snap(200, [main(10), linux(502, 10, 1003), linux(501, 10), linux(503, 10, 1012)]),
+      snap(300, [main(10)]),
+    ];
+    expect([...workerCensus(missed, 1, [], isWorker, 2)[1].retiring]).toEqual([501]);
+  });
+
+  it("#175: two runs at once still exceed the bound when one of them replaces a fork within one interval", () => {
+    const snaps = [
+      snap(100, [main(10), main(20)]),
+      snap(200, [main(10), main(20), linux(501, 10), linux(502, 10), linux(503, 10), linux(601, 20), linux(602, 20)]),
+      snap(300, [main(10), main(20), linux(701, 10), linux(801, 20)]),
+      snap(400, [main(10), main(20)]),
+    ];
+    const census = workerCensus(snaps, 1, [], isWorker, 2);
+    // Main 10's replaced fork is excused; main 20's two are within its cap and both run: 4 against a bound of 2.
+    expect(census.map(c => c.running)).toEqual([0, 4, 2, 0]);
+    expect(census[1].retiring.size).toBe(1);
+    // Two mains with two forks each, all seen once and both going on: nothing is excused.
+    const pairs = [
+      snap(100, [main(10), main(20)]),
+      snap(200, [main(10), main(20), linux(501, 10), linux(502, 10), linux(601, 20), linux(602, 20)]),
+      snap(300, [main(10), main(20), linux(701, 10), linux(801, 20)]),
+    ];
+    expect(workerCensus(pairs, 1, [], isWorker, 2).map(c => c.running)).toEqual([0, 4, 2]);
+  });
+});
+
+// Always runs (pure): the POSIX frame, with the Linux /proc start ticks (#175).
+describe("e2e sampler helpers: POSIX frames and /proc/<pid>/stat", () => {
+  // A /proc/<pid>/stat line as Linux writes it (52 fields); field 22 (starttime) is 1795812.
+  const STAT_38006 =
+    "38006 (node) S 37966 37950 37950 0 -1 4194304 2876 0 0 0 7 2 0 0 39 19 11 0 1795812 1105735680 11420 " +
+    "18446744073709551615 1 1 0 0 0 0 0 16781312 134235650 0 0 0 17 3 0 0 0 0 0 0 0 0 0 0 0 0 0";
+  const stat = (pid: number, comm: string, ppid: number, startTicks: number): string =>
+    STAT_38006.replace(/^38006 \(node\) S 37966/, `${pid} (${comm}) S ${ppid}`).replace(" 0 1795812 ", ` 0 ${startTicks} `);
+
+  it("reads field 22 (start ticks), counting from the last ')' of comm", () => {
+    expect(parseProcStat(STAT_38006)).toEqual({ pid: 38006, startTicks: 1795812 });
+    // comm may hold spaces and parentheses.
+    expect(parseProcStat(stat(38012, "node (fork) 2)", 37966, 1795815))).toEqual({ pid: 38012, startTicks: 1795815 });
+    expect(parseProcStat(stat(7, ") S 1 1 1", 1, 42))).toEqual({ pid: 7, startTicks: 42 });
+    // Not a stat line, or one cut short.
+    expect(parseProcStat("  38006  37966  19 node forks.js")).toBeUndefined();
+    expect(parseProcStat("38006 (node) S 37966 37950")).toBeUndefined();
+    expect(parseProcStat(STAT_38006.replace(" 1795812 ", " x "))).toBeUndefined();
+  });
+
+  it("attaches the start ticks to the ps row of the same pid; a process gone before the read has none", () => {
+    const W = "node /r/node_modules/vitest/dist/workers/forks.js";
+    const frame = parsePosixFrame(1000, [
+      "37966 37950  19 node /r/node_modules/vitest/vitest.mjs related src/m12.js",
+      "38006 37966  19 " + W,
+      "38012 37966  19 " + W,
+      "@@STAT",
+      stat(37966, "node", 37950, 1795700),
+      STAT_38006,
+      // A process born after `ps` (cat itself): no row to attach to.
+      stat(38100, "cat", 38090, 1795820),
+    ]);
+    expect(frame.t).toBe(1000);
+    expect(frame.procs.map(p => [p.pid, p.ppid, p.priority, p.lowPriority, p.startTicks])).toEqual([
+      [37966, 37950, 19, true, 1795700],
+      [38006, 37966, 19, true, 1795812],
+      [38012, 37966, 19, true, undefined],
+    ]);
+    expect(frame.procs[1].args).toBe(W);
+    expect(frame.procs.every(p => p.createdMs === undefined)).toBe(true);
+    // No /proc (macOS): no section, no start ticks.
+    expect(parsePosixFrame(1000, ["38006 37966 0 " + W]).procs.map(p => [p.pid, p.startTicks])).toEqual([[38006, undefined]]);
   });
 });
 
