@@ -68,6 +68,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   completed or aborted plan is refused before its attachment closes, so an abort's cleanup (child stops, slot saves
   and releases) is no longer cut off. Recovered work that waits for leases another holder has no longer wakes the
   orchestrator. Once the slot pool closes, no slot claim waits on its base lookup any more, and none claims a slot.
+- **OpenCode v2: a held background verification whose verdict cannot be settled no longer stays `verifying` (#193).**
+  When a step before the held gate settled its pending entry threw, the entry stayed `verifying` with no verdict posted,
+  and `router_verify` on its handle waited for that run until its deadline. The entry now settles exactly once as
+  `UNVERIFIABLE` with the scrubbed error as its reason, the verdict is posted to the parent session, and the error is
+  logged. OpenCode v1 is unchanged.
 
 ### Security
 
