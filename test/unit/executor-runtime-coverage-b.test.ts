@@ -1287,7 +1287,7 @@ describe("probation", () => {
     expect(h.state("T1")).toBe("running");
   });
 
-  it("a watch for a child the attempt does not record is dropped without a read or an interrupt (line 3163)", async () => {
+  it("QA-4.2-40: a feed naming a child the attempt does not record is not adopted: no re-bind, read or interrupt", async () => {
     const h = await mk(planOf([task("T1")]));
     await h.begin();
     await h.running("T1", 1, "ses-c1");
@@ -1306,7 +1306,7 @@ describe("probation", () => {
     expect(reads).toEqual([]);
     expect(h.hosts.interrupted).toEqual([]);
     expect(h.state("T1")).toBe("running");
-    expect(h.bindings.binds.map((b) => b.childSessionID)).toEqual(["ses-x"]);
+    expect(h.bindings.binds.map((b) => b.childSessionID)).toEqual([]);
   });
 });
 

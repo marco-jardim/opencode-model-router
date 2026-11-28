@@ -3,6 +3,18 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+
+// QA-4.2-42 (#189): the native realpath resolves these win32 8.3 short names to their long form; the JS realpath does
+// not (it throws here, as for any path that does not exist). Every other path passes through unchanged.
+const shortNames = vi.hoisted(() => new Map<string, string>());
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  const native = (path: string, options?: unknown): unknown =>
+    shortNames.get(String(path)) ?? actual.realpathSync.native(path, options as never);
+  const realpathSync = Object.assign((path: string, options?: unknown): unknown => actual.realpathSync(path, options as never), { native });
+  return { ...actual, default: { ...actual, realpathSync }, realpathSync };
+});
+
 import { createLedgerStore } from "../../src/executor/ledger.js";
 import { FakeClock, FakeProc } from "../fixtures/cpx/ledger/fakes.js";
 import { removeDirWhenReleased } from "../helpers/remove-dir.js";
@@ -994,5 +1006,15 @@ describe("sameToplevel (L5)", () => {
   it("ignores separators and trailing slashes", () => {
     expect(sameToplevel("C:\\no\\such\\repo", "C:/no/such/repo/")).toBe(true);
     expect(sameToplevel("/no/such/a", "/no/such/b")).toBe(false);
+  });
+
+  it("QA-4.2-42: an 8.3 short-name toplevel is the same repository as its long form", () => {
+    shortNames.set("C:\\PROGRA~1\\OMR-RE~1", "C:\\Program Files\\omr-repository");
+    try {
+      expect(sameToplevel("C:\\PROGRA~1\\OMR-RE~1", "C:\\Program Files\\omr-repository")).toBe(true);
+      expect(sameToplevel("C:\\PROGRA~1\\OMR-RE~1", "C:\\Program Files\\other-repository")).toBe(false);
+    } finally {
+      shortNames.clear();
+    }
   });
 });

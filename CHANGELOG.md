@@ -59,6 +59,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   later); the product modules it imports already use erasable syntax only. `engines.node` stays `>=22`: it describes
   the published plugin, not the repository tools. CONTRIBUTING.md now states the development floor separately: Node
   22.18 / 23.6 or newer for the coverage merge and `npm run routing:stats`, Node 22.13 or newer for the soak analyzer.
+- **OpenCode v2: plan executor restart and recovery edge cases (#189).** A repository toplevel spelled with a Windows
+  8.3 short name is now the same repository as its long form, so its plans are no longer treated as foreign. At start,
+  a plan of this repository whose writer lock is stale is taken over and reconciled even when the restart report
+  missed it, instead of waiting for an adopt or another restart; a live holder is still refused. A plan whose
+  recovery cannot classify its tasks is no longer run unrecovered: it is paused with one blocking item naming the
+  cause, and resuming it runs the recovery again. Recovery adopts a child only when the attempt records it. Adopting a
+  completed or aborted plan is refused before its attachment closes, so an abort's cleanup (child stops, slot saves
+  and releases) is no longer cut off. Recovered work that waits for leases another holder has no longer wakes the
+  orchestrator. Once the slot pool closes, no slot claim waits on its base lookup any more, and none claims a slot.
 
 ### Security
 

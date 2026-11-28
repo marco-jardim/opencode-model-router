@@ -1156,6 +1156,40 @@ describe("short recovery barrier and context-admitted pipelines (D16)", () => {
     return { h, original, slot, nativeEnd, native, toolList, parents, verify, created, timers, synthetic, capture };
   }
 
+  it("Recovery-R1-n2: recovered verification held by its leases requests no wake while they are held elsewhere", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    await h.parts().writer.append([
+      { type: "attempt-ended", taskId: "T1", n: 1, outcome: "succeeded", endedAt: h.clock.iso(), detail: null },
+      tr("T1", "running", "completed", "child-ended"),
+      { type: "task-slot", taskId: "T1", slot: h.task("T1").slot, branch: taskBranchName(PLAN_ID, "T1") },
+      tr("T1", "completed", "verifying", "committed"),
+    ]);
+    await h.crash();
+    (h.deps.leaseRegistry as RegistryDouble).held.set("src/T1.ts", { holderID: "ses-foreign", taskRef: null });
+    h.engine();
+    h.launcher.gateValue = { ok: false, reason: "awaiting-first-router-call",
+      wake: { reason: "stale-context", stateKey: "await-router-call:restart:ses-0" } };
+    await h.runtime.start();
+    await h.runtime.settled();
+    expect(h.state("T1")).toBe("verifying");
+    expect(h.ledger().inbox.some((i) => i.taskId === "T1" && i.text.includes("could not re-take the leases"))).toBe(true);
+    expect((await h.events()).filter((e) => e.type === "wake")).toEqual([]);
+    expect(h.verifier.calls).toEqual([]);
+
+    // Positive control: once the foreign lease goes, the hold ends and the now admissible work wakes the root once.
+    (h.deps.leaseRegistry as RegistryDouble).held.delete("src/T1.ts");
+    h.runtime.onLeaseReleased();
+    await h.runtime.settled();
+    h.runtime.onLeaseReleased();
+    await h.runtime.settled();
+    expect((await h.events()).filter((e) => e.type === "wake")).toEqual([
+      expect.objectContaining({ reason: "stale-context", stateKey: "await-router-call:restart:ses-0" }),
+    ]);
+    expect(h.verifier.calls).toEqual([]); // still no root context: admission stays closed
+  });
+
   it.each([false, true])("reconciles later feeds and wakes once even with only pending verification (later=%s)", async (later) => {
     const x = await parked(later), { h } = x;
     expect(h.state("T1")).toBe("verifying");
@@ -1758,6 +1792,39 @@ describe("G-1: a child recovery adopted is stopped before its slot goes back", (
     expect(h.bindings.evicted).toEqual(["ses-c1"]);
   });
 
+  it("pdf2-1 minor-5: adopting an aborted plan is refused before its attachment closes; the abort's cleanup still runs", async () => {
+    const h = await adoptedAndRebound();
+    h.hosts.interruptImpl = async (sid) => {
+      h.log.push(`hosts.interrupt:${sid}`);
+    };
+    const slot = need(h.task("T1").slot, "slot of T1");
+    await h.runtime.abort(PLAN_ID, ORCH);
+    await until(() => h.hosts.interrupts.includes("ses-c1"), "the adopted child interrupted");
+    const mark = h.log.length;
+    await expect(h.runtime.adopt(PLAN_ID, "ses-new")).rejects.toThrow(/is aborted/);
+    expect(h.log.slice(mark)).not.toContain("queue.dispose");
+    expect(h.ledger().orchestrator.sessionID).toBe(ORCH);
+    h.hosts.emit({ type: "execution.interrupted", sessionID: "ses-c1", at: h.clock.iso() });
+    await until(() => h.slots.released.length > 0, "the slot released after the child's end", () => ({ logs: h.logs }));
+    await h.runtime.settled();
+    expect(h.slots.released).toEqual([slot]);
+  });
+
+  it("pdf2-1 minor-5: adopting a completed plan is refused before its attachment closes or recovery runs", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    const e = h.engine();
+    const adopt = vi.spyOn(e, "adopt");
+    await h.parts().writer.append([{ type: "status-changed", from: "running", to: "completed", reason: "plan-completed" }]);
+    const mark = h.log.length;
+    await expect(h.runtime.adopt(PLAN_ID, "ses-new")).rejects.toThrow(/is completed/);
+    expect(adopt).not.toHaveBeenCalled();
+    expect(h.log.slice(mark)).not.toContain("queue.dispose");
+    expect(h.ledger().orchestrator.sessionID).toBe(ORCH);
+    expect(h.ledger().status).toBe("completed");
+  });
+
   it("abort: an adopted child whose interrupt fails keeps its slot leased under the hold, with one blocking item", async () => {
     const h = await adoptedAndRebound();
     h.hosts.interruptImpl = async () => {
@@ -1892,6 +1959,102 @@ describe("start and locks (L2)", () => {
     h.hosts.emit({ type: "execution.completed", sessionID: "ses-c1", at: h.clock.iso() });
     await untilEnqueued(h, "T1");
     expect(endsOf(await h.events(), "T1")).toHaveLength(1);
+  });
+
+  it("QA-4.2-33: a stale same-repo plan the recover() report missed is taken over by start and reconciled", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    await h.crash();
+    await h.otherHolder(200); // another process took the lock and died (pid 200 is not alive)
+    h.hosts.activityValue = "inactive"; // reconciled: lost -> requeued -> relaunched
+    const e = h.engine();
+    e.recover = async () => []; // a transient error kept the plan out of the report
+    await h.runtime.start();
+    await h.runOf("T1", 2);
+
+    const takeovers = (await h.events()).filter((ev) => JSON.stringify(ev).includes("lock-takeover"));
+    expect(takeovers.length).toBe(1);
+    expect(JSON.stringify(takeovers[0])).toContain('"recover"');
+    expect(h.task("T1").attempts[0]).toMatchObject({ outcome: "lost" });
+    expect(h.logs.some((l) => l.startsWith(`warn: plan ${PLAN_ID} not attached`))).toBe(false);
+  });
+
+  it("#189: a stale plan recovery cannot classify is taken over but paused with one blocking item; a resume recovers it", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    await h.crash();
+    await h.otherHolder(200); // stale
+    h.hosts.activityValue = "inactive"; // once classified: lost -> requeued -> relaunched
+    const e = h.engine();
+    const reconcile0 = e.reconcile;
+    let broken = true;
+    e.recover = async () => {
+      throw new Error("the plan index is unreadable");
+    };
+    e.reconcile = async (l, tracked) => {
+      if (broken) throw new Error("the slots folder cannot be listed");
+      return reconcile0(l, tracked);
+    };
+    const logMark = h.log.length;
+    await h.runtime.start();
+    await h.runtime.settled();
+
+    expect((await h.events()).filter((ev) => JSON.stringify(ev).includes("lock-takeover"))).toHaveLength(1);
+    expect(h.ledger().status).toBe("paused");
+    const items = h.ledger().inbox.filter((i) => i.answer === null && i.text.includes("could not classify its tasks"));
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({ severity: "blocking", taskId: null });
+    expect(items[0]?.text).toContain("the slots folder cannot be listed");
+    // No recovery step ran: no interrupt, requeue, relaunch or integration resume.
+    expect(h.state("T1")).toBe("running");
+    expect(h.task("T1").attempts).toHaveLength(1);
+    expect(h.hosts.interrupts).toEqual([]);
+    expect(h.launcher.runs).toEqual([]);
+    expect(h.log.slice(logMark).filter((l) => l.startsWith("queue.resume"))).toEqual([]);
+
+    broken = false;
+    await h.runtime.resume(PLAN_ID, ORCH);
+    await h.runOf("T1", 2);
+    expect(h.task("T1").attempts[0]).toMatchObject({ outcome: "lost" });
+    expect(h.ledger().status).toBe("running");
+  });
+
+  it("#189: a resume whose recovery still cannot classify the plan leaves it paused and launches nothing", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    await h.crash();
+    h.hosts.activityValue = "inactive";
+    const e = h.engine();
+    e.reconcile = async () => {
+      throw new Error("the slots folder cannot be listed");
+    };
+    e.recover = async () => [];
+    await h.runtime.start();
+    await h.runtime.settled();
+    expect(h.ledger().status).toBe("paused");
+    await h.runtime.resume(PLAN_ID, ORCH);
+    await h.runtime.settled();
+    expect(h.ledger().status).toBe("paused");
+    expect(h.launcher.runs).toEqual([]);
+    expect(h.task("T1").attempts).toHaveLength(1);
+  });
+
+  it("#189: without a recovery service a stale lock is never taken over (E_LOCK_HELD, not attached)", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    await h.crash();
+    await h.otherHolder(200); // stale, but nothing could reconcile the plan
+    expect(h.deps.recovery).toBeNull();
+    await h.runtime.start();
+    await h.runtime.settled();
+
+    expect(h.logs.some((l) => l.startsWith(`warn: plan ${PLAN_ID} not attached`) && l.includes("held"))).toBe(true);
+    expect(h.runtime.planLine(ORCH)).toBeNull();
+    expect((await h.events()).some((ev) => JSON.stringify(ev).includes("lock-takeover"))).toBe(false);
   });
 
   it("a live holder is skipped and logged: nothing is taken over, attached or interrupted", async () => {

@@ -722,6 +722,11 @@ interface PlanRt {
   attachment: AbortController;
   /** §9: `queue.resume()` ran in this activation and did not halt; a user `resume` retries while false. */
   integrationResumed: boolean;
+  /**
+   * #189: this activation's `reconcile` threw, so the plan was paused before any recovery step ran (never run with no
+   * feeds); the user's `resume` runs the activation, and so the recovery, again.
+   */
+  unreconciled: boolean;
   /** R1a: children adopted on probation, keyed by child session id. */
   probation: Map<string, ProbationWatch>;
   /** R1a: the poll timer of the probation watch (one per plan), null when no child is on probation. */
@@ -1150,7 +1155,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
    * left its held states (or its slot) leaves the hold without one.
    */
   async function retryHeldLeases(p: PlanRt): Promise<void> {
-    if (p.leaseHeld.size === 0 || p.disposed || p.passive) return;
+    if (p.leaseHeld.size === 0 || p.disposed || p.passive || p.unreconciled) return;
     const l = p.writer.ledger;
     const tasks: Array<{ id: TaskId; slot: string | null; tree: string | null; footprint: Footprint }> = [];
     for (const id of [...p.leaseHeld].sort()) {
@@ -1279,16 +1284,26 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     p.recoveredWork.clear();
   }
 
+  /**
+   * R2 must still try to recover an invalid slot even when the old tree's lease rebuild failed. Re-provisioning
+   * performs its own lease acquisition/undo; only commit/check/verify remains held until leases are back: a
+   * re-verify of a valid slot and a completed child's end (commit then verify). An end that needs no verification
+   * (a failed, lost, capacity-stopped or interrupted child) is recorded at once and releases its token.
+   */
+  function recoveredWorkHeld(p: PlanRt, w: RecoveredWork): boolean {
+    return p.leaseHeld.has(w.taskId) && (w.work.kind === "reverify" ? w.work.slotValid !== false : w.work.end.kind === "completed");
+  }
+
+  /** Recovery-R1-n2 (#189): recovered work admission would start now; lease-held work requests no wake. */
+  function recoveredWorkWaiting(p: PlanRt): boolean {
+    return [...p.recoveredWork.values()].some((w) => !w.started && !recoveredWorkHeld(p, w));
+  }
+
   /** The launcher's live context gate is also the admission gate for recovered verification (D14). */
   function admitRecoveredWork(p: PlanRt): void {
     if (p.recovering || p.disposed || disposed || p.passive) return;
     for (const w of p.recoveredWork.values()) {
-      // R2 must still try to recover an invalid slot even when the old tree's lease rebuild failed. Re-provisioning
-      // performs its own lease acquisition/undo; only commit/check/verify remains held until leases are back: a
-      // re-verify of a valid slot and a completed child's end (commit then verify). An end that needs no verification
-      // (a failed, lost, capacity-stopped or interrupted child) is recorded at once and releases its token.
-      const held = (): boolean => p.leaseHeld.has(w.taskId)
-        && (w.work.kind === "reverify" ? w.work.slotValid !== false : w.work.end.kind === "completed");
+      const held = (): boolean => recoveredWorkHeld(p, w);
       if (w.started || held()) continue;
       if (!d.launcher.gate(p.writer.ledger.orchestrator.sessionID).ok) return;
       w.started = true; // synchronous reservation: repeated ticks/captures cannot queue a second pipeline
@@ -2056,8 +2071,9 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
   function schedule(p: PlanRt): void {
     observe(p, "schedule");
     // A passively attached (refused) plan never ticks (QA-3.1-19); an activation under way neither (4.2.5: recovery and
-    // the integration resume come before the first tick, which `recoverPlan`/`activate` schedule themselves).
-    if (p.disposed || disposed || p.passive || p.recovering) return;
+    // the integration resume come before the first tick, which `recoverPlan`/`activate` schedule themselves). #189: nor
+    // a plan whose recovery could not classify it, until a resume recovers it (even if its pause could not be journaled).
+    if (p.disposed || disposed || p.passive || p.recovering || p.unreconciled) return;
     if (p.ticking) {
       p.again = true;
       return;
@@ -2116,7 +2132,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     if (l.status !== "running") {
       closeIdle(p);
       // Recovery also re-verifies paused plans. Their pending work needs a root context even without launchable work.
-      if ([...p.recoveredWork.values()].some((w) => !w.started)) {
+      if (recoveredWorkWaiting(p)) {
         const gate = d.launcher.gate(l.orchestrator.sessionID);
         if (!gate.ok && gate.wake !== null) await wakeOnce(p, gate.wake.reason, gate.wake.stateKey);
       }
@@ -2162,7 +2178,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     }
     observe(p, "launch-gate", () => ({ ok: gate.ok, ready: ready.map((r) => r.taskId) }));
     if (ready.length === 0 || !gate.ok) {
-      if ((ready.length > 0 || [...p.recoveredWork.values()].some((w) => !w.started)) && !gate.ok && gate.wake !== null) {
+      if ((ready.length > 0 || recoveredWorkWaiting(p)) && !gate.ok && gate.wake !== null) {
         await wakeOnce(p, gate.wake.reason, gate.wake.stateKey);
       }
       updateIdle(p, ready, 0);
@@ -4126,6 +4142,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       attachmentWork: new Set(),
       attachment: new AbortController(),
       integrationResumed: false,
+      unreconciled: false,
       probation: new Map(),
       probationTimer: null,
       interrupting: new Set(),
@@ -4219,8 +4236,6 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     });
   }
 
-  /** Plans `recover()` reported eligible (same toplevel) or adopted here: only these may be taken over by `start()`. */
-  const recoverable = new Set<PlanId>();
   /** QA-4.2-17: plans of another toplevel `start()` attached passively; never recovered, resumed or ticked here. */
   const foreignPlans = new Set<PlanId>();
   /**
@@ -4291,7 +4306,15 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
    */
   async function recoverPlan(p: PlanRt): Promise<void> {
     // (2) classification, read-only; launches this process tracks are never reconciled (D12)
-    const feeds = await reconcileFeeds(p);
+    const got = await reconcileFeeds(p);
+    // #189: a ledger that could not be classified (e.g. a stale plan `start` took over outside the recover() report,
+    // whose slot markers cannot be read) is never run with no feeds: paused, one blocking item, no recovery step.
+    if (!Array.isArray(got)) {
+      await reconcileFailed(p, got.failed);
+      return;
+    }
+    p.unreconciled = false;
+    const feeds = got;
     // (3) orphans, best effort
     for (const f of feeds) for (const s of f.orphans) await interruptQuiet(s);
     // (4) the integration queue, before any dequeue (D7)
@@ -4330,7 +4353,30 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     }
   }
 
-  async function reconcileFeeds(p: PlanRt): Promise<ReconcileFeed[]> {
+  /** #189: pauses a plan whose `reconcile` threw and raises ONE blocking item naming the cause; never throws. */
+  async function reconcileFailed(p: PlanRt, e: unknown): Promise<void> {
+    p.unreconciled = true;
+    let paused = false;
+    try {
+      paused = await appendIf(p, (cur) =>
+        cur.status === "running" ? [{ type: "status-changed", from: "running", to: "paused", reason: "reconcile-failed" }] : [],
+      );
+    } catch (e2) {
+      d.log("error", "reconcile pause failed", errorText(e2));
+    }
+    if (paused) closeIdle(p);
+    counter(p, "reconcile-failed");
+    await raiseSafe(p, {
+      kind: "failure",
+      severity: "blocking",
+      taskId: null,
+      text: `the restart recovery of plan ${p.planId} could not classify its tasks (${errorText(e).slice(0, 500)}); the plan is paused and no recovery step ran: resume it once the cause is fixed (the resume recovers it again)`,
+      options: [],
+    });
+  }
+
+  /** The recovery feeds of `p`; `{ failed }` when `reconcile` threw (#189: the caller pauses the plan). */
+  async function reconcileFeeds(p: PlanRt): Promise<ReconcileFeed[] | { failed: unknown }> {
     const rec = d.recovery;
     const l = p.writer.ledger;
     const tracked = new Set<string>();
@@ -4358,7 +4404,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       return await rec.reconcile(l, tracked);
     } catch (e) {
       d.log("error", "reconcile failed", errorText(e));
-      return [];
+      return { failed: e };
     }
   }
 
@@ -4425,7 +4471,8 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
   async function adoptChild(p: PlanRt, t: TaskNode, f: ReconcileFeed): Promise<void> {
     const a = t.attempts.find((x) => x.n === f.n);
     const child = f.childSessionID;
-    if (a === undefined || child === null) return;
+    // QA-4.2-40 (#189): only the child the attempt records is adopted (token, handle, re-bind, probation).
+    if (a === undefined || child === null || a.childSessionID !== child) return;
     const n = a.n;
     const live = f.evidence !== "finished";
     // QA-4.2-16: a task whose leases could not be re-taken never adopts a live child (it would write without leases):
@@ -5689,6 +5736,10 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
           p.passive = false;
           observe(p, "promote");
           await activate(p, true);
+        } else if (p.unreconciled) {
+          // #189: the activation whose `reconcile` threw runs again (leases, recovery, integration resume).
+          await activate(p, true);
+          if (p.unreconciled) return;
         } else if (!p.integrationResumed) {
           // §9: a halted (or failed) integration resume is retried by the user's resume.
           await resumeIntegration(p);
@@ -5883,6 +5934,11 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
           st,
         );
       }
+      // pdf2-1 minor-5 (#189): a finished plan is never adopted (`recovery.adopt` refuses it too); refused before its
+      // attachment is closed, so an abort's background cleanup (stops, saves, releases, collection) is not cut.
+      if (st === "completed" || st === "aborted") {
+        throw new ExecutorError("E_PLAN_STATE", `plan ${planId} is ${st}`, { planId, status: st });
+      }
       // QA-4.2-21: a plan of another repository is never adopted here; its passive attachment stays as it is.
       if (seen !== null && isForeign(seen.repo.toplevel)) {
         throw new ExecutorError(
@@ -5929,7 +5985,6 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
             throw new ExecutorError("E_PLAN_STATE", `plan ${planId} belongs to another repository; its attachment is read-only`, { planId });
           }
           // L3: the reopened local ledger is reconciled on activation.
-          recoverable.add(planId);
           let writer: LedgerWriter;
           try {
             writer = await d.store.open(planId, d.holder(sessionID));
@@ -6092,9 +6147,9 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       // recover() report) is attached passively.
       if (d.recovery !== null) {
         try {
-          // L2: only the plans recover() reports (same toplevel, running or paused) may be taken over and reconciled.
+          // L2: recover() reports this repository's running or paused plans. It no longer limits takeover (QA-4.2-33,
+          // #189): any stale plan of this repository is taken over below, and one `reconcile` cannot classify is paused.
           for (const r of await d.recovery.recover()) {
-            recoverable.add(r.planId);
             // Nit: the engine's report carries full feeds; the plan's first recoverPlan reuses it (one reconcile, not two).
             const feeds: ReconcileFeed[] = [];
             for (const a of r.actions) if (isFeed(a)) feeds.push(a);
@@ -6125,7 +6180,9 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
           } catch (err) {
             // L2: `open` never takes over; a stale holder of an eligible plan is (the store refuses a live one with
             // E_LOCK_HELD: skipped and logged below, nothing interrupted). Plans of another toplevel are never taken over.
-            if (errorCode(err) !== "E_LOCK_HELD" || !recoverable.has(e.planId)) throw err;
+            // QA-4.2-33 (#189): eligible is this repository's plan (foreign ones attached above), whether or not the
+            // recover() report carried it; the attachment reconciles a plan the report missed (QA-4.2-21).
+            if (errorCode(err) !== "E_LOCK_HELD" || d.recovery === null) throw err;
             writer = await d.store.takeover(e.planId, holder, RECOVER_TAKEOVER_REASON);
           }
           // A same-repo plan the report missed still attaches actively and recoverPlan reconciles it.

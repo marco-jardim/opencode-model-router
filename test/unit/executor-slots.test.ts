@@ -879,6 +879,32 @@ describe("SlotPool concurrency", () => {
     }
   });
 
+  it("R2-3: once the pool closes, the head claim stops waiting on its hung lookup and no claim claims a slot", async () => {
+    const h = harness({ maxParallel: 3 });
+    await h.pool.open();
+    const lookups = Array.from({ length: 3 }, () => deferred<string>());
+    const revParse = h.git.revParse.bind(h.git);
+    let calls = 0;
+    h.git.revParse = (cwd, rev) => cwd === TOP ? lookups[calls++]!.promise : revParse(cwd, rev);
+    const writes = h.fs.markerWrites.length;
+    const attempts = [h.pool.acquire(PLAN, "first", C1), h.pool.acquireSpecial(PLAN, "integration"), h.pool.acquire(PLAN, "third", C3)];
+    const settled = Promise.allSettled(attempts);
+    try {
+      expect(calls).toBe(3);
+      h.pool.close(); // Every lookup stays hung, the head claim's included.
+      const results = await settled;
+      expect(results.map(r => r.status)).toEqual(["rejected", "rejected", "rejected"]);
+      for (const r of results) {
+        expect(r.status === "rejected" ? r.reason : null).toMatchObject({ code: "E_PLAN_STATE", message: "the slot pool is closed" });
+      }
+      expect(await h.pool.list()).toEqual([]);
+      expect(h.fs.markerWrites.length).toBe(writes);
+    } finally {
+      lookups.forEach(lookup => { lookup.resolve(C1); });
+      await settled;
+    }
+  });
+
   it("8 acquires on 4 slots: 4 succeed with distinct slots, 4 are refused as unavailable", async () => {
     const h = harness({ maxParallel: 4 });
     await h.pool.open();
